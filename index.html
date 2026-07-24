@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>chitra</title>
+<meta name="description" content="chitra: goal-aware, lightweight multi-agent orchestration for running AI coding agents unattended, with deterministic dispatch and LLM-judged completion review.">
+<style>
+  :root {
+    --paper: #f7f8f5;
+    --paper-raised: #ffffff;
+    --ink: #1c2422;
+    --ink-soft: #4d5a55;
+    --rule: #d8ded9;
+    --accent: #0e6e5c;
+    --accent-soft: #e3efe9;
+    --gate: #a8783a;
+    --gate-soft: #f3ead9;
+    --code-bg: #eef1ec;
+    --serif: Charter, "Bitstream Charter", "Sitka Text", Cambria, Georgia, serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --btn-text: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #151a18;
+      --paper-raised: #1c2320;
+      --ink: #e6ebe8;
+      --ink-soft: #9fada6;
+      --rule: #2e3733;
+      --accent: #57b9a4;
+      --accent-soft: #1e2f2a;
+      --gate: #d3a15e;
+      --gate-soft: #2e2618;
+      --code-bg: #101412;
+      --btn-text: #10201b;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #151a18;
+    --paper-raised: #1c2320;
+    --ink: #e6ebe8;
+    --ink-soft: #9fada6;
+    --rule: #2e3733;
+    --accent: #57b9a4;
+    --accent-soft: #1e2f2a;
+    --gate: #d3a15e;
+    --gate-soft: #2e2618;
+    --code-bg: #101412;
+    --btn-text: #10201b;
+  }
+  :root[data-theme="light"] {
+    --paper: #f7f8f5;
+    --paper-raised: #ffffff;
+    --ink: #1c2422;
+    --ink-soft: #4d5a55;
+    --rule: #d8ded9;
+    --accent: #0e6e5c;
+    --accent-soft: #e3efe9;
+    --gate: #a8783a;
+    --gate-soft: #f3ead9;
+    --code-bg: #eef1ec;
+    --btn-text: #ffffff;
+  }
+
+  html { background: var(--paper); }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--serif);
+    font-size: 1.0625rem;
+    line-height: 1.65;
+    margin: 0;
+  }
+  .wrap {
+    max-width: 44rem;
+    margin: 0 auto;
+    padding: 0 1.25rem;
+  }
+
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:hover { text-decoration-thickness: 2px; }
+  a:focus-visible, .btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  header.hero { padding: 4.5rem 0 2.75rem; }
+  .hero h1 {
+    font-size: clamp(2.6rem, 7vw, 3.6rem);
+    font-weight: 400;
+    letter-spacing: -0.01em;
+    line-height: 1.05;
+    margin: 0 0 0.4rem;
+  }
+  .hero h1 .mark { color: var(--accent); }
+  .tagline {
+    font-size: clamp(1.2rem, 3vw, 1.45rem);
+    line-height: 1.35;
+    margin: 0 0 1.5rem;
+    color: var(--ink);
+    text-wrap: balance;
+  }
+  .duality {
+    border-left: 3px solid var(--accent);
+    padding: 0.1rem 0 0.1rem 1.1rem;
+    margin: 0 0 1.75rem;
+    color: var(--ink-soft);
+    font-size: 1rem;
+  }
+  .duality p { margin: 0 0 0.75rem; }
+  .duality p:last-child { margin-bottom: 0; }
+  .duality strong { color: var(--ink); font-weight: 600; }
+
+  .meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.5rem;
+    align-items: center;
+    font-family: var(--sans);
+    font-size: 0.8125rem;
+    color: var(--ink-soft);
+  }
+  .btn {
+    display: inline-block;
+    font-family: var(--sans);
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--btn-text);
+    background: var(--accent);
+    padding: 0.55rem 1.1rem;
+    border-radius: 4px;
+    text-decoration: none;
+  }
+  .btn:hover { filter: brightness(1.08); }
+  .meta-sep { color: var(--rule); }
+
+  section { border-top: 1px solid var(--rule); padding: 2.75rem 0; }
+  .eyebrow {
+    font-family: var(--sans);
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 0.9rem;
+  }
+  h2 {
+    font-size: 1.6rem;
+    font-weight: 500;
+    line-height: 1.25;
+    margin: 0 0 1rem;
+    text-wrap: balance;
+  }
+  section > .wrap > p { margin: 0 0 1rem; max-width: 65ch; }
+
+  .why-list { display: grid; gap: 1.4rem; margin: 1.5rem 0 0; padding: 0; list-style: none; }
+  .why-list h3 {
+    font-family: var(--sans);
+    font-size: 0.95rem;
+    font-weight: 650;
+    margin: 0 0 0.25rem;
+  }
+  .why-list p { margin: 0; color: var(--ink-soft); font-size: 1rem; max-width: 62ch; }
+
+  .diagram-frame {
+    background: var(--paper-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 1.25rem 1rem 0.75rem;
+    margin: 1.5rem 0 0.5rem;
+    overflow-x: auto;
+  }
+  .diagram-frame svg { display: block; min-width: 620px; width: 100%; height: auto; }
+  .diagram-caption {
+    font-family: var(--sans);
+    font-size: 0.78rem;
+    color: var(--ink-soft);
+    margin: 0.25rem 0 0;
+  }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 1.5rem;
+    font-family: var(--sans);
+    font-size: 0.8125rem;
+    color: var(--ink-soft);
+    margin: 0.9rem 0 0;
+  }
+  .legend .key {
+    display: inline-block;
+    width: 1.6rem;
+    height: 0;
+    border-top: 2.5px solid var(--accent);
+    vertical-align: middle;
+    margin-right: 0.45rem;
+  }
+  .legend .key.gate { border-top-style: dashed; border-top-color: var(--gate); }
+
+  .aside-tech { font-size: 0.95rem; color: var(--ink-soft); }
+  .aside-tech h2 { font-size: 1.15rem; color: var(--ink); }
+  .aside-tech p { max-width: 65ch; margin: 0 0 0.8rem; }
+  .aside-tech code { color: var(--accent); }
+
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 1rem 1.1rem;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    line-height: 1.55;
+    margin: 1.25rem 0;
+  }
+  code { font-family: var(--mono); font-size: 0.85em; }
+  p code, li code {
+    background: var(--code-bg);
+    border-radius: 3px;
+    padding: 0.08em 0.3em;
+  }
+  .snippet-note {
+    font-family: var(--sans);
+    font-size: 0.78rem;
+    color: var(--ink-soft);
+    margin: -0.6rem 0 0;
+  }
+
+  footer {
+    border-top: 1px solid var(--rule);
+    padding: 2.25rem 0 3.5rem;
+    font-family: var(--sans);
+    font-size: 0.85rem;
+    color: var(--ink-soft);
+  }
+  footer .links { display: flex; flex-wrap: wrap; gap: 0.4rem 1.5rem; margin: 0 0 1rem; }
+  footer .colophon { margin: 0; max-width: 62ch; }
+
+  @media (prefers-reduced-motion: no-preference) {
+    a, .btn { transition: filter 120ms ease, text-decoration-thickness 80ms ease; }
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <h1><span class="mark">chitra</span></h1>
+    <p class="tagline">Run AI coding agents unattended — with goals they can&rsquo;t quietly abandon.</p>
+    <div class="duality">
+      <p><strong>The bookkeeping never guesses.</strong> Everything that queues, delivers, and records work is plain deterministic code — no model decides what gets sent or when, every action is logged, and a crash never loses your place.</p>
+      <p><strong>The judgment is real judgment.</strong> Where a decision needs reasoning — is this work actually finished? has this session drifted off goal? — chitra calls a large language model (LLM) to review it. It directs and checks the work of AI coding agents such as Claude (via claude-code) and Codex; it doesn&rsquo;t do their work for them.</p>
+    </div>
+    <div class="meta-row">
+      <a class="btn" href="https://github.com/ReticleWorks/chitra">View on GitHub</a>
+      <span>MIT license</span>
+      <span class="meta-sep" aria-hidden="true">·</span>
+      <span>Python 3.12+</span>
+      <span class="meta-sep" aria-hidden="true">·</span>
+      <span>Requires tmux</span>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <p class="eyebrow">What chitra does for you</p>
+    <h2>Step away from the terminal. The work keeps moving — and stays honest.</h2>
+    <p>AI coding agents are good at working and bad at being left alone: they drift from the goal, declare victory early, and stall on rate limits. chitra was built to run many agent sessions in parallel without a person babysitting each one.</p>
+    <ul class="why-list">
+      <li>
+        <h3>It watches sessions so you don&rsquo;t have to</h3>
+        <p>chitra tracks every session&rsquo;s state around the clock. It keeps a live roster of each session&rsquo;s goal and open questions, so long-running work doesn&rsquo;t quietly go off track while you&rsquo;re doing something else.</p>
+      </li>
+      <li>
+        <h3>It catches &ldquo;done&rdquo; that isn&rsquo;t done</h3>
+        <p>When an agent claims it&rsquo;s finished, independent LLM reviewers check that claim against the goal you set at the start — a goal recorded once and never rewritten to fit whatever got built. Work that falls short doesn&rsquo;t get to close.</p>
+      </li>
+      <li>
+        <h3>It nudges drifting agents back on goal</h3>
+        <p>Instead of letting a session wander, chitra sends it back toward the stated goal — and keeps a record of every nudge it delivers.</p>
+      </li>
+      <li>
+        <h3>It rides out rate limits without losing progress</h3>
+        <p>When a provider limit or host overload hits, chitra pauses the affected sessions, saves a note of exactly where the work stood, and resumes them safely once the limit clears. No abandoned half-finished tasks.</p>
+      </li>
+      <li>
+        <h3>You stay in control of what matters</h3>
+        <p>Anything that spends money, touches credentials, or can&rsquo;t be undone waits for a human. And every message chitra delivers is written to a signed, append-only log, so you can always prove what was sent, and when.</p>
+      </li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="eyebrow">How it works</p>
+    <h2>Reliable machinery, with judgment at the gates.</h2>
+    <p>Work flows along a fully deterministic path: queued, delivered into the agent&rsquo;s session, confirmed against the session&rsquo;s own transcript, and signed into a permanent log. The one place a model enters that loop is the gate: when an agent says &ldquo;done,&rdquo; isolated LLM reviewers judge the claim, and their verdicts go into chitra&rsquo;s own records — never back into the agent&rsquo;s session.</p>
+
+    <div class="diagram-frame" role="img" aria-label="Illustrative diagram: a JSON order queue flows to dispatchd, then to a tmux agent session, then to transcript confirmation and the signed ledger. Above the session, watchd and the completion gate call LLM reviewers, shown as a dashed path.">
+      <svg viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <defs>
+          <marker id="arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0 0 L8 4 L0 8 z" fill="var(--accent)"></path>
+          </marker>
+          <marker id="arrg" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0 0 L8 4 L0 8 z" fill="var(--gate)"></path>
+          </marker>
+        </defs>
+        <style>
+          .box { fill: var(--paper); stroke: var(--accent); stroke-width: 1.5; rx: 5; }
+          .gbox { fill: var(--gate-soft); stroke: var(--gate); stroke-width: 1.5; stroke-dasharray: 5 4; rx: 5; }
+          .lbl { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 13px; font-weight: 600; fill: var(--ink); }
+          .sub { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 10.5px; fill: var(--ink-soft); }
+          .flow { stroke: var(--accent); stroke-width: 1.75; fill: none; }
+          .gflow { stroke: var(--gate); stroke-width: 1.75; stroke-dasharray: 5 4; fill: none; }
+        </style>
+
+        <!-- deterministic row -->
+        <rect class="box" x="8" y="150" width="128" height="58" rx="5"></rect>
+        <text class="lbl" x="72" y="175" text-anchor="middle">order queue</text>
+        <text class="sub" x="72" y="192" text-anchor="middle">JSON orders</text>
+
+        <rect class="box" x="176" y="150" width="128" height="58" rx="5"></rect>
+        <text class="lbl" x="240" y="175" text-anchor="middle">dispatchd</text>
+        <text class="sub" x="240" y="192" text-anchor="middle">LaneLock · one writer</text>
+
+        <rect class="box" x="344" y="150" width="140" height="58" rx="5"></rect>
+        <text class="lbl" x="414" y="175" text-anchor="middle">tmux session</text>
+        <text class="sub" x="414" y="192" text-anchor="middle">coding agent</text>
+
+        <rect class="box" x="524" y="150" width="100" height="58" rx="5"></rect>
+        <text class="lbl" x="574" y="175" text-anchor="middle">confirm</text>
+        <text class="sub" x="574" y="192" text-anchor="middle">transcript grep</text>
+
+        <rect class="box" x="664" y="150" width="88" height="58" rx="5"></rect>
+        <text class="lbl" x="708" y="175" text-anchor="middle">ledger</text>
+        <text class="sub" x="708" y="192" text-anchor="middle">HMAC-signed</text>
+
+        <line class="flow" x1="136" y1="179" x2="170" y2="179" marker-end="url(#arr)"></line>
+        <line class="flow" x1="304" y1="179" x2="338" y2="179" marker-end="url(#arr)"></line>
+        <line class="flow" x1="484" y1="179" x2="518" y2="179" marker-end="url(#arr)"></line>
+        <line class="flow" x1="624" y1="179" x2="658" y2="179" marker-end="url(#arr)"></line>
+
+        <!-- LLM gate row -->
+        <rect class="gbox" x="284" y="24" width="120" height="52" rx="5"></rect>
+        <text class="lbl" x="344" y="46" text-anchor="middle">watchd</text>
+        <text class="sub" x="344" y="62" text-anchor="middle">turn-end events</text>
+
+        <rect class="gbox" x="452" y="24" width="176" height="52" rx="5"></rect>
+        <text class="lbl" x="540" y="46" text-anchor="middle">completion gate</text>
+        <text class="sub" x="540" y="62" text-anchor="middle">LLM reviewers · claude -p</text>
+
+        <path class="gflow" d="M 414 144 L 414 100 L 360 100 L 360 82" marker-end="url(#arrg)"></path>
+        <path class="gflow" d="M 404 50 L 446 50" marker-end="url(#arrg)"></path>
+        <path class="gflow" d="M 540 82 L 540 116 L 700 116 L 700 144" marker-end="url(#arrg)"></path>
+        <text class="sub" x="628" y="110" text-anchor="middle">verdicts → chitra&rsquo;s logs only</text>
+        <text class="sub" x="380" y="116" text-anchor="start">claim: &ldquo;done&rdquo;</text>
+      </svg>
+      <p class="diagram-caption">Illustrative diagram of the dispatch and gating path — not a screenshot.</p>
+    </div>
+    <div class="legend">
+      <span><span class="key" aria-hidden="true"></span>Deterministic path — no LLM calls</span>
+      <span><span class="key gate" aria-hidden="true"></span>LLM judgment — real model calls</span>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="eyebrow">Quickstart</p>
+    <h2>Install</h2>
+    <p>Requires Python 3.12+ and <code>tmux</code> on the host.</p>
+    <pre><code>pip install chitra-monitor  # or: pip install git+https://github.com/first-polyphony/chitra.git@&lt;tag&gt;</code></pre>
+    <p>For local development:</p>
+    <pre><code>git clone https://github.com/first-polyphony/chitra.git
+cd chitra
+pip install -e '.[test]'
+pytest</code></pre>
+    <p class="snippet-note">Commands reproduced verbatim from the project README. Not yet on PyPI — see the README&rsquo;s Install section for details.</p>
+  </div>
+</section>
+
+<section class="aside-tech">
+  <div class="wrap">
+    <p class="eyebrow">For the technically curious</p>
+    <h2>Under the hood</h2>
+    <p>chitra installs eleven command-line entrypoints backed by small, single-purpose modules. <code>dispatchd</code> and <code>triaged</code> run as always-on, systemd-supervised daemons. Delivery is single-writer per session (a file-based <code>LaneLock</code>), idempotent across crashes, and confirmed by grepping the target session&rsquo;s own transcript. Every delivery is appended to a ledger signed with HMAC-SHA256 (a keyed cryptographic checksum) and stored as JSONL (one JSON record per line). Orders, results, and event logs are plain, documented file formats any read-only consumer can build against.</p>
+    <p>The full module list, delivery guarantees, and configuration reference are in the <a href="https://github.com/ReticleWorks/chitra#readme">README</a>; design rationale is in <a href="https://github.com/ReticleWorks/chitra/blob/main/docs/DESIGN.md">docs/DESIGN.md</a>.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="links">
+      <a href="https://github.com/ReticleWorks/chitra">GitHub — ReticleWorks/chitra</a>
+      <a href="https://github.com/ReticleWorks/chitra#readme">README</a>
+      <a href="https://github.com/ReticleWorks/chitra/tree/main/docs">Full documentation (docs/)</a>
+      <a href="https://github.com/ReticleWorks/chitra/issues">Issues</a>
+    </div>
+    <p class="colophon">MIT © 2026 Reticle Works. The name is a short form of <em>Chitragupta</em>, the divine registrar of Hindu tradition — one who records, verifies, and reports, but does not act on the decision-maker&rsquo;s behalf. Used respectfully as a functional reference.</p>
+  </div>
+</footer>
+
+</body>
+</html>
