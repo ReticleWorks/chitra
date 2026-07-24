@@ -143,5 +143,5 @@ Usage snapshots are grouped by account (never merged). One fresh session cannot 
 
 ## See Also
 
-- **[Rate-limit-guard](rate-limit-guard.md)** — Consumes usage snapshots and makes pause/resume decisions.
-- **[Configuration](../configuration.md)** — Policy thresholds (pause_5h_pct, warn_7d_pct, etc).
+- **[Rate-limit-guard](../delivery/rate-limit-guard.md)** — Consumes usage snapshots and makes pause/resume decisions.
+- **[Configuration](../../configuration/)** — Policy thresholds (pause_5h_pct, warn_7d_pct, etc).

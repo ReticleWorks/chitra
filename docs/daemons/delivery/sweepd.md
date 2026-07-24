@@ -119,5 +119,5 @@ A dashboard can poll the digest file every 10-30 seconds and render the current 
 ## See Also
 
 - **[Triaged](triaged.md)** — Provides critical-flags input to sweepd.
-- **[Goals CLI](goals-cli.md)** — Manages the goals state that sweepd reads.
-- **[Convlog](convlog.md)** — Records pending decisions that sweepd includes.
+- **[Goals CLI](../operator-tools/goals-cli.md)** — Manages the goals state that sweepd reads.
+- **[Convlog](../operator-tools/convlog.md)** — Records pending decisions that sweepd includes.

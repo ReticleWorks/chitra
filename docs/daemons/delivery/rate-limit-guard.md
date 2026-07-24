@@ -143,6 +143,6 @@ These are never LLM-authored. They come from chitra's shipped templates.
 
 ## See Also
 
-- **[Pause and Recovery](../pause-recovery.md)** — Detailed mechanics of pause/resume phases.
-- **[Configuration](../configuration.md)** — How to set policy thresholds.
-- **[Usage](usage.md)** — How usage snapshots are captured.
+- **[Pause and Recovery](../../pause-recovery.md)** — Detailed mechanics of pause/resume phases.
+- **[Configuration](../../configuration/)** — How to set policy thresholds.
+- **[Usage](../operator-tools/usage.md)** — How usage snapshots are captured.

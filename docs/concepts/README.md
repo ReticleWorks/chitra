@@ -122,6 +122,6 @@ The deterministic and LLM layers are separate. An LLM verdict never forces a dec
 
 ## See Also
 
-- **[Design notes](DESIGN.md)** — Detailed origin, single-writer rule, done-condition ownership, distribution model.
-- **[Daemons reference](daemons/)** — How each daemon/CLI tool works and what it does.
-- **[Configuration](configuration.md)** — Routing and policy settings.
+- **[Design notes](../DESIGN.md)** — Detailed origin, single-writer rule, done-condition ownership, distribution model.
+- **[Daemons reference](../daemons/)** — How each daemon/CLI tool works and what it does.
+- **[Configuration](../configuration/)** — Routing and policy settings.

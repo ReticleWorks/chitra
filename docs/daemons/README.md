@@ -1,31 +1,32 @@
-# Daemons and CLI Tools
+# Daemons and Tools
 
-Chitra provides a set of command-line tools and daemons. Two run continuously (dispatchd, triaged). The rest are periodic, ad-hoc, or observation-only services.
+Chitra provides a set of command-line tools and daemons organized by function. Two run continuously (dispatchd, triaged). The rest are periodic, ad-hoc, or observation-only services.
 
-## Always-on daemons
+## Delivery Systems
 
-- **[dispatchd](dispatchd.md)** — Delivery daemon. Drains the message queue, delivers to tmux sessions, verifies delivery, and logs each send to a signed ledger.
-- **[triaged](triaged.md)** — State deduplication. Tails the events log, deduplicates pane changes, and emits alerts on critical conditions (crash, merge, rate limit, etc).
+The deterministic core that handles message queuing, delivery, and ledger recording.
 
-## Periodic and ad-hoc
+- **[Delivery](delivery/)** — Dispatch daemon, state deduplication, and fleet digests
 
-- **[watchd](watchd.md)** — Completion reviewer. Watches tmux panes for completion claims and launches isolated LLM reviewer processes to judge whether claims match frozen goals. (This is where chitra makes real LLM calls.)
-- **[sweepd](sweepd.md)** — Fleet state digest. Reads canonical goals, rate-limit state, and triaged flags, then publishes delta-only updates for downstream dashboards.
-- **[rate-limit-guard](rate-limit-guard.md)** — Rate limiting and load shedding. Pauses and resumes sessions via a durable transaction ledger based on account usage and host pressure.
-- **[chitra-goals](goals-cli.md)** — Goal management CLI. Enroll sessions, query status, close goals, hold/resume, track open asks, and render the operator board.
-- **[chitra-convo](convlog.md)** — Operator decision log. Records four-stage conversation (raw message → brief → ruling → directive) as an append-only JSONL log.
-- **[chitra-artifacts](artifacts.md)** — Artifact review tracking. Records Claude-artifact publish state and marks artifacts as reviewed.
-- **[chitra-usage](usage.md)** — Usage snapshot evaluation. Reads API provider usage (Claude, Codex) and checks against policy thresholds.
-- **[draft-scanner](draft-scanner.md)** — Unsubmitted draft detection. Scans tmux input boxes for unsent operator drafts.
-- **[chitra-capabilities](capabilities.md)** — Runtime authorization toggles. Enable/disable capabilities (dispatch, goal enforcement, etc) with optional expiry.
-- **[replay-eval](replay-eval.md)** — Regression testing. Deterministically evaluates synthetic fixture cases against chitra's policy (CI tool, zero LLM calls).
+## Authority and Access Control
 
-## Observe-only services
+Read-only services for ownership verification and pressure observation.
 
-- **[petra](petra.md)** — Dark-launch observe-only authority. Validates advisory "pressure observation" events from Watchtower and records them to SQLite. Never acts on observations; pure recording.
-- **[ownership-provider](ownership-provider.md)** — Read-only ownership fence. Answers whether a host:lane:instance belongs to a canonical managed lane by reading goals.json and a digest marker. Never discovers sessions or modifies state.
+- **[Authority](authority/)** — Ownership verification and dark-launch observation
 
-## Quick reference
+## Operator Tools
+
+CLI utilities and watchers for managing sessions, goals, and policy enforcement.
+
+- **[Operator Tools](operator-tools/)** — Session management, goal tracking, artifact review, and decision logging
+
+## Utilities
+
+Auxiliary tools for testing, debugging, and drift detection.
+
+- **[Utilities](utilities/)** — Draft scanning and regression testing
+
+## Quick Start
 
 **Start chitra for the first time:**
 
@@ -60,5 +61,5 @@ chitra-usage evaluate --dir /var/lib/chitra/usage --policy-config /etc/chitra/po
 
 ## See Also
 
-- **[Concepts](../concepts.md)** — How daemons fit together (deterministic core vs LLM-judgment layer).
-- **[Configuration](../configuration.md)** — Policy and routing settings.
+- **[Concepts](../concepts/)** — How daemons fit together
+- **[Configuration](../configuration/)** — Policy and routing settings

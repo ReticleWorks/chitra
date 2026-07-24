@@ -6,15 +6,15 @@ Chitra delivers messages to long-running LLM agent sessions in tmux and watches 
 
 Start here if you're new to chitra:
 
-- **[Getting Started](getting-started.md)** — Install chitra and run your first dispatch.
-- **[Concepts](concepts.md)** — Understand chitra's two layers: the deterministic core (delivery, ledger, rate-limiting, routing, ownership) and the LLM-judgment layer (goal enforcement via watchd).
+- **[Quickstart](quickstart/)** — Install chitra and run your first dispatch.
+- **[Concepts](concepts/)** — Understand chitra's two layers: the deterministic core (delivery, ledger, rate-limiting, routing, ownership) and the LLM-judgment layer (goal enforcement via watchd).
 
 ## Core reference
 
 Understand how chitra works:
 
-- **[Daemons and CLI tools](daemons/)** — One page per daemon and entrypoint.
-- **[Configuration](configuration.md)** — Routing and policy settings, with worked examples.
+- **[Daemons and Tools](daemons/)** — Message delivery, session management, policy enforcement, and utilities.
+- **[Configuration](configuration/)** — Routing and policy settings, with worked examples.
 
 ## Deep dives
 

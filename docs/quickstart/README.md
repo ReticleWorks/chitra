@@ -27,7 +27,7 @@ pip install chitra-monitor  # or: pip install git+https://github.com/ReticleWork
 
 Replace `<tag>` with a released version from the [tags page](https://github.com/ReticleWorks/chitra/tags), or drop `@<tag>` to install from the default branch.
 
-Requires Python 3.12+ and `tmux` on the host. See [Install](#install) for local development setup, [Configuration](configuration.md) for environment variables, and the main [README](../README.md) for what chitra actually does to a pane.
+Requires Python 3.12+ and `tmux` on the host. See [Install](#install) for local development setup, [Configuration](../configuration/) for environment variables, and the main [README](../README.md) for what chitra actually does to a pane.
 
 ## Your first dispatch
 
@@ -84,7 +84,7 @@ Each successful delivery is HMAC-signed and recorded here. The ledger is append-
 
 ## What's next
 
-- Read [Concepts](concepts.md) to understand chitra's two layers: the deterministic core and the LLM-judgment layer.
-- Check the [Daemons reference](daemons/) to learn what each tool does.
-- See [Configuration](configuration.md) to set up routing and policy for your deployment.
+- Read [Concepts](../concepts/) to understand chitra's two layers: the deterministic core and the LLM-judgment layer.
+- Check the [Daemons reference](../daemons/) to learn what each tool does.
+- See [Configuration](../configuration/) to set up routing and policy for your deployment.
 - For systemd integration and running daemons continuously, refer to the main [README](../README.md).

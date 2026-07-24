@@ -28,7 +28,7 @@ routes:
 
 Chitra resolves routes (structured form) into a `model@harness[+zdr]` string and records it in the ledger. A routes entry wins over a defaults entry for the same task_type.
 
-The task_type keys are operator-defined. Chitra has no opinion on what they mean. These examples happen to draw from real orchestration patterns (see [workflow patterns catalog](workflow-pattern-catalog.md)), but your vocabulary is your own.
+The task_type keys are operator-defined. Chitra has no opinion on what they mean. These examples happen to draw from real orchestration patterns (see [workflow patterns catalog](../workflow-pattern-catalog.md)), but your vocabulary is your own.
 
 ## Policy Configuration
 
@@ -199,7 +199,7 @@ To understand how policy works, walk through a scenario:
 
 ## See Also
 
-- **[Routing feedback and usage](routing-feedback-usage.md)** — Advanced routing tuning.
-- **[Self-tuning](self-tuning.md)** — Automated policy feedback loop.
-- **[Pause and recovery](pause-recovery.md)** — Detailed pause/resume mechanics.
-- **[Rate-limit-guard](daemons/rate-limit-guard.md)** — How policy is applied.
+- **[Routing feedback and usage](../routing-feedback-usage.md)** — Advanced routing tuning.
+- **[Self-tuning](../self-tuning.md)** — Automated policy feedback loop.
+- **[Pause and recovery](../pause-recovery.md)** — Detailed pause/resume mechanics.
+- **[Rate-limit-guard](../daemons/delivery/rate-limit-guard.md)** — How policy is applied.

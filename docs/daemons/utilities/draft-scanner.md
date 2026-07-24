@@ -94,4 +94,4 @@ draft-scanner --targets "localhost:session:0" | jq '.[] | select(.has_draft)'
 
 ## See Also
 
-- **[Rate-limit-guard](rate-limit-guard.md)** — May use draft-scanner before pausing.
+- **[Rate-limit-guard](../delivery/rate-limit-guard.md)** — May use draft-scanner before pausing.

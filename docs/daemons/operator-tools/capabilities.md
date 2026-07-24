@@ -175,4 +175,4 @@ If a required capability is missing or unknown, the daemon fails safely (does no
 
 ## See Also
 
-- **[Configuration](../configuration.md)** — Policy settings that interact with capabilities.
+- **[Configuration](../../configuration/)** — Policy settings that interact with capabilities.
