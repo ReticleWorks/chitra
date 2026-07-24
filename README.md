@@ -1,5 +1,7 @@
 # chitra
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)]() [![PyPI](https://img.shields.io/pypi/v/chitra-monitor.svg)](https://pypi.org/project/chitra-monitor/)
+
 chitra is a set of systemd-supervised daemons that deterministically deliver text into `tmux`-hosted AI-agent sessions, record what happened, and watch their state. Its core dispatch, ledger, rate-limit, and routing paths are Python control loops, not an LLM deciding what to send or where to send it.
 
 It was built to manage large parallel sessions with LLM coding agents, allowing the user to do more while chitra handles delivery and state tracking, applies optional LLM-backed judgment gates, and gates external harnesses such as Claude and Codex against clearly defined goals.
