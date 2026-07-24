@@ -12,8 +12,20 @@ requires-python = ">=3.12"
 authors = [
     { name = "Trey Herr" },
 ]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Monitoring",
+]
 dependencies = [
-    "structlog>=26.1.0",
+    "structlog>=26.1.0,<27",
     "pydantic>=2.13.4,<3",
     "pyyaml>=6.0.3,<7",
 ]
@@ -42,8 +54,10 @@ chitra-capabilities = "chitra.capabilities:main"
 chitra-pr-review = "chitra.pr_reviewd:main"
 
 [project.urls]
+Homepage = "https://github.com/ReticleWorks/chitra"
 Repository = "https://github.com/ReticleWorks/chitra"
 Issues = "https://github.com/ReticleWorks/chitra/issues"
+Changelog = "https://github.com/ReticleWorks/chitra/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/chitra"]
