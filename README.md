@@ -1,14 +1,14 @@
 # chitra
 
-chitra is a set of deterministic, systemd-supervised daemons that deliver text into `tmux`-hosted AI-agent sessions and watch their state. It lets long-running coding-agent sessions run unattended instead of being babysat pane by pane.
+chitra is a set of systemd-supervised daemons that deterministically deliver text into `tmux`-hosted AI-agent sessions, record what happened, and watch their state. Its core dispatch, ledger, rate-limit, and routing paths are Python control loops, not an LLM deciding what to send or where to send it.
 
-It was built to manage large parallel sessions with LLMs, allowing the user to do more while chitra manages clearly defined goals and nudges agents forward.
+It was built to manage large parallel sessions with LLM coding agents, allowing the user to do more while chitra handles delivery and state tracking, applies optional LLM-backed judgment gates, and gates external harnesses such as Claude and Codex against clearly defined goals.
 
 ## Scope
 
-chitra delivers messages to LLM-driven sessions in tmux and observes their state. Everything on the delivery, queueing, evidence-check, and state-tracking path is deterministic — no model decides what to send or when.
+chitra delivers messages to LLM-driven sessions in tmux and observes their state. Delivery, queueing, routing, rate limiting, ledger writes, and state tracking are deterministic; routing is config lookup, not content judgment.
 
-The one deliberate exception is **goal enforcement**. When a watched session ends a turn claiming it is done, `chitra.goal_enforcement` launches independent `claude -p` reviewer processes to check that claim against the session's frozen goal. The reviewers never draft chitra's messages, and their verdicts stay in chitra's own logs — they are never pasted back into the watched session.
+LLM judgment is layered on deliberately for specific gates: goal nudging, completion-claim review, and interview functionality. Chitra also dispatches to and gates external coding-agent harnesses such as Claude via `claude-code` and Codex; those agents do the content work, while chitra records, routes, reviews, and releases according to its own ledgers and policies.
 
 ## Quickstart
 
