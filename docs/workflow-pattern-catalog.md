@@ -2,10 +2,7 @@
 
 This is prior art, not a spec: a catalog of nine named orchestration loop
 patterns from a "Fable 5 builder's guide," recorded here purely as a naming
-reference for chitra's `task_type` values. **Chitra does not implement,
-execute, or choose between any of these patterns.** It only carries whatever
-`task_type` string a caller provides through to `routing.yaml`'s lookup,
-unchanged — see the README's "Routing config" section and
+reference for chitra's `task_type` values. **Chitra does not choose, design, or decompose work according to any of these patterns.** However, it does provide the orchestration infrastructure — dispatch, tracking, and state coordination — that a deployment wires into one of these patterns. Chitra carries whatever `task_type` string a caller provides through to `routing.yaml`'s lookup, unchanged — see the README's "Routing config" section and
 `chitra.routing_config` for the actual mechanics.
 
 A deployment populating `routing.yaml` might reasonably use `task_type`
