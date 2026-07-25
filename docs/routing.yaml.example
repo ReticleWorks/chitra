@@ -1,0 +1,42 @@
+# chitra routing preferences — maps task_type to a default routing_hint.
+#
+# Purely mechanical lookup: chitra does not interpret task_type's meaning
+# or evaluate any content to classify it. The caller states task_type on a
+# DispatchOrder; dispatchd looks it up here and fills in routing_hint only
+# if the caller did not already supply one directly (an explicit
+# routing_hint on the order always wins over this table).
+#
+# This file is entirely operator-populated — chitra ships no opinions
+# about what task types or routing targets (sub-agent types, model names)
+# mean in any given deployment. Copy this file, edit the keys/values for
+# your deployment, and point CHITRA_ROUTING_CONFIG (or dispatchd's
+# --routing-config-path flag) at it. Unset/missing: dispatchd runs with no
+# routing config, a normal no-op.
+# The task_type keys below are purely illustrative examples, not a
+# prescribed vocabulary. They happen to be drawn from real-world named
+# orchestration loop patterns (see docs/workflow-pattern-catalog.md) —
+# chitra has no opinion on task_type naming and does not require these
+# specific keys.
+# Two shapes, both keyed by task_type, both operator-populated:
+#
+#   defaults -- flat task_type -> routing_hint. Chitra fills in the opaque
+#               routing_hint string but never acts on it. This is the
+#               original, unchanged shape.
+#   routes   -- structured task_type -> {model, harness, zdr?}. Chitra
+#               RESOLVES the model+harness at dispatch into a
+#               model@harness[+zdr] routing_hint and records the ZDR setting.
+#               A routes entry wins over a defaults entry for the same
+#               task_type.
+defaults:
+  heartbeat: sonnet
+  sparring: fable
+  quorum: haiku
+
+routes:
+  design-judgment:
+    model: opus-4.8
+    harness: claude-code
+    zdr: true
+  code-fix:
+    model: gpt-5.6-sol
+    harness: codex-cli

@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design notes &middot; chitra docs</title>
+<meta name="description" content="chitra documentation — goal-aware, lightweight multi-agent orchestration. Deterministic dispatch, LLM-judged completion review.">
+<style>
+  :root {
+    --paper: #f2f3ee; --paper-raised: #fbfcf8; --ink: #1e2925; --ink-soft: #52605a;
+    --rule: #d3d8cf; --rule-strong: #b9c1b6; --accent: #17695a; --accent-soft: #e1eee8;
+    --gate: #9a6b2f; --gate-soft: #f2e9d8; --code-bg: #e9ece5; --btn-text: #ffffff;
+    --display: "Bahnschrift", "DIN Alternate", "Franklin Gothic Medium", "Avenir Next Condensed", "Nimbus Sans Narrow", "Arial Narrow", sans-serif;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "URW Palladio L", P052, Georgia, serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) { :root {
+    --paper: #141917; --paper-raised: #1b211e; --ink: #e5eae6; --ink-soft: #9caba3;
+    --rule: #2c342f; --rule-strong: #3d463f; --accent: #52b7a2; --accent-soft: #1c2e28;
+    --gate: #d0a05f; --gate-soft: #2d2517; --code-bg: #101412; --btn-text: #0f1f1a;
+  } }
+  :root[data-theme="dark"] {
+    --paper: #141917; --paper-raised: #1b211e; --ink: #e5eae6; --ink-soft: #9caba3;
+    --rule: #2c342f; --rule-strong: #3d463f; --accent: #52b7a2; --accent-soft: #1c2e28;
+    --gate: #d0a05f; --gate-soft: #2d2517; --code-bg: #101412; --btn-text: #0f1f1a;
+  }
+  :root[data-theme="light"] {
+    --paper: #f2f3ee; --paper-raised: #fbfcf8; --ink: #1e2925; --ink-soft: #52605a;
+    --rule: #d3d8cf; --rule-strong: #b9c1b6; --accent: #17695a; --accent-soft: #e1eee8;
+    --gate: #9a6b2f; --gate-soft: #f2e9d8; --code-bg: #e9ece5; --btn-text: #ffffff;
+  }
+
+  html { background: var(--paper); scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  body {
+    background: var(--paper); color: var(--ink); font-family: var(--serif);
+    font-size: 1.0625rem; line-height: 1.62; margin: 0;
+  }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:hover { text-decoration-thickness: 2px; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+  /* masthead — same register as the landing page */
+  .masthead { border-bottom: 2px solid var(--ink); }
+  .masthead .wrap {
+    max-width: 90rem; margin: 0 auto; padding: 1.1rem 1.5rem;
+    display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 0.5rem 1.5rem;
+  }
+  .masthead .brand {
+    font-family: var(--display); font-size: 1.05rem; font-weight: 600;
+    letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink); text-decoration: none;
+  }
+  .masthead .brand .docmark { color: var(--accent); }
+  .masthead nav { display: flex; flex-wrap: wrap; gap: 0.4rem 1.4rem; font-family: var(--sans); font-size: 0.8125rem; }
+  .masthead nav a { color: var(--ink-soft); text-decoration: none; }
+  .masthead nav a:hover { color: var(--accent); text-decoration: underline; }
+
+  .shell {
+    max-width: 90rem; margin: 0 auto; padding: 0 1.5rem;
+    display: grid; grid-template-columns: 16.5rem minmax(0, 1fr) 13rem; gap: 0 3rem;
+  }
+
+  /* sidebar */
+  .sidebar {
+    border-right: 1px solid var(--rule-strong);
+    padding: 2rem 1.5rem 3rem 0;
+    position: sticky; top: 0; align-self: start;
+    max-height: 100vh; overflow-y: auto;
+    font-family: var(--sans);
+  }
+  .docnav .backlink {
+    display: block; font-size: 0.8125rem; color: var(--ink-soft);
+    text-decoration: none; margin: 0 0 1.6rem;
+  }
+  .docnav .backlink:hover { color: var(--accent); text-decoration: underline; }
+  .docnav .group {
+    font-family: var(--display); font-size: 0.72rem; font-weight: 600;
+    letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-soft);
+    margin: 1.6rem 0 0.5rem;
+  }
+  .docnav .group:first-of-type { margin-top: 0; }
+  .docnav ul { list-style: none; margin: 0; padding: 0; }
+  .docnav li a {
+    display: block; padding: 0.24rem 0 0.24rem 0.7rem; font-size: 0.85rem;
+    color: var(--ink-soft); text-decoration: none;
+    border-left: 2px solid transparent;
+  }
+  .docnav li a:hover { color: var(--accent); }
+  .docnav li a[aria-current="page"] {
+    color: var(--accent); font-weight: 600; border-left-color: var(--accent);
+  }
+  .docnav li.ind1 a { padding-left: 1.6rem; }
+  .docnav li.ind2 a { padding-left: 2.5rem; font-family: var(--mono); font-size: 0.78rem; }
+
+  /* mobile nav */
+  .mobilenav { display: none; }
+
+  /* content */
+  .doc { padding: 2.4rem 0 3rem; min-width: 0; }
+  article { max-width: 46rem; }
+  .crumbs {
+    font-family: var(--sans); font-size: 0.78rem; color: var(--ink-soft);
+    letter-spacing: 0.04em; margin: 0 0 1.4rem;
+  }
+  .crumbs a { color: var(--ink-soft); text-decoration: none; }
+  .crumbs a:hover { color: var(--accent); text-decoration: underline; }
+  article h1 {
+    font-family: var(--display); font-size: clamp(1.9rem, 4vw, 2.4rem); font-weight: 600;
+    line-height: 1.1; letter-spacing: 0.01em; margin: 0 0 1.1rem;
+    padding-bottom: 0.8rem; border-bottom: 2px solid var(--ink); text-wrap: balance;
+  }
+  article h2 {
+    font-family: var(--display); font-size: 1.45rem; font-weight: 600; line-height: 1.2;
+    margin: 2.6rem 0 0.9rem; padding-top: 1.4rem; border-top: 1px solid var(--rule);
+    text-wrap: balance;
+  }
+  article h3 {
+    font-family: var(--sans); font-size: 1rem; font-weight: 650; margin: 1.9rem 0 0.5rem;
+  }
+  article h4 {
+    font-family: var(--sans); font-size: 0.9rem; font-weight: 650; margin: 1.5rem 0 0.4rem;
+    color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  article p, article li { max-width: 65ch; }
+  article p { margin: 0 0 1rem; }
+  article ul, article ol { padding-left: 1.4rem; margin: 0 0 1.1rem; }
+  article li { margin: 0 0 0.35rem; }
+  article hr { border: 0; border-top: 1px solid var(--rule-strong); margin: 2.2rem 0; }
+  article blockquote {
+    margin: 1.2rem 0; padding: 0.1rem 0 0.1rem 1.1rem;
+    border-left: 3px solid var(--accent); color: var(--ink-soft);
+  }
+  article pre {
+    background: var(--code-bg); border: 1px solid var(--rule); border-radius: 6px;
+    padding: 0.9rem 1rem; overflow-x: auto; font-family: var(--mono);
+    font-size: 0.82rem; line-height: 1.55; margin: 1.1rem 0;
+  }
+  article code { font-family: var(--mono); font-size: 0.85em; }
+  article p code, article li code, article td code, article h1 code, article h2 code, article h3 code {
+    background: var(--code-bg); border-radius: 3px; padding: 0.08em 0.3em;
+  }
+  article pre code { background: none; padding: 0; font-size: 1em; }
+  .table-wrap { overflow-x: auto; margin: 1.2rem 0; }
+  article table {
+    border-collapse: collapse; font-family: var(--sans); font-size: 0.85rem; line-height: 1.5;
+    min-width: 100%;
+  }
+  article th {
+    font-family: var(--display); font-size: 0.75rem; font-weight: 600;
+    letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-soft);
+    text-align: left; padding: 0.45rem 1rem 0.45rem 0; border-bottom: 2px solid var(--ink);
+  }
+  article td {
+    padding: 0.5rem 1rem 0.5rem 0; border-bottom: 1px solid var(--rule);
+    vertical-align: top; font-variant-numeric: tabular-nums;
+  }
+
+  /* prev / next */
+  .pagenav {
+    max-width: 46rem; display: flex; justify-content: space-between; gap: 1rem;
+    margin: 3rem 0 0; padding-top: 1.4rem; border-top: 2px solid var(--ink);
+    font-family: var(--sans); font-size: 0.875rem;
+  }
+  .pagenav a { text-decoration: none; max-width: 46%; }
+  .pagenav a:hover .pn-title { text-decoration: underline; }
+  .pagenav .pn-dir {
+    display: block; font-family: var(--display); font-size: 0.7rem; font-weight: 600;
+    letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-soft); margin-bottom: 0.15rem;
+  }
+  .pagenav .pn-title { color: var(--accent); font-weight: 600; }
+  .pagenav .next { margin-left: auto; text-align: right; }
+
+  /* on this page */
+  .toc-rail {
+    padding: 2.4rem 0 3rem; position: sticky; top: 0; align-self: start;
+    max-height: 100vh; overflow-y: auto; font-family: var(--sans);
+  }
+  .toc-rail .group {
+    font-family: var(--display); font-size: 0.72rem; font-weight: 600;
+    letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-soft); margin: 0 0 0.5rem;
+  }
+  .toc-rail ul { list-style: none; margin: 0; padding: 0; }
+  .toc-rail a {
+    display: block; padding: 0.2rem 0; font-size: 0.8rem; color: var(--ink-soft); text-decoration: none;
+  }
+  .toc-rail a:hover { color: var(--accent); }
+
+  footer.site {
+    border-top: 2px solid var(--ink); margin-top: 1rem;
+    font-family: var(--sans); font-size: 0.85rem; color: var(--ink-soft);
+  }
+  footer.site .wrap { max-width: 90rem; margin: 0 auto; padding: 2rem 1.5rem 3rem; }
+  footer.site .links { display: flex; flex-wrap: wrap; gap: 0.4rem 1.5rem; margin: 0 0 0.9rem; }
+  footer.site p { margin: 0; }
+
+  @media (max-width: 1200px) {
+    .shell { grid-template-columns: 16.5rem minmax(0, 1fr); }
+    .toc-rail { display: none; }
+  }
+  @media (max-width: 900px) {
+    .shell { grid-template-columns: minmax(0, 1fr); }
+    .sidebar { display: none; }
+    .mobilenav {
+      display: block; margin: 1.4rem 0 0; font-family: var(--sans);
+      background: var(--paper-raised); border: 1px solid var(--rule-strong); border-radius: 6px;
+    }
+    .mobilenav summary {
+      cursor: pointer; padding: 0.7rem 1rem;
+      font-family: var(--display); font-size: 0.8rem; font-weight: 600;
+      letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent);
+    }
+    .mobilenav .docnav { padding: 0.4rem 1rem 1rem; }
+    .doc { padding-top: 0.6rem; }
+    .mobilewrap { padding: 0; }
+  }
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="wrap">
+    <a class="brand" href="/chitra/docs/">chitra <span class="docmark">&middot; docs</span></a>
+    <nav aria-label="Project links">
+      <a href="/chitra/">Home</a>
+      <a href="https://pypi.org/project/chitra-monitor/">PyPI</a>
+      <a href="https://github.com/ReticleWorks/chitra">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="sidebar">
+<nav class="docnav" aria-label="Documentation">
+<a class="backlink" href="/chitra/">&larr; chitra home</a>
+<p class="group">Documentation</p><ul>
+<li><a href="/chitra/docs/">Overview</a></li>
+</ul>
+<p class="group">Getting started</p><ul>
+<li><a href="/chitra/docs/quickstart/">Quickstart</a></li>
+<li><a href="/chitra/docs/concepts/">Concepts</a></li>
+</ul>
+<p class="group">Reference</p><ul>
+<li><a href="/chitra/docs/configuration/">Configuration</a></li>
+<li><a href="/chitra/docs/daemons/">Daemons &amp; Tools</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/delivery/">Delivery</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/dispatchd.html">dispatchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/triaged.html">triaged</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/sweepd.html">sweepd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/rate-limit-guard.html">rate-limit-guard</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/authority/">Authority</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/petra.html">petra</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/ownership-provider.html">ownership-provider</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/operator-tools/">Operator tools</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/watchd.html">watchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/goals-cli.html">goals CLI</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/artifacts.html">artifacts</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/capabilities.html">capabilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/convlog.html">convlog</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/usage.html">usage</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/utilities/">Utilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/draft-scanner.html">draft-scanner</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/replay-eval.html">replay-eval</a></li>
+</ul>
+<p class="group">Deep dives</p><ul>
+<li><a href="/chitra/docs/DESIGN.html" aria-current="page">Design notes</a></li>
+<li><a href="/chitra/docs/evasion-taxonomy.html">Evasion taxonomy</a></li>
+<li><a href="/chitra/docs/pause-recovery.html">Pause &amp; recovery</a></li>
+<li><a href="/chitra/docs/petra-authority.html">Petra authority</a></li>
+<li><a href="/chitra/docs/self-tuning.html">Self-tuning</a></li>
+<li><a href="/chitra/docs/workflow-pattern-catalog.html">Workflow patterns</a></li>
+<li><a href="/chitra/docs/routing-feedback-usage.html">Routing feedback &amp; usage</a></li>
+</ul>
+</nav>
+  </aside>
+  <main class="doc">
+    <div class="mobilewrap">
+      <details class="mobilenav">
+        <summary>Docs navigation</summary>
+<nav class="docnav" aria-label="Documentation">
+<a class="backlink" href="/chitra/">&larr; chitra home</a>
+<p class="group">Documentation</p><ul>
+<li><a href="/chitra/docs/">Overview</a></li>
+</ul>
+<p class="group">Getting started</p><ul>
+<li><a href="/chitra/docs/quickstart/">Quickstart</a></li>
+<li><a href="/chitra/docs/concepts/">Concepts</a></li>
+</ul>
+<p class="group">Reference</p><ul>
+<li><a href="/chitra/docs/configuration/">Configuration</a></li>
+<li><a href="/chitra/docs/daemons/">Daemons &amp; Tools</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/delivery/">Delivery</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/dispatchd.html">dispatchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/triaged.html">triaged</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/sweepd.html">sweepd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/rate-limit-guard.html">rate-limit-guard</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/authority/">Authority</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/petra.html">petra</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/ownership-provider.html">ownership-provider</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/operator-tools/">Operator tools</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/watchd.html">watchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/goals-cli.html">goals CLI</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/artifacts.html">artifacts</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/capabilities.html">capabilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/convlog.html">convlog</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/usage.html">usage</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/utilities/">Utilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/draft-scanner.html">draft-scanner</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/replay-eval.html">replay-eval</a></li>
+</ul>
+<p class="group">Deep dives</p><ul>
+<li><a href="/chitra/docs/DESIGN.html" aria-current="page">Design notes</a></li>
+<li><a href="/chitra/docs/evasion-taxonomy.html">Evasion taxonomy</a></li>
+<li><a href="/chitra/docs/pause-recovery.html">Pause &amp; recovery</a></li>
+<li><a href="/chitra/docs/petra-authority.html">Petra authority</a></li>
+<li><a href="/chitra/docs/self-tuning.html">Self-tuning</a></li>
+<li><a href="/chitra/docs/workflow-pattern-catalog.html">Workflow patterns</a></li>
+<li><a href="/chitra/docs/routing-feedback-usage.html">Routing feedback &amp; usage</a></li>
+</ul>
+</nav>
+      </details>
+    </div>
+    <p class="crumbs"><a href="/chitra/docs/">Docs</a></p>
+    <article>
+<h1 id="design-notes">Design notes</h1>
+<h2 id="origin">Origin</h2>
+<p>chitra grew out of a tmux dispatch function that had two real, silently-triggering bugs (documented in <code>src/chitra/dispatch.py</code>'s module docstring). It was pulled out into its own hardened, tested library alongside a small set of daemons that turn &quot;occasionally invoke this function from an interactive AI session&quot; into &quot;always-on, deterministic, systemd-supervised background service.&quot;</p>
+<h2 id="bounded-reasoning-boundary">Bounded reasoning boundary</h2>
+<p>chitra delivers messages to, and observes the state of, sessions that are themselves driven by an LLM. Its queue, dispatch, evidence, and storage paths remain deterministic. Goal enforcement is the one narrow process boundary: for a completion-claim turn-end, <code>watchd</code> invokes separate <code>claude -p</code> reviewers on a bounded worker pool to scrutinize the watched session's completed turn against a frozen goal. The pane poll never waits for those reviewers; it keeps an in-flight lane non-green and collects ready verdicts on later polls. Non-completion turns retain deterministic direction signals but do not launch an isolated reviewer. The reviewers do not draft or review Chitra's prospective response, share context, mutate state, or bypass the operator gates for spend, credentials, irreversible actions, and strategy redirects. Their structured signal is an input to <code>DecisionAttestation</code>; only the attested approved text can reach the pane.</p>
+<p>General-purpose agent orchestration, task decomposition, and response generation remain out of scope. They belong in a higher-level system that uses chitra's delivery and audit surfaces. This bounded exception exists to make the completion and goal gates real rather than trusting the lane's own self-report.</p>
+<h2 id="done-condition-ownership-and-close-boundary">Done-condition ownership and close boundary</h2>
+<p>Done conditions belong to the operator and the material used to enroll a session. Chitra never enumerates, derives, proposes, authors, annotates, or rewrites <code>done_when</code>; post-hoc authorship would let the system fit the condition to whatever already exists. The first record write copies that condition into write-once <code>enrolled_done_when</code>/<code>enrolled_at</code> anchors, and every later write is checked at the single <code>_upsert_goal_locked</code> boundary. A stable <code>lane_id</code>, derived from the session name without host or instance suffix, prevents an open lane from being re-enrolled under a fresh volatile <code>session_ref</code>. Legacy records with no anchors are backfilled in memory from their current condition and stored timestamps, then persist the normalization on their next write. Enrollment-time interactive elicitation requires a separate operator-interaction channel and is outside this release.</p>
+<p><code>chitra.close_gate</code> therefore has a deliberately narrower role. It deterministically reads explicit items and counts from <code>enrolled_done_when</code>, computes enrolled-minus-current and history-derived descopes, compares the remaining inventory with caller-supplied delivered items or explicit <code>CompletionEvidence.todo_item</code> bindings, and blocks <code>chitra-goals close</code> before state deletion when the inventory is short. It also treats follow-on/out-of-scope/deferred/future-work language over a still-required item as a silent-descope tell unless a recorded operator redirect removed that condition or the caller supplies an explicit operator acknowledgement. Operator-facing core summaries render a reduced current condition together with its <code>dropping: ...</code> delta; adapters that render goal conditions must use <code>descope_delta(record)</code> to do the same.</p>
+<p>The companion done-condition lint is surfacing-only. At <code>chitra-goals set</code>, missing or vague aggregate conditions add one fixed persistent <code>open_asks</code> flag for the board's <code>AWAITING RULING</code> section. Enrollment is not blocked, the supplied value is unchanged, and Chitra emits no replacement or suggested enumeration.</p>
+<h2 id="distribution-and-packaging">Distribution and packaging</h2>
+<ul>
+<li><strong>Distribution:</strong> git-installable (<code>pip install git+https://...@&lt;tag&gt;</code>) for now, not yet on PyPI. chitra's current consumers install a pinned revision onto systemd hosts they provision themselves — PyPI's advantages (name-based discovery, version-range resolution for downstream packagers) don't apply yet. The build backend (hatchling, standards-based <code>pyproject.toml</code>) keeps a future PyPI release a small, mechanical step rather than a rewrite.</li>
+<li><strong>Layout:</strong> <code>src/chitra/</code> (src-layout), not a flat top-level package. This ensures <code>import chitra</code> always resolves to the installed wheel, never to a loose working-directory copy — important for a package whose main job is running as an installed systemd service.</li>
+<li><strong>Versioning:</strong> plain SemVer in the 0.x range. SemVer reserves 0.y.z for &quot;anything may change&quot; — appropriate before there's a real external consumer depending on a stable interface. 1.0.0 is reserved for the day the maintainers are willing to promise CLI/API stability.</li>
+</ul>
+<h2 id="single-writer-rule-why-lanelock-exists">Single-writer rule (why <code>LaneLock</code> exists)</h2>
+<p>A tmux-hosted AI agent session is, from the outside, just a process with a terminal attached. It's tempting to assume you can deliver a message to it two different ways — inject text via tmux, or resume/replay into its own session transcript via whatever resume mechanism the agent's CLI provides — and pick whichever is convenient. In testing, doing so concurrently against a <strong>live, actively-running</strong> session caused a real, reproducible failure: the out-of-band delivery silently appended to the session's own transcript while racing its in-flight writes, corrupting its next turn with no visible error. <code>LaneLock</code> exists specifically to make &quot;two writers, one session, at once&quot; structurally impossible: <code>dispatchd</code> acquires an exclusive, file-based lock for a session id before attempting delivery and releases it after, and a second acquisition attempt against an already-held lock fails or blocks rather than silently proceeding.</p>
+<p>The tmux-injection recipe (documented in the README) is the only channel this repo considers safe for delivering to a <strong>live</strong> session. Any out-of-band resume/replay fallback is outside chitra and must independently confirm the target session is genuinely detached or stopped while honoring the same single-writer lock.</p>
+<h2 id="future-reconciler-task-origin-contract">Future reconciler task-origin contract</h2>
+<p>No reconciliation or drift-detection path exists in chitra. If one is added, it must use a valid signed delivery-ledger entry to establish that chitra originated a task. It may add tasks or reorder chitra-originated tasks, but a task without matching delivery proof is presumed operator-authored and must never be removed, held, or corrected away. A growing task list is not drift.</p>
+<h2 id="extensibility-without-coupling">Extensibility without coupling</h2>
+<p>chitra exposes plain, documented file and queue formats: JSON orders and results (<code>chitra.dispatch</code>'s <code>DispatchOrder</code>/<code>DispatchResult</code> models), the <code>&lt;ISO8601&gt; &lt;LANE_ID&gt; &lt;TEXT&gt;</code> events-log line format documented in <code>chitra.triaged</code>'s module docstring, and the JSON triage log it emits. Any read-only consumer — a dashboard, a learning loop, another project — can be built against these formats without chitra needing to know it exists. For such a consumer, the module docstrings are the complete contract.</p>
+
+    </article>
+    <nav class="pagenav" aria-label="Previous and next page"><a class="prev" href="/chitra/docs/daemons/utilities/replay-eval.html"><span class="pn-dir">&larr; Previous</span><span class="pn-title">replay-eval</span></a><a class="next" href="/chitra/docs/evasion-taxonomy.html"><span class="pn-dir">Next &rarr;</span><span class="pn-title">Evasion taxonomy</span></a></nav>
+  </main>
+  <aside class="toc-rail" aria-label="On this page"><p class="group">On this page</p><ul><li><a href="#origin">Origin</a></li><li><a href="#bounded-reasoning-boundary">Bounded reasoning boundary</a></li><li><a href="#done-condition-ownership-and-close-boundary">Done-condition ownership and close boundary</a></li><li><a href="#distribution-and-packaging">Distribution and packaging</a></li><li><a href="#single-writer-rule-why-lanelock-exists">Single-writer rule (why LaneLock exists)</a></li><li><a href="#future-reconciler-task-origin-contract">Future reconciler task-origin contract</a></li><li><a href="#extensibility-without-coupling">Extensibility without coupling</a></li></ul></aside>
+</div>
+
+<footer class="site">
+  <div class="wrap">
+    <div class="links">
+      <a href="/chitra/">chitra home</a>
+      <a href="https://pypi.org/project/chitra-monitor/">PyPI — chitra-monitor</a>
+      <a href="https://github.com/ReticleWorks/chitra">GitHub — ReticleWorks/chitra</a>
+      <a href="https://github.com/ReticleWorks/chitra/issues">Issues</a>
+    </div>
+    <p>MIT &copy; 2026 Reticle Works.</p>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,555 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>watchd — Completion Reviewer &middot; chitra docs</title>
+<meta name="description" content="chitra documentation — goal-aware, lightweight multi-agent orchestration. Deterministic dispatch, LLM-judged completion review.">
+<style>
+  :root {
+    --paper: #f2f3ee; --paper-raised: #fbfcf8; --ink: #1e2925; --ink-soft: #52605a;
+    --rule: #d3d8cf; --rule-strong: #b9c1b6; --accent: #17695a; --accent-soft: #e1eee8;
+    --gate: #9a6b2f; --gate-soft: #f2e9d8; --code-bg: #e9ece5; --btn-text: #ffffff;
+    --display: "Bahnschrift", "DIN Alternate", "Franklin Gothic Medium", "Avenir Next Condensed", "Nimbus Sans Narrow", "Arial Narrow", sans-serif;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "URW Palladio L", P052, Georgia, serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) { :root {
+    --paper: #141917; --paper-raised: #1b211e; --ink: #e5eae6; --ink-soft: #9caba3;
+    --rule: #2c342f; --rule-strong: #3d463f; --accent: #52b7a2; --accent-soft: #1c2e28;
+    --gate: #d0a05f; --gate-soft: #2d2517; --code-bg: #101412; --btn-text: #0f1f1a;
+  } }
+  :root[data-theme="dark"] {
+    --paper: #141917; --paper-raised: #1b211e; --ink: #e5eae6; --ink-soft: #9caba3;
+    --rule: #2c342f; --rule-strong: #3d463f; --accent: #52b7a2; --accent-soft: #1c2e28;
+    --gate: #d0a05f; --gate-soft: #2d2517; --code-bg: #101412; --btn-text: #0f1f1a;
+  }
+  :root[data-theme="light"] {
+    --paper: #f2f3ee; --paper-raised: #fbfcf8; --ink: #1e2925; --ink-soft: #52605a;
+    --rule: #d3d8cf; --rule-strong: #b9c1b6; --accent: #17695a; --accent-soft: #e1eee8;
+    --gate: #9a6b2f; --gate-soft: #f2e9d8; --code-bg: #e9ece5; --btn-text: #ffffff;
+  }
+
+  html { background: var(--paper); scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  body {
+    background: var(--paper); color: var(--ink); font-family: var(--serif);
+    font-size: 1.0625rem; line-height: 1.62; margin: 0;
+  }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:hover { text-decoration-thickness: 2px; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+  /* masthead — same register as the landing page */
+  .masthead { border-bottom: 2px solid var(--ink); }
+  .masthead .wrap {
+    max-width: 90rem; margin: 0 auto; padding: 1.1rem 1.5rem;
+    display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 0.5rem 1.5rem;
+  }
+  .masthead .brand {
+    font-family: var(--display); font-size: 1.05rem; font-weight: 600;
+    letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink); text-decoration: none;
+  }
+  .masthead .brand .docmark { color: var(--accent); }
+  .masthead nav { display: flex; flex-wrap: wrap; gap: 0.4rem 1.4rem; font-family: var(--sans); font-size: 0.8125rem; }
+  .masthead nav a { color: var(--ink-soft); text-decoration: none; }
+  .masthead nav a:hover { color: var(--accent); text-decoration: underline; }
+
+  .shell {
+    max-width: 90rem; margin: 0 auto; padding: 0 1.5rem;
+    display: grid; grid-template-columns: 16.5rem minmax(0, 1fr) 13rem; gap: 0 3rem;
+  }
+
+  /* sidebar */
+  .sidebar {
+    border-right: 1px solid var(--rule-strong);
+    padding: 2rem 1.5rem 3rem 0;
+    position: sticky; top: 0; align-self: start;
+    max-height: 100vh; overflow-y: auto;
+    font-family: var(--sans);
+  }
+  .docnav .backlink {
+    display: block; font-size: 0.8125rem; color: var(--ink-soft);
+    text-decoration: none; margin: 0 0 1.6rem;
+  }
+  .docnav .backlink:hover { color: var(--accent); text-decoration: underline; }
+  .docnav .group {
+    font-family: var(--display); font-size: 0.72rem; font-weight: 600;
+    letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-soft);
+    margin: 1.6rem 0 0.5rem;
+  }
+  .docnav .group:first-of-type { margin-top: 0; }
+  .docnav ul { list-style: none; margin: 0; padding: 0; }
+  .docnav li a {
+    display: block; padding: 0.24rem 0 0.24rem 0.7rem; font-size: 0.85rem;
+    color: var(--ink-soft); text-decoration: none;
+    border-left: 2px solid transparent;
+  }
+  .docnav li a:hover { color: var(--accent); }
+  .docnav li a[aria-current="page"] {
+    color: var(--accent); font-weight: 600; border-left-color: var(--accent);
+  }
+  .docnav li.ind1 a { padding-left: 1.6rem; }
+  .docnav li.ind2 a { padding-left: 2.5rem; font-family: var(--mono); font-size: 0.78rem; }
+
+  /* mobile nav */
+  .mobilenav { display: none; }
+
+  /* content */
+  .doc { padding: 2.4rem 0 3rem; min-width: 0; }
+  article { max-width: 46rem; }
+  .crumbs {
+    font-family: var(--sans); font-size: 0.78rem; color: var(--ink-soft);
+    letter-spacing: 0.04em; margin: 0 0 1.4rem;
+  }
+  .crumbs a { color: var(--ink-soft); text-decoration: none; }
+  .crumbs a:hover { color: var(--accent); text-decoration: underline; }
+  article h1 {
+    font-family: var(--display); font-size: clamp(1.9rem, 4vw, 2.4rem); font-weight: 600;
+    line-height: 1.1; letter-spacing: 0.01em; margin: 0 0 1.1rem;
+    padding-bottom: 0.8rem; border-bottom: 2px solid var(--ink); text-wrap: balance;
+  }
+  article h2 {
+    font-family: var(--display); font-size: 1.45rem; font-weight: 600; line-height: 1.2;
+    margin: 2.6rem 0 0.9rem; padding-top: 1.4rem; border-top: 1px solid var(--rule);
+    text-wrap: balance;
+  }
+  article h3 {
+    font-family: var(--sans); font-size: 1rem; font-weight: 650; margin: 1.9rem 0 0.5rem;
+  }
+  article h4 {
+    font-family: var(--sans); font-size: 0.9rem; font-weight: 650; margin: 1.5rem 0 0.4rem;
+    color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  article p, article li { max-width: 65ch; }
+  article p { margin: 0 0 1rem; }
+  article ul, article ol { padding-left: 1.4rem; margin: 0 0 1.1rem; }
+  article li { margin: 0 0 0.35rem; }
+  article hr { border: 0; border-top: 1px solid var(--rule-strong); margin: 2.2rem 0; }
+  article blockquote {
+    margin: 1.2rem 0; padding: 0.1rem 0 0.1rem 1.1rem;
+    border-left: 3px solid var(--accent); color: var(--ink-soft);
+  }
+  article pre {
+    background: var(--code-bg); border: 1px solid var(--rule); border-radius: 6px;
+    padding: 0.9rem 1rem; overflow-x: auto; font-family: var(--mono);
+    font-size: 0.82rem; line-height: 1.55; margin: 1.1rem 0;
+  }
+  article code { font-family: var(--mono); font-size: 0.85em; }
+  article p code, article li code, article td code, article h1 code, article h2 code, article h3 code {
+    background: var(--code-bg); border-radius: 3px; padding: 0.08em 0.3em;
+  }
+  article pre code { background: none; padding: 0; font-size: 1em; }
+  .table-wrap { overflow-x: auto; margin: 1.2rem 0; }
+  article table {
+    border-collapse: collapse; font-family: var(--sans); font-size: 0.85rem; line-height: 1.5;
+    min-width: 100%;
+  }
+  article th {
+    font-family: var(--display); font-size: 0.75rem; font-weight: 600;
+    letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-soft);
+    text-align: left; padding: 0.45rem 1rem 0.45rem 0; border-bottom: 2px solid var(--ink);
+  }
+  article td {
+    padding: 0.5rem 1rem 0.5rem 0; border-bottom: 1px solid var(--rule);
+    vertical-align: top; font-variant-numeric: tabular-nums;
+  }
+
+  /* prev / next */
+  .pagenav {
+    max-width: 46rem; display: flex; justify-content: space-between; gap: 1rem;
+    margin: 3rem 0 0; padding-top: 1.4rem; border-top: 2px solid var(--ink);
+    font-family: var(--sans); font-size: 0.875rem;
+  }
+  .pagenav a { text-decoration: none; max-width: 46%; }
+  .pagenav a:hover .pn-title { text-decoration: underline; }
+  .pagenav .pn-dir {
+    display: block; font-family: var(--display); font-size: 0.7rem; font-weight: 600;
+    letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-soft); margin-bottom: 0.15rem;
+  }
+  .pagenav .pn-title { color: var(--accent); font-weight: 600; }
+  .pagenav .next { margin-left: auto; text-align: right; }
+
+  /* on this page */
+  .toc-rail {
+    padding: 2.4rem 0 3rem; position: sticky; top: 0; align-self: start;
+    max-height: 100vh; overflow-y: auto; font-family: var(--sans);
+  }
+  .toc-rail .group {
+    font-family: var(--display); font-size: 0.72rem; font-weight: 600;
+    letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-soft); margin: 0 0 0.5rem;
+  }
+  .toc-rail ul { list-style: none; margin: 0; padding: 0; }
+  .toc-rail a {
+    display: block; padding: 0.2rem 0; font-size: 0.8rem; color: var(--ink-soft); text-decoration: none;
+  }
+  .toc-rail a:hover { color: var(--accent); }
+
+  footer.site {
+    border-top: 2px solid var(--ink); margin-top: 1rem;
+    font-family: var(--sans); font-size: 0.85rem; color: var(--ink-soft);
+  }
+  footer.site .wrap { max-width: 90rem; margin: 0 auto; padding: 2rem 1.5rem 3rem; }
+  footer.site .links { display: flex; flex-wrap: wrap; gap: 0.4rem 1.5rem; margin: 0 0 0.9rem; }
+  footer.site p { margin: 0; }
+
+  @media (max-width: 1200px) {
+    .shell { grid-template-columns: 16.5rem minmax(0, 1fr); }
+    .toc-rail { display: none; }
+  }
+  @media (max-width: 900px) {
+    .shell { grid-template-columns: minmax(0, 1fr); }
+    .sidebar { display: none; }
+    .mobilenav {
+      display: block; margin: 1.4rem 0 0; font-family: var(--sans);
+      background: var(--paper-raised); border: 1px solid var(--rule-strong); border-radius: 6px;
+    }
+    .mobilenav summary {
+      cursor: pointer; padding: 0.7rem 1rem;
+      font-family: var(--display); font-size: 0.8rem; font-weight: 600;
+      letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent);
+    }
+    .mobilenav .docnav { padding: 0.4rem 1rem 1rem; }
+    .doc { padding-top: 0.6rem; }
+    .mobilewrap { padding: 0; }
+  }
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="wrap">
+    <a class="brand" href="/chitra/docs/">chitra <span class="docmark">&middot; docs</span></a>
+    <nav aria-label="Project links">
+      <a href="/chitra/">Home</a>
+      <a href="https://pypi.org/project/chitra-monitor/">PyPI</a>
+      <a href="https://github.com/ReticleWorks/chitra">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="sidebar">
+<nav class="docnav" aria-label="Documentation">
+<a class="backlink" href="/chitra/">&larr; chitra home</a>
+<p class="group">Documentation</p><ul>
+<li><a href="/chitra/docs/">Overview</a></li>
+</ul>
+<p class="group">Getting started</p><ul>
+<li><a href="/chitra/docs/quickstart/">Quickstart</a></li>
+<li><a href="/chitra/docs/concepts/">Concepts</a></li>
+</ul>
+<p class="group">Reference</p><ul>
+<li><a href="/chitra/docs/configuration/">Configuration</a></li>
+<li><a href="/chitra/docs/daemons/">Daemons &amp; Tools</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/delivery/">Delivery</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/dispatchd.html">dispatchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/triaged.html">triaged</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/sweepd.html">sweepd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/rate-limit-guard.html">rate-limit-guard</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/authority/">Authority</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/petra.html">petra</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/ownership-provider.html">ownership-provider</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/operator-tools/">Operator tools</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/watchd.html" aria-current="page">watchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/goals-cli.html">goals CLI</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/artifacts.html">artifacts</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/capabilities.html">capabilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/convlog.html">convlog</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/usage.html">usage</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/utilities/">Utilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/draft-scanner.html">draft-scanner</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/replay-eval.html">replay-eval</a></li>
+</ul>
+<p class="group">Deep dives</p><ul>
+<li><a href="/chitra/docs/DESIGN.html">Design notes</a></li>
+<li><a href="/chitra/docs/evasion-taxonomy.html">Evasion taxonomy</a></li>
+<li><a href="/chitra/docs/pause-recovery.html">Pause &amp; recovery</a></li>
+<li><a href="/chitra/docs/petra-authority.html">Petra authority</a></li>
+<li><a href="/chitra/docs/self-tuning.html">Self-tuning</a></li>
+<li><a href="/chitra/docs/workflow-pattern-catalog.html">Workflow patterns</a></li>
+<li><a href="/chitra/docs/routing-feedback-usage.html">Routing feedback &amp; usage</a></li>
+</ul>
+</nav>
+  </aside>
+  <main class="doc">
+    <div class="mobilewrap">
+      <details class="mobilenav">
+        <summary>Docs navigation</summary>
+<nav class="docnav" aria-label="Documentation">
+<a class="backlink" href="/chitra/">&larr; chitra home</a>
+<p class="group">Documentation</p><ul>
+<li><a href="/chitra/docs/">Overview</a></li>
+</ul>
+<p class="group">Getting started</p><ul>
+<li><a href="/chitra/docs/quickstart/">Quickstart</a></li>
+<li><a href="/chitra/docs/concepts/">Concepts</a></li>
+</ul>
+<p class="group">Reference</p><ul>
+<li><a href="/chitra/docs/configuration/">Configuration</a></li>
+<li><a href="/chitra/docs/daemons/">Daemons &amp; Tools</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/delivery/">Delivery</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/dispatchd.html">dispatchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/triaged.html">triaged</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/sweepd.html">sweepd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/rate-limit-guard.html">rate-limit-guard</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/authority/">Authority</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/petra.html">petra</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/ownership-provider.html">ownership-provider</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/operator-tools/">Operator tools</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/watchd.html" aria-current="page">watchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/goals-cli.html">goals CLI</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/artifacts.html">artifacts</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/capabilities.html">capabilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/convlog.html">convlog</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/usage.html">usage</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/utilities/">Utilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/draft-scanner.html">draft-scanner</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/replay-eval.html">replay-eval</a></li>
+</ul>
+<p class="group">Deep dives</p><ul>
+<li><a href="/chitra/docs/DESIGN.html">Design notes</a></li>
+<li><a href="/chitra/docs/evasion-taxonomy.html">Evasion taxonomy</a></li>
+<li><a href="/chitra/docs/pause-recovery.html">Pause &amp; recovery</a></li>
+<li><a href="/chitra/docs/petra-authority.html">Petra authority</a></li>
+<li><a href="/chitra/docs/self-tuning.html">Self-tuning</a></li>
+<li><a href="/chitra/docs/workflow-pattern-catalog.html">Workflow patterns</a></li>
+<li><a href="/chitra/docs/routing-feedback-usage.html">Routing feedback &amp; usage</a></li>
+</ul>
+</nav>
+      </details>
+    </div>
+    <p class="crumbs"><a href="/chitra/docs/">Docs</a> &rsaquo; <a href="/chitra/docs/daemons/">Daemons &amp; Tools</a> &rsaquo; <a href="/chitra/docs/daemons/operator-tools/">Operator tools</a></p>
+    <article>
+<h1 id="watchd--completion-reviewer">watchd — Completion Reviewer</h1>
+<p>Watchd watches tmux panes for session activity and completion claims. When a session claims it is done, watchd launches isolated LLM reviewer processes to judge whether the claim matches the frozen goal. <strong>This is where chitra makes real LLM calls.</strong></p>
+<h2 id="what-it-does">What it does</h2>
+<p><strong>On each poll interval:</strong></p>
+<ol>
+<li>List all tmux panes matching the session prefix filter.</li>
+<li>For each pane:
+<ul>
+<li>Capture its current content.</li>
+<li>Compute a SHA256 hash of the content.</li>
+<li>If the hash differs from the last known state, a change occurred. Emit an event.</li>
+<li>If the pane shows a completion claim marker, enqueue a completion review.</li>
+</ul>
+</li>
+<li>For each pending review:
+<ul>
+<li>Spawn an isolated <code>claude -p</code> reviewer process (bounded concurrency, default max 2 running at once).</li>
+<li>Pass the frozen goal and the pane content to the reviewer.</li>
+<li>Wait for the verdict: accept, reject, or unavailable.</li>
+<li>Record the verdict to completion_reviews.jsonl.</li>
+</ul>
+</li>
+</ol>
+<p>The reviewer processes are isolated. They run on their own and never:</p>
+<ul>
+<li>Draft chitra's messages.</li>
+<li>Mutate chitra's state.</li>
+<li>Bypass operator gates.</li>
+<li>Share context with other reviewers.</li>
+</ul>
+<p>Watchd itself remains responsive; it does not wait for reviewers to finish before continuing to poll.</p>
+<h2 id="cli-usage">CLI usage</h2>
+<pre><code class="language-bash">watchd \
+  --state-dir /var/lib/chitra \
+  --events-log /var/lib/chitra/events.log \
+  --session-prefix agent \
+  --interval-seconds 5 \
+  --reviewer-count 2 \
+  --reviewer-model claude-opus
+</code></pre>
+<p>Omit <code>--once</code> to run continuously. Provide <code>--once</code> to run one poll and exit.</p>
+<h2 id="key-flags">Key flags</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--state-dir</code></td>
+<td><code>/var/lib/chitra</code></td>
+<td>Base state directory.</td>
+</tr>
+<tr>
+<td><code>--events-log</code></td>
+<td><code>$CHITRA_STATE_DIR/events.log</code></td>
+<td>Where to write pane-change events.</td>
+</tr>
+<tr>
+<td><code>--session-prefix</code></td>
+<td>Unset (all sessions)</td>
+<td>Match only sessions starting with this prefix.</td>
+</tr>
+<tr>
+<td><code>--exclude-session-prefix</code></td>
+<td>None</td>
+<td>Exclude sessions starting with this prefix.</td>
+</tr>
+<tr>
+<td><code>--interval-seconds</code></td>
+<td>5</td>
+<td>Seconds between polls.</td>
+</tr>
+<tr>
+<td><code>--panes</code></td>
+<td>All visible</td>
+<td>Target specific pane references (e.g., <code>session:window.pane</code>).</td>
+</tr>
+<tr>
+<td><code>--reviewer-count</code></td>
+<td>2</td>
+<td>Max concurrent LLM reviewer processes.</td>
+</tr>
+<tr>
+<td><code>--reviewer-model</code></td>
+<td><code>claude</code></td>
+<td>Model to use for reviewers.</td>
+</tr>
+<tr>
+<td><code>--reviewer-command</code></td>
+<td><code>claude</code></td>
+<td>CLI command to invoke (e.g., <code>claude</code>, <code>codex</code>).</td>
+</tr>
+<tr>
+<td><code>--reasoned-dispatch</code></td>
+<td>false</td>
+<td>Enable reasoned dispatch on rejection.</td>
+</tr>
+<tr>
+<td><code>--once</code></td>
+<td>False</td>
+<td>Run one poll and exit.</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="environment-variables">Environment variables</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CHITRA_WATCHD_EVENT_LOG</code></td>
+<td><code>/var/lib/chitra/events.log</code></td>
+<td>Path to events log.</td>
+</tr>
+<tr>
+<td><code>CHITRA_WATCHD_INTERVAL</code></td>
+<td>5</td>
+<td>Poll interval in seconds.</td>
+</tr>
+<tr>
+<td><code>CHITRA_WATCHD_PANES</code></td>
+<td>None</td>
+<td>Target panes (space-separated).</td>
+</tr>
+<tr>
+<td><code>CHITRA_WATCHD_SESSION_PREFIXES</code></td>
+<td>None</td>
+<td>Session prefix filter.</td>
+</tr>
+<tr>
+<td><code>CHITRA_WATCHD_MAX_LOG_BYTES</code></td>
+<td>5242880 (5 MiB)</td>
+<td>Rotate log at this size.</td>
+</tr>
+<tr>
+<td><code>CHITRA_WATCHD_REVIEWER_COUNT</code></td>
+<td>2</td>
+<td>Max concurrent reviewers.</td>
+</tr>
+<tr>
+<td><code>CHITRA_WATCHD_REVIEWER_COMMAND</code></td>
+<td><code>claude</code></td>
+<td>Reviewer CLI.</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="events-log-format">Events log format</h2>
+<p>Watchd emits events to an JSONL log. Each line is ISO8601 timestamp, lane ID, and event text:</p>
+<pre><code>2025-01-15T12:34:56Z agent-session output_changed
+2025-01-15T12:34:57Z agent-session completion_claimed
+2025-01-15T12:35:02Z agent-session completion_reviewed accept
+</code></pre>
+<h2 id="completion-reviews">Completion reviews</h2>
+<p>Watchd spawns a reviewer process for each completion claim. The reviewer reads:</p>
+<ul>
+<li>The session's frozen goal.</li>
+<li>The session's current pane output.</li>
+</ul>
+<p>The reviewer outputs a verdict:</p>
+<ul>
+<li><strong>accept:</strong> The output satisfies the goal.</li>
+<li><strong>reject:</strong> The output does not satisfy the goal (e.g., uses deferral language like &quot;future work&quot;).</li>
+<li><strong>unavailable:</strong> The reviewer could not run or could not decide.</li>
+</ul>
+<p>The verdict is recorded to <code>completion_reviews.jsonl</code> with a timestamp, goal state, and reasoning (if available).</p>
+<h2 id="common-tasks">Common tasks</h2>
+<p><strong>Watch a single session:</strong></p>
+<pre><code class="language-bash">watchd --session-prefix my-agent --interval-seconds 5
+</code></pre>
+<p><strong>Run as a systemd service (continuous):</strong></p>
+<p>See <code>packaging/systemd/chitra-watchd.service.example</code> in the repo.</p>
+<p><strong>View completion verdicts:</strong></p>
+<pre><code class="language-bash">cat /var/lib/chitra/completion_reviews.jsonl | jq .
+</code></pre>
+<p><strong>See pane-change events:</strong></p>
+<pre><code class="language-bash">tail -f /var/lib/chitra/events.log
+</code></pre>
+<h2 id="reviewer-process-isolation">Reviewer process isolation</h2>
+<p>Each reviewer is a subprocess:</p>
+<pre><code class="language-bash">claude -p &lt;&lt; 'EOF'
+Goal: &lt;frozen goal&gt;
+
+Session output:
+&lt;pane content&gt;
+
+Is the session output complete against the goal?
+EOF
+</code></pre>
+<p>The reviewer never:</p>
+<ul>
+<li>Sees chitra's internal state.</li>
+<li>Receives context from other reviewers.</li>
+<li>Drafts messages to the session.</li>
+<li>Has access to operator gates or credentials.</li>
+</ul>
+<p>The verdict goes back to watchd as structured output (accept/reject) and is recorded to the completion_reviews.jsonl log.</p>
+<h2 id="see-also">See Also</h2>
+<ul>
+<li><strong><a href="../../concepts/#goal-enforcement-and-completion-review">Concepts — Goal Enforcement</a></strong> — How completion review fits into chitra's architecture.</li>
+<li><strong><a href="../../DESIGN.html#bounded-reasoning-boundary">Design notes — Bounded reasoning boundary</a></strong> — Why reviewers are isolated.</li>
+</ul>
+
+    </article>
+    <nav class="pagenav" aria-label="Previous and next page"><a class="prev" href="/chitra/docs/daemons/operator-tools/"><span class="pn-dir">&larr; Previous</span><span class="pn-title">Operator tools</span></a><a class="next" href="/chitra/docs/daemons/operator-tools/goals-cli.html"><span class="pn-dir">Next &rarr;</span><span class="pn-title">goals CLI</span></a></nav>
+  </main>
+  <aside class="toc-rail" aria-label="On this page"><p class="group">On this page</p><ul><li><a href="#what-it-does">What it does</a></li><li><a href="#cli-usage">CLI usage</a></li><li><a href="#key-flags">Key flags</a></li><li><a href="#environment-variables">Environment variables</a></li><li><a href="#events-log-format">Events log format</a></li><li><a href="#completion-reviews">Completion reviews</a></li><li><a href="#common-tasks">Common tasks</a></li><li><a href="#reviewer-process-isolation">Reviewer process isolation</a></li><li><a href="#see-also">See Also</a></li></ul></aside>
+</div>
+
+<footer class="site">
+  <div class="wrap">
+    <div class="links">
+      <a href="/chitra/">chitra home</a>
+      <a href="https://pypi.org/project/chitra-monitor/">PyPI — chitra-monitor</a>
+      <a href="https://github.com/ReticleWorks/chitra">GitHub — ReticleWorks/chitra</a>
+      <a href="https://github.com/ReticleWorks/chitra/issues">Issues</a>
+    </div>
+    <p>MIT &copy; 2026 Reticle Works.</p>
+  </div>
+</footer>
+
+</body>
+</html>

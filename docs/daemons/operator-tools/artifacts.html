@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>chitra-artifacts — Artifact Review Tracking &middot; chitra docs</title>
+<meta name="description" content="chitra documentation — goal-aware, lightweight multi-agent orchestration. Deterministic dispatch, LLM-judged completion review.">
+<style>
+  :root {
+    --paper: #f2f3ee; --paper-raised: #fbfcf8; --ink: #1e2925; --ink-soft: #52605a;
+    --rule: #d3d8cf; --rule-strong: #b9c1b6; --accent: #17695a; --accent-soft: #e1eee8;
+    --gate: #9a6b2f; --gate-soft: #f2e9d8; --code-bg: #e9ece5; --btn-text: #ffffff;
+    --display: "Bahnschrift", "DIN Alternate", "Franklin Gothic Medium", "Avenir Next Condensed", "Nimbus Sans Narrow", "Arial Narrow", sans-serif;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "URW Palladio L", P052, Georgia, serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) { :root {
+    --paper: #141917; --paper-raised: #1b211e; --ink: #e5eae6; --ink-soft: #9caba3;
+    --rule: #2c342f; --rule-strong: #3d463f; --accent: #52b7a2; --accent-soft: #1c2e28;
+    --gate: #d0a05f; --gate-soft: #2d2517; --code-bg: #101412; --btn-text: #0f1f1a;
+  } }
+  :root[data-theme="dark"] {
+    --paper: #141917; --paper-raised: #1b211e; --ink: #e5eae6; --ink-soft: #9caba3;
+    --rule: #2c342f; --rule-strong: #3d463f; --accent: #52b7a2; --accent-soft: #1c2e28;
+    --gate: #d0a05f; --gate-soft: #2d2517; --code-bg: #101412; --btn-text: #0f1f1a;
+  }
+  :root[data-theme="light"] {
+    --paper: #f2f3ee; --paper-raised: #fbfcf8; --ink: #1e2925; --ink-soft: #52605a;
+    --rule: #d3d8cf; --rule-strong: #b9c1b6; --accent: #17695a; --accent-soft: #e1eee8;
+    --gate: #9a6b2f; --gate-soft: #f2e9d8; --code-bg: #e9ece5; --btn-text: #ffffff;
+  }
+
+  html { background: var(--paper); scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  body {
+    background: var(--paper); color: var(--ink); font-family: var(--serif);
+    font-size: 1.0625rem; line-height: 1.62; margin: 0;
+  }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:hover { text-decoration-thickness: 2px; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+  /* masthead — same register as the landing page */
+  .masthead { border-bottom: 2px solid var(--ink); }
+  .masthead .wrap {
+    max-width: 90rem; margin: 0 auto; padding: 1.1rem 1.5rem;
+    display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 0.5rem 1.5rem;
+  }
+  .masthead .brand {
+    font-family: var(--display); font-size: 1.05rem; font-weight: 600;
+    letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink); text-decoration: none;
+  }
+  .masthead .brand .docmark { color: var(--accent); }
+  .masthead nav { display: flex; flex-wrap: wrap; gap: 0.4rem 1.4rem; font-family: var(--sans); font-size: 0.8125rem; }
+  .masthead nav a { color: var(--ink-soft); text-decoration: none; }
+  .masthead nav a:hover { color: var(--accent); text-decoration: underline; }
+
+  .shell {
+    max-width: 90rem; margin: 0 auto; padding: 0 1.5rem;
+    display: grid; grid-template-columns: 16.5rem minmax(0, 1fr) 13rem; gap: 0 3rem;
+  }
+
+  /* sidebar */
+  .sidebar {
+    border-right: 1px solid var(--rule-strong);
+    padding: 2rem 1.5rem 3rem 0;
+    position: sticky; top: 0; align-self: start;
+    max-height: 100vh; overflow-y: auto;
+    font-family: var(--sans);
+  }
+  .docnav .backlink {
+    display: block; font-size: 0.8125rem; color: var(--ink-soft);
+    text-decoration: none; margin: 0 0 1.6rem;
+  }
+  .docnav .backlink:hover { color: var(--accent); text-decoration: underline; }
+  .docnav .group {
+    font-family: var(--display); font-size: 0.72rem; font-weight: 600;
+    letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-soft);
+    margin: 1.6rem 0 0.5rem;
+  }
+  .docnav .group:first-of-type { margin-top: 0; }
+  .docnav ul { list-style: none; margin: 0; padding: 0; }
+  .docnav li a {
+    display: block; padding: 0.24rem 0 0.24rem 0.7rem; font-size: 0.85rem;
+    color: var(--ink-soft); text-decoration: none;
+    border-left: 2px solid transparent;
+  }
+  .docnav li a:hover { color: var(--accent); }
+  .docnav li a[aria-current="page"] {
+    color: var(--accent); font-weight: 600; border-left-color: var(--accent);
+  }
+  .docnav li.ind1 a { padding-left: 1.6rem; }
+  .docnav li.ind2 a { padding-left: 2.5rem; font-family: var(--mono); font-size: 0.78rem; }
+
+  /* mobile nav */
+  .mobilenav { display: none; }
+
+  /* content */
+  .doc { padding: 2.4rem 0 3rem; min-width: 0; }
+  article { max-width: 46rem; }
+  .crumbs {
+    font-family: var(--sans); font-size: 0.78rem; color: var(--ink-soft);
+    letter-spacing: 0.04em; margin: 0 0 1.4rem;
+  }
+  .crumbs a { color: var(--ink-soft); text-decoration: none; }
+  .crumbs a:hover { color: var(--accent); text-decoration: underline; }
+  article h1 {
+    font-family: var(--display); font-size: clamp(1.9rem, 4vw, 2.4rem); font-weight: 600;
+    line-height: 1.1; letter-spacing: 0.01em; margin: 0 0 1.1rem;
+    padding-bottom: 0.8rem; border-bottom: 2px solid var(--ink); text-wrap: balance;
+  }
+  article h2 {
+    font-family: var(--display); font-size: 1.45rem; font-weight: 600; line-height: 1.2;
+    margin: 2.6rem 0 0.9rem; padding-top: 1.4rem; border-top: 1px solid var(--rule);
+    text-wrap: balance;
+  }
+  article h3 {
+    font-family: var(--sans); font-size: 1rem; font-weight: 650; margin: 1.9rem 0 0.5rem;
+  }
+  article h4 {
+    font-family: var(--sans); font-size: 0.9rem; font-weight: 650; margin: 1.5rem 0 0.4rem;
+    color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  article p, article li { max-width: 65ch; }
+  article p { margin: 0 0 1rem; }
+  article ul, article ol { padding-left: 1.4rem; margin: 0 0 1.1rem; }
+  article li { margin: 0 0 0.35rem; }
+  article hr { border: 0; border-top: 1px solid var(--rule-strong); margin: 2.2rem 0; }
+  article blockquote {
+    margin: 1.2rem 0; padding: 0.1rem 0 0.1rem 1.1rem;
+    border-left: 3px solid var(--accent); color: var(--ink-soft);
+  }
+  article pre {
+    background: var(--code-bg); border: 1px solid var(--rule); border-radius: 6px;
+    padding: 0.9rem 1rem; overflow-x: auto; font-family: var(--mono);
+    font-size: 0.82rem; line-height: 1.55; margin: 1.1rem 0;
+  }
+  article code { font-family: var(--mono); font-size: 0.85em; }
+  article p code, article li code, article td code, article h1 code, article h2 code, article h3 code {
+    background: var(--code-bg); border-radius: 3px; padding: 0.08em 0.3em;
+  }
+  article pre code { background: none; padding: 0; font-size: 1em; }
+  .table-wrap { overflow-x: auto; margin: 1.2rem 0; }
+  article table {
+    border-collapse: collapse; font-family: var(--sans); font-size: 0.85rem; line-height: 1.5;
+    min-width: 100%;
+  }
+  article th {
+    font-family: var(--display); font-size: 0.75rem; font-weight: 600;
+    letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-soft);
+    text-align: left; padding: 0.45rem 1rem 0.45rem 0; border-bottom: 2px solid var(--ink);
+  }
+  article td {
+    padding: 0.5rem 1rem 0.5rem 0; border-bottom: 1px solid var(--rule);
+    vertical-align: top; font-variant-numeric: tabular-nums;
+  }
+
+  /* prev / next */
+  .pagenav {
+    max-width: 46rem; display: flex; justify-content: space-between; gap: 1rem;
+    margin: 3rem 0 0; padding-top: 1.4rem; border-top: 2px solid var(--ink);
+    font-family: var(--sans); font-size: 0.875rem;
+  }
+  .pagenav a { text-decoration: none; max-width: 46%; }
+  .pagenav a:hover .pn-title { text-decoration: underline; }
+  .pagenav .pn-dir {
+    display: block; font-family: var(--display); font-size: 0.7rem; font-weight: 600;
+    letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-soft); margin-bottom: 0.15rem;
+  }
+  .pagenav .pn-title { color: var(--accent); font-weight: 600; }
+  .pagenav .next { margin-left: auto; text-align: right; }
+
+  /* on this page */
+  .toc-rail {
+    padding: 2.4rem 0 3rem; position: sticky; top: 0; align-self: start;
+    max-height: 100vh; overflow-y: auto; font-family: var(--sans);
+  }
+  .toc-rail .group {
+    font-family: var(--display); font-size: 0.72rem; font-weight: 600;
+    letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-soft); margin: 0 0 0.5rem;
+  }
+  .toc-rail ul { list-style: none; margin: 0; padding: 0; }
+  .toc-rail a {
+    display: block; padding: 0.2rem 0; font-size: 0.8rem; color: var(--ink-soft); text-decoration: none;
+  }
+  .toc-rail a:hover { color: var(--accent); }
+
+  footer.site {
+    border-top: 2px solid var(--ink); margin-top: 1rem;
+    font-family: var(--sans); font-size: 0.85rem; color: var(--ink-soft);
+  }
+  footer.site .wrap { max-width: 90rem; margin: 0 auto; padding: 2rem 1.5rem 3rem; }
+  footer.site .links { display: flex; flex-wrap: wrap; gap: 0.4rem 1.5rem; margin: 0 0 0.9rem; }
+  footer.site p { margin: 0; }
+
+  @media (max-width: 1200px) {
+    .shell { grid-template-columns: 16.5rem minmax(0, 1fr); }
+    .toc-rail { display: none; }
+  }
+  @media (max-width: 900px) {
+    .shell { grid-template-columns: minmax(0, 1fr); }
+    .sidebar { display: none; }
+    .mobilenav {
+      display: block; margin: 1.4rem 0 0; font-family: var(--sans);
+      background: var(--paper-raised); border: 1px solid var(--rule-strong); border-radius: 6px;
+    }
+    .mobilenav summary {
+      cursor: pointer; padding: 0.7rem 1rem;
+      font-family: var(--display); font-size: 0.8rem; font-weight: 600;
+      letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent);
+    }
+    .mobilenav .docnav { padding: 0.4rem 1rem 1rem; }
+    .doc { padding-top: 0.6rem; }
+    .mobilewrap { padding: 0; }
+  }
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="wrap">
+    <a class="brand" href="/chitra/docs/">chitra <span class="docmark">&middot; docs</span></a>
+    <nav aria-label="Project links">
+      <a href="/chitra/">Home</a>
+      <a href="https://pypi.org/project/chitra-monitor/">PyPI</a>
+      <a href="https://github.com/ReticleWorks/chitra">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="sidebar">
+<nav class="docnav" aria-label="Documentation">
+<a class="backlink" href="/chitra/">&larr; chitra home</a>
+<p class="group">Documentation</p><ul>
+<li><a href="/chitra/docs/">Overview</a></li>
+</ul>
+<p class="group">Getting started</p><ul>
+<li><a href="/chitra/docs/quickstart/">Quickstart</a></li>
+<li><a href="/chitra/docs/concepts/">Concepts</a></li>
+</ul>
+<p class="group">Reference</p><ul>
+<li><a href="/chitra/docs/configuration/">Configuration</a></li>
+<li><a href="/chitra/docs/daemons/">Daemons &amp; Tools</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/delivery/">Delivery</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/dispatchd.html">dispatchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/triaged.html">triaged</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/sweepd.html">sweepd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/rate-limit-guard.html">rate-limit-guard</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/authority/">Authority</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/petra.html">petra</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/ownership-provider.html">ownership-provider</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/operator-tools/">Operator tools</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/watchd.html">watchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/goals-cli.html">goals CLI</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/artifacts.html" aria-current="page">artifacts</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/capabilities.html">capabilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/convlog.html">convlog</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/usage.html">usage</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/utilities/">Utilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/draft-scanner.html">draft-scanner</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/replay-eval.html">replay-eval</a></li>
+</ul>
+<p class="group">Deep dives</p><ul>
+<li><a href="/chitra/docs/DESIGN.html">Design notes</a></li>
+<li><a href="/chitra/docs/evasion-taxonomy.html">Evasion taxonomy</a></li>
+<li><a href="/chitra/docs/pause-recovery.html">Pause &amp; recovery</a></li>
+<li><a href="/chitra/docs/petra-authority.html">Petra authority</a></li>
+<li><a href="/chitra/docs/self-tuning.html">Self-tuning</a></li>
+<li><a href="/chitra/docs/workflow-pattern-catalog.html">Workflow patterns</a></li>
+<li><a href="/chitra/docs/routing-feedback-usage.html">Routing feedback &amp; usage</a></li>
+</ul>
+</nav>
+  </aside>
+  <main class="doc">
+    <div class="mobilewrap">
+      <details class="mobilenav">
+        <summary>Docs navigation</summary>
+<nav class="docnav" aria-label="Documentation">
+<a class="backlink" href="/chitra/">&larr; chitra home</a>
+<p class="group">Documentation</p><ul>
+<li><a href="/chitra/docs/">Overview</a></li>
+</ul>
+<p class="group">Getting started</p><ul>
+<li><a href="/chitra/docs/quickstart/">Quickstart</a></li>
+<li><a href="/chitra/docs/concepts/">Concepts</a></li>
+</ul>
+<p class="group">Reference</p><ul>
+<li><a href="/chitra/docs/configuration/">Configuration</a></li>
+<li><a href="/chitra/docs/daemons/">Daemons &amp; Tools</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/delivery/">Delivery</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/dispatchd.html">dispatchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/triaged.html">triaged</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/sweepd.html">sweepd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/rate-limit-guard.html">rate-limit-guard</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/authority/">Authority</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/petra.html">petra</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/ownership-provider.html">ownership-provider</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/operator-tools/">Operator tools</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/watchd.html">watchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/goals-cli.html">goals CLI</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/artifacts.html" aria-current="page">artifacts</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/capabilities.html">capabilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/convlog.html">convlog</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/usage.html">usage</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/utilities/">Utilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/draft-scanner.html">draft-scanner</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/replay-eval.html">replay-eval</a></li>
+</ul>
+<p class="group">Deep dives</p><ul>
+<li><a href="/chitra/docs/DESIGN.html">Design notes</a></li>
+<li><a href="/chitra/docs/evasion-taxonomy.html">Evasion taxonomy</a></li>
+<li><a href="/chitra/docs/pause-recovery.html">Pause &amp; recovery</a></li>
+<li><a href="/chitra/docs/petra-authority.html">Petra authority</a></li>
+<li><a href="/chitra/docs/self-tuning.html">Self-tuning</a></li>
+<li><a href="/chitra/docs/workflow-pattern-catalog.html">Workflow patterns</a></li>
+<li><a href="/chitra/docs/routing-feedback-usage.html">Routing feedback &amp; usage</a></li>
+</ul>
+</nav>
+      </details>
+    </div>
+    <p class="crumbs"><a href="/chitra/docs/">Docs</a> &rsaquo; <a href="/chitra/docs/daemons/">Daemons &amp; Tools</a> &rsaquo; <a href="/chitra/docs/daemons/operator-tools/">Operator tools</a></p>
+    <article>
+<h1 id="chitra-artifacts--artifact-review-tracking">chitra-artifacts — Artifact Review Tracking</h1>
+<p>Chitra-artifacts records and tracks Claude-artifact publish state and explicit review status. It validates delivery briefs and marks artifacts as reviewed. It does not make review decisions itself.</p>
+<h2 id="subcommands">Subcommands</h2>
+<h3 id="record--log-a-new-artifact">record — Log a new artifact</h3>
+<pre><code class="language-bash">chitra-artifacts record \
+  --root /var/lib/chitra/artifacts \
+  --url https://claude.ai/code/artifact/abc123 \
+  --title &quot;User Authentication Form&quot; \
+  --kind &quot;react-component&quot; \
+  --source &quot;session:agent-1&quot; \
+  --brief &quot;Implements a login form component with email+password validation. Tests cover success and error paths.&quot;
+</code></pre>
+<p>Records an artifact with:</p>
+<ul>
+<li>HTTPS URL (must start with <code>https://claude.ai/code/artifact/</code>).</li>
+<li>Title and kind (e.g., &quot;react-component&quot;, &quot;sql-query&quot;, &quot;bash-script&quot;).</li>
+<li>Source (who published it).</li>
+<li>Brief describing what was built, what it does, and whether it works.</li>
+</ul>
+<p>The brief must have three sections with concrete evidence:</p>
+<ol>
+<li><strong>What was built:</strong> Specific component/feature (e.g., &quot;Login form with JWT validation&quot;).</li>
+<li><strong>What it does:</strong> Functionality (e.g., &quot;Accepts email+password, validates format, calls POST /auth/login, stores JWT in localStorage&quot;).</li>
+<li><strong>Does it actually work:</strong> Proof (e.g., &quot;Tested with 20 test cases covering success/error paths; all passing&quot;).</li>
+</ol>
+<h3 id="mark-reviewed--flag-an-artifact-as-reviewed">mark-reviewed — Flag an artifact as reviewed</h3>
+<pre><code class="language-bash">chitra-artifacts mark-reviewed \
+  --root /var/lib/chitra/artifacts \
+  --url https://claude.ai/code/artifact/abc123 \
+  --response &quot;Reviewed by operator. Code quality OK. Security review: no obvious flaws.&quot;
+</code></pre>
+<p>Sets the <code>reviewed</code> flag and records the reviewer's response.</p>
+<h3 id="list--show-all-artifacts">list — Show all artifacts</h3>
+<pre><code class="language-bash">chitra-artifacts list --root /var/lib/chitra/artifacts
+</code></pre>
+<p>Lists all recorded artifacts (JSON or human-readable).</p>
+<h3 id="unreviewed--show-unreviewed-artifacts">unreviewed — Show unreviewed artifacts</h3>
+<pre><code class="language-bash">chitra-artifacts unreviewed --root /var/lib/chitra/artifacts
+</code></pre>
+<p>Quick view of artifacts pending review.</p>
+<h3 id="nonconforming--show-non-conforming-artifacts">nonconforming — Show non-conforming artifacts</h3>
+<pre><code class="language-bash">chitra-artifacts nonconforming --root /var/lib/chitra/artifacts
+</code></pre>
+<p>Lists artifacts that bypassed the guarded CLI (and thus lack proper briefs).</p>
+<h3 id="get--retrieve-an-artifact-record">get — Retrieve an artifact record</h3>
+<pre><code class="language-bash">chitra-artifacts get \
+  --root /var/lib/chitra/artifacts \
+  --url https://claude.ai/code/artifact/abc123
+</code></pre>
+<p>Returns the full record (timestamp, brief, review status).</p>
+<h2 id="brief-validation">Brief validation</h2>
+<p>A brief must have three clear sections:</p>
+<p><strong>Example:</strong></p>
+<pre><code>Built: React login component with email+password form, client-side validation.
+
+Does: Accepts user input, validates format (email regex, 8+ char password), calls POST /auth/login with credentials, handles error responses (401, 400), stores JWT in localStorage on success.
+
+Works: 20 test cases passing. Tested signup flow (success), incorrect password (error), network timeout (retry).
+</code></pre>
+<p>Validation checks:</p>
+<ul>
+<li>All three sections present.</li>
+<li>Plain language (no codenames, no abbreviations).</li>
+<li>Evidence is concrete (specific endpoints, test counts, error cases).</li>
+<li>&lt;400 chars per section.</li>
+</ul>
+<p>If validation fails, chitra-artifacts rejects the record.</p>
+<h2 id="storage-format">Storage format</h2>
+<p>Each artifact is stored as JSON:</p>
+<pre><code class="language-json">{
+  &quot;url&quot;: &quot;https://claude.ai/code/artifact/abc123&quot;,
+  &quot;title&quot;: &quot;User Authentication Form&quot;,
+  &quot;kind&quot;: &quot;react-component&quot;,
+  &quot;source&quot;: &quot;session:agent-1&quot;,
+  &quot;published_at&quot;: &quot;2025-01-15T12:34:56Z&quot;,
+  &quot;brief&quot;: {
+    &quot;built&quot;: &quot;React login component...&quot;,
+    &quot;does&quot;: &quot;Accepts user input...&quot;,
+    &quot;works&quot;: &quot;20 test cases passing...&quot;
+  },
+  &quot;reviewed&quot;: false,
+  &quot;reviewed_at&quot;: null,
+  &quot;reviewer_response&quot;: null
+}
+</code></pre>
+<h2 id="common-tasks">Common tasks</h2>
+<p><strong>Record an artifact from a dispatch:</strong></p>
+<pre><code class="language-bash">chitra-artifacts record \
+  --root /var/lib/chitra/artifacts \
+  --url &quot;$(jq -r .artifact_url result.json)&quot; \
+  --title &quot;Generated API Client&quot; \
+  --kind &quot;typescript&quot; \
+  --source &quot;dispatchd:order-123&quot; \
+  --brief &quot;Generates a TypeScript client from OpenAPI spec. Exports all CRUD methods. Tested against the staging API.&quot;
+</code></pre>
+<p><strong>Mark as reviewed:</strong></p>
+<pre><code class="language-bash">chitra-artifacts mark-reviewed \
+  --url https://claude.ai/code/artifact/abc123 \
+  --response &quot;LGTM. Code is clean and well-documented.&quot;
+</code></pre>
+<p><strong>Monitor for unreviewed artifacts:</strong></p>
+<pre><code class="language-bash">chitra-artifacts unreviewed --root /var/lib/chitra/artifacts | jq '.[].url'
+</code></pre>
+<p><strong>Check for conformance:</strong></p>
+<pre><code class="language-bash">chitra-artifacts nonconforming --root /var/lib/chitra/artifacts
+</code></pre>
+<h2 id="nonconforming-artifacts">Nonconforming artifacts</h2>
+<p>Artifacts recorded outside the guarded CLI (e.g., written directly to the JSON file) are flagged as &quot;nonconforming&quot; because they lack proper briefs. Chitra-goals roster will highlight these.</p>
+<h2 id="integration-with-the-operator-board">Integration with the operator board</h2>
+<p>Chitra-goals roster displays unreviewed artifacts from chitra-artifacts. The operator can see:</p>
+<ul>
+<li>Artifact URL.</li>
+<li>Title and kind.</li>
+<li>Brief (if present).</li>
+<li>Review status.</li>
+</ul>
+<h2 id="see-also">See Also</h2>
+<ul>
+<li><strong><a href="convlog.html">Convlog</a></strong> — Operator decision log (often linked with artifact approvals).</li>
+<li><strong><a href="goals-cli.html">Goals CLI</a></strong> — Fleet board that displays unreviewed artifacts.</li>
+</ul>
+
+    </article>
+    <nav class="pagenav" aria-label="Previous and next page"><a class="prev" href="/chitra/docs/daemons/operator-tools/goals-cli.html"><span class="pn-dir">&larr; Previous</span><span class="pn-title">goals CLI</span></a><a class="next" href="/chitra/docs/daemons/operator-tools/capabilities.html"><span class="pn-dir">Next &rarr;</span><span class="pn-title">capabilities</span></a></nav>
+  </main>
+  <aside class="toc-rail" aria-label="On this page"><p class="group">On this page</p><ul><li><a href="#subcommands">Subcommands</a></li><li><a href="#brief-validation">Brief validation</a></li><li><a href="#storage-format">Storage format</a></li><li><a href="#common-tasks">Common tasks</a></li><li><a href="#nonconforming-artifacts">Nonconforming artifacts</a></li><li><a href="#integration-with-the-operator-board">Integration with the operator board</a></li><li><a href="#see-also">See Also</a></li></ul></aside>
+</div>
+
+<footer class="site">
+  <div class="wrap">
+    <div class="links">
+      <a href="/chitra/">chitra home</a>
+      <a href="https://pypi.org/project/chitra-monitor/">PyPI — chitra-monitor</a>
+      <a href="https://github.com/ReticleWorks/chitra">GitHub — ReticleWorks/chitra</a>
+      <a href="https://github.com/ReticleWorks/chitra/issues">Issues</a>
+    </div>
+    <p>MIT &copy; 2026 Reticle Works.</p>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chitra Concepts &middot; chitra docs</title>
+<meta name="description" content="chitra documentation — goal-aware, lightweight multi-agent orchestration. Deterministic dispatch, LLM-judged completion review.">
+<style>
+  :root {
+    --paper: #f2f3ee; --paper-raised: #fbfcf8; --ink: #1e2925; --ink-soft: #52605a;
+    --rule: #d3d8cf; --rule-strong: #b9c1b6; --accent: #17695a; --accent-soft: #e1eee8;
+    --gate: #9a6b2f; --gate-soft: #f2e9d8; --code-bg: #e9ece5; --btn-text: #ffffff;
+    --display: "Bahnschrift", "DIN Alternate", "Franklin Gothic Medium", "Avenir Next Condensed", "Nimbus Sans Narrow", "Arial Narrow", sans-serif;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "URW Palladio L", P052, Georgia, serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) { :root {
+    --paper: #141917; --paper-raised: #1b211e; --ink: #e5eae6; --ink-soft: #9caba3;
+    --rule: #2c342f; --rule-strong: #3d463f; --accent: #52b7a2; --accent-soft: #1c2e28;
+    --gate: #d0a05f; --gate-soft: #2d2517; --code-bg: #101412; --btn-text: #0f1f1a;
+  } }
+  :root[data-theme="dark"] {
+    --paper: #141917; --paper-raised: #1b211e; --ink: #e5eae6; --ink-soft: #9caba3;
+    --rule: #2c342f; --rule-strong: #3d463f; --accent: #52b7a2; --accent-soft: #1c2e28;
+    --gate: #d0a05f; --gate-soft: #2d2517; --code-bg: #101412; --btn-text: #0f1f1a;
+  }
+  :root[data-theme="light"] {
+    --paper: #f2f3ee; --paper-raised: #fbfcf8; --ink: #1e2925; --ink-soft: #52605a;
+    --rule: #d3d8cf; --rule-strong: #b9c1b6; --accent: #17695a; --accent-soft: #e1eee8;
+    --gate: #9a6b2f; --gate-soft: #f2e9d8; --code-bg: #e9ece5; --btn-text: #ffffff;
+  }
+
+  html { background: var(--paper); scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  body {
+    background: var(--paper); color: var(--ink); font-family: var(--serif);
+    font-size: 1.0625rem; line-height: 1.62; margin: 0;
+  }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:hover { text-decoration-thickness: 2px; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+  /* masthead — same register as the landing page */
+  .masthead { border-bottom: 2px solid var(--ink); }
+  .masthead .wrap {
+    max-width: 90rem; margin: 0 auto; padding: 1.1rem 1.5rem;
+    display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 0.5rem 1.5rem;
+  }
+  .masthead .brand {
+    font-family: var(--display); font-size: 1.05rem; font-weight: 600;
+    letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink); text-decoration: none;
+  }
+  .masthead .brand .docmark { color: var(--accent); }
+  .masthead nav { display: flex; flex-wrap: wrap; gap: 0.4rem 1.4rem; font-family: var(--sans); font-size: 0.8125rem; }
+  .masthead nav a { color: var(--ink-soft); text-decoration: none; }
+  .masthead nav a:hover { color: var(--accent); text-decoration: underline; }
+
+  .shell {
+    max-width: 90rem; margin: 0 auto; padding: 0 1.5rem;
+    display: grid; grid-template-columns: 16.5rem minmax(0, 1fr) 13rem; gap: 0 3rem;
+  }
+
+  /* sidebar */
+  .sidebar {
+    border-right: 1px solid var(--rule-strong);
+    padding: 2rem 1.5rem 3rem 0;
+    position: sticky; top: 0; align-self: start;
+    max-height: 100vh; overflow-y: auto;
+    font-family: var(--sans);
+  }
+  .docnav .backlink {
+    display: block; font-size: 0.8125rem; color: var(--ink-soft);
+    text-decoration: none; margin: 0 0 1.6rem;
+  }
+  .docnav .backlink:hover { color: var(--accent); text-decoration: underline; }
+  .docnav .group {
+    font-family: var(--display); font-size: 0.72rem; font-weight: 600;
+    letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-soft);
+    margin: 1.6rem 0 0.5rem;
+  }
+  .docnav .group:first-of-type { margin-top: 0; }
+  .docnav ul { list-style: none; margin: 0; padding: 0; }
+  .docnav li a {
+    display: block; padding: 0.24rem 0 0.24rem 0.7rem; font-size: 0.85rem;
+    color: var(--ink-soft); text-decoration: none;
+    border-left: 2px solid transparent;
+  }
+  .docnav li a:hover { color: var(--accent); }
+  .docnav li a[aria-current="page"] {
+    color: var(--accent); font-weight: 600; border-left-color: var(--accent);
+  }
+  .docnav li.ind1 a { padding-left: 1.6rem; }
+  .docnav li.ind2 a { padding-left: 2.5rem; font-family: var(--mono); font-size: 0.78rem; }
+
+  /* mobile nav */
+  .mobilenav { display: none; }
+
+  /* content */
+  .doc { padding: 2.4rem 0 3rem; min-width: 0; }
+  article { max-width: 46rem; }
+  .crumbs {
+    font-family: var(--sans); font-size: 0.78rem; color: var(--ink-soft);
+    letter-spacing: 0.04em; margin: 0 0 1.4rem;
+  }
+  .crumbs a { color: var(--ink-soft); text-decoration: none; }
+  .crumbs a:hover { color: var(--accent); text-decoration: underline; }
+  article h1 {
+    font-family: var(--display); font-size: clamp(1.9rem, 4vw, 2.4rem); font-weight: 600;
+    line-height: 1.1; letter-spacing: 0.01em; margin: 0 0 1.1rem;
+    padding-bottom: 0.8rem; border-bottom: 2px solid var(--ink); text-wrap: balance;
+  }
+  article h2 {
+    font-family: var(--display); font-size: 1.45rem; font-weight: 600; line-height: 1.2;
+    margin: 2.6rem 0 0.9rem; padding-top: 1.4rem; border-top: 1px solid var(--rule);
+    text-wrap: balance;
+  }
+  article h3 {
+    font-family: var(--sans); font-size: 1rem; font-weight: 650; margin: 1.9rem 0 0.5rem;
+  }
+  article h4 {
+    font-family: var(--sans); font-size: 0.9rem; font-weight: 650; margin: 1.5rem 0 0.4rem;
+    color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  article p, article li { max-width: 65ch; }
+  article p { margin: 0 0 1rem; }
+  article ul, article ol { padding-left: 1.4rem; margin: 0 0 1.1rem; }
+  article li { margin: 0 0 0.35rem; }
+  article hr { border: 0; border-top: 1px solid var(--rule-strong); margin: 2.2rem 0; }
+  article blockquote {
+    margin: 1.2rem 0; padding: 0.1rem 0 0.1rem 1.1rem;
+    border-left: 3px solid var(--accent); color: var(--ink-soft);
+  }
+  article pre {
+    background: var(--code-bg); border: 1px solid var(--rule); border-radius: 6px;
+    padding: 0.9rem 1rem; overflow-x: auto; font-family: var(--mono);
+    font-size: 0.82rem; line-height: 1.55; margin: 1.1rem 0;
+  }
+  article code { font-family: var(--mono); font-size: 0.85em; }
+  article p code, article li code, article td code, article h1 code, article h2 code, article h3 code {
+    background: var(--code-bg); border-radius: 3px; padding: 0.08em 0.3em;
+  }
+  article pre code { background: none; padding: 0; font-size: 1em; }
+  .table-wrap { overflow-x: auto; margin: 1.2rem 0; }
+  article table {
+    border-collapse: collapse; font-family: var(--sans); font-size: 0.85rem; line-height: 1.5;
+    min-width: 100%;
+  }
+  article th {
+    font-family: var(--display); font-size: 0.75rem; font-weight: 600;
+    letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-soft);
+    text-align: left; padding: 0.45rem 1rem 0.45rem 0; border-bottom: 2px solid var(--ink);
+  }
+  article td {
+    padding: 0.5rem 1rem 0.5rem 0; border-bottom: 1px solid var(--rule);
+    vertical-align: top; font-variant-numeric: tabular-nums;
+  }
+
+  /* prev / next */
+  .pagenav {
+    max-width: 46rem; display: flex; justify-content: space-between; gap: 1rem;
+    margin: 3rem 0 0; padding-top: 1.4rem; border-top: 2px solid var(--ink);
+    font-family: var(--sans); font-size: 0.875rem;
+  }
+  .pagenav a { text-decoration: none; max-width: 46%; }
+  .pagenav a:hover .pn-title { text-decoration: underline; }
+  .pagenav .pn-dir {
+    display: block; font-family: var(--display); font-size: 0.7rem; font-weight: 600;
+    letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-soft); margin-bottom: 0.15rem;
+  }
+  .pagenav .pn-title { color: var(--accent); font-weight: 600; }
+  .pagenav .next { margin-left: auto; text-align: right; }
+
+  /* on this page */
+  .toc-rail {
+    padding: 2.4rem 0 3rem; position: sticky; top: 0; align-self: start;
+    max-height: 100vh; overflow-y: auto; font-family: var(--sans);
+  }
+  .toc-rail .group {
+    font-family: var(--display); font-size: 0.72rem; font-weight: 600;
+    letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-soft); margin: 0 0 0.5rem;
+  }
+  .toc-rail ul { list-style: none; margin: 0; padding: 0; }
+  .toc-rail a {
+    display: block; padding: 0.2rem 0; font-size: 0.8rem; color: var(--ink-soft); text-decoration: none;
+  }
+  .toc-rail a:hover { color: var(--accent); }
+
+  footer.site {
+    border-top: 2px solid var(--ink); margin-top: 1rem;
+    font-family: var(--sans); font-size: 0.85rem; color: var(--ink-soft);
+  }
+  footer.site .wrap { max-width: 90rem; margin: 0 auto; padding: 2rem 1.5rem 3rem; }
+  footer.site .links { display: flex; flex-wrap: wrap; gap: 0.4rem 1.5rem; margin: 0 0 0.9rem; }
+  footer.site p { margin: 0; }
+
+  @media (max-width: 1200px) {
+    .shell { grid-template-columns: 16.5rem minmax(0, 1fr); }
+    .toc-rail { display: none; }
+  }
+  @media (max-width: 900px) {
+    .shell { grid-template-columns: minmax(0, 1fr); }
+    .sidebar { display: none; }
+    .mobilenav {
+      display: block; margin: 1.4rem 0 0; font-family: var(--sans);
+      background: var(--paper-raised); border: 1px solid var(--rule-strong); border-radius: 6px;
+    }
+    .mobilenav summary {
+      cursor: pointer; padding: 0.7rem 1rem;
+      font-family: var(--display); font-size: 0.8rem; font-weight: 600;
+      letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent);
+    }
+    .mobilenav .docnav { padding: 0.4rem 1rem 1rem; }
+    .doc { padding-top: 0.6rem; }
+    .mobilewrap { padding: 0; }
+  }
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="wrap">
+    <a class="brand" href="/chitra/docs/">chitra <span class="docmark">&middot; docs</span></a>
+    <nav aria-label="Project links">
+      <a href="/chitra/">Home</a>
+      <a href="https://pypi.org/project/chitra-monitor/">PyPI</a>
+      <a href="https://github.com/ReticleWorks/chitra">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="sidebar">
+<nav class="docnav" aria-label="Documentation">
+<a class="backlink" href="/chitra/">&larr; chitra home</a>
+<p class="group">Documentation</p><ul>
+<li><a href="/chitra/docs/">Overview</a></li>
+</ul>
+<p class="group">Getting started</p><ul>
+<li><a href="/chitra/docs/quickstart/">Quickstart</a></li>
+<li><a href="/chitra/docs/concepts/" aria-current="page">Concepts</a></li>
+</ul>
+<p class="group">Reference</p><ul>
+<li><a href="/chitra/docs/configuration/">Configuration</a></li>
+<li><a href="/chitra/docs/daemons/">Daemons &amp; Tools</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/delivery/">Delivery</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/dispatchd.html">dispatchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/triaged.html">triaged</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/sweepd.html">sweepd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/rate-limit-guard.html">rate-limit-guard</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/authority/">Authority</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/petra.html">petra</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/ownership-provider.html">ownership-provider</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/operator-tools/">Operator tools</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/watchd.html">watchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/goals-cli.html">goals CLI</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/artifacts.html">artifacts</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/capabilities.html">capabilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/convlog.html">convlog</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/usage.html">usage</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/utilities/">Utilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/draft-scanner.html">draft-scanner</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/replay-eval.html">replay-eval</a></li>
+</ul>
+<p class="group">Deep dives</p><ul>
+<li><a href="/chitra/docs/DESIGN.html">Design notes</a></li>
+<li><a href="/chitra/docs/evasion-taxonomy.html">Evasion taxonomy</a></li>
+<li><a href="/chitra/docs/pause-recovery.html">Pause &amp; recovery</a></li>
+<li><a href="/chitra/docs/petra-authority.html">Petra authority</a></li>
+<li><a href="/chitra/docs/self-tuning.html">Self-tuning</a></li>
+<li><a href="/chitra/docs/workflow-pattern-catalog.html">Workflow patterns</a></li>
+<li><a href="/chitra/docs/routing-feedback-usage.html">Routing feedback &amp; usage</a></li>
+</ul>
+</nav>
+  </aside>
+  <main class="doc">
+    <div class="mobilewrap">
+      <details class="mobilenav">
+        <summary>Docs navigation</summary>
+<nav class="docnav" aria-label="Documentation">
+<a class="backlink" href="/chitra/">&larr; chitra home</a>
+<p class="group">Documentation</p><ul>
+<li><a href="/chitra/docs/">Overview</a></li>
+</ul>
+<p class="group">Getting started</p><ul>
+<li><a href="/chitra/docs/quickstart/">Quickstart</a></li>
+<li><a href="/chitra/docs/concepts/" aria-current="page">Concepts</a></li>
+</ul>
+<p class="group">Reference</p><ul>
+<li><a href="/chitra/docs/configuration/">Configuration</a></li>
+<li><a href="/chitra/docs/daemons/">Daemons &amp; Tools</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/delivery/">Delivery</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/dispatchd.html">dispatchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/triaged.html">triaged</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/sweepd.html">sweepd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/rate-limit-guard.html">rate-limit-guard</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/authority/">Authority</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/petra.html">petra</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/ownership-provider.html">ownership-provider</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/operator-tools/">Operator tools</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/watchd.html">watchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/goals-cli.html">goals CLI</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/artifacts.html">artifacts</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/capabilities.html">capabilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/convlog.html">convlog</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/usage.html">usage</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/utilities/">Utilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/draft-scanner.html">draft-scanner</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/replay-eval.html">replay-eval</a></li>
+</ul>
+<p class="group">Deep dives</p><ul>
+<li><a href="/chitra/docs/DESIGN.html">Design notes</a></li>
+<li><a href="/chitra/docs/evasion-taxonomy.html">Evasion taxonomy</a></li>
+<li><a href="/chitra/docs/pause-recovery.html">Pause &amp; recovery</a></li>
+<li><a href="/chitra/docs/petra-authority.html">Petra authority</a></li>
+<li><a href="/chitra/docs/self-tuning.html">Self-tuning</a></li>
+<li><a href="/chitra/docs/workflow-pattern-catalog.html">Workflow patterns</a></li>
+<li><a href="/chitra/docs/routing-feedback-usage.html">Routing feedback &amp; usage</a></li>
+</ul>
+</nav>
+      </details>
+    </div>
+    <p class="crumbs"><a href="/chitra/docs/">Docs</a></p>
+    <article>
+<h1 id="chitra-concepts">Chitra Concepts</h1>
+<p>Chitra has two distinct layers: a deterministic core that makes zero LLM calls, and an LLM-judgment layer where specific gates make decisions about completion claims and goal enforcement.</p>
+<h2 id="the-deterministic-core">The Deterministic Core</h2>
+<p>Everything on chitra's delivery, ledger, routing, rate-limiting, and ownership-checking path is deterministic Python. No model evaluates any input. No LLM is consulted about what to send or when. This core loop is auditable, crash-safe, and repeatable.</p>
+<h3 id="dispatch">Dispatch</h3>
+<p>Dispatchd drains a JSON order queue (one order per file), delivers messages to tmux sessions, and records results. The delivery path is:</p>
+<ol>
+<li>Acquire an exclusive file-based lock (LaneLock) per session. This prevents two writers from racing and corrupting the same session's input.</li>
+<li>Load the message text from the order file.</li>
+<li>Use <code>tmux load-buffer</code> and <code>tmux paste-buffer</code> to inject the text into the session's input line.</li>
+<li>Verify delivery by grepping the session's transcript for the exact text. &quot;Looks sent&quot; is not evidence; grep confirms it actually arrived.</li>
+<li>Write a result file and sign an entry to the ledger (HMAC-SHA256).</li>
+</ol>
+<p>Dispatchd is idempotent: once a result file exists for an order, it is never redispatched, even across a restart. A crash between paste and result is reconciled with a send-nonce marker, not a blind second paste.</p>
+<h3 id="routing">Routing</h3>
+<p>Routing maps task types to routing hints. A dispatch order carries an opaque <code>task_type</code> tag. If a routing config is set, dispatchd looks up that tag and fills in a <code>routing_hint</code> (a model/harness preference the caller's system uses). An explicit <code>routing_hint</code> on the order always wins over the config table. Chitra records the hint in the ledger but never acts on it — your caller's system decides what to do with the hint.</p>
+<p>This is pure dictionary lookup. No content is ever evaluated. Chitra makes no judgment about which task types or models are appropriate.</p>
+<h3 id="rate-limiting">Rate Limiting</h3>
+<p>Rate-limit-guard pauses and resumes sessions using a durable transaction ledger. Every pause phase is recorded with a reason and timestamp. A session holds in place if:</p>
+<ul>
+<li>The account is approaching provider limits (e.g., 92% of Claude's 5-hour window used).</li>
+<li>Host load pressure is high (memory available dropping, CPU/memory pressure sustained).</li>
+</ul>
+<p>All nudges (the messages sent to a paused session) are fixed canned templates. They are never LLM-authored. Chitra never drafts prose to explain the pause. It just enforces the decision and records the reasoning.</p>
+<h3 id="ownership">Ownership</h3>
+<p>Ownership-provider is a read-only fence answering whether a given host:lane:instance reference belongs to a canonical managed lane. It does not discover sessions or scan processes. It only reads two files:</p>
+<ul>
+<li><code>goals.json</code> — the canonical goal store.</li>
+<li><code>goals.managed.json</code> — a digest marker the manager writes.</li>
+</ul>
+<p>It validates that both files match in digest and freshness, that timestamps and host IDs match, and then returns owned/unowned/unknown with a reason. This is pure read, zero state change.</p>
+<h3 id="ledger">Ledger</h3>
+<p>Every successful dispatch is signed and logged. The ledger is an append-only JSONL file with one entry per successful send. Each entry includes:</p>
+<ul>
+<li>Order ID and lane ID.</li>
+<li>The exact text delivered.</li>
+<li>Delivery timestamp.</li>
+<li>HMAC-SHA256 signature over the entry.</li>
+</ul>
+<p>This is a trusted-host model: anyone who can write to the ledger file can rewrite it. So treat &quot;not in the ledger&quot; as a strong signal, not tamper-proof evidence. But a reader with the signing key can prove that a given message was delivered by verifying the signature.</p>
+<h2 id="the-llm-judgment-layer">The LLM-Judgment Layer</h2>
+<p>One deliberate gate lets chitra invoke an LLM: goal enforcement via watchd.</p>
+<h3 id="goal-enforcement-and-completion-review">Goal Enforcement and Completion Review</h3>
+<p>Watchd watches tmux panes for session activity. When a session ends a turn claiming completion (via a marker in the pane output), watchd:</p>
+<ol>
+<li>Freezes the session's goal statement.</li>
+<li>Launches isolated <code>claude -p</code> reviewer processes (bounded concurrency, default max 2 at once).</li>
+<li>Each reviewer reads the goal and the session's turn output, then judges: does the output satisfy the stated goal?</li>
+<li>Records the verdict (accept/reject/unavailable) to a signed completion_reviews.jsonl log.</li>
+</ol>
+<p>These reviewer processes are isolated. They never:</p>
+<ul>
+<li>Draft or review chitra's own prospective messages to the session.</li>
+<li>Share context with other reviewers or with chitra's main loop.</li>
+<li>Mutate chitra's state.</li>
+<li>Bypass operator gates for spend, credentials, or irreversible actions.</li>
+</ul>
+<p>The pane poll never waits for reviewers to finish; it keeps the lane non-green and collects ready verdicts on later polls. The verdicts are inputs to decision attestation, but only approved text (flagged as such by an operator via convlog) can reach the pane.</p>
+<h3 id="goals-and-completion-gating">Goals and Completion Gating</h3>
+<p>A goal is a statement of what the session should accomplish. Chitra stores each goal with:</p>
+<ul>
+<li>A 6-word minimum to encourage clarity.</li>
+<li>A <code>done_when</code> condition: the gate looks for this language in the session's final output.</li>
+<li>One of 8 statuses: open, working, paused, held, complete, abandoned, redirected, or deferred.</li>
+<li>An immutable <code>lane_id</code> once set (prevents re-enrollment of the same logical lane under a fresh session ref).</li>
+</ul>
+<p>Chitra never rewrites the <code>done_when</code> statement. The operator authors it once at enrollment. Post-hoc rewriting would let the system fit the condition to whatever already exists. The first write copies the condition into write-once <code>enrolled_done_when</code> and <code>enrolled_at</code> anchors; every later write is checked against these.</p>
+<p>When a session finishes and claims completion, the completion gate:</p>
+<ol>
+<li>Reads the enrolled done_when condition.</li>
+<li>Checks the session's output for the required language (via watchd's LLM reviewers).</li>
+<li>Counts delivered items against the goal's inventory.</li>
+<li>Blocks goal closure if the inventory count is short.</li>
+</ol>
+<p>It also treats follow-on/deferred language over a still-required item as a silent descope tell, unless the operator explicitly acknowledged the descope or redirected the goal via convlog (the conversation log).</p>
+<h2 id="the-ledger-and-audit-trail">The Ledger and Audit Trail</h2>
+<p>Chitra records:</p>
+<ul>
+<li>Every dispatch: order ID, text, timestamp, HMAC-signature.</li>
+<li>Every completion verdict: goal state, reviewer judgment (accept/reject), reasoning.</li>
+<li>Every state transition: lane status changes, hold/resume events, rate-limit phases.</li>
+<li>Every rate-limit decision: account usage snapshot, load pressure, pause reason.</li>
+</ul>
+<p>This log is append-only. Once an entry is written, it is never modified or deleted. Any reader with the signing key can verify that an entry was created at a specific timestamp.</p>
+<p>The model for trust is &quot;trusted host.&quot; The host running chitra is assumed to be secure. Anyone who can write to the ledger file can rewrite it. But across a network or audit boundary, the log is evidence: absence of an entry is a strong signal that something did not happen.</p>
+<h2 id="how-the-layers-work-together">How the Layers Work Together</h2>
+<p>A typical session flow:</p>
+<ol>
+<li><strong>Enrollment (deterministic):</strong> An operator enrolls a session with a goal statement via chitra-goals set. Chitra validates the goal, stores it immutably, and sets lane_id.</li>
+<li><strong>Delivery (deterministic):</strong> The operator (or an orchestration system) queues messages. Dispatchd drains the queue, delivers each message to the session via tmux, and logs the delivery.</li>
+<li><strong>Rate limiting (deterministic):</strong> Rate-limit-guard polls the account's usage and host load, pauses the session if thresholds are hit, and records the pause in a durable ledger.</li>
+<li><strong>Completion (LLM-judgment):</strong> The session ends a turn claiming completion. Watchd detects this, launches isolated reviewers, and collects verdicts.</li>
+<li><strong>Goal closure (deterministic + LLM):</strong> The operator runs chitra-goals close. Chitra reads the enrolled goal, checks the reviewer verdicts from step 4, counts delivered items, and blocks closure if the inventory is short.</li>
+</ol>
+<p>The deterministic and LLM layers are separate. An LLM verdict never forces a decision; an operator always has the last word via convlog. And the core dispatch, ledger, and rate-limiting paths never call an LLM.</p>
+<h2 id="see-also">See Also</h2>
+<ul>
+<li><strong><a href="../DESIGN.html">Design notes</a></strong> — Detailed origin, single-writer rule, done-condition ownership, distribution model.</li>
+<li><strong><a href="../daemons/">Daemons reference</a></strong> — How each daemon/CLI tool works and what it does.</li>
+<li><strong><a href="../configuration/">Configuration</a></strong> — Routing and policy settings.</li>
+</ul>
+
+    </article>
+    <nav class="pagenav" aria-label="Previous and next page"><a class="prev" href="/chitra/docs/quickstart/"><span class="pn-dir">&larr; Previous</span><span class="pn-title">Quickstart</span></a><a class="next" href="/chitra/docs/configuration/"><span class="pn-dir">Next &rarr;</span><span class="pn-title">Configuration</span></a></nav>
+  </main>
+  <aside class="toc-rail" aria-label="On this page"><p class="group">On this page</p><ul><li><a href="#the-deterministic-core">The Deterministic Core</a></li><li><a href="#the-llm-judgment-layer">The LLM-Judgment Layer</a></li><li><a href="#the-ledger-and-audit-trail">The Ledger and Audit Trail</a></li><li><a href="#how-the-layers-work-together">How the Layers Work Together</a></li><li><a href="#see-also">See Also</a></li></ul></aside>
+</div>
+
+<footer class="site">
+  <div class="wrap">
+    <div class="links">
+      <a href="/chitra/">chitra home</a>
+      <a href="https://pypi.org/project/chitra-monitor/">PyPI — chitra-monitor</a>
+      <a href="https://github.com/ReticleWorks/chitra">GitHub — ReticleWorks/chitra</a>
+      <a href="https://github.com/ReticleWorks/chitra/issues">Issues</a>
+    </div>
+    <p>MIT &copy; 2026 Reticle Works.</p>
+  </div>
+</footer>
+
+</body>
+</html>

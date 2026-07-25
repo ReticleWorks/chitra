@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rate-limit-guard — Rate Limit and Load Shedding &middot; chitra docs</title>
+<meta name="description" content="chitra documentation — goal-aware, lightweight multi-agent orchestration. Deterministic dispatch, LLM-judged completion review.">
+<style>
+  :root {
+    --paper: #f2f3ee; --paper-raised: #fbfcf8; --ink: #1e2925; --ink-soft: #52605a;
+    --rule: #d3d8cf; --rule-strong: #b9c1b6; --accent: #17695a; --accent-soft: #e1eee8;
+    --gate: #9a6b2f; --gate-soft: #f2e9d8; --code-bg: #e9ece5; --btn-text: #ffffff;
+    --display: "Bahnschrift", "DIN Alternate", "Franklin Gothic Medium", "Avenir Next Condensed", "Nimbus Sans Narrow", "Arial Narrow", sans-serif;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "URW Palladio L", P052, Georgia, serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) { :root {
+    --paper: #141917; --paper-raised: #1b211e; --ink: #e5eae6; --ink-soft: #9caba3;
+    --rule: #2c342f; --rule-strong: #3d463f; --accent: #52b7a2; --accent-soft: #1c2e28;
+    --gate: #d0a05f; --gate-soft: #2d2517; --code-bg: #101412; --btn-text: #0f1f1a;
+  } }
+  :root[data-theme="dark"] {
+    --paper: #141917; --paper-raised: #1b211e; --ink: #e5eae6; --ink-soft: #9caba3;
+    --rule: #2c342f; --rule-strong: #3d463f; --accent: #52b7a2; --accent-soft: #1c2e28;
+    --gate: #d0a05f; --gate-soft: #2d2517; --code-bg: #101412; --btn-text: #0f1f1a;
+  }
+  :root[data-theme="light"] {
+    --paper: #f2f3ee; --paper-raised: #fbfcf8; --ink: #1e2925; --ink-soft: #52605a;
+    --rule: #d3d8cf; --rule-strong: #b9c1b6; --accent: #17695a; --accent-soft: #e1eee8;
+    --gate: #9a6b2f; --gate-soft: #f2e9d8; --code-bg: #e9ece5; --btn-text: #ffffff;
+  }
+
+  html { background: var(--paper); scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  body {
+    background: var(--paper); color: var(--ink); font-family: var(--serif);
+    font-size: 1.0625rem; line-height: 1.62; margin: 0;
+  }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:hover { text-decoration-thickness: 2px; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+  /* masthead — same register as the landing page */
+  .masthead { border-bottom: 2px solid var(--ink); }
+  .masthead .wrap {
+    max-width: 90rem; margin: 0 auto; padding: 1.1rem 1.5rem;
+    display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 0.5rem 1.5rem;
+  }
+  .masthead .brand {
+    font-family: var(--display); font-size: 1.05rem; font-weight: 600;
+    letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink); text-decoration: none;
+  }
+  .masthead .brand .docmark { color: var(--accent); }
+  .masthead nav { display: flex; flex-wrap: wrap; gap: 0.4rem 1.4rem; font-family: var(--sans); font-size: 0.8125rem; }
+  .masthead nav a { color: var(--ink-soft); text-decoration: none; }
+  .masthead nav a:hover { color: var(--accent); text-decoration: underline; }
+
+  .shell {
+    max-width: 90rem; margin: 0 auto; padding: 0 1.5rem;
+    display: grid; grid-template-columns: 16.5rem minmax(0, 1fr) 13rem; gap: 0 3rem;
+  }
+
+  /* sidebar */
+  .sidebar {
+    border-right: 1px solid var(--rule-strong);
+    padding: 2rem 1.5rem 3rem 0;
+    position: sticky; top: 0; align-self: start;
+    max-height: 100vh; overflow-y: auto;
+    font-family: var(--sans);
+  }
+  .docnav .backlink {
+    display: block; font-size: 0.8125rem; color: var(--ink-soft);
+    text-decoration: none; margin: 0 0 1.6rem;
+  }
+  .docnav .backlink:hover { color: var(--accent); text-decoration: underline; }
+  .docnav .group {
+    font-family: var(--display); font-size: 0.72rem; font-weight: 600;
+    letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-soft);
+    margin: 1.6rem 0 0.5rem;
+  }
+  .docnav .group:first-of-type { margin-top: 0; }
+  .docnav ul { list-style: none; margin: 0; padding: 0; }
+  .docnav li a {
+    display: block; padding: 0.24rem 0 0.24rem 0.7rem; font-size: 0.85rem;
+    color: var(--ink-soft); text-decoration: none;
+    border-left: 2px solid transparent;
+  }
+  .docnav li a:hover { color: var(--accent); }
+  .docnav li a[aria-current="page"] {
+    color: var(--accent); font-weight: 600; border-left-color: var(--accent);
+  }
+  .docnav li.ind1 a { padding-left: 1.6rem; }
+  .docnav li.ind2 a { padding-left: 2.5rem; font-family: var(--mono); font-size: 0.78rem; }
+
+  /* mobile nav */
+  .mobilenav { display: none; }
+
+  /* content */
+  .doc { padding: 2.4rem 0 3rem; min-width: 0; }
+  article { max-width: 46rem; }
+  .crumbs {
+    font-family: var(--sans); font-size: 0.78rem; color: var(--ink-soft);
+    letter-spacing: 0.04em; margin: 0 0 1.4rem;
+  }
+  .crumbs a { color: var(--ink-soft); text-decoration: none; }
+  .crumbs a:hover { color: var(--accent); text-decoration: underline; }
+  article h1 {
+    font-family: var(--display); font-size: clamp(1.9rem, 4vw, 2.4rem); font-weight: 600;
+    line-height: 1.1; letter-spacing: 0.01em; margin: 0 0 1.1rem;
+    padding-bottom: 0.8rem; border-bottom: 2px solid var(--ink); text-wrap: balance;
+  }
+  article h2 {
+    font-family: var(--display); font-size: 1.45rem; font-weight: 600; line-height: 1.2;
+    margin: 2.6rem 0 0.9rem; padding-top: 1.4rem; border-top: 1px solid var(--rule);
+    text-wrap: balance;
+  }
+  article h3 {
+    font-family: var(--sans); font-size: 1rem; font-weight: 650; margin: 1.9rem 0 0.5rem;
+  }
+  article h4 {
+    font-family: var(--sans); font-size: 0.9rem; font-weight: 650; margin: 1.5rem 0 0.4rem;
+    color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  article p, article li { max-width: 65ch; }
+  article p { margin: 0 0 1rem; }
+  article ul, article ol { padding-left: 1.4rem; margin: 0 0 1.1rem; }
+  article li { margin: 0 0 0.35rem; }
+  article hr { border: 0; border-top: 1px solid var(--rule-strong); margin: 2.2rem 0; }
+  article blockquote {
+    margin: 1.2rem 0; padding: 0.1rem 0 0.1rem 1.1rem;
+    border-left: 3px solid var(--accent); color: var(--ink-soft);
+  }
+  article pre {
+    background: var(--code-bg); border: 1px solid var(--rule); border-radius: 6px;
+    padding: 0.9rem 1rem; overflow-x: auto; font-family: var(--mono);
+    font-size: 0.82rem; line-height: 1.55; margin: 1.1rem 0;
+  }
+  article code { font-family: var(--mono); font-size: 0.85em; }
+  article p code, article li code, article td code, article h1 code, article h2 code, article h3 code {
+    background: var(--code-bg); border-radius: 3px; padding: 0.08em 0.3em;
+  }
+  article pre code { background: none; padding: 0; font-size: 1em; }
+  .table-wrap { overflow-x: auto; margin: 1.2rem 0; }
+  article table {
+    border-collapse: collapse; font-family: var(--sans); font-size: 0.85rem; line-height: 1.5;
+    min-width: 100%;
+  }
+  article th {
+    font-family: var(--display); font-size: 0.75rem; font-weight: 600;
+    letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-soft);
+    text-align: left; padding: 0.45rem 1rem 0.45rem 0; border-bottom: 2px solid var(--ink);
+  }
+  article td {
+    padding: 0.5rem 1rem 0.5rem 0; border-bottom: 1px solid var(--rule);
+    vertical-align: top; font-variant-numeric: tabular-nums;
+  }
+
+  /* prev / next */
+  .pagenav {
+    max-width: 46rem; display: flex; justify-content: space-between; gap: 1rem;
+    margin: 3rem 0 0; padding-top: 1.4rem; border-top: 2px solid var(--ink);
+    font-family: var(--sans); font-size: 0.875rem;
+  }
+  .pagenav a { text-decoration: none; max-width: 46%; }
+  .pagenav a:hover .pn-title { text-decoration: underline; }
+  .pagenav .pn-dir {
+    display: block; font-family: var(--display); font-size: 0.7rem; font-weight: 600;
+    letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-soft); margin-bottom: 0.15rem;
+  }
+  .pagenav .pn-title { color: var(--accent); font-weight: 600; }
+  .pagenav .next { margin-left: auto; text-align: right; }
+
+  /* on this page */
+  .toc-rail {
+    padding: 2.4rem 0 3rem; position: sticky; top: 0; align-self: start;
+    max-height: 100vh; overflow-y: auto; font-family: var(--sans);
+  }
+  .toc-rail .group {
+    font-family: var(--display); font-size: 0.72rem; font-weight: 600;
+    letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-soft); margin: 0 0 0.5rem;
+  }
+  .toc-rail ul { list-style: none; margin: 0; padding: 0; }
+  .toc-rail a {
+    display: block; padding: 0.2rem 0; font-size: 0.8rem; color: var(--ink-soft); text-decoration: none;
+  }
+  .toc-rail a:hover { color: var(--accent); }
+
+  footer.site {
+    border-top: 2px solid var(--ink); margin-top: 1rem;
+    font-family: var(--sans); font-size: 0.85rem; color: var(--ink-soft);
+  }
+  footer.site .wrap { max-width: 90rem; margin: 0 auto; padding: 2rem 1.5rem 3rem; }
+  footer.site .links { display: flex; flex-wrap: wrap; gap: 0.4rem 1.5rem; margin: 0 0 0.9rem; }
+  footer.site p { margin: 0; }
+
+  @media (max-width: 1200px) {
+    .shell { grid-template-columns: 16.5rem minmax(0, 1fr); }
+    .toc-rail { display: none; }
+  }
+  @media (max-width: 900px) {
+    .shell { grid-template-columns: minmax(0, 1fr); }
+    .sidebar { display: none; }
+    .mobilenav {
+      display: block; margin: 1.4rem 0 0; font-family: var(--sans);
+      background: var(--paper-raised); border: 1px solid var(--rule-strong); border-radius: 6px;
+    }
+    .mobilenav summary {
+      cursor: pointer; padding: 0.7rem 1rem;
+      font-family: var(--display); font-size: 0.8rem; font-weight: 600;
+      letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent);
+    }
+    .mobilenav .docnav { padding: 0.4rem 1rem 1rem; }
+    .doc { padding-top: 0.6rem; }
+    .mobilewrap { padding: 0; }
+  }
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="wrap">
+    <a class="brand" href="/chitra/docs/">chitra <span class="docmark">&middot; docs</span></a>
+    <nav aria-label="Project links">
+      <a href="/chitra/">Home</a>
+      <a href="https://pypi.org/project/chitra-monitor/">PyPI</a>
+      <a href="https://github.com/ReticleWorks/chitra">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="sidebar">
+<nav class="docnav" aria-label="Documentation">
+<a class="backlink" href="/chitra/">&larr; chitra home</a>
+<p class="group">Documentation</p><ul>
+<li><a href="/chitra/docs/">Overview</a></li>
+</ul>
+<p class="group">Getting started</p><ul>
+<li><a href="/chitra/docs/quickstart/">Quickstart</a></li>
+<li><a href="/chitra/docs/concepts/">Concepts</a></li>
+</ul>
+<p class="group">Reference</p><ul>
+<li><a href="/chitra/docs/configuration/">Configuration</a></li>
+<li><a href="/chitra/docs/daemons/">Daemons &amp; Tools</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/delivery/">Delivery</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/dispatchd.html">dispatchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/triaged.html">triaged</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/sweepd.html">sweepd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/rate-limit-guard.html" aria-current="page">rate-limit-guard</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/authority/">Authority</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/petra.html">petra</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/ownership-provider.html">ownership-provider</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/operator-tools/">Operator tools</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/watchd.html">watchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/goals-cli.html">goals CLI</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/artifacts.html">artifacts</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/capabilities.html">capabilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/convlog.html">convlog</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/usage.html">usage</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/utilities/">Utilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/draft-scanner.html">draft-scanner</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/replay-eval.html">replay-eval</a></li>
+</ul>
+<p class="group">Deep dives</p><ul>
+<li><a href="/chitra/docs/DESIGN.html">Design notes</a></li>
+<li><a href="/chitra/docs/evasion-taxonomy.html">Evasion taxonomy</a></li>
+<li><a href="/chitra/docs/pause-recovery.html">Pause &amp; recovery</a></li>
+<li><a href="/chitra/docs/petra-authority.html">Petra authority</a></li>
+<li><a href="/chitra/docs/self-tuning.html">Self-tuning</a></li>
+<li><a href="/chitra/docs/workflow-pattern-catalog.html">Workflow patterns</a></li>
+<li><a href="/chitra/docs/routing-feedback-usage.html">Routing feedback &amp; usage</a></li>
+</ul>
+</nav>
+  </aside>
+  <main class="doc">
+    <div class="mobilewrap">
+      <details class="mobilenav">
+        <summary>Docs navigation</summary>
+<nav class="docnav" aria-label="Documentation">
+<a class="backlink" href="/chitra/">&larr; chitra home</a>
+<p class="group">Documentation</p><ul>
+<li><a href="/chitra/docs/">Overview</a></li>
+</ul>
+<p class="group">Getting started</p><ul>
+<li><a href="/chitra/docs/quickstart/">Quickstart</a></li>
+<li><a href="/chitra/docs/concepts/">Concepts</a></li>
+</ul>
+<p class="group">Reference</p><ul>
+<li><a href="/chitra/docs/configuration/">Configuration</a></li>
+<li><a href="/chitra/docs/daemons/">Daemons &amp; Tools</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/delivery/">Delivery</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/dispatchd.html">dispatchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/triaged.html">triaged</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/sweepd.html">sweepd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/delivery/rate-limit-guard.html" aria-current="page">rate-limit-guard</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/authority/">Authority</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/petra.html">petra</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/authority/ownership-provider.html">ownership-provider</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/operator-tools/">Operator tools</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/watchd.html">watchd</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/goals-cli.html">goals CLI</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/artifacts.html">artifacts</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/capabilities.html">capabilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/convlog.html">convlog</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/operator-tools/usage.html">usage</a></li>
+<li class="ind1"><a href="/chitra/docs/daemons/utilities/">Utilities</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/draft-scanner.html">draft-scanner</a></li>
+<li class="ind2"><a href="/chitra/docs/daemons/utilities/replay-eval.html">replay-eval</a></li>
+</ul>
+<p class="group">Deep dives</p><ul>
+<li><a href="/chitra/docs/DESIGN.html">Design notes</a></li>
+<li><a href="/chitra/docs/evasion-taxonomy.html">Evasion taxonomy</a></li>
+<li><a href="/chitra/docs/pause-recovery.html">Pause &amp; recovery</a></li>
+<li><a href="/chitra/docs/petra-authority.html">Petra authority</a></li>
+<li><a href="/chitra/docs/self-tuning.html">Self-tuning</a></li>
+<li><a href="/chitra/docs/workflow-pattern-catalog.html">Workflow patterns</a></li>
+<li><a href="/chitra/docs/routing-feedback-usage.html">Routing feedback &amp; usage</a></li>
+</ul>
+</nav>
+      </details>
+    </div>
+    <p class="crumbs"><a href="/chitra/docs/">Docs</a> &rsaquo; <a href="/chitra/docs/daemons/">Daemons &amp; Tools</a> &rsaquo; <a href="/chitra/docs/daemons/delivery/">Delivery</a></p>
+    <article>
+<h1 id="rate-limit-guard--rate-limit-and-load-shedding">rate-limit-guard — Rate Limit and Load Shedding</h1>
+<p>Rate-limit-guard pauses and resumes sessions when account usage approaches limits or host load is high. It works via a durable transaction ledger that records each pause/resume phase.</p>
+<h2 id="what-it-does">What it does</h2>
+<p><strong>On each run (typically every few minutes via systemd timer):</strong></p>
+<ol>
+<li>Read account usage snapshots (Claude API, Codex API, or custom).</li>
+<li>Evaluate pause/warn thresholds:
+<ul>
+<li>Claude: 5-hour and 7-day windows.</li>
+<li>Codex: primary and secondary limits.</li>
+</ul>
+</li>
+<li>Read host load pressure (memory available, CPU/memory PSI).</li>
+<li>For each active session:
+<ul>
+<li>Check if its account is approaching limits.</li>
+<li>Check if the host is under load pressure.</li>
+<li>Pause the session if either threshold is hit (via a nudge order in the dispatchd queue).</li>
+<li>Resume the session if both thresholds are cleared.</li>
+</ul>
+</li>
+<li>Record each decision (pause_requested → checkpoint_sent → stop_sent → awaiting_quiescence → held → resume_requested → resume_sent → cleared) to a durable transaction ledger.</li>
+</ol>
+<p>All nudges are fixed canned templates (e.g., &quot;Pausing due to rate limit&quot;). Chitra never drafts prose or LLM reasoning. It just enforces the decision.</p>
+<h2 id="cli-usage">CLI usage</h2>
+<pre><code class="language-bash">chitra-rate-limit-guard \
+  --usage-dir /var/lib/chitra/usage \
+  --goals-root /var/lib/chitra/goals \
+  --queue-dir /var/lib/chitra/queue \
+  --policy-config /etc/chitra/policy.yaml
+</code></pre>
+<p>Typical systemd timer: run every 3-5 minutes.</p>
+<h2 id="key-flags">Key flags</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--usage-dir</code></td>
+<td>Unset</td>
+<td>Directory for usage snapshots.</td>
+</tr>
+<tr>
+<td><code>--host</code></td>
+<td>localhost</td>
+<td>Host to read usage and load for.</td>
+</tr>
+<tr>
+<td><code>--staleness-seconds</code></td>
+<td>1200 (20 min)</td>
+<td>How old a usage snapshot can be.</td>
+</tr>
+<tr>
+<td><code>--goals-root</code></td>
+<td>Unset</td>
+<td>Root directory for goals.json.</td>
+</tr>
+<tr>
+<td><code>--queue-dir</code></td>
+<td><code>$CHITRA_STATE_DIR/queue</code></td>
+<td>Dispatchd order queue.</td>
+</tr>
+<tr>
+<td><code>--policy-config</code></td>
+<td>Unset</td>
+<td>Policy config (YAML) with pause thresholds.</td>
+</tr>
+<tr>
+<td><code>--codex</code></td>
+<td>false</td>
+<td>Use Codex thresholds instead of Claude.</td>
+</tr>
+<tr>
+<td><code>--codex-bin</code></td>
+<td><code>codex</code></td>
+<td>Codex CLI binary path.</td>
+</tr>
+<tr>
+<td><code>--once</code></td>
+<td>False</td>
+<td>Run once and exit.</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="environment-variables">Environment variables</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CHITRA_NEVER_PAUSE_SESSION_PREFIXES</code></td>
+<td>Unset</td>
+<td>Comma-separated prefixes to never pause.</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="policy-config">Policy config</h2>
+<p>The policy YAML sets thresholds. Example (see <code>docs/policy.yaml.example</code>):</p>
+<pre><code class="language-yaml">usage:
+  pause_5h_pct: 92.0        # Pause at 92% of 5-hour window
+  pause_7d_pct: 95.0        # Pause at 95% of 7-day window
+  warn_5h_pct: 80.0         # Warn at 80% (don't assign new work)
+  warn_7d_pct: 90.0         # Warn at 90%
+  max_running: null          # Max sessions running (null = use default)
+  auto_resume: true          # Re-arm timed holds after reset
+load:
+  baseline_max_running: 8    # Sessions to run at baseline load
+  l1_max_running: 6          # Sessions at L1 load pressure
+  l2_max_running: 4          # Sessions at L2
+  l3_max_running: 2          # Sessions at L3 (critical)
+  l1_mem_available_pct: 25.0 # Trigger L1 at 25% mem available
+  l2_mem_available_pct: 15.0 # Trigger L2 at 15%
+  l3_mem_available_pct: 8.0  # Trigger L3 at 8%
+  # ... PSI thresholds omitted for brevity
+</code></pre>
+<h2 id="pause-and-resume-states">Pause and resume states</h2>
+<p>Rate-limit-guard tracks each pause as a phase:</p>
+<ol>
+<li><strong>pause_requested</strong> — Decision made to pause; nudge queued.</li>
+<li><strong>checkpoint_sent</strong> — Nudge pasted to session.</li>
+<li><strong>stop_sent</strong> — Waiting for session to stop generating.</li>
+<li><strong>awaiting_quiescence</strong> — Watching for silence (no new output).</li>
+<li><strong>held</strong> — Session paused and silent.</li>
+<li><strong>resume_requested</strong> — Decision made to resume; nudge queued.</li>
+<li><strong>resume_sent</strong> — Resume nudge pasted.</li>
+<li><strong>cleared</strong> — Session resumed and consuming normally.</li>
+</ol>
+<p>Each phase transition consumes a dispatchd result (proof the nudge was delivered). The ledger is durable; if rate-limit-guard crashes mid-pause, the next run reads the ledger and continues from where it left off.</p>
+<h2 id="common-tasks">Common tasks</h2>
+<p><strong>View pause/resume history:</strong></p>
+<pre><code class="language-bash">cat /var/lib/chitra/rate-limit-ledger.json | jq '.[] | select(.lane_id == &quot;my-session&quot;)'
+</code></pre>
+<p><strong>Never pause certain sessions:</strong></p>
+<pre><code class="language-bash">export CHITRA_NEVER_PAUSE_SESSION_PREFIXES=&quot;admin,critical&quot;
+chitra-rate-limit-guard
+</code></pre>
+<p><strong>Check current hold status:</strong></p>
+<pre><code class="language-bash">chitra-rate-limit-guard --usage-dir /var/lib/chitra/usage --goals-root /var/lib/chitra/goals
+</code></pre>
+<p><strong>Run as a systemd timer:</strong></p>
+<pre><code class="language-bash">sudo cp packaging/systemd/chitra-rate-limit-guard.timer.example /etc/systemd/system/chitra-rate-limit-guard.timer
+sudo cp packaging/systemd/chitra-rate-limit-guard.service.example /etc/systemd/system/chitra-rate-limit-guard.service
+sudoedit /etc/systemd/system/chitra-rate-limit-guard.service  # fill in placeholders
+sudo systemctl daemon-reload
+sudo systemctl enable --now chitra-rate-limit-guard.timer
+</code></pre>
+<h2 id="load-shedding-strategy">Load shedding strategy</h2>
+<p>Host load pressure is sampled from <code>/proc</code> on each run:</p>
+<ul>
+<li><strong>L1 (moderate):</strong> Memory drops below L1 threshold or CPU/memory PSI sustained.</li>
+<li><strong>L2 (high):</strong> Memory drops below L2 or PSI increases further.</li>
+<li><strong>L3 (critical):</strong> Memory critically low or PSI very high.</li>
+</ul>
+<p>As load increases, rate-limit-guard reduces the number of allowed concurrent sessions. L3 uses shorter timeouts for phase transitions.</p>
+<h2 id="nudge-templates">Nudge templates</h2>
+<p>Pause nudges are fixed. Examples:</p>
+<ul>
+<li>&quot;Pausing: Claude 5-hour limit at 92%.&quot;</li>
+<li>&quot;Pausing: Host memory pressure.&quot;</li>
+<li>&quot;Resuming: Usage back to normal.&quot;</li>
+</ul>
+<p>These are never LLM-authored. They come from chitra's shipped templates.</p>
+<h2 id="see-also">See Also</h2>
+<ul>
+<li><strong><a href="../../pause-recovery.html">Pause and Recovery</a></strong> — Detailed mechanics of pause/resume phases.</li>
+<li><strong><a href="../../configuration/">Configuration</a></strong> — How to set policy thresholds.</li>
+<li><strong><a href="../operator-tools/usage.html">Usage</a></strong> — How usage snapshots are captured.</li>
+</ul>
+
+    </article>
+    <nav class="pagenav" aria-label="Previous and next page"><a class="prev" href="/chitra/docs/daemons/delivery/sweepd.html"><span class="pn-dir">&larr; Previous</span><span class="pn-title">sweepd</span></a><a class="next" href="/chitra/docs/daemons/authority/"><span class="pn-dir">Next &rarr;</span><span class="pn-title">Authority</span></a></nav>
+  </main>
+  <aside class="toc-rail" aria-label="On this page"><p class="group">On this page</p><ul><li><a href="#what-it-does">What it does</a></li><li><a href="#cli-usage">CLI usage</a></li><li><a href="#key-flags">Key flags</a></li><li><a href="#environment-variables">Environment variables</a></li><li><a href="#policy-config">Policy config</a></li><li><a href="#pause-and-resume-states">Pause and resume states</a></li><li><a href="#common-tasks">Common tasks</a></li><li><a href="#load-shedding-strategy">Load shedding strategy</a></li><li><a href="#nudge-templates">Nudge templates</a></li><li><a href="#see-also">See Also</a></li></ul></aside>
+</div>
+
+<footer class="site">
+  <div class="wrap">
+    <div class="links">
+      <a href="/chitra/">chitra home</a>
+      <a href="https://pypi.org/project/chitra-monitor/">PyPI — chitra-monitor</a>
+      <a href="https://github.com/ReticleWorks/chitra">GitHub — ReticleWorks/chitra</a>
+      <a href="https://github.com/ReticleWorks/chitra/issues">Issues</a>
+    </div>
+    <p>MIT &copy; 2026 Reticle Works.</p>
+  </div>
+</footer>
+
+</body>
+</html>
