@@ -39,6 +39,11 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   matched session is "Chitra's own monitor/harness session" — the prefixes
   are operator-configured and may match any session, not necessarily
   Chitra's own.
+- `dispatchd`'s Codex-TUI placeholder detection now also treats a known
+  placeholder hint as idle at normal (non-dimmed) render intensity, not only
+  when the whole row renders dim. Either signal alone is sufficient evidence
+  of a placeholder; an unknown, normal-intensity draft is still blocked as a
+  real operator draft.
 
 ## [0.8.2.6] - 2026-07-16
 
