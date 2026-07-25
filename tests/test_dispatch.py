@@ -209,6 +209,32 @@ def test_transcript_confirms_nudge_excludes_given_path(tmp_path: Path) -> None:
     assert path is None
 
 
+def test_find_recent_transcript_searches_multiple_pathsep_separated_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session under a non-default CLAUDE_CONFIG_DIR (e.g. chitra's own
+    monitor/harness identity, which runs under ~/.claude-chitra rather than
+    ~/.claude) writes its transcripts under that root's projects/ dir.
+    CHITRA_CLAUDE_PROJECTS must be able to list more than one root or
+    transcript-grep can never confirm delivery to such a session -- see
+    dispatch_to_tmux's fall-through to FAILED when both transcript-grep and
+    the pane-capture fallback miss.
+    """
+    default_root = tmp_path / "home" / ".claude" / "projects"
+    alt_root = tmp_path / "home" / ".claude-chitra" / "projects"
+    session_dir = alt_root / "some-harness-project"
+    session_dir.mkdir(parents=True)
+    default_root.mkdir(parents=True)
+    transcript = session_dir / "abc123.jsonl"
+    transcript.write_text(json.dumps({"text": "fleet status sweep now"}) + "\n", encoding="utf-8")
+
+    monkeypatch.setenv("CHITRA_CLAUDE_PROJECTS", f"{default_root}{os.pathsep}{alt_root}")
+
+    found = find_recent_transcript("fleet status sweep now", now_ts=time.time())
+
+    assert found == transcript
+
+
 def test_remote_transcript_find_script_expands_default_tilde_root() -> None:
     script = _remote_transcript_grep_command("marker", "~/.claude/projects", 300)
 
@@ -638,11 +664,45 @@ def test_pane_input_check_blocks_a_codex_tui_operator_draft() -> None:
     assert check.last_line == "› fix the parser bug"
 
 
-def test_pane_input_check_blocks_an_unknown_dim_codex_tui_suggestion() -> None:
+def test_pane_input_check_treats_an_unknown_dim_codex_tui_suggestion_as_idle() -> None:
+    """An all-dim row is sufficient evidence of a placeholder even when the
+    hint text isn't in the known list yet — Codex adds hints across releases."""
     check = pane_input_check(
         [
             "• Ready for input",
             "\x1b[1m›\x1b[0m \x1b[2mRun the production migration\x1b[22m",
+            "  ? for shortcuts                                       100% context left",
+        ]
+    )
+
+    assert check.ok is True
+    assert check.reason == "idle: Codex TUI input row shows only a placeholder hint"
+
+
+def test_pane_input_check_treats_a_known_codex_hint_at_normal_intensity_as_idle() -> None:
+    """An exact match against a known placeholder hint is sufficient evidence
+    of a placeholder at any render intensity: a real operator draft that is
+    character-identical to a rotating hint is not plausible content worth
+    protecting."""
+    check = pane_input_check(
+        [
+            "• Ready for input",
+            "\x1b[1m›\x1b[0m Summarize recent commits",
+            "  ? for shortcuts                                       100% context left",
+        ]
+    )
+
+    assert check.ok is True
+    assert check.reason == "idle: Codex TUI input row shows only a placeholder hint"
+
+
+def test_pane_input_check_blocks_an_unknown_normal_intensity_codex_draft() -> None:
+    """A normal-intensity row that is not a known hint remains blocked — the
+    fail-closed property for real drafts is preserved."""
+    check = pane_input_check(
+        [
+            "• Ready for input",
+            "\x1b[1m›\x1b[0m Run the production migration",
             "  ? for shortcuts                                       100% context left",
         ]
     )

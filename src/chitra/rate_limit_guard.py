@@ -436,7 +436,7 @@ def plan_pauses(verdicts: list[AccountedVerdict], *, host: str, goals_root: Path
             continue
         never_pause = _never_pause_session_prefixes()
         if never_pause and session_ref.startswith(never_pause):
-            skipped.append(f"{session_ref}: Chitra's own monitor/harness session is never paused")
+            skipped.append(f"{session_ref}: matches a configured never-pause session prefix")
             continue
         existing = get_goal(goals_root, session_ref)
         if existing is None:

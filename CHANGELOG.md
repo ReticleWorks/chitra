@@ -21,6 +21,30 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   a hardcoded `NEVER_PAUSE_SESSION_PREFIXES` constant. The default is empty:
   no session is exempt from pausing unless the deployment sets the variable.
 
+### Fixed
+- `chitra.dispatch`'s local transcript-grep verification (`find_recent_transcript`)
+  now searches every root in an `os.pathsep`-separated `CHITRA_CLAUDE_PROJECTS`
+  list, not just the first. A local session running under a non-default
+  `CLAUDE_CONFIG_DIR` (e.g. a dedicated persona/harness identity) writes its
+  transcripts under that root's `projects/`, not the default
+  `~/.claude/projects` — previously that session's delivery could never be
+  confirmed by transcript-grep and always fell through to the weaker
+  pane-capture fallback or FAILED.
+- `chitra.lane_read`'s open-ask heading match and `chitra.triaged`'s
+  `needs_operator` critical rule no longer require a hardcoded fleet-operator
+  name; both default to the name-free `you`/`operator` case and accept
+  additional operator names or aliases via the comma-separated
+  `CHITRA_OPERATOR_ALIASES` env var.
+- The rate-limit guard's never-pause-prefix skip reason no longer claims the
+  matched session is "Chitra's own monitor/harness session" — the prefixes
+  are operator-configured and may match any session, not necessarily
+  Chitra's own.
+- `dispatchd`'s Codex-TUI placeholder detection now also treats a known
+  placeholder hint as idle at normal (non-dimmed) render intensity, not only
+  when the whole row renders dim. Either signal alone is sufficient evidence
+  of a placeholder; an unknown, normal-intensity draft is still blocked as a
+  real operator draft.
+
 ## [0.8.2.6] - 2026-07-16
 
 ### Fixed
