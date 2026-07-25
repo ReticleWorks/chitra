@@ -21,6 +21,16 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   a hardcoded `NEVER_PAUSE_SESSION_PREFIXES` constant. The default is empty:
   no session is exempt from pausing unless the deployment sets the variable.
 
+### Fixed
+- `chitra.dispatch`'s local transcript-grep verification (`find_recent_transcript`)
+  now searches every root in an `os.pathsep`-separated `CHITRA_CLAUDE_PROJECTS`
+  list, not just the first. A local session running under a non-default
+  `CLAUDE_CONFIG_DIR` (e.g. a dedicated persona/harness identity) writes its
+  transcripts under that root's `projects/`, not the default
+  `~/.claude/projects` — previously that session's delivery could never be
+  confirmed by transcript-grep and always fell through to the weaker
+  pane-capture fallback or FAILED.
+
 ## [0.8.2.6] - 2026-07-16
 
 ### Fixed
