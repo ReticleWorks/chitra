@@ -388,7 +388,7 @@ pytest</code></pre>
   <div class="wrap">
     <p class="eyebrow">For the technically curious</p>
     <h2>Under the hood</h2>
-    <p>chitra installs eleven command-line entrypoints backed by small, single-purpose modules. <code>dispatchd</code> and <code>triaged</code> run as always-on, systemd-supervised daemons. Delivery is single-writer per session (a file-based <code>LaneLock</code>), idempotent across crashes, and confirmed by grepping the target session&rsquo;s own transcript. Every delivery is appended to a ledger signed with HMAC-SHA256 (a keyed cryptographic checksum) and stored as JSONL (one JSON record per line). Orders, results, and event logs are plain, documented file formats any read-only consumer can build against.</p>
+    <p>chitra installs twelve command-line entrypoints backed by small, single-purpose modules. <code>dispatchd</code> and <code>triaged</code> run as always-on, systemd-supervised daemons. Delivery is single-writer per session (a file-based <code>LaneLock</code>), idempotent across crashes, and confirmed by grepping the target session&rsquo;s own transcript. Every delivery is appended to a ledger signed with HMAC-SHA256 (a keyed cryptographic checksum) and stored as JSONL (one JSON record per line). Orders, results, and event logs are plain, documented file formats any read-only consumer can build against.</p>
     <p>The full module list, delivery guarantees, and configuration reference are in the <a href="https://github.com/ReticleWorks/chitra#readme">README</a>; design rationale is in <a href="https://github.com/ReticleWorks/chitra/blob/main/docs/DESIGN.md">docs/DESIGN.md</a>.</p>
   </div>
 </section>
