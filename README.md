@@ -119,6 +119,10 @@ pip install -e '.[test]'
 pytest
 ```
 
+## Documentation
+
+For comprehensive guides, API reference, and daemon documentation, see [the docs/](docs/README.md). Start with [Getting Started](docs/getting-started.md) for install and first dispatch, or [Concepts](docs/concepts.md) to understand chitra's architecture.
+
 ## Getting help
 
 Questions and bug reports: [open an issue](https://github.com/ReticleWorks/chitra/issues). See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a nontrivial PR; security reports go through [SECURITY.md](SECURITY.md).
