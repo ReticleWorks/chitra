@@ -108,7 +108,7 @@ Requires Python 3.12+ and `tmux` (chitra shells out to the `tmux` binary; there 
 pip install chitra-monitor  # or: pip install git+https://github.com/ReticleWorks/chitra.git@<tag>
 ```
 
-Not yet on PyPI — see [`docs/DESIGN.md`](docs/DESIGN.md) for the packaging rationale.
+`chitra-monitor` is published on PyPI and the recommended installation method.
 
 For local development:
 
