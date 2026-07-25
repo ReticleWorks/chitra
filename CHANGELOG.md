@@ -30,6 +30,15 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   `~/.claude/projects` — previously that session's delivery could never be
   confirmed by transcript-grep and always fell through to the weaker
   pane-capture fallback or FAILED.
+- `chitra.lane_read`'s open-ask heading match and `chitra.triaged`'s
+  `needs_operator` critical rule no longer require a hardcoded fleet-operator
+  name; both default to the name-free `you`/`operator` case and accept
+  additional operator names or aliases via the comma-separated
+  `CHITRA_OPERATOR_ALIASES` env var.
+- The rate-limit guard's never-pause-prefix skip reason no longer claims the
+  matched session is "Chitra's own monitor/harness session" — the prefixes
+  are operator-configured and may match any session, not necessarily
+  Chitra's own.
 
 ## [0.8.2.6] - 2026-07-16
 

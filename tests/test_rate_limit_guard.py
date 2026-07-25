@@ -170,7 +170,7 @@ def test_plan_pauses_never_selects_configured_never_pause_prefixes(tmp_path: Pat
 
     assert to_pause == []
     assert len(skipped) == 2
-    assert all("Chitra's own monitor/harness session is never paused" in reason for reason in skipped)
+    assert all("matches a configured never-pause session prefix" in reason for reason in skipped)
 
 
 def test_apply_pause_freezes_immediately_and_starts_pause_requested(tmp_path: Path) -> None:
