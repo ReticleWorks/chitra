@@ -127,5 +127,5 @@ If ownership-provider cannot validate a query (files missing, digest mismatch, s
 
 ## See Also
 
-- **[Petra Authority](../petra-authority.md)** — How ownership-provider is used by petra and other authorities.
+- **[Petra Authority](../../petra-authority.md)** — How ownership-provider is used by petra and other authorities.
 - **[Petra](petra.md)** — The dark-launch observer that queries ownership-provider.

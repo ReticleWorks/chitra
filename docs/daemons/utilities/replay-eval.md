@@ -126,5 +126,5 @@ Replay-eval reports:
 
 ## See Also
 
-- **[Concepts — Completion Gating](../../concepts/#goals-and-completion-gating)** — How completion review works in production.
+- **[Concepts — Completion Gating](../../concepts/README.md#goals-and-completion-gating)** — How completion review works in production.
 - **[Watchd](../operator-tools/watchd.md)** — The production completion-review daemon.

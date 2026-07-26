@@ -45,6 +45,21 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   of a placeholder; an unknown, normal-intensity draft is still blocked as a
   real operator draft.
 
+## [0.8.2.7] - 2026-07-18
+
+### Added
+- Comprehensive user-facing documentation tree (`docs/`) covering getting started, concepts, daemon reference, and configuration with worked examples.
+- Stock PR security-review workflow (`.github/workflows/pr-security-review.yml`) integrated with the `chitra-pr-review` CLI; deterministic pre-checks plus isolated multi-reviewer security pass over pull request diffs.
+- Standard shields.io badges (license, Python version, PyPI package) to README header.
+
+### Changed
+- **Distribution renamed to `chitra-monitor` on PyPI** — Package is published and installable via `pip install chitra-monitor`. Python import module name (`chitra`) remains unchanged. GitHub repository URL updated from the defunct `first-polyphony/chitra` to `ReticleWorks/chitra` across README, documentation, examples, and pyproject.toml metadata.
+- Clarified README and DESIGN.md framing: chitra's deterministic core (dispatch, ledger, routing, rate-limiting, ownership) is separated from optional LLM-judgment layers (goal enforcement, completion review). Chitra performs orchestration (dispatch, tracking, state coordination, hold/resume, completion gating) but not task decomposition or response generation.
+- Removed hardcoded operator name (`trey`) from `chitra.lane_read` and `chitra.triaged` regex patterns; both now accept configured aliases via `CHITRA_OPERATOR_ALIASES` env var, defaulting to generic `you`/`operator` terms.
+
+### Fixed
+- Consolidated 8 pending feature/fix branches: multi-config-dir transcript-grep support, operator-name genericization, and Codex placeholder detection.
+
 ## [0.8.2.6] - 2026-07-16
 
 ### Fixed
