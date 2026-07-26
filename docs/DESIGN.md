@@ -20,7 +20,7 @@ The companion done-condition lint is surfacing-only. At `chitra-goals set`, miss
 
 ## Distribution and packaging
 
-- **Distribution:** git-installable (`pip install git+https://...@<tag>`) for now, not yet on PyPI. chitra's current consumers install a pinned revision onto systemd hosts they provision themselves — PyPI's advantages (name-based discovery, version-range resolution for downstream packagers) don't apply yet. The build backend (hatchling, standards-based `pyproject.toml`) keeps a future PyPI release a small, mechanical step rather than a rewrite.
+- **Distribution:** Published on PyPI as `chitra-monitor` and installable via `pip install chitra-monitor`. Alternatively, you can install a pinned revision from GitHub with `pip install git+https://github.com/ReticleWorks/chitra.git@<tag>` (replace `<tag>` with a released version). The build backend (hatchling, standards-based `pyproject.toml`) makes publishing and installation straightforward.
 - **Layout:** `src/chitra/` (src-layout), not a flat top-level package. This ensures `import chitra` always resolves to the installed wheel, never to a loose working-directory copy — important for a package whose main job is running as an installed systemd service.
 - **Versioning:** plain SemVer in the 0.x range. SemVer reserves 0.y.z for "anything may change" — appropriate before there's a real external consumer depending on a stable interface. 1.0.0 is reserved for the day the maintainers are willing to promise CLI/API stability.
 

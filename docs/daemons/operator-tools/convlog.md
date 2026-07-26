@@ -148,5 +148,5 @@ chitra-convo show \
 
 ## See Also
 
-- **[Concepts — Goals and Completion Gating](../concepts.md#goals-and-completion-gating)** — How convlog decisions feed into goal enforcement.
+- **[Concepts — Goals and Completion Gating](../../concepts/README.md#goals-and-completion-gating)** — How convlog decisions feed into goal enforcement.
 - **[Artifacts](artifacts.md)** — Tracking Claude-artifact review status (often linked in briefs).

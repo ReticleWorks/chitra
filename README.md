@@ -121,7 +121,7 @@ pytest
 
 ## Documentation
 
-For comprehensive guides, API reference, and daemon documentation, see [the docs/](docs/README.md). Start with [Getting Started](docs/getting-started.md) for install and first dispatch, or [Concepts](docs/concepts.md) to understand chitra's architecture.
+For comprehensive guides, API reference, and daemon documentation, see [the docs/](docs/README.md). Start with [Getting Started](docs/quickstart/README.md) for install and first dispatch, or [Concepts](docs/concepts/README.md) to understand chitra's architecture.
 
 ## Getting help
 
