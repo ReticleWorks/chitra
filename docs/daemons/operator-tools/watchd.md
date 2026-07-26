@@ -144,5 +144,5 @@ The verdict goes back to watchd as structured output (accept/reject) and is reco
 
 ## See Also
 
-- **[Concepts — Goal Enforcement](../concepts.md#goal-enforcement-and-completion-review)** — How completion review fits into chitra's architecture.
-- **[Design notes — Bounded reasoning boundary](../DESIGN.md#bounded-reasoning-boundary)** — Why reviewers are isolated.
+- **[Concepts — Goal Enforcement](../../concepts/README.md#goal-enforcement-and-completion-review)** — How completion review fits into chitra's architecture.
+- **[Design notes — Bounded reasoning boundary](../../DESIGN.md#bounded-reasoning-boundary)** — Why reviewers are isolated.

@@ -116,5 +116,5 @@ It only records what Watchtower observes. This allows fleet-wide pressure monito
 
 ## See Also
 
-- **[Petra Authority](../petra-authority.md)** — Deep dive on petra's authority model and how it integrates with chitra.
+- **[Petra Authority](../../petra-authority.md)** — Deep dive on petra's authority model and how it integrates with chitra.
 - **[Ownership Provider](ownership-provider.md)** — Petra's authority-checking partner.
