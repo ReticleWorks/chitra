@@ -7,7 +7,9 @@ on:
 
 jobs:
   analyze:
-    runs-on: reticle-ci-heavy
+    # GitHub's CodeQL CLI does not support the estate's Linux ARM64 runners.
+    # Keep this weekly scan on hosted x64 rather than dropping the security gate.
+    runs-on: ubuntu-latest
     permissions:
       security-events: write
       contents: read
