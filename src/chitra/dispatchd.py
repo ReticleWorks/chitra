@@ -336,6 +336,7 @@ def process_one_order(
     dispatch_runner: TmuxRunner | None = None,
     projects_root: Path | None = None,
     local_extra: set[str] | None = None,
+    tmux_socket: Path | None = None,
     allowed_session_prefixes: tuple[str, ...] = (),
     denied_session_prefixes: tuple[str, ...] = (),
 ) -> DispatchResult | None:
@@ -421,6 +422,7 @@ def process_one_order(
             dispatch_runner=dispatch_runner,
             projects_root=projects_root,
             local_extra=local_extra,
+            tmux_socket=tmux_socket,
             allowed_session_prefixes=allowed_session_prefixes,
             denied_session_prefixes=denied_session_prefixes,
         )
@@ -448,6 +450,7 @@ def _process_claimed_order(
     dispatch_runner: TmuxRunner | None,
     projects_root: Path | None,
     local_extra: set[str] | None,
+    tmux_socket: Path | None,
     allowed_session_prefixes: tuple[str, ...],
     denied_session_prefixes: tuple[str, ...],
 ) -> DispatchResult | None:
@@ -698,7 +701,13 @@ def _process_claimed_order(
         if dispatch_result is None:
             nonce_path.write_text(uuid.uuid4().hex, encoding="utf-8")
             dispatch_result = dispatch_to_tmux(
-                order, policy=policy, tuning=tuning, runner=dispatch_runner, projects_root=projects_root, local_extra=local_extra
+                order,
+                policy=policy,
+                tuning=tuning,
+                runner=dispatch_runner,
+                projects_root=projects_root,
+                local_extra=local_extra,
+                tmux_socket=tmux_socket,
             )
         result = dispatch_result
     finally:
@@ -771,6 +780,7 @@ def run_once(
     dispatch_runner: TmuxRunner | None = None,
     projects_root: Path | None = None,
     local_extra: set[str] | None = None,
+    tmux_socket: Path | None = None,
     allowed_session_prefixes: tuple[str, ...] = (),
     denied_session_prefixes: tuple[str, ...] = (),
 ) -> list[DispatchResult]:
@@ -817,6 +827,7 @@ def run_once(
             dispatch_runner=dispatch_runner,
             projects_root=projects_root,
             local_extra=local_extra,
+            tmux_socket=tmux_socket,
             allowed_session_prefixes=allowed_session_prefixes,
             denied_session_prefixes=denied_session_prefixes,
         )
@@ -838,6 +849,7 @@ def run_forever(
     invalid_dir: Path | None = None,
     tuning: DispatchTuning | None = None,
     goals_root: Path | None = None,
+    tmux_socket: Path | None = None,
     allowed_session_prefixes: tuple[str, ...] = (),
     denied_session_prefixes: tuple[str, ...] = (),
 ) -> None:
@@ -856,8 +868,60 @@ def run_forever(
             invalid_dir=invalid_dir,
             tuning=tuning,
             goals_root=goals_root,
+            tmux_socket=tmux_socket,
             allowed_session_prefixes=allowed_session_prefixes,
             denied_session_prefixes=denied_session_prefixes,
+        )
+        time.sleep(poll_seconds)
+
+
+def run_lanes_once(
+    lanes_file: Path | None = None,
+    *,
+    routing_config_path: Path | None = None,
+    policy_config_path: Path | None = None,
+    invalid_dir_name: str = "invalid",
+    tuning: DispatchTuning | None = None,
+    dispatch_runner: TmuxRunner | None = None,
+) -> dict[str, list[DispatchResult]]:
+    """Drain every enabled lane from one rendered declaration."""
+    from chitra.lane_config import enabled_lanes
+
+    results: dict[str, list[DispatchResult]] = {}
+    for lane in enabled_lanes(lanes_file):
+        results[lane.identifier] = run_once(
+            lane.queue_dir,
+            lock_dir=lane.state_dir / "locks",
+            ledger_path=lane.state_dir / "ledger.jsonl",
+            ledger_key_path=lane.state_dir / "ledger.key",
+            attestation_ledger_path=lane.state_dir / "attestations.jsonl",
+            routing_config_path=routing_config_path,
+            policy_config_path=policy_config_path,
+            invalid_dir=lane.queue_dir / invalid_dir_name,
+            tuning=tuning,
+            goals_root=lane.state_dir,
+            dispatch_runner=dispatch_runner,
+            projects_root=lane.config_dir / "projects",
+            tmux_socket=lane.tmux_socket,
+        )
+    return results
+
+
+def run_lanes_forever(
+    lanes_file: Path | None = None,
+    *,
+    poll_seconds: float = DEFAULT_POLL_SECONDS,
+    routing_config_path: Path | None = None,
+    policy_config_path: Path | None = None,
+    tuning: DispatchTuning | None = None,
+) -> None:
+    """Run one shared dispatchd process over all enabled lane queues."""
+    while True:
+        run_lanes_once(
+            lanes_file,
+            routing_config_path=routing_config_path,
+            policy_config_path=policy_config_path,
+            tuning=tuning,
         )
         time.sleep(poll_seconds)
 
@@ -865,6 +929,12 @@ def run_forever(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="dispatchd", description="Deterministic tmux dispatch daemon (chitra phase 1).")
     parser.add_argument("--queue-dir", type=Path, default=None, help="Order/result/processed queue root (default: CHITRA_STATE_DIR/queue).")
+    parser.add_argument(
+        "--lanes-file",
+        type=Path,
+        default=None,
+        help="Rendered lane declaration; when set, one process drains every enabled lane.",
+    )
     parser.add_argument(
         "--lock-dir",
         type=Path,
@@ -930,6 +1000,24 @@ def main(argv: list[str] | None = None) -> int:
         transcript_recency_seconds=args.transcript_recency_seconds,
         lane_lock_timeout_seconds=args.lane_lock_timeout_seconds,
     )
+    if args.lanes_file is not None:
+        if args.once:
+            results = run_lanes_once(
+                args.lanes_file,
+                routing_config_path=args.routing_config_path,
+                policy_config_path=args.policy_config_path,
+                tuning=tuning,
+            )
+            print(json.dumps({key: [item.model_dump(mode="json") for item in value] for key, value in results.items()}, indent=2))
+            return 0
+        run_lanes_forever(
+            args.lanes_file,
+            poll_seconds=args.poll_seconds,
+            routing_config_path=args.routing_config_path,
+            policy_config_path=args.policy_config_path,
+            tuning=tuning,
+        )
+        return 0
     if args.once:
         results = run_once(
             queue_dir,
