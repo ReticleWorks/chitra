@@ -5,88 +5,11 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 ## [Unreleased]
 
 ### Added
-- A PR security review gate, `chitra.pr_review` / `chitra.pr_reviewd` (new `chitra-pr-review`
-  entrypoint). Fetches one pull request via `gh`, runs deterministic blast-radius/diff-size
-  pre-checks, then an isolated multi-reviewer `claude -p` security pass over the diff
-  (hardcoded secrets, injection classes, auth bypass, insecure deserialization, dependency
-  risk, prompt injection). Findings are logged to a signed, deduplicated `pr_reviews.jsonl`
-  ledger and reported as one plain PR comment. Conservative default: never merges, approves,
-  requests changes, or fails a required check; `PRReviewPolicy.block_on_findings` (default
-  `false`) is the explicit, off-by-default opt-in for a blocking posture. Ships with a stock
-  `.github/workflows/pr-security-review.yml` trigger on `pull_request` events.
-
-### Changed
-- The rate-limit guard's never-pause session prefixes are now configured via
-  the comma-separated `CHITRA_NEVER_PAUSE_SESSION_PREFIXES` env var instead of
-  a hardcoded `NEVER_PAUSE_SESSION_PREFIXES` constant. The default is empty:
-  no session is exempt from pausing unless the deployment sets the variable.
-
-### Fixed
-- `chitra.dispatch`'s local transcript-grep verification (`find_recent_transcript`)
-  now searches every root in an `os.pathsep`-separated `CHITRA_CLAUDE_PROJECTS`
-  list, not just the first. A local session running under a non-default
-  `CLAUDE_CONFIG_DIR` (e.g. a dedicated persona/harness identity) writes its
-  transcripts under that root's `projects/`, not the default
-  `~/.claude/projects` — previously that session's delivery could never be
-  confirmed by transcript-grep and always fell through to the weaker
-  pane-capture fallback or FAILED.
-- `chitra.lane_read`'s open-ask heading match and `chitra.triaged`'s
-  `needs_operator` critical rule no longer require a hardcoded fleet-operator
-  name; both default to the name-free `you`/`operator` case and accept
-  additional operator names or aliases via the comma-separated
-  `CHITRA_OPERATOR_ALIASES` env var.
-- The rate-limit guard's never-pause-prefix skip reason no longer claims the
-  matched session is "Chitra's own monitor/harness session" — the prefixes
-  are operator-configured and may match any session, not necessarily
-  Chitra's own.
-- `dispatchd`'s Codex-TUI placeholder detection now also treats a known
-  placeholder hint as idle at normal (non-dimmed) render intensity, not only
-  when the whole row renders dim. Either signal alone is sufficient evidence
-  of a placeholder; an unknown, normal-intensity draft is still blocked as a
-  real operator draft.
-
-## [0.8.2.7] - 2026-07-18
-
-### Added
-- Comprehensive user-facing documentation tree (`docs/`) covering getting started, concepts, daemon reference, and configuration with worked examples.
-- Stock PR security-review workflow (`.github/workflows/pr-security-review.yml`) integrated with the `chitra-pr-review` CLI; deterministic pre-checks plus isolated multi-reviewer security pass over pull request diffs.
-- Standard shields.io badges (license, Python version, PyPI package) to README header.
-
-### Changed
-- **Distribution renamed to `chitra-monitor` on PyPI** — Package is published and installable via `pip install chitra-monitor`. Python import module name (`chitra`) remains unchanged. GitHub repository URL updated from the defunct `first-polyphony/chitra` to `ReticleWorks/chitra` across README, documentation, examples, and pyproject.toml metadata.
-- Clarified README and DESIGN.md framing: chitra's deterministic core (dispatch, ledger, routing, rate-limiting, ownership) is separated from optional LLM-judgment layers (goal enforcement, completion review). Chitra performs orchestration (dispatch, tracking, state coordination, hold/resume, completion gating) but not task decomposition or response generation.
-- Removed hardcoded operator name (`trey`) from `chitra.lane_read` and `chitra.triaged` regex patterns; both now accept configured aliases via `CHITRA_OPERATOR_ALIASES` env var, defaulting to generic `you`/`operator` terms.
-
-### Fixed
-- Consolidated 8 pending feature/fix branches: multi-config-dir transcript-grep support, operator-name genericization, and Codex placeholder detection.
-
-## [0.8.2.6] - 2026-07-16
-
-### Fixed
-- Fixed: dispatchd Codex-TUI placeholder detection;
-  `COMPLETION_CLAIM_RE` hyphen-compound false-positive.
-
-## [0.8.2.5] - 2026-07-15
-
-### Removed
-- Removed the local HTML-file board output path and the `chitra-board`
-  entrypoint. The roster renderer and validated board-facts plumbing are
-  unchanged; consumers can render the roster output however they choose.
-
-## [0.8.2.3] - 2026-07-15
-
-### Added
-- A durable per-pause recovery ledger records the held session, reason,
-  existing transcript pointer, goal-derived resume note, and reset time.
-  Attached sessions remain pausable; only session refs matching the
-  configured never-pause prefixes are excluded.
-- Close-time inventory diffing for `chitra-goals close`, which blocks when
-  caller-stated delivered items do not satisfy the enrolled `done_when` or
-  when a required item is relabeled as follow-on/out of scope/deferred/future
-  work without a recorded descope or explicit acknowledgement. `chitra-goals
-  set` now also surfaces a persistent flag for missing or vague aggregate
-  done conditions while storing the input unchanged. Chitra consumes done conditions; it never enumerates, proposes,
-  authors, derives, annotates, or rewrites them.
+- Adoption-time enumeration review and close-time inventory diff for goal
+  contracts. A `done_when` must fix a deliverable count or carry a structured
+  normative annex; annex items are frozen into the goal contract hash, and
+  `chitra-goals close` rejects missing required/carried items or unapproved
+  follow-on reclassification.
 - Forced completion review at every detected lane turn-end. `watchd` now
   distinguishes an ordinary finished turn from a completion claim, requires
   concrete deploy/live citations and per-item verification for a clean claim,
@@ -98,28 +21,10 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   Reversible informational and in-scope technical answers may release after
   unanimous acceptance, while spend, credentials, irreversible actions, and
   strategy redirects always require operator confirmation.
-- Required sidecar-authored delivery briefs for `chitra-artifacts record`,
-  covering what was built, what it does, and whether it actually works with
-  concrete evidence.
-- Example systemd service/timer units for the two-minute capacity sweep, plus
-  a read-only `chitra-ownership` query for Watchtower to check resolved session
-  references against currently tracked working lanes.
-- A persisted per-host load-pressure ladder using MemAvailable and Linux PSI,
-  two-sweep anti-flap/hysteresis, 8/6/4/2 running-lane caps, deterministic shed
-  priority, last-shed-first recovery, and backend-neutral Watchd activity facts.
+- Required delivery briefs for `chitra-artifacts record`, covering what was
+  built, what it does, and whether it actually works with concrete evidence.
 
 ### Changed
-- Moved isolated completion review onto a bounded two-worker pool so
-  `poll_once` never waits on `claude -p`; in-flight lanes remain yellow and
-  later polls apply the completed verdict. Delivery-brief validation now lives
-  only on the guarded artifact record path; lane completion disputes stay on
-  cited-evidence and posture grounds.
-- Defaulted `watchd`'s isolated reviewer to the ambient monitor model (ruling
-  3A: same model as the monitor, different context), exposed its model,
-  normal-round count, and command through environment and CLI configuration
-  (operators may still pin a cheaper model deliberately), and scoped
-  subprocess reviews to completion-claim turn-ends while retaining
-  deterministic auditing for every finished turn.
 - Consolidated `DecisionProvenance` and `ReasonedDecision` into the immutable
   `DecisionAttestation` API. Every reasoned answer or nudge is bound to the
   exact approved text and logged to Chitra's own attestation ledger before
@@ -132,29 +37,11 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 - Raised the default graceful-pause thresholds to 92% for the five-hour
   window and 95% for the seven-day window, with approaching warnings at
   80% and 90%, respectively.
-- Enabled the rate-limit guard capability by default, limited new resumes to
-  one deterministic lane per sweep, and added a janitor that closes dead
-  `superseded-by:` holds instead of re-arming them.
-- Generalized the existing checkpoint/stop/quiescence transaction boundary so
-  load shedding reuses it. Claude lanes retain `/goal clear`; Codex lanes use a
-  fixed checkpoint-and-stop order followed by pane-quiescence verification.
-- Consolidated filesystem and JSON persistence primitives, shared validation
-  lexicons, and dispatch/persisted contract models, and replaced fleet-specific
-  hostnames and paths in documentation with generic examples.
-
-### Removed
-- Removed the merge-queue engine, the `chitra-queue` entrypoint, and the
-  queue-management capability surface.
-- Removed unused routing provenance fields (`resolved_model`,
-  `resolved_harness`, and `routing_hint_source`).
-- Removed dead board-updater validators, MCP mapping code, and dispatch stubs.
-- Trimmed non-operationalized codes from the executable taxonomy while
-  retaining their design context in documentation.
 
 ## [0.8.1] - 2026-07-12
 
 A hardening patch, not a feature release. An independent adversarial review
-of the two open feature PRs this
+(`docs/SOL-ADVERSARIAL-REVIEW.md`) of the two open feature PRs this
 consolidates (#54 board-table-colors, #55 graceful-session-pause-resume)
 found two BLOCKER-severity defects and five HIGH-severity defects across
 dispatch delivery, pause/resume durability, and account-identity handling.
@@ -229,9 +116,9 @@ happy path) — see the PR description for the full per-finding table.
   Needs cell no longer produces a wider physical line than its column.
   Overlong unbroken tokens are hard-split by display width, never by code
   points. The `cards`/`box` default is **unchanged** (still `cards`) —
-  the default format remains an open decision; it is now a single named
-  constant (`board.ROSTER_DEFAULT_FORMAT`) so resolving that decision
-  later is a one-line change.
+  which format the operator wants by default remains an open decision; it
+  is now a single named constant (`board.ROSTER_DEFAULT_FORMAT`) so
+  resolving that decision later is a one-line change.
 
 ### Changed
 - Version escalation is frozen at the `0.8.x` line. Six minor-version
@@ -242,7 +129,7 @@ happy path) — see the PR description for the full per-finding table.
   rewritten. Only `0.8.x` hardening patches ship until transactionality,
   idempotence, and evidence-backed status are demonstrated with the kind of
   fault-injection tests this release adds — no `0.9` without an explicit
-  maintainer decision.
+  operator go-ahead.
 
 ## [0.8.0] - 2026-07-11
 

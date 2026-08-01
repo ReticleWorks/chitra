@@ -14,9 +14,7 @@ import pytest
 import chitra.dispatchd as dispatchd_mod
 from chitra.account_registry import RegistryEntry, get_entry
 from chitra.dispatch import DispatchOrder, DispatchResult, DispatchStatus
-from chitra.goals import LOAD_SHED_HOLD_REASON_PREFIX, RATE_LIMIT_HOLD_REASON_PREFIX, GoalRecord, get_goal, hold_goal, upsert_goal
-from chitra.lane_activity import LaneActivity, upsert_lane_activity
-from chitra.load_shed import PressureSample
+from chitra.goals import GoalRecord, get_goal, upsert_goal
 from chitra.policy_config import PausePolicy, PolicyConfig, UsagePolicy
 from chitra.rate_limit_guard import (
     CHECKPOINT_NUDGE,
@@ -27,8 +25,7 @@ from chitra.rate_limit_guard import (
     plan_resumes,
     sweep,
 )
-from chitra.rate_limit_state import LoadHostState, Transaction, get_load_state, get_transaction, upsert_load_state, upsert_transaction
-from chitra.recovery import load_recovery_records, record_pause_recovery, recovery_records_path
+from chitra.rate_limit_state import Transaction, get_transaction, upsert_transaction
 from chitra.usage import AccountedVerdict, UsageSnapshot, UsageWindow
 
 FAST_POLICY = PolicyConfig(
@@ -41,7 +38,6 @@ FAST_POLICY = PolicyConfig(
         max_retry_attempts=3,
     )
 )
-CLEAR_PRESSURE = PressureSample(80, 0, 0, 0)
 
 
 def _snapshot(*, session_id: str, tmux_session: str, account: str = "acct@example.com", five_hour_pct: float, ts: str) -> UsageSnapshot:
@@ -61,11 +57,11 @@ def _write_snapshot(usage_dir: Path, snapshot: UsageSnapshot) -> None:
     (usage_dir / f"{snapshot.session_id}.json").write_text(json.dumps(snapshot.to_dict()), encoding="utf-8")
 
 
-def _goal(session_ref: str = "host-b:lane1:0.0") -> GoalRecord:
+def _goal(session_ref: str = "tophand:lane1:0.0") -> GoalRecord:
     return GoalRecord(
         session_ref=session_ref,
         goal="Ship the tested rate-limit guard safely under a real sweep cycle.",
-        done_when="Tests pass and the full suite is green.",
+        done_when="Both targeted tests and the full suite pass.",
         source="task",
         status="working",
     )
@@ -96,7 +92,7 @@ def _now(minutes: float = 0, seconds: float = 0) -> datetime:
 
 
 def test_plan_pauses_skips_untracked_sessions_and_foreign_holds(tmp_path: Path) -> None:
-    upsert_goal(tmp_path, _goal("host-b:tracked:0.0"))
+    upsert_goal(tmp_path, _goal("tophand:tracked:0.0"))
     verdicts = [
         AccountedVerdict(
             session_id="s1",
@@ -121,56 +117,9 @@ def test_plan_pauses_skips_untracked_sessions_and_foreign_holds(tmp_path: Path) 
             account_attributed=False,
         ),
     ]
-    to_pause, skipped = plan_pauses(verdicts, host="host-b", goals_root=tmp_path)
+    to_pause, skipped = plan_pauses(verdicts, host="tophand", goals_root=tmp_path)
     assert [v.tmux_session for v in to_pause] == ["tracked"]
     assert any("untracked" in reason and "no chitra goal record" in reason for reason in skipped)
-
-
-def test_plan_pauses_selects_a_non_chitra_session(tmp_path: Path) -> None:
-    session_ref = "host-a:operator-work:0.0"
-    upsert_goal(tmp_path, _goal(session_ref))
-    verdict = AccountedVerdict(
-        session_id="attached-operator-session",
-        tmux_session="operator-work",
-        kind="claude",
-        account="a",
-        level="pause",
-        binding_window="5h",
-        resume_at_epoch=1_700_000_000,
-        self_fresh=True,
-        account_attributed=False,
-    )
-
-    to_pause, skipped = plan_pauses([verdict], host="host-a", goals_root=tmp_path)
-
-    assert to_pause == [verdict]
-    assert skipped == []
-
-
-def test_plan_pauses_never_selects_configured_never_pause_prefixes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CHITRA_NEVER_PAUSE_SESSION_PREFIXES", "host-a:monitor:,host-a:harness:")
-    upsert_goal(tmp_path, _goal("host-a:monitor:0.0"))
-    upsert_goal(tmp_path, _goal("host-a:harness:0.0"))
-    verdicts = [
-        AccountedVerdict(
-            session_id=f"chitra-{tmux_session}",
-            tmux_session=tmux_session,
-            kind="claude",
-            account="a",
-            level="pause",
-            binding_window=binding_window,
-            resume_at_epoch=1_700_000_000,
-            self_fresh=True,
-            account_attributed=False,
-        )
-        for tmux_session, binding_window in (("monitor", "5h"), ("harness", "7d"))
-    ]
-
-    to_pause, skipped = plan_pauses(verdicts, host="host-a", goals_root=tmp_path)
-
-    assert to_pause == []
-    assert len(skipped) == 2
-    assert all("matches a configured never-pause session prefix" in reason for reason in skipped)
 
 
 def test_apply_pause_freezes_immediately_and_starts_pause_requested(tmp_path: Path) -> None:
@@ -186,103 +135,12 @@ def test_apply_pause_freezes_immediately_and_starts_pause_requested(tmp_path: Pa
         self_fresh=True,
         account_attributed=False,
     )
-    txn = apply_pause(verdict, host="host-b", goals_root=tmp_path, now=_now())
+    txn = apply_pause(verdict, host="tophand", goals_root=tmp_path, now=_now())
 
     assert txn.phase == "pause_requested"
-    goal = get_goal(tmp_path, "host-b:lane1:0.0")
+    goal = get_goal(tmp_path, "tophand:lane1:0.0")
     assert goal is not None and goal.status == "held"
     assert goal.hold_reason == "rate-limit:5h"
-
-
-def test_progressive_resume_starts_one_stable_lane_per_sweep(tmp_path: Path) -> None:
-    usage_dir = tmp_path / "usage"
-    refs = [f"host-b:lane{i}:0.0" for i in (3, 1, 2)]
-    for ref in refs:
-        upsert_goal(tmp_path, _goal(ref))
-        hold_goal(tmp_path, ref, reason="rate-limit:5h", resume_at=_iso(minutes=-1))
-        upsert_transaction(
-            tmp_path,
-            Transaction(
-                session_ref=ref,
-                phase="held",
-                hold_reason="rate-limit:5h",
-                resume_at=_iso(minutes=-1),
-                created_at=_iso(),
-                updated_at=_iso(),
-            ),
-        )
-        session = ref.split(":")[1]
-        _write_snapshot(usage_dir, _snapshot(session_id=session, tmux_session=session, five_hour_pct=5, ts=_iso()))
-
-    sweep(
-        usage_dir=usage_dir,
-        host="host-b",
-        goals_root=tmp_path,
-        queue_dir=tmp_path / "queue",
-        policy=FAST_POLICY,
-        pressure_sample=CLEAR_PRESSURE,
-        now=_now(),
-    )
-
-    assert get_transaction(tmp_path, "host-b:lane1:0.0").phase == "resume_requested"
-    assert get_transaction(tmp_path, "host-b:lane2:0.0").phase == "held"
-    assert get_transaction(tmp_path, "host-b:lane3:0.0").phase == "held"
-
-    sweep(
-        usage_dir=usage_dir,
-        host="host-b",
-        goals_root=tmp_path,
-        queue_dir=tmp_path / "queue",
-        policy=FAST_POLICY,
-        pressure_sample=CLEAR_PRESSURE,
-        now=_now(minutes=1),
-    )
-
-    assert get_transaction(tmp_path, "host-b:lane1:0.0").phase == "resume_sent"
-    assert get_transaction(tmp_path, "host-b:lane2:0.0").phase == "resume_requested"
-    assert get_transaction(tmp_path, "host-b:lane3:0.0").phase == "held"
-
-
-def test_progressive_resume_does_not_limit_brand_new_rate_limit_pauses(tmp_path: Path) -> None:
-    usage_dir = tmp_path / "usage"
-    for index in range(3):
-        session = f"hot{index}"
-        upsert_goal(tmp_path, _goal(f"host-b:{session}:0.0"))
-        _write_snapshot(usage_dir, _snapshot(session_id=session, tmux_session=session, five_hour_pct=99, ts=_iso()))
-
-    sweep(
-        usage_dir=usage_dir,
-        host="host-b",
-        goals_root=tmp_path,
-        queue_dir=tmp_path / "queue",
-        policy=FAST_POLICY,
-        pressure_sample=CLEAR_PRESSURE,
-        now=_now(),
-    )
-
-    assert all(get_goal(tmp_path, f"host-b:hot{index}:0.0").status == "held" for index in range(3))
-    assert all(get_transaction(tmp_path, f"host-b:hot{index}:0.0").phase == "pause_requested" for index in range(3))
-
-
-def test_superseded_hold_janitor_closes_dead_goal_without_dispatch(tmp_path: Path) -> None:
-    ref = "host-b:old-lane:0.0"
-    upsert_goal(tmp_path, _goal(ref))
-    hold_goal(tmp_path, ref, reason="superseded-by:host:other:0.0")
-
-    report = sweep(
-        usage_dir=tmp_path / "usage",
-        host="host-b",
-        goals_root=tmp_path,
-        queue_dir=tmp_path / "queue",
-        policy=FAST_POLICY,
-        pressure_sample=CLEAR_PRESSURE,
-        now=_now(),
-    )
-
-    assert report.cleared == [ref]
-    assert get_goal(tmp_path, ref) is None
-    assert get_transaction(tmp_path, ref) is None
-    assert not list((tmp_path / "queue" / "orders").glob("*.json"))
 
 
 # --- full multi-sweep pause sequence ----------------------------------------
@@ -297,19 +155,19 @@ def test_full_pause_sequence_checkpoint_stop_and_verified_quiescence(tmp_path: P
     queue_dir = tmp_path / "queue"
     usage_dir = tmp_path / "usage"
     transcript = tmp_path / "session.jsonl"
-    monkeypatch.setenv("CHITRA_LOCAL_HOST", "host-b")
+    monkeypatch.setenv("CHITRA_LOCAL_HOST", "tophand")
     upsert_goal(goals_root, _goal())
     _write_snapshot(usage_dir, _snapshot(session_id="s1", tmux_session="lane1", five_hour_pct=93, ts=_iso()))
 
-    report1 = sweep(usage_dir=usage_dir, host="host-b", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now())
-    assert get_goal(goals_root, "host-b:lane1:0.0").status == "held"  # frozen immediately
-    txn = get_transaction(goals_root, "host-b:lane1:0.0")
+    report1 = sweep(usage_dir=usage_dir, host="tophand", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now())
+    assert get_goal(goals_root, "tophand:lane1:0.0").status == "held"  # frozen immediately
+    txn = get_transaction(goals_root, "tophand:lane1:0.0")
     assert txn is not None and txn.phase == "pause_requested"
     assert report1.paused == []
 
     # sweep 2: pause_requested -> checkpoint_sent (enqueues the checkpoint order)
-    sweep(usage_dir=usage_dir, host="host-b", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=1))
-    txn = get_transaction(goals_root, "host-b:lane1:0.0")
+    sweep(usage_dir=usage_dir, host="tophand", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=1))
+    txn = get_transaction(goals_root, "tophand:lane1:0.0")
     assert txn.phase == "checkpoint_sent"
     order_path = queue_dir / "orders" / f"{txn.checkpoint_order_id}.json"
     assert order_path.exists()
@@ -318,16 +176,16 @@ def test_full_pause_sequence_checkpoint_stop_and_verified_quiescence(tmp_path: P
     assert json.loads(order_path.read_text())["task_type"] == "rate-limit-checkpoint"
 
     # sweep 3, no result yet: stays in checkpoint_sent, no double-enqueue
-    sweep(usage_dir=usage_dir, host="host-b", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=2))
-    assert get_transaction(goals_root, "host-b:lane1:0.0").phase == "checkpoint_sent"
+    sweep(usage_dir=usage_dir, host="tophand", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=2))
+    assert get_transaction(goals_root, "tophand:lane1:0.0").phase == "checkpoint_sent"
 
     # dispatchd delivers the checkpoint
     _deliver(queue_dir, txn.checkpoint_order_id, transcript_path=str(transcript))
     transcript.write_text("checkpoint delivered\n", encoding="utf-8")
 
     # sweep 4: checkpoint confirmed -> stop_sent (enqueues the deterministic /goal clear order)
-    sweep(usage_dir=usage_dir, host="host-b", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=3))
-    txn = get_transaction(goals_root, "host-b:lane1:0.0")
+    sweep(usage_dir=usage_dir, host="tophand", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=3))
+    txn = get_transaction(goals_root, "tophand:lane1:0.0")
     assert txn.phase == "stop_sent"
     stop_order_path = queue_dir / "orders" / f"{txn.stop_order_id}.json"
     assert json.loads(stop_order_path.read_text())["nudge"] == STOP_NUDGE == "/goal clear"
@@ -337,45 +195,33 @@ def test_full_pause_sequence_checkpoint_stop_and_verified_quiescence(tmp_path: P
 
     # sweep 5: stop confirmed -> awaiting_quiescence (transcript path recorded; the mtime
     # observation itself is a separate step, taken the NEXT sweep -- one phase per sweep).
-    sweep(usage_dir=usage_dir, host="host-b", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=4))
-    txn = get_transaction(goals_root, "host-b:lane1:0.0")
+    sweep(usage_dir=usage_dir, host="tophand", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=4))
+    txn = get_transaction(goals_root, "tophand:lane1:0.0")
     assert txn.phase == "awaiting_quiescence"
     assert txn.last_transcript_mtime is None
 
     # sweep 6: first mtime observation.
-    sweep(usage_dir=usage_dir, host="host-b", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=5))
-    txn = get_transaction(goals_root, "host-b:lane1:0.0")
+    sweep(usage_dir=usage_dir, host="tophand", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=5))
+    txn = get_transaction(goals_root, "tophand:lane1:0.0")
     assert txn.phase == "awaiting_quiescence"
     assert txn.last_transcript_mtime is not None
 
     # sweep 7: transcript still unchanged, but not yet quiet long enough (FAST_POLICY quiet=30s, only ~1s elapsed)
     sweep(
-        usage_dir=usage_dir, host="host-b", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=5, seconds=1)
+        usage_dir=usage_dir, host="tophand", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=5, seconds=1)
     )
-    assert get_transaction(goals_root, "host-b:lane1:0.0").phase == "awaiting_quiescence"
+    assert get_transaction(goals_root, "tophand:lane1:0.0").phase == "awaiting_quiescence"
 
     # sweep 8: still unchanged, now past the quiet window -> verified held
     report_final = sweep(
-        usage_dir=usage_dir, host="host-b", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=5, seconds=31)
+        usage_dir=usage_dir, host="tophand", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=5, seconds=31)
     )
-    txn = get_transaction(goals_root, "host-b:lane1:0.0")
+    txn = get_transaction(goals_root, "tophand:lane1:0.0")
     assert txn.phase == "held"
     assert len(report_final.paused) == 1
-    assert report_final.paused[0].session_ref == "host-b:lane1:0.0"
-    recovery_records = load_recovery_records(goals_root)
-    assert len(recovery_records) == 1
-    recovery = recovery_records[0]
-    assert recovery.pause_id
-    assert recovery.session_ref == "host-b:lane1:0.0"
-    assert recovery.hold_reason == "rate-limit:5h"
-    assert recovery.transcript_path == str(transcript)
-    assert "Ship the tested rate-limit guard safely" in recovery.resume_note
-    assert "Tests pass and the full suite is green" in recovery.resume_note
-    assert recovery.resume_at
-    assert recovery.paused_at == _iso(minutes=5, seconds=31)
-    assert recovery_records_path(goals_root).exists()
+    assert report_final.paused[0].session_ref == "tophand:lane1:0.0"
     # The goal itself was never re-touched to something other than held.
-    assert get_goal(goals_root, "host-b:lane1:0.0").status == "held"
+    assert get_goal(goals_root, "tophand:lane1:0.0").status == "held"
 
 
 def test_quiescence_resets_if_the_transcript_is_still_active(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -384,11 +230,11 @@ def test_quiescence_resets_if_the_transcript_is_still_active(tmp_path: Path, mon
     goals_root = tmp_path / "state"
     queue_dir = tmp_path / "queue"
     transcript = tmp_path / "session.jsonl"
-    monkeypatch.setenv("CHITRA_LOCAL_HOST", "host-b")
+    monkeypatch.setenv("CHITRA_LOCAL_HOST", "tophand")
     transcript.write_text("still going\n", encoding="utf-8")
     upsert_goal(goals_root, _goal())
     txn = Transaction(
-        session_ref="host-b:lane1:0.0",
+        session_ref="tophand:lane1:0.0",
         phase="awaiting_quiescence",
         hold_reason="rate-limit:5h",
         resume_at=_iso(minutes=60),
@@ -410,14 +256,14 @@ def test_quiescence_resets_if_the_transcript_is_still_active(tmp_path: Path, mon
 
     report = sweep(
         usage_dir=tmp_path / "usage",
-        host="host-b",
+        host="tophand",
         goals_root=goals_root,
         queue_dir=queue_dir,
         policy=FAST_POLICY,
         now=_now(seconds=31),  # past the original quiet window, but the transcript just changed
     )
     del evaluate_grouped  # unused import guard -- kept for readability of intent above
-    txn = get_transaction(goals_root, "host-b:lane1:0.0")
+    txn = get_transaction(goals_root, "tophand:lane1:0.0")
     assert txn.phase == "awaiting_quiescence"  # never advanced to held
     assert report.paused == []
 
@@ -431,9 +277,9 @@ def test_no_verified_transcript_escalates_instead_of_falsely_claiming_stopped(tm
     goals_root = tmp_path / "state"
     queue_dir = tmp_path / "queue"
     upsert_goal(goals_root, _goal())
-    hold_goal(goals_root, "host-b:lane1:0.0", reason="rate-limit:5h", resume_at=_iso(minutes=60))
+    hold_goal(goals_root, "tophand:lane1:0.0", reason="rate-limit:5h", resume_at=_iso(minutes=60))
     txn = Transaction(
-        session_ref="host-b:lane1:0.0",
+        session_ref="tophand:lane1:0.0",
         phase="awaiting_quiescence",
         hold_reason="rate-limit:5h",
         resume_at=_iso(minutes=60),
@@ -444,13 +290,13 @@ def test_no_verified_transcript_escalates_instead_of_falsely_claiming_stopped(tm
     )
     upsert_transaction(goals_root, txn)
 
-    report = sweep(usage_dir=tmp_path / "usage", host="host-b", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now())
+    report = sweep(usage_dir=tmp_path / "usage", host="tophand", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now())
 
-    txn = get_transaction(goals_root, "host-b:lane1:0.0")
+    txn = get_transaction(goals_root, "tophand:lane1:0.0")
     assert txn.phase == "awaiting_quiescence"  # never silently marked held
     assert txn.escalated is True
     assert any("cannot safely" not in e and "pane-capture fallback" in e for e in report.escalations)
-    assert get_goal(goals_root, "host-b:lane1:0.0").status == "held"  # freeze remains
+    assert get_goal(goals_root, "tophand:lane1:0.0").status == "held"  # freeze remains
 
 
 # --- bounded retry / no-strand-forever --------------------------------------
@@ -469,9 +315,9 @@ def test_missing_checkpoint_result_retries_then_escalates_without_dropping_the_f
     goals_root = tmp_path / "state"
     queue_dir = tmp_path / "queue"
     upsert_goal(goals_root, _goal())
-    hold_goal(goals_root, "host-b:lane1:0.0", reason="rate-limit:5h", resume_at=_iso(minutes=60))
+    hold_goal(goals_root, "tophand:lane1:0.0", reason="rate-limit:5h", resume_at=_iso(minutes=60))
     txn = Transaction(
-        session_ref="host-b:lane1:0.0",
+        session_ref="tophand:lane1:0.0",
         phase="checkpoint_sent",
         hold_reason="rate-limit:5h",
         resume_at=_iso(minutes=60),
@@ -484,8 +330,8 @@ def test_missing_checkpoint_result_retries_then_escalates_without_dropping_the_f
     policy = PolicyConfig(pause=PausePolicy(checkpoint_deadline_seconds=1, max_retry_attempts=2))
 
     # sweep 1: overdue, attempt 1 of 2 -- waits longer, same order id (no evidence of failure to retry against)
-    sweep(usage_dir=tmp_path / "usage", host="host-b", goals_root=goals_root, queue_dir=queue_dir, policy=policy, now=_now())
-    txn = get_transaction(goals_root, "host-b:lane1:0.0")
+    sweep(usage_dir=tmp_path / "usage", host="tophand", goals_root=goals_root, queue_dir=queue_dir, policy=policy, now=_now())
+    txn = get_transaction(goals_root, "tophand:lane1:0.0")
     assert txn.phase == "checkpoint_sent"
     assert txn.attempts == 1
     assert txn.checkpoint_order_id == "ord-checkpoint-1"
@@ -494,28 +340,28 @@ def test_missing_checkpoint_result_retries_then_escalates_without_dropping_the_f
     # sweep 2: overdue again, attempts+1 >= max_attempts -- escalates permanently
     report = sweep(
         usage_dir=tmp_path / "usage",
-        host="host-b",
+        host="tophand",
         goals_root=goals_root,
         queue_dir=queue_dir,
         policy=policy,
         now=_now(seconds=5),
     )
-    txn = get_transaction(goals_root, "host-b:lane1:0.0")
+    txn = get_transaction(goals_root, "tophand:lane1:0.0")
     assert txn.escalated is True
     assert any("escalating" in e for e in report.escalations)
     # The freeze is never lifted by escalation.
-    assert get_goal(goals_root, "host-b:lane1:0.0").status == "held"
+    assert get_goal(goals_root, "tophand:lane1:0.0").status == "held"
 
     # sweep 3: already escalated -- reported again for visibility, not re-retried into a new attempt count
     report3 = sweep(
         usage_dir=tmp_path / "usage",
-        host="host-b",
+        host="tophand",
         goals_root=goals_root,
         queue_dir=queue_dir,
         policy=policy,
         now=_now(seconds=10),
     )
-    txn_after = get_transaction(goals_root, "host-b:lane1:0.0")
+    txn_after = get_transaction(goals_root, "tophand:lane1:0.0")
     assert txn_after.attempts == txn.attempts  # not incremented further
     assert any("escalated earlier" in e for e in report3.escalations)
 
@@ -529,9 +375,9 @@ def test_terminal_delivery_failure_retries_with_a_fresh_order(tmp_path: Path) ->
     goals_root = tmp_path / "state"
     queue_dir = tmp_path / "queue"
     upsert_goal(goals_root, _goal())
-    hold_goal(goals_root, "host-b:lane1:0.0", reason="rate-limit:5h", resume_at=_iso(minutes=60))
+    hold_goal(goals_root, "tophand:lane1:0.0", reason="rate-limit:5h", resume_at=_iso(minutes=60))
     txn = Transaction(
-        session_ref="host-b:lane1:0.0",
+        session_ref="tophand:lane1:0.0",
         phase="checkpoint_sent",
         hold_reason="rate-limit:5h",
         resume_at=_iso(minutes=60),
@@ -544,9 +390,9 @@ def test_terminal_delivery_failure_retries_with_a_fresh_order(tmp_path: Path) ->
     _deliver(queue_dir, "ord-checkpoint-1", status=DispatchStatus.FAILED)
     policy = PolicyConfig(pause=PausePolicy(checkpoint_deadline_seconds=60, max_retry_attempts=3))
 
-    sweep(usage_dir=tmp_path / "usage", host="host-b", goals_root=goals_root, queue_dir=queue_dir, policy=policy, now=_now())
+    sweep(usage_dir=tmp_path / "usage", host="tophand", goals_root=goals_root, queue_dir=queue_dir, policy=policy, now=_now())
 
-    txn = get_transaction(goals_root, "host-b:lane1:0.0")
+    txn = get_transaction(goals_root, "tophand:lane1:0.0")
     assert txn.attempts == 1
     assert txn.checkpoint_order_id != "ord-checkpoint-1"
     assert (queue_dir / "orders" / f"{txn.checkpoint_order_id}.json").exists()
@@ -561,18 +407,18 @@ def test_orphaned_hold_with_no_transaction_is_reconciled_not_stranded(tmp_path: 
 
     goals_root = tmp_path / "state"
     upsert_goal(goals_root, _goal())
-    hold_goal(goals_root, "host-b:lane1:0.0", reason="rate-limit:5h", resume_at=_iso(minutes=60))
-    assert get_transaction(goals_root, "host-b:lane1:0.0") is None  # no transaction yet -- the orphan scenario
+    hold_goal(goals_root, "tophand:lane1:0.0", reason="rate-limit:5h", resume_at=_iso(minutes=60))
+    assert get_transaction(goals_root, "tophand:lane1:0.0") is None  # no transaction yet -- the orphan scenario
 
     report = sweep(
-        usage_dir=tmp_path / "usage", host="host-b", goals_root=goals_root, queue_dir=tmp_path / "queue", policy=FAST_POLICY, now=_now()
+        usage_dir=tmp_path / "usage", host="tophand", goals_root=goals_root, queue_dir=tmp_path / "queue", policy=FAST_POLICY, now=_now()
     )
 
     # Reconciled AND immediately progressed one more step within the same
     # sweep (the freshly-recovered transaction is picked up by this same
     # sweep's progression pass) -- the key regression check is that it is no
     # longer stuck with NO transaction at all.
-    txn = get_transaction(goals_root, "host-b:lane1:0.0")
+    txn = get_transaction(goals_root, "tophand:lane1:0.0")
     assert txn is not None and txn.phase == "checkpoint_sent"
     assert any("reconciled" in note for note in report.advanced)
 
@@ -597,7 +443,7 @@ def test_full_resume_sequence_clears_hold_only_after_confirmed_delivery_and_requ
 
     upsert_goal(goals_root, _goal())
     held = Transaction(
-        session_ref="host-b:lane1:0.0",
+        session_ref="tophand:lane1:0.0",
         phase="held",
         hold_reason="rate-limit:5h",
         resume_at=_iso(minutes=1),
@@ -607,10 +453,10 @@ def test_full_resume_sequence_clears_hold_only_after_confirmed_delivery_and_requ
     upsert_transaction(goals_root, held)
     from chitra.goals import hold_goal
 
-    hold_goal(goals_root, "host-b:lane1:0.0", reason="rate-limit:5h", resume_at=_iso(minutes=1))
+    hold_goal(goals_root, "tophand:lane1:0.0", reason="rate-limit:5h", resume_at=_iso(minutes=1))
 
     # An ordinary order arrives while held -- must defer, no pane I/O.
-    ordinary = DispatchOrder(order_id="ord-ordinary", session_ref="host-b:lane1:0.0", nudge="do the real work")
+    ordinary = DispatchOrder(order_id="ord-ordinary", session_ref="tophand:lane1:0.0", nudge="do the real work")
     (queue_dir / "orders").mkdir(parents=True, exist_ok=True)
     (queue_dir / "orders" / "ord-ordinary.json").write_text(ordinary.model_dump_json(), encoding="utf-8")
     deferred_results = dispatchd_mod.run_once(
@@ -623,16 +469,16 @@ def test_full_resume_sequence_clears_hold_only_after_confirmed_delivery_and_requ
     _write_snapshot(usage_dir, _snapshot(session_id="s1", tmux_session="lane1", five_hour_pct=5, ts=_iso(minutes=2)))  # back to ok
 
     # sweep: window due + fresh verdict ok -> starts the resume sequence
-    sweep(usage_dir=usage_dir, host="host-b", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=2))
-    txn = get_transaction(goals_root, "host-b:lane1:0.0")
+    sweep(usage_dir=usage_dir, host="tophand", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=2))
+    txn = get_transaction(goals_root, "tophand:lane1:0.0")
     assert txn.phase == "resume_requested"
-    assert get_goal(goals_root, "host-b:lane1:0.0").status == "held"  # hold NOT cleared yet
+    assert get_goal(goals_root, "tophand:lane1:0.0").status == "held"  # hold NOT cleared yet
 
     # sweep: resume_requested -> resume_sent (enqueues the re-arm nudge)
-    sweep(usage_dir=usage_dir, host="host-b", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=3))
-    txn = get_transaction(goals_root, "host-b:lane1:0.0")
+    sweep(usage_dir=usage_dir, host="tophand", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=3))
+    txn = get_transaction(goals_root, "tophand:lane1:0.0")
     assert txn.phase == "resume_sent"
-    assert get_goal(goals_root, "host-b:lane1:0.0").status == "held"  # still held -- not yet confirmed delivered
+    assert get_goal(goals_root, "tophand:lane1:0.0").status == "held"  # still held -- not yet confirmed delivered
 
     # dispatchd actually delivers the resume order for real (drains the queue).
     real_results = dispatchd_mod.run_once(
@@ -641,9 +487,9 @@ def test_full_resume_sequence_clears_hold_only_after_confirmed_delivery_and_requ
     assert any(r.order_id == txn.resume_order_id and r.status == DispatchStatus.SENT for r in real_results)
 
     # sweep: resume confirmed -> hold cleared, deferred backlog requeued, transaction removed
-    report = sweep(usage_dir=usage_dir, host="host-b", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=4))
-    assert get_goal(goals_root, "host-b:lane1:0.0").status == "working"
-    assert get_transaction(goals_root, "host-b:lane1:0.0") is None
+    report = sweep(usage_dir=usage_dir, host="tophand", goals_root=goals_root, queue_dir=queue_dir, policy=FAST_POLICY, now=_now(minutes=4))
+    assert get_goal(goals_root, "tophand:lane1:0.0").status == "working"
+    assert get_transaction(goals_root, "tophand:lane1:0.0") is None
     assert len(report.resumed) == 1
     assert (queue_dir / "orders" / "ord-ordinary.json").exists()  # requeued out of deferred/
     assert not (queue_dir / "deferred" / "ord-ordinary.json").exists()
@@ -684,7 +530,7 @@ def test_never_resumes_into_a_still_hot_window(tmp_path: Path) -> None:
     goals_root = tmp_path / "state"
     upsert_goal(goals_root, _goal())
     resets_epoch = int(_now(minutes=2).timestamp()) + 3600
-    _pause_held_with_matching_window(goals_root, session_ref="host-b:lane1:0.0", resets_epoch=resets_epoch, now=_now())
+    _pause_held_with_matching_window(goals_root, session_ref="tophand:lane1:0.0", resets_epoch=resets_epoch, now=_now())
     usage_dir = tmp_path / "usage"
     _write_snapshot(
         usage_dir,
@@ -699,29 +545,29 @@ def test_never_resumes_into_a_still_hot_window(tmp_path: Path) -> None:
         ),
     )  # STILL hot -- same window, not yet reset
 
-    sweep(usage_dir=usage_dir, host="host-b", goals_root=goals_root, queue_dir=tmp_path / "queue", policy=FAST_POLICY, now=_now(minutes=2))
+    sweep(usage_dir=usage_dir, host="tophand", goals_root=goals_root, queue_dir=tmp_path / "queue", policy=FAST_POLICY, now=_now(minutes=2))
 
-    txn = get_transaction(goals_root, "host-b:lane1:0.0")
+    txn = get_transaction(goals_root, "tophand:lane1:0.0")
     assert txn is not None and txn.phase not in ("resume_requested", "resume_sent")  # no resume transaction started
-    assert get_goal(goals_root, "host-b:lane1:0.0").status == "held"
+    assert get_goal(goals_root, "tophand:lane1:0.0").status == "held"
 
 
 def test_auto_resume_false_escalates_instead_of_resuming(tmp_path: Path) -> None:
     goals_root = tmp_path / "state"
     upsert_goal(goals_root, _goal())
     resets_epoch = int(_now(minutes=1).timestamp())  # due by the time the sweep below runs at minutes=2
-    _pause_held_with_matching_window(goals_root, session_ref="host-b:lane1:0.0", resets_epoch=resets_epoch, now=_now())
+    _pause_held_with_matching_window(goals_root, session_ref="tophand:lane1:0.0", resets_epoch=resets_epoch, now=_now())
     usage_dir = tmp_path / "usage"
     _write_snapshot(usage_dir, _snapshot(session_id="s1", tmux_session="lane1", five_hour_pct=5, ts=_iso(minutes=2)))
     policy = PolicyConfig(usage=UsagePolicy(auto_resume=False), pause=FAST_POLICY.pause)
 
     report = sweep(
-        usage_dir=usage_dir, host="host-b", goals_root=goals_root, queue_dir=tmp_path / "queue", policy=policy, now=_now(minutes=2)
+        usage_dir=usage_dir, host="tophand", goals_root=goals_root, queue_dir=tmp_path / "queue", policy=policy, now=_now(minutes=2)
     )
 
-    txn = get_transaction(goals_root, "host-b:lane1:0.0")
+    txn = get_transaction(goals_root, "tophand:lane1:0.0")
     assert txn is not None and txn.phase == "held"  # never advanced into a resume transaction
-    assert get_goal(goals_root, "host-b:lane1:0.0").status == "held"
+    assert get_goal(goals_root, "tophand:lane1:0.0").status == "held"
     assert any("auto_resume is False" in e for e in report.escalations)
 
 
@@ -731,11 +577,11 @@ def test_plan_resumes_waits_for_the_pause_sequence_to_finish_before_starting_res
     upsert_goal(tmp_path, _goal())
     from chitra.goals import hold_goal
 
-    hold_goal(tmp_path, "host-b:lane1:0.0", reason="rate-limit:5h", resume_at=_iso(minutes=1))
+    hold_goal(tmp_path, "tophand:lane1:0.0", reason="rate-limit:5h", resume_at=_iso(minutes=1))
     upsert_transaction(
         tmp_path,
         Transaction(
-            session_ref="host-b:lane1:0.0",
+            session_ref="tophand:lane1:0.0",
             phase="awaiting_quiescence",
             hold_reason="rate-limit:5h",
             resume_at=_iso(minutes=1),
@@ -764,11 +610,11 @@ def test_apply_resume_uses_existing_held_transaction_if_present(tmp_path: Path) 
     upsert_goal(tmp_path, _goal())
     from chitra.goals import hold_goal
 
-    hold_goal(tmp_path, "host-b:lane1:0.0", reason="rate-limit:5h", resume_at=_iso())
+    hold_goal(tmp_path, "tophand:lane1:0.0", reason="rate-limit:5h", resume_at=_iso())
     upsert_transaction(
         tmp_path,
         Transaction(
-            session_ref="host-b:lane1:0.0",
+            session_ref="tophand:lane1:0.0",
             phase="held",
             hold_reason="rate-limit:5h",
             resume_at=_iso(),
@@ -776,7 +622,7 @@ def test_apply_resume_uses_existing_held_transaction_if_present(tmp_path: Path) 
             updated_at=_iso(),
         ),
     )
-    record = get_goal(tmp_path, "host-b:lane1:0.0")
+    record = get_goal(tmp_path, "tophand:lane1:0.0")
     txn = apply_resume(record, goals_root=tmp_path, now=_now())
     assert txn.phase == "resume_requested"
 
@@ -789,12 +635,12 @@ def test_sweep_escalates_when_a_tracked_session_disappears_from_the_usage_batch(
     usage_dir = tmp_path / "usage"
     upsert_goal(goals_root, _goal())
     _write_snapshot(usage_dir, _snapshot(session_id="s1", tmux_session="lane1", five_hour_pct=10, ts=_iso()))
-    sweep(usage_dir=usage_dir, host="host-b", goals_root=goals_root, queue_dir=tmp_path / "queue", policy=FAST_POLICY, now=_now())
+    sweep(usage_dir=usage_dir, host="tophand", goals_root=goals_root, queue_dir=tmp_path / "queue", policy=FAST_POLICY, now=_now())
     assert get_entry(goals_root, "lane1") is not None
 
     (usage_dir / "s1.json").unlink()  # sidecar stops writing entirely
     report = sweep(
-        usage_dir=usage_dir, host="host-b", goals_root=goals_root, queue_dir=tmp_path / "queue", policy=FAST_POLICY, now=_now(minutes=1)
+        usage_dir=usage_dir, host="tophand", goals_root=goals_root, queue_dir=tmp_path / "queue", policy=FAST_POLICY, now=_now(minutes=1)
     )
 
     assert any("lane1" in e and "missing this sweep" in e for e in report.escalations)
@@ -805,13 +651,13 @@ def test_sweep_escalates_on_account_identity_change_between_sweeps(tmp_path: Pat
     usage_dir = tmp_path / "usage"
     upsert_goal(goals_root, _goal())
     _write_snapshot(usage_dir, _snapshot(session_id="s1", tmux_session="lane1", account="old@example.com", five_hour_pct=10, ts=_iso()))
-    sweep(usage_dir=usage_dir, host="host-b", goals_root=goals_root, queue_dir=tmp_path / "queue", policy=FAST_POLICY, now=_now())
+    sweep(usage_dir=usage_dir, host="tophand", goals_root=goals_root, queue_dir=tmp_path / "queue", policy=FAST_POLICY, now=_now())
 
     _write_snapshot(
         usage_dir, _snapshot(session_id="s1", tmux_session="lane1", account="new@example.com", five_hour_pct=10, ts=_iso(minutes=1))
     )
     report = sweep(
-        usage_dir=usage_dir, host="host-b", goals_root=goals_root, queue_dir=tmp_path / "queue", policy=FAST_POLICY, now=_now(minutes=1)
+        usage_dir=usage_dir, host="tophand", goals_root=goals_root, queue_dir=tmp_path / "queue", policy=FAST_POLICY, now=_now(minutes=1)
     )
 
     assert any("old@example.com" in e and "new@example.com" in e for e in report.escalations)
@@ -821,7 +667,7 @@ def test_registry_entry_records_the_observed_account(tmp_path: Path) -> None:
     usage_dir = tmp_path / "usage"
     upsert_goal(tmp_path, _goal())
     _write_snapshot(usage_dir, _snapshot(session_id="s1", tmux_session="lane1", account="a@x.com", five_hour_pct=10, ts=_iso()))
-    sweep(usage_dir=usage_dir, host="host-b", goals_root=tmp_path, queue_dir=tmp_path / "queue", policy=FAST_POLICY, now=_now())
+    sweep(usage_dir=usage_dir, host="tophand", goals_root=tmp_path, queue_dir=tmp_path / "queue", policy=FAST_POLICY, now=_now())
     entry = get_entry(tmp_path, "lane1")
     assert isinstance(entry, RegistryEntry)
     assert entry.account == "a@x.com"
@@ -844,211 +690,6 @@ def test_codex_synthetic_verdict_is_skipped_not_silently_fanned_out(tmp_path: Pa
             account_attributed=False,
         )
     ]
-    to_pause, skipped = plan_pauses(verdicts, host="host-b", goals_root=tmp_path)
+    to_pause, skipped = plan_pauses(verdicts, host="tophand", goals_root=tmp_path)
     assert to_pause == []
     assert any("no tmux_session" in reason for reason in skipped)
-
-
-# --- host-load ladder integration -------------------------------------------
-
-
-def test_load_shed_acts_only_after_second_breach_and_uses_distinct_prefix(tmp_path: Path) -> None:
-    usage_dir = tmp_path / "usage"
-    queue_dir = tmp_path / "queue"
-    for index in range(7):
-        status = "blocked" if index == 0 else "working"
-        upsert_goal(tmp_path, dataclasses.replace(_goal(f"host-b:lane{index}:0.0"), status=status))
-    codex_lane = dataclasses.replace(_snapshot(session_id="lane0", tmux_session="lane0", five_hour_pct=5, ts=_iso()), kind="codex")
-    _write_snapshot(usage_dir, codex_lane)
-    breach = PressureSample(24, 0, 0, 0)
-
-    first = sweep(
-        usage_dir=usage_dir,
-        host="host-b",
-        goals_root=tmp_path,
-        queue_dir=queue_dir,
-        policy=FAST_POLICY,
-        pressure_sample=breach,
-        now=_now(),
-    )
-    assert first.load_level == 0
-    assert all(get_goal(tmp_path, f"host-b:lane{index}:0.0").status != "held" for index in range(7))
-
-    second = sweep(
-        usage_dir=usage_dir,
-        host="host-b",
-        goals_root=tmp_path,
-        queue_dir=queue_dir,
-        policy=FAST_POLICY,
-        pressure_sample=breach,
-        now=_now(minutes=1),
-    )
-
-    shed = get_goal(tmp_path, "host-b:lane0:0.0")
-    txn = get_transaction(tmp_path, "host-b:lane0:0.0")
-    assert second.load_level == 1
-    assert shed is not None and shed.status == "held"
-    assert shed.hold_reason == "load-shed:host-b:1"
-    assert shed.hold_reason.startswith(LOAD_SHED_HOLD_REASON_PREFIX)
-    assert not shed.hold_reason.startswith(RATE_LIMIT_HOLD_REASON_PREFIX)
-    assert txn is not None and txn.backend == "codex" and txn.phase == "pause_requested"
-    assert second.shed_lanes == ["host-b:lane0:0.0"]
-
-    upsert_lane_activity(
-        tmp_path,
-        [
-            LaneActivity(
-                session_ref="host-b:lane0:0.0",
-                pane_id="%1",
-                last_change_at=_iso(minutes=1),
-                last_seen_at=_iso(minutes=1),
-                attached=True,
-                backend="codex",
-            )
-        ],
-    )
-    sweep(
-        usage_dir=usage_dir,
-        host="host-b",
-        goals_root=tmp_path,
-        queue_dir=queue_dir,
-        policy=FAST_POLICY,
-        pressure_sample=breach,
-        now=_now(minutes=2),
-    )
-    txn = get_transaction(tmp_path, "host-b:lane0:0.0")
-    assert txn is not None and txn.phase == "checkpoint_sent"
-    checkpoint = json.loads((queue_dir / "orders" / f"{txn.checkpoint_order_id}.json").read_text(encoding="utf-8"))
-    assert checkpoint["task_type"] == "load-shed-checkpoint"
-    assert "Codex lane" in checkpoint["nudge"]
-
-    _deliver(queue_dir, txn.checkpoint_order_id)
-    sweep(
-        usage_dir=usage_dir,
-        host="host-b",
-        goals_root=tmp_path,
-        queue_dir=queue_dir,
-        policy=FAST_POLICY,
-        pressure_sample=breach,
-        now=_now(minutes=3),
-    )
-    txn = get_transaction(tmp_path, "host-b:lane0:0.0")
-    assert txn is not None and txn.phase == "awaiting_quiescence"
-    assert txn.stop_order_id == ""
-    assert not any(json.loads(path.read_text())["task_type"] == "load-shed-stop" for path in (queue_dir / "orders").glob("*.json"))
-
-
-def test_load_resume_waits_for_two_clear_sweeps_then_uses_last_shed_first(tmp_path: Path) -> None:
-    refs = ("host-b:first:0.0", "host-b:last:0.0")
-    for ref in refs:
-        upsert_goal(tmp_path, _goal(ref))
-        hold_goal(tmp_path, ref, reason="load-shed:host-b:1")
-        upsert_transaction(
-            tmp_path,
-            Transaction(
-                session_ref=ref,
-                phase="held",
-                hold_reason="load-shed:host-b:1",
-                created_at=_iso(),
-                updated_at=_iso(),
-            ),
-        )
-    upsert_load_state(
-        tmp_path,
-        LoadHostState(
-            host="host-b",
-            observed_level=1,
-            load_level=1,
-            shed_lanes=refs,
-            updated_at=_iso(),
-        ),
-    )
-
-    first = sweep(
-        usage_dir=tmp_path / "usage",
-        host="host-b",
-        goals_root=tmp_path,
-        queue_dir=tmp_path / "queue",
-        policy=FAST_POLICY,
-        pressure_sample=CLEAR_PRESSURE,
-        now=_now(minutes=1),
-    )
-    assert first.load_level == 1
-    assert get_transaction(tmp_path, refs[1]).phase == "held"
-
-    second = sweep(
-        usage_dir=tmp_path / "usage",
-        host="host-b",
-        goals_root=tmp_path,
-        queue_dir=tmp_path / "queue",
-        policy=FAST_POLICY,
-        pressure_sample=CLEAR_PRESSURE,
-        now=_now(minutes=2),
-    )
-
-    state = get_load_state(tmp_path, "host-b")
-    assert second.load_level == 0
-    assert state is not None and state.load_level == 0
-    assert get_transaction(tmp_path, refs[1]).phase == "resume_requested"
-    assert get_transaction(tmp_path, refs[0]).phase == "held"
-
-
-def test_record_pause_recovery_allows_load_shed_hold_without_resume_at(tmp_path: Path) -> None:
-    """A load-shed hold resumes when host pressure clears, not at a wall-clock
-    time, so it carries an empty ``resume_at`` by design. Recording (and reading
-    back) its pause recovery must not raise -- otherwise the guard sweep crashes
-    every run the moment a load-shed lane reaches ``held`` (observed live on
-    host-a: ``held transaction is missing required pause recovery data``)."""
-    session_ref = "host-a:F5-docs:0.0"
-    upsert_goal(
-        tmp_path,
-        dataclasses.replace(
-            _goal(session_ref),
-            status="held",
-            hold_reason=f"{LOAD_SHED_HOLD_REASON_PREFIX}host-a:3",
-        ),
-    )
-    held = Transaction(
-        session_ref=session_ref,
-        phase="held",
-        hold_reason=f"{LOAD_SHED_HOLD_REASON_PREFIX}host-a:3",
-        transcript_path="/home/ubuntu/.claude/projects/-/abc.jsonl",
-        resume_at="",
-        created_at=_now().isoformat(),
-        updated_at=_now().isoformat(),
-    )
-
-    record = record_pause_recovery(tmp_path, held, paused_at=_now(minutes=1).isoformat())
-
-    assert record.resume_at == ""
-    assert record.session_ref == session_ref
-    # Reads back cleanly -- the read-side validator also tolerates empty resume_at.
-    persisted = load_recovery_records(tmp_path)
-    assert [r.pause_id for r in persisted] == [record.pause_id]
-
-
-def test_record_pause_recovery_still_requires_resume_at_for_rate_limit_hold(tmp_path: Path) -> None:
-    """Rate-limit holds carry a real wall-clock resume time; an empty one is a
-    genuine data defect and must still fail loud (regression guard for the
-    load-shed carve-out above)."""
-    session_ref = "host-a:F9-codex:0.0"
-    upsert_goal(
-        tmp_path,
-        dataclasses.replace(
-            _goal(session_ref),
-            status="held",
-            hold_reason=f"{RATE_LIMIT_HOLD_REASON_PREFIX}anthropic",
-        ),
-    )
-    held = Transaction(
-        session_ref=session_ref,
-        phase="held",
-        hold_reason=f"{RATE_LIMIT_HOLD_REASON_PREFIX}anthropic",
-        transcript_path="/home/ubuntu/.claude/projects/-/def.jsonl",
-        resume_at="",
-        created_at=_now().isoformat(),
-        updated_at=_now().isoformat(),
-    )
-
-    with pytest.raises(ValueError, match="missing required pause recovery data"):
-        record_pause_recovery(tmp_path, held, paused_at=_now(minutes=1).isoformat())

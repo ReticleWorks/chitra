@@ -102,7 +102,9 @@ def test_reasoned_order_logs_attestation_our_side_without_leaking_metadata_into_
         attestation_ledger_path=tmp_path / "attestations.jsonl",
     )[0]
 
-    entry = ledger_mod.AttestationLedgerEntry.model_validate_json((tmp_path / "attestations.jsonl").read_text(encoding="utf-8"))
+    entry = ledger_mod.AttestationLedgerEntry.model_validate_json(
+        (tmp_path / "attestations.jsonl").read_text(encoding="utf-8")
+    )
     assert entry.attestation == attestation
     assert result.decision_attestation_id == attestation.attestation_id
     assert seen_nudges == [approved]
@@ -321,11 +323,11 @@ def test_ledger_write_failure_does_not_prevent_completion_or_cause_redelivery(tm
 # --- rate-limit freeze / durable deferred subqueue (SOL findings #1, #7) ---
 
 
-def _tracked_goal(session_ref: str = "host-b:feeds-111:0.0") -> GoalRecord:
+def _tracked_goal(session_ref: str = "tophand:feeds-111:0.0") -> GoalRecord:
     return GoalRecord(
         session_ref=session_ref,
         goal="Ship the tested feature to production safely.",
-        done_when="Tests pass.",
+        done_when="Both unit tests and integration tests pass.",
         source="task",
         status="working",
     )
@@ -347,10 +349,10 @@ def test_rate_limit_held_session_is_deferred_not_discarded(tmp_path: Path, monke
 
     goals_root = tmp_path / "goals"
     upsert_goal(goals_root, _tracked_goal())
-    hold_goal(goals_root, "host-b:feeds-111:0.0", reason="rate-limit:5h", resume_at="2026-07-12T12:00:00+00:00")
+    hold_goal(goals_root, "tophand:feeds-111:0.0", reason="rate-limit:5h", resume_at="2026-07-12T12:00:00+00:00")
 
     queue_dir = tmp_path / "queue"
-    order = DispatchOrder(order_id="ord-frozen", session_ref="host-b:feeds-111:0.0", nudge="new work")
+    order = DispatchOrder(order_id="ord-frozen", session_ref="tophand:feeds-111:0.0", nudge="new work")
     _write_order(queue_dir / "orders", order)
 
     results = run_once(queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl", goals_root=goals_root)
@@ -380,10 +382,10 @@ def test_deferred_order_is_requeued_and_delivered_exactly_once_after_resume(tmp_
 
     goals_root = tmp_path / "goals"
     upsert_goal(goals_root, _tracked_goal())
-    hold_goal(goals_root, "host-b:feeds-111:0.0", reason="rate-limit:5h", resume_at="2026-07-12T12:00:00+00:00")
+    hold_goal(goals_root, "tophand:feeds-111:0.0", reason="rate-limit:5h", resume_at="2026-07-12T12:00:00+00:00")
 
     queue_dir = tmp_path / "queue"
-    order = DispatchOrder(order_id="ord-later", session_ref="host-b:feeds-111:0.0", nudge="new work")
+    order = DispatchOrder(order_id="ord-later", session_ref="tophand:feeds-111:0.0", nudge="new work")
     _write_order(queue_dir / "orders", order)
 
     deferred_pass = run_once(queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl", goals_root=goals_root)
@@ -394,8 +396,8 @@ def test_deferred_order_is_requeued_and_delivered_exactly_once_after_resume(tmp_
     # chitra.rate_limit_guard.apply_resume) returns the backlog to orders/.
     from chitra.goals import resume_goal
 
-    resume_goal(goals_root, "host-b:feeds-111:0.0")
-    requeued = requeue_deferred_for_session(queue_dir, "host-b:feeds-111:0.0")
+    resume_goal(goals_root, "tophand:feeds-111:0.0")
+    requeued = requeue_deferred_for_session(queue_dir, "tophand:feeds-111:0.0")
     assert requeued == ["ord-later"]
     assert not (queue_dir / "deferred" / "ord-later.json").exists()
     assert (queue_dir / "orders" / "ord-later.json").exists()
@@ -423,10 +425,10 @@ def test_hold_for_non_rate_limit_reason_does_not_freeze_dispatch(tmp_path: Path,
 
     goals_root = tmp_path / "goals"
     upsert_goal(goals_root, _tracked_goal())
-    hold_goal(goals_root, "host-b:feeds-111:0.0", reason="operator")
+    hold_goal(goals_root, "tophand:feeds-111:0.0", reason="operator")
 
     queue_dir = tmp_path / "queue"
-    order = DispatchOrder(order_id="ord-not-frozen", session_ref="host-b:feeds-111:0.0", nudge="new work")
+    order = DispatchOrder(order_id="ord-not-frozen", session_ref="tophand:feeds-111:0.0", nudge="new work")
     _write_order(queue_dir / "orders", order)
 
     results = run_once(queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl", goals_root=goals_root)
@@ -449,12 +451,12 @@ def test_bypass_flag_alone_does_not_escape_the_freeze_without_a_sealed_task_type
 
     goals_root = tmp_path / "goals"
     upsert_goal(goals_root, _tracked_goal())
-    hold_goal(goals_root, "host-b:feeds-111:0.0", reason="rate-limit:5h", resume_at="2026-07-12T12:00:00+00:00")
+    hold_goal(goals_root, "tophand:feeds-111:0.0", reason="rate-limit:5h", resume_at="2026-07-12T12:00:00+00:00")
 
     queue_dir = tmp_path / "queue"
     order = DispatchOrder(
         order_id="ord-fake-bypass",
-        session_ref="host-b:feeds-111:0.0",
+        session_ref="tophand:feeds-111:0.0",
         nudge="not really a checkpoint",
         bypass_rate_limit_freeze=True,
         task_type="anything-else",
@@ -481,12 +483,12 @@ def test_sealed_task_type_bypass_is_delivered_despite_the_hold(tmp_path: Path, m
 
     goals_root = tmp_path / "goals"
     upsert_goal(goals_root, _tracked_goal())
-    hold_goal(goals_root, "host-b:feeds-111:0.0", reason="rate-limit:5h", resume_at="2026-07-12T12:00:00+00:00")
+    hold_goal(goals_root, "tophand:feeds-111:0.0", reason="rate-limit:5h", resume_at="2026-07-12T12:00:00+00:00")
 
     queue_dir = tmp_path / "queue"
     order = DispatchOrder(
         order_id="ord-checkpoint",
-        session_ref="host-b:feeds-111:0.0",
+        session_ref="tophand:feeds-111:0.0",
         nudge="checkpoint now",
         bypass_rate_limit_freeze=True,
         task_type="rate-limit-checkpoint",
@@ -497,39 +499,6 @@ def test_sealed_task_type_bypass_is_delivered_despite_the_hold(tmp_path: Path, m
 
     assert call_count["n"] == 1
     assert results[0].status == DispatchStatus.SENT
-
-
-def test_load_shed_hold_defers_ordinary_work_but_allows_guard_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[str] = []
-
-    def fake_dispatch(order: DispatchOrder, **kwargs: Any) -> DispatchResult:
-        calls.append(order.order_id)
-        return DispatchResult(order_id=order.order_id, session_ref=order.session_ref, status=DispatchStatus.SENT)
-
-    monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", fake_dispatch)
-    goals_root = tmp_path / "goals"
-    upsert_goal(goals_root, _tracked_goal())
-    hold_goal(goals_root, "host-b:feeds-111:0.0", reason="load-shed:host-b:2")
-    queue_dir = tmp_path / "queue"
-    _write_order(
-        queue_dir / "orders",
-        DispatchOrder(order_id="ordinary", session_ref="host-b:feeds-111:0.0", nudge="new work"),
-    )
-    _write_order(
-        queue_dir / "orders",
-        DispatchOrder(
-            order_id="load-checkpoint",
-            session_ref="host-b:feeds-111:0.0",
-            nudge="checkpoint now",
-            task_type="load-shed-checkpoint",
-            bypass_rate_limit_freeze=True,
-        ),
-    )
-
-    results = run_once(queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl", goals_root=goals_root)
-
-    assert [result.status for result in results] == [DispatchStatus.DEFERRED, DispatchStatus.SENT]
-    assert calls == ["load-checkpoint"]
 
 
 def test_no_goals_root_configured_leaves_dispatch_unaffected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -544,7 +513,7 @@ def test_no_goals_root_configured_leaves_dispatch_unaffected(tmp_path: Path, mon
     monkeypatch.setenv("CHITRA_STATE_DIR", str(tmp_path / "no-such-state-dir"))
 
     queue_dir = tmp_path / "queue"
-    order = DispatchOrder(order_id="ord-default", session_ref="host-b:feeds-111:0.0", nudge="new work")
+    order = DispatchOrder(order_id="ord-default", session_ref="tophand:feeds-111:0.0", nudge="new work")
     _write_order(queue_dir / "orders", order)
 
     results = run_once(queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl")
@@ -568,10 +537,10 @@ def test_goals_root_is_wired_through_the_cli_entrypoint(tmp_path: Path, monkeypa
 
     goals_root = tmp_path / "goals"
     upsert_goal(goals_root, _tracked_goal())
-    hold_goal(goals_root, "host-b:feeds-111:0.0", reason="rate-limit:5h", resume_at="2026-07-12T12:00:00+00:00")
+    hold_goal(goals_root, "tophand:feeds-111:0.0", reason="rate-limit:5h", resume_at="2026-07-12T12:00:00+00:00")
 
     queue_dir = tmp_path / "queue"
-    order = DispatchOrder(order_id="ord-cli", session_ref="host-b:feeds-111:0.0", nudge="new work")
+    order = DispatchOrder(order_id="ord-cli", session_ref="tophand:feeds-111:0.0", nudge="new work")
     _write_order(queue_dir / "orders", order)
 
     exit_code = main(
@@ -866,7 +835,9 @@ def test_dead_preclaim_reservation_is_reclaimed_before_processing(tmp_path: Path
     assert (queue_dir / "processed" / "ord-stale-reservation.json").exists()
 
 
-def test_result_appearing_while_waiting_for_the_lane_lock_is_caught_under_the_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_result_appearing_while_waiting_for_the_lane_lock_is_caught_under_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Regression for SOL finding #5's explicit ask: recheck idempotency
     UNDER the lane lock, not only before acquiring it. Simulate a
     concurrent order for the same session finishing (writing this order's
@@ -1229,12 +1200,17 @@ def test_routing_provenance_is_stamped_on_result_and_signed_ledger(tmp_path: Pat
     )[0]
 
     assert result.task_type == "code-review"
+    assert result.routing_hint_source == "config"
     entry = ledger_mod.LedgerEntry.model_validate_json(ledger_path.read_text(encoding="utf-8"))
     assert entry.task_type == "code-review"
-    assert entry.sig_v == 4
+    assert entry.routing_hint_source == "config"
+    assert entry.sig_v == 3
 
 
-def test_routes_entry_resolves_hint_and_zdr_into_result_and_signed_ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_routes_entry_resolves_model_and_harness_into_result_and_signed_ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A structured ``routes`` entry is actively RESOLVED at dispatch: the
+    concrete model+harness (+zdr) and ``"route"`` provenance land on the
+    result and in the HMAC-signed ledger entry (closes ROADMAP line 97)."""
     monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", _fake_dispatch_passthrough)
     config_path = tmp_path / "routing.yaml"
     config_path.write_text(
@@ -1257,12 +1233,14 @@ def test_routes_entry_resolves_hint_and_zdr_into_result_and_signed_ledger(tmp_pa
     )[0]
 
     assert result.routing_hint == "opus-4.8@claude-code+zdr"
-    assert result.resolved_zdr is True
+    assert result.routing_hint_source == "route"
+    assert (result.resolved_model, result.resolved_harness, result.resolved_zdr) == ("opus-4.8", "claude-code", True)
 
     key = ledger_mod.load_or_create_signing_key(tmp_path / "ledger.key")
     entry = ledger_mod.LedgerEntry.model_validate_json(ledger_path.read_text(encoding="utf-8"))
-    assert entry.resolved_zdr is True
-    assert entry.sig_v == 4
+    assert (entry.resolved_model, entry.resolved_harness, entry.resolved_zdr) == ("opus-4.8", "claude-code", True)
+    assert entry.routing_hint_source == "route"
+    assert entry.sig_v == 3
     assert ledger_mod.verify_entry(entry, key=key) is True
 
 
@@ -1295,10 +1273,14 @@ def test_routes_entry_wins_over_a_defaults_entry_for_same_task_type(tmp_path: Pa
     )[0]
 
     assert result.routing_hint == "gpt-5.6-sol@codex-cli"
-    assert result.resolved_zdr is False
+    assert result.routing_hint_source == "route"
+    assert result.resolved_model == "gpt-5.6-sol"
 
 
-def test_defaults_only_config_leaves_resolved_zdr_false_backcompat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_defaults_only_config_leaves_resolved_fields_empty_backcompat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Back-compat: a defaults-only config behaves exactly as before — the
+    opaque routing_hint is filled with ``"config"`` provenance and no
+    resolved model/harness selection is recorded."""
     monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", _fake_dispatch_passthrough)
     config_path = tmp_path / "routing.yaml"
     config_path.write_text(yaml.safe_dump({"defaults": {"code-review": "sonnet"}}), encoding="utf-8")
@@ -1317,7 +1299,8 @@ def test_defaults_only_config_leaves_resolved_zdr_false_backcompat(tmp_path: Pat
     )[0]
 
     assert result.routing_hint == "sonnet"
-    assert result.resolved_zdr is False
+    assert result.routing_hint_source == "config"
+    assert (result.resolved_model, result.resolved_harness, result.resolved_zdr) == (None, None, False)
 
 
 def test_policy_file_is_wired_to_completion_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1331,9 +1314,9 @@ def test_policy_file_is_wired_to_completion_gate(tmp_path: Path, monkeypatch: py
             order_id="policy-gate",
             session_ref="localhost:s:0.0",
             nudge=(
-                "The configured policy gate was completed.\n"
-                "It exercises the configured evidence requirements.\n"
-                "Local probe status=200 with 1 check; /tmp/policy-proof.json."
+                "What was built: The configured policy gate was completed.\n"
+                "What it does: It exercises the configured evidence requirements.\n"
+                "Does it actually work: Local probe status=200 with 1 check; /tmp/policy-proof.json."
             ),
             completion_todo_items=[],
         ),

@@ -11,11 +11,8 @@ from typing import cast
 
 import pytest
 
-from chitra import board
 from chitra.artifacts import ARTIFACT_URL_PREFIX, ArtifactRecord, upsert_artifact
-from chitra.close_gate import DONE_WHEN_OPERATOR_FLAG, CloseGateError
 from chitra.goals import (
-    EnrolledScopeImmutableError,
     GoalNotFoundError,
     GoalRecord,
     GoalRedirectRequiredError,
@@ -24,14 +21,12 @@ from chitra.goals import (
     add_ask,
     check_specification,
     close_goal,
-    descope_delta,
     due_goals,
     get_goal,
     hold_goal,
     list_goals,
     load_goals,
     main,
-    mark_completion_gate_passed,
     redirect_goal,
     resolve_ask,
     resume_goal,
@@ -50,7 +45,7 @@ def _mp_upsert_new_lane(root_str: str, session_ref: str) -> None:
         GoalRecord(
             session_ref=session_ref,
             goal="Ship the tested deterministic goals store safely under load.",
-            done_when="The full suite and static checks pass.",
+            done_when="Both the full suite and static checks pass.",
             source="task-file:/tmp/goal-store.md",
             status="working",
         ),
@@ -63,9 +58,9 @@ def _mp_add_ask(root_str: str, session_ref: str, ask: str) -> None:
 
 def _record(**changes: str) -> GoalRecord:
     values: dict[str, str] = {
-        "session_ref": "host-b:f2-77:0.0",
+        "session_ref": "tophand:f2-77:0.0",
         "goal": "Ship the tested deterministic goals store safely.",
-        "done_when": "The full suite and static checks pass.",
+        "done_when": "Both the full suite and static checks pass.",
         "source": "task-file:/tmp/goal-store.md",
         "status": "working",
         "intent": "Safely deliver a deterministic persistent goals store for operators.",
@@ -103,11 +98,6 @@ def test_store_round_trip_and_atomic_write(tmp_path: Path) -> None:
     assert payload["goals"][0]["needs"] == "you: run the interview"
     assert payload["goals"][0]["goal_version"] == 1
     assert payload["goals"][0]["goal_history"] == []
-    assert stored.lane_id == "f2-77"
-    assert stored.enrolled_done_when == stored.done_when
-    assert stored.enrolled_at == stored.created_at
-    assert payload["goals"][0]["enrolled_done_when"] == stored.done_when
-    assert payload["goals"][0]["enrolled_at"] == stored.enrolled_at
 
 
 def test_upsert_preserves_created_timestamp_and_recomputes_updated(tmp_path: Path) -> None:
@@ -186,15 +176,9 @@ def test_load_old_record_without_optional_fields_is_backward_compatible(tmp_path
     assert record.scope == ""
     assert record.goal_version == 1
     assert record.goal_history == ()
-    assert record.lane_id == "lane"
-    assert record.enrolled_done_when == record.done_when
-    assert record.enrolled_at == payload["updated_at"]
     stored = upsert_goal(tmp_path, record)
     assert load_goals(tmp_path) == [stored]
     assert stored.to_dict()["goal_history"] == []
-    persisted = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))["goals"][0]
-    assert persisted["enrolled_done_when"] == record.done_when
-    assert persisted["enrolled_at"] == payload["updated_at"]
 
 
 @pytest.mark.parametrize(
@@ -204,9 +188,6 @@ def test_load_old_record_without_optional_fields_is_backward_compatible(tmp_path
         ("scope", 1, "scope must be a string"),
         ("goal_version", True, "goal_version must be an integer"),
         ("goal_history", "not-a-list", "goal_history must be a list"),
-        ("lane_id", 1, "lane_id must be a string"),
-        ("enrolled_done_when", 1, "enrolled_done_when must be a string"),
-        ("enrolled_at", 1, "enrolled_at must be a string"),
         (
             "goal_history",
             [{"goal": "g", "done_when": "d", "intent": "i", "scope": "s", "revised_at": "t"}],
@@ -241,39 +222,6 @@ def test_plain_upsert_preserves_strategic_version_and_history(tmp_path: Path) ->
     assert revised.now == "running checks"
     assert revised.goal_version == 2
     assert revised.goal_history == redirected.goal_history
-
-
-def test_enrolled_scope_is_write_once_and_carried_through_later_writes(tmp_path: Path) -> None:
-    enrolled = upsert_goal(tmp_path, _record())
-
-    with pytest.raises(EnrolledScopeImmutableError, match="enrolled_done_when"):
-        upsert_goal(tmp_path, replace(enrolled, enrolled_done_when="A smaller condition replaces the original."))
-    with pytest.raises(EnrolledScopeImmutableError, match="enrolled_at"):
-        upsert_goal(tmp_path, replace(enrolled, enrolled_at="2026-07-14T00:00:00+00:00"))
-
-    revised = upsert_goal(tmp_path, replace(enrolled, now="running the complete suite"))
-    assert (revised.enrolled_done_when, revised.enrolled_at) == (
-        enrolled.enrolled_done_when,
-        enrolled.enrolled_at,
-    )
-
-
-def test_redirect_now_hold_resume_and_close_preserve_enrollment_anchor(tmp_path: Path) -> None:
-    enrolled = upsert_goal(tmp_path, _record(done_when="both the X client and the Y client pass live validation"))
-    redirected = redirect_goal(
-        tmp_path,
-        enrolled.session_ref,
-        reason="operator explicitly descoped Y",
-        done_when="The X client passes live validation",
-    )
-    updated = update_now(tmp_path, redirected.session_ref, now="validating X")
-    held = hold_goal(tmp_path, updated.session_ref, reason="operator")
-    resumed = resume_goal(tmp_path, held.session_ref)
-    closed = close_goal(tmp_path, resumed.session_ref, delivered_items=("X client",))
-
-    for record in (redirected, updated, held, resumed, closed):
-        assert record.enrolled_done_when == enrolled.done_when
-        assert record.enrolled_at == enrolled.enrolled_at
 
 
 @pytest.mark.parametrize(
@@ -349,69 +297,6 @@ def test_update_now_is_tactical_only_and_requires_an_existing_record(tmp_path: P
     )
     with pytest.raises(GoalNotFoundError):
         update_now(tmp_path, "missing:lane", now="nothing")
-
-
-@pytest.mark.parametrize("status", ["done-pending-verification", "done-pending-close"])
-def test_done_status_requires_completion_gate(tmp_path: Path, status: GoalStatus) -> None:
-    stored = upsert_goal(tmp_path, _record())
-
-    with pytest.raises(GoalValidationError, match=r"update_now cannot set a done-\*"):
-        update_now(tmp_path, stored.session_ref, status=status)
-    with pytest.raises(GoalValidationError, match="completion gate"):
-        upsert_goal(tmp_path, replace(stored, status=status))
-
-
-def test_fresh_session_ref_for_open_lane_requires_redirect(tmp_path: Path) -> None:
-    stored = upsert_goal(tmp_path, _record(session_ref="host-b:folio:0.0"))
-    assert stored.lane_id == "folio"
-
-    with pytest.raises(GoalRedirectRequiredError, match="already has an open goal"):
-        upsert_goal(tmp_path, _record(session_ref="other-host:folio:9.1"))
-    with pytest.raises(GoalValidationError, match="derived"):
-        upsert_goal(tmp_path, replace(_record(session_ref="host:other:0.0"), lane_id="spoofed"))
-
-
-def test_redirect_invalidates_prior_done_state(tmp_path: Path) -> None:
-    stored = upsert_goal(tmp_path, _record())
-    completed = mark_completion_gate_passed(
-        tmp_path,
-        stored.session_ref,
-        now="completion gate passed",
-        last_verified="2026-07-14T00:00:00+00:00",
-    )
-    redirected = redirect_goal(
-        tmp_path,
-        completed.session_ref,
-        reason="operator revised the completion contract",
-        done_when="The expanded full suite and static checks pass.",
-    )
-
-    assert redirected.status == "working"
-    assert redirected.last_verified == ""
-
-
-def test_folio_scope_laundering_paths_are_structurally_blocked_and_visible(tmp_path: Path) -> None:
-    full = "both the Folio import lane and the Folio export lane pass live validation"
-    stored = upsert_goal(tmp_path, _record(session_ref="host-b:folio:0.0", done_when=full))
-    narrowed = redirect_goal(
-        tmp_path,
-        stored.session_ref,
-        reason="operator is considering a reduced delivery",
-        done_when="The Folio import lane passes live validation",
-    )
-
-    with pytest.raises(GoalRedirectRequiredError, match="redirect"):
-        upsert_goal(
-            tmp_path,
-            _record(
-                session_ref="host-b:folio:1.0",
-                done_when="The Folio import lane passes live validation",
-            ),
-        )
-    with pytest.raises(GoalValidationError, match=r"update_now cannot set a done-\*"):
-        update_now(tmp_path, narrowed.session_ref, status="done-pending-close")
-
-    assert [item.text for item in descope_delta(narrowed)] == ["the Folio export lane pass live validation"]
 
 
 @pytest.mark.parametrize(
@@ -671,134 +556,19 @@ def test_upsert_rejects_invalid_records(tmp_path: Path, record: GoalRecord, mess
 def test_close_removes_record_and_raises_for_absent_goal(tmp_path: Path) -> None:
     stored = upsert_goal(tmp_path, _record())
 
-    assert close_goal(tmp_path, stored.session_ref, delivered_items=("full suite", "static checks")) == stored
+    assert close_goal(tmp_path, stored.session_ref) == stored
     assert list_goals(tmp_path) == []
     with pytest.raises(GoalNotFoundError):
         close_goal(tmp_path, stored.session_ref)
 
 
-def test_close_blocks_f8_shape_and_preserves_goal_until_operator_ack(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    stored = upsert_goal(
-        tmp_path,
-        _record(done_when="both the X client and the Y client pass live validation"),
-    )
-
-    with pytest.raises(CloseGateError, match="F8 close tell"):
-        close_goal(
-            tmp_path,
-            stored.session_ref,
-            delivered_items=("X client",),
-            close_notes=("Y client is follow-on.",),
-        )
-    assert get_goal(tmp_path, stored.session_ref) == stored
-
-    close_args = [
-        "close",
-        "--root",
-        str(tmp_path),
-        "--session-ref",
-        stored.session_ref,
-        "--delivered-item",
-        "X client",
-        "--close-note",
-        "Y client is follow-on.",
-    ]
-    assert main(close_args) == 1
-    assert "F8 close tell" in capsys.readouterr().err
-    assert main([*close_args, "--operator-acknowledged-item", "Y client"]) == 0
-    assert get_goal(tmp_path, stored.session_ref) is None
-
-
-def test_close_passes_after_operator_redirect_records_descope(tmp_path: Path) -> None:
-    stored = upsert_goal(
-        tmp_path,
-        _record(done_when="both the X client and the Y client pass live validation"),
-    )
-    redirected = redirect_goal(
-        tmp_path,
-        stored.session_ref,
-        reason="operator descoped the Y client",
-        done_when="The X client passes live validation",
-    )
-
-    closed = close_goal(
-        tmp_path,
-        redirected.session_ref,
-        delivered_items=("X client",),
-        close_notes=("Y client is future work.",),
-    )
-
-    assert closed.goal_version == 2
-    assert closed.goal_history[0]["done_when"] == "both the X client and the Y client pass live validation"
-    assert get_goal(tmp_path, redirected.session_ref) is None
-
-
-def test_goal_cli_set_surfaces_vague_done_when_without_rewriting(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    record = _record(done_when="representative consumers pass live validation")
-
-    assert (
-        main(
-            [
-                "set",
-                "--root",
-                str(tmp_path),
-                "--session-ref",
-                record.session_ref,
-                "--goal",
-                record.goal,
-                "--done-when",
-                record.done_when,
-                "--source",
-                record.source,
-            ]
-        )
-        == 0
-    )
-    output = capsys.readouterr().out
-    stored = get_goal(tmp_path, record.session_ref)
-
-    assert stored is not None
-    assert stored.done_when == "representative consumers pass live validation"
-    assert stored.open_asks == (DONE_WHEN_OPERATOR_FLAG,)
-    assert "missing or vague" in output
-    assert DONE_WHEN_OPERATOR_FLAG in board.render_roster([stored], fmt="markdown")
-
-
-def test_goal_cli_set_does_not_surface_vague_flag_for_explicit_both(tmp_path: Path) -> None:
-    record = _record(done_when="both consumer A and consumer B pass live validation")
-
-    assert (
-        main(
-            [
-                "set",
-                "--root",
-                str(tmp_path),
-                "--session-ref",
-                record.session_ref,
-                "--goal",
-                record.goal,
-                "--done-when",
-                record.done_when,
-                "--source",
-                record.source,
-            ]
-        )
-        == 0
-    )
-    stored = get_goal(tmp_path, record.session_ref)
-
-    assert stored is not None
-    assert stored.done_when == "both consumer A and consumer B pass live validation"
-    assert stored.open_asks == ()
-
-
 @pytest.mark.parametrize(
     ("session_ref", "expected_host", "expected_name"),
     [
-        ("host-b:f2-77:0.0", "host-b", "f2-77"),
-        ("host-b:f2-77", "host-b", "f2-77"),
+        ("tophand:f2-77:0.0", "tophand", "f2-77"),
+        ("tophand:f2-77", "tophand", "f2-77"),
         ("lane-token", "lane-token", "lane-token"),
-        ("host-b:", "host-b", "host-b"),
+        ("tophand:", "tophand", "tophand"),
     ],
 )
 def test_session_ref_helpers_degrade_gracefully(session_ref: str, expected_host: str, expected_name: str) -> None:
@@ -828,7 +598,7 @@ def test_roster_command_reads_unreviewed_artifacts_from_the_shared_store(tmp_pat
             url=f"{ARTIFACT_URL_PREFIX}operator-copyable-link",
             title="Operator artifact",
             kind="page",
-            source="host-b:/var/lib/chitra/artifact.html",
+            source="tophand:/var/lib/chitra/artifact.html",
             brief=(
                 "What was built: An operator-facing artifact roster entry.\n"
                 "What it does: It exposes the full copyable artifact link.\n"
@@ -876,13 +646,13 @@ def test_concurrent_writers_adding_asks_to_the_same_lane_do_not_lose_each_other(
     upsert_goal(tmp_path, _record())
     ctx = multiprocessing.get_context("fork")
     asks = [f"{i}. Concurrent ask number {i}." for i in range(15)]
-    procs = [ctx.Process(target=_mp_add_ask, args=(str(tmp_path), "host-b:f2-77:0.0", ask)) for ask in asks]
+    procs = [ctx.Process(target=_mp_add_ask, args=(str(tmp_path), "tophand:f2-77:0.0", ask)) for ask in asks]
     for p in procs:
         p.start()
     for p in procs:
         p.join(timeout=30)
         assert p.exitcode == 0
 
-    stored = get_goal(tmp_path, "host-b:f2-77:0.0")
+    stored = get_goal(tmp_path, "tophand:f2-77:0.0")
     assert stored is not None
     assert set(stored.open_asks) == set(asks)

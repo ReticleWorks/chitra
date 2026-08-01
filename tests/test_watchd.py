@@ -4,28 +4,15 @@ from __future__ import annotations
 
 import json
 import subprocess
-import threading
 from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 
-from chitra.dispatch import DispatchOrder
-from chitra.goal_enforcement import ReviewerVerdict, ReviewFinding
+from chitra.goal_enforcement import ReviewerVerdict
 from chitra.goals import GoalRecord, get_goal, upsert_goal
-from chitra.lane_activity import load_lane_activity
 from chitra.triaged import parse_event_line
-from chitra.watchd import (
-    Pane,
-    Watchd,
-    WatchdConfig,
-    append_event,
-    build_arg_parser,
-    event_line,
-    list_panes,
-    normalize,
-    resolve_config,
-)
+from chitra.watchd import Pane, Watchd, WatchdConfig, append_event, event_line, list_panes, normalize, resolve_config
 
 
 def _completed(command: Sequence[str], stdout: str, returncode: int = 0) -> subprocess.CompletedProcess[str]:
@@ -93,27 +80,6 @@ class _AcceptingReviewer:
         )
 
 
-class _RejectingReviewer:
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-
-    def review(self, goal, behavior, reviewer_id: str) -> ReviewerVerdict:
-        self.calls.append(reviewer_id)
-        return ReviewerVerdict(
-            reviewer_id=reviewer_id,
-            goal_contract_id=goal.contract_id,
-            behavior_sha256=behavior.behavior_sha256,
-            verdict="reject",
-            findings=(
-                ReviewFinding(
-                    code="unsupported_completion",
-                    detail="The completion claim lacks the required proof.",
-                    citation="The forced completion review was completed and deployed.",
-                ),
-            ),
-        )
-
-
 def _tracked_goal(root: Path) -> GoalRecord:
     return upsert_goal(
         root,
@@ -121,7 +87,7 @@ def _tracked_goal(root: Path) -> GoalRecord:
             session_ref="localhost:fleet:0.0",
             intent="Deliver the requested gate while preserving every explicit operator boundary.",
             goal="Build and verify the requested forced completion review.",
-            done_when="The live completion probe passes with cited evidence.",
+            done_when="Both the completion probe and cited evidence validate.",
             scope="WS1 source tests and documentation only.",
             source="task-file:/tmp/ws1.md",
             status="working",
@@ -129,99 +95,14 @@ def _tracked_goal(root: Path) -> GoalRecord:
     )
 
 
-class _BlockingReviewer:
-    """A reviewer whose review() blocks until released, to prove poll_once
-    never runs the isolated review inline on the sensing thread."""
-
-    def __init__(self) -> None:
-        self.release = threading.Event()
-        self.entered = threading.Event()
-        self.calls: list[str] = []
-
-    def review(self, goal, behavior, reviewer_id: str) -> ReviewerVerdict:
-        self.entered.set()
-        # Block until the test releases us. If poll_once ran this inline it would
-        # deadlock the sensing loop; the test proceeding past poll_once proves
-        # the review is off-thread.
-        self.release.wait(timeout=30)
-        self.calls.append(reviewer_id)
-        return ReviewerVerdict(
-            reviewer_id=reviewer_id,
-            goal_contract_id=goal.contract_id,
-            behavior_sha256=behavior.behavior_sha256,
-            verdict="accept",
-        )
-
-
-_CITED_CLAIM_CAPTURE = """The forced completion review was completed and deployed at SHA abc1234.
-It reviews every finished lane turn before any done state is trusted.
-Live health probe status=200 with 24 requests; /tmp/live-review.log.
-\u276f
-"""
-
-
-def test_poll_once_does_not_block_on_a_slow_reviewer_and_later_drains_it(tmp_path: Path) -> None:
-    goal = _tracked_goal(tmp_path)
-    reviewer = _BlockingReviewer()
-    state = {"polls": 0}
-
-    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
-        if command[1] == "list-panes":
-            return _completed(command, "%1\tfleet:0.0\n")
-        if command[1] == "capture-pane":
-            # First capture is a mid-turn baseline; every capture after the
-            # baseline is the finished completion-claim turn (stable content).
-            content = "working on the implementation\nesc to interrupt\n\u276f\n" if state["polls"] == 0 else _CITED_CLAIM_CAPTURE
-            return _completed(command, content)
-        raise AssertionError(f"unexpected command: {command}")
-
-    watcher = Watchd(
-        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"),
-        runner=runner,
-        reviewer=reviewer,
-    )
-    try:
-        # First poll: no completion claim yet, establishes the baseline.
-        watcher.poll_once()
-        state["polls"] = 1
-        # Second poll: completion-claim turn-end. This SUBMITS the review to the
-        # executor and returns; if it ran the blocking reviewer inline the call
-        # would hang for the reviewer's 30s wait and never return here.
-        watcher.poll_once()
-        # The review is genuinely running off-thread (it entered review()).
-        assert reviewer.entered.wait(timeout=5)
-        # ...but it has NOT finalized: the lane is in-flight, not done/blocked.
-        stored = get_goal(tmp_path, goal.session_ref)
-        assert stored is not None
-        assert stored.status == "turn-finished-unverified"
-        assert "in flight" in stored.now
-        assert reviewer.calls == []  # reviewer still blocked, no verdict yet
-
-        # Release the reviewer; a later poll drains the completed future.
-        reviewer.release.set()
-        for _ in range(50):
-            watcher.poll_once()
-            drained = get_goal(tmp_path, goal.session_ref)
-            assert drained is not None
-            if drained.status == "done-pending-close":
-                break
-            threading.Event().wait(0.05)
-        drained = get_goal(tmp_path, goal.session_ref)
-        assert drained is not None
-        assert drained.status == "done-pending-close"
-    finally:
-        reviewer.release.set()
-        watcher.shutdown()
-
-
 def test_turn_end_automatically_runs_review_and_marks_cited_completion_pending_close(tmp_path: Path) -> None:
     goal = _tracked_goal(tmp_path)
     captures = iter(
         [
             "working on the implementation\nesc to interrupt\n❯\n",
-            """The forced completion review was completed and deployed at SHA abc1234.
-It reviews every finished lane turn before any done state is trusted.
-Live health probe status=200 with 24 requests; /tmp/live-review.log.
+            """What was built: The forced completion review was completed and deployed at SHA abc1234.
+What it does: It reviews every finished lane turn before any done state is trusted.
+Does it actually work: Live health probe status=200 with 24 requests; /tmp/live-review.log.
 ❯
 """,
         ]
@@ -231,7 +112,7 @@ Live health probe status=200 with 24 requests; /tmp/live-review.log.
         if command[1] == "list-panes":
             return _completed(command, "%1\tfleet:0.0\n")
         if command[1] == "capture-pane":
-            return _completed(command, next(captures, _CITED_CLAIM_CAPTURE))
+            return _completed(command, next(captures))
         raise AssertionError(f"unexpected command: {command}")
 
     reviewer = _AcceptingReviewer()
@@ -240,13 +121,6 @@ Live health probe status=200 with 24 requests; /tmp/live-review.log.
     assert watcher.poll_once() == 0
     assert watcher.poll_once() == 1
 
-    for _ in range(50):
-        stored = get_goal(tmp_path, goal.session_ref)
-        assert stored is not None
-        if stored.status == "done-pending-close":
-            break
-        threading.Event().wait(0.01)
-        watcher.poll_once()
     stored = get_goal(tmp_path, goal.session_ref)
     assert stored is not None
     assert stored.status == "done-pending-close"
@@ -257,50 +131,8 @@ Live health probe status=200 with 24 requests; /tmp/live-review.log.
     assert review["completion_verdict"] == "CLEAN"
 
 
-def test_rejected_turn_review_enqueues_reasoned_dispatch(tmp_path: Path) -> None:
-    goal = _tracked_goal(tmp_path)
-    reviewer = _RejectingReviewer()
-    state = {"finished": False}
-
-    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
-        if command[1] == "list-panes":
-            return _completed(command, "%1\tfleet:0.0\n")
-        if command[1] == "capture-pane":
-            content = _CITED_CLAIM_CAPTURE if state["finished"] else "working on the implementation\nesc to interrupt\n❯\n"
-            return _completed(command, content)
-        raise AssertionError(f"unexpected command: {command}")
-
-    watcher = Watchd(
-        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"),
-        runner=runner,
-        reviewer=reviewer,
-    )
-    try:
-        watcher.poll_once()
-        state["finished"] = True
-        watcher.poll_once()
-        for _ in range(50):
-            orders = list((tmp_path / "queue" / "orders").glob("*.json"))
-            if orders:
-                break
-            threading.Event().wait(0.05)
-            watcher.poll_once()
-
-        assert len(orders) == 1
-        order = DispatchOrder.model_validate_json(orders[0].read_text(encoding="utf-8"))
-        assert order.session_ref == goal.session_ref
-        assert order.message_kind == "reasoned_action"
-        assert order.decision_attestation is not None
-        assert order.decision_attestation.review_verdict == "reject"
-        assert order.decision_attestation.operator_confirmed is True
-        assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
-    finally:
-        watcher.shutdown()
-
-
 def test_turn_end_without_claim_is_finished_unverified_not_idle_green(tmp_path: Path) -> None:
     goal = _tracked_goal(tmp_path)
-    reviewer = _AcceptingReviewer()
 
     def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
         if command[1] == "list-panes":
@@ -312,7 +144,7 @@ def test_turn_end_without_claim_is_finished_unverified_not_idle_green(tmp_path: 
     watcher = Watchd(
         WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"),
         runner=runner,
-        reviewer=reviewer,
+        reviewer=_AcceptingReviewer(),
     )
     watcher.poll_once()
 
@@ -320,10 +152,6 @@ def test_turn_end_without_claim_is_finished_unverified_not_idle_green(tmp_path: 
     assert stored is not None
     assert stored.status == "turn-finished-unverified"
     assert "without a completion claim" in stored.now
-    assert reviewer.calls == []
-    review = json.loads((tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8"))
-    assert review["review_verdict"] == "unavailable"
-    assert "isolated review was not run" in review["summary"]
 
 
 def test_list_panes_uses_live_tmux_enumeration_and_deduplicates_pane_id() -> None:
@@ -334,36 +162,7 @@ def test_list_panes_uses_live_tmux_enumeration_and_deduplicates_pane_id() -> Non
         return _completed(command, "%1\tfleet:0.0\n%2\tfleet:0.1\n%1\tduplicate:9.9\n")
 
     assert list_panes(runner=runner) == [Pane(pane_id="%1", target="fleet:0.0"), Pane(pane_id="%2", target="fleet:0.1")]
-    assert seen_commands == [
-        [
-            "tmux",
-            "list-panes",
-            "-a",
-            "-F",
-            "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{session_attached}\t#{pane_current_command}",
-        ]
-    ]
-
-
-def test_watchd_persists_backend_neutral_change_recency_and_attachment(tmp_path: Path) -> None:
-    _tracked_goal(tmp_path)
-
-    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
-        if command[1] == "list-panes":
-            return _completed(command, "%1\tfleet:0.0\t0\tcodex\n")
-        if command[1] == "capture-pane":
-            return _completed(command, "working on the requested change\n")
-        raise AssertionError(f"unexpected command: {command}")
-
-    watcher = Watchd(WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"), runner=runner)
-    watcher.poll_once()
-
-    activity = load_lane_activity(tmp_path)
-    assert len(activity) == 1
-    assert activity[0].session_ref == "localhost:fleet:0.0"
-    assert activity[0].attached is False
-    assert activity[0].backend == "codex"
-    assert activity[0].last_change_at
+    assert seen_commands == [["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}"]]
 
 
 def test_list_panes_can_isolate_a_session_namespace() -> None:
@@ -373,7 +172,9 @@ def test_list_panes_can_isolate_a_session_namespace() -> None:
             "%1\tmonitor:0.0\n%2\tboomtown:0.0\n%3\tboomtown-design-a:0.0\n%4\tother:0.0\n",
         )
 
-    assert list_panes(runner=runner, session_prefixes=("boomtown-",)) == [Pane(pane_id="%3", target="boomtown-design-a:0.0")]
+    assert list_panes(runner=runner, session_prefixes=("boomtown-",)) == [
+        Pane(pane_id="%3", target="boomtown-design-a:0.0")
+    ]
     assert list_panes(runner=runner, excluded_session_prefixes=("boomtown",)) == [
         Pane(pane_id="%1", target="monitor:0.0"),
         Pane(pane_id="%4", target="other:0.0"),
@@ -408,10 +209,6 @@ def test_resolve_config_uses_chitra_state_and_watchd_environment(monkeypatch: py
     monkeypatch.setenv("CHITRA_WATCHD_PANES", "%1, %2")
     monkeypatch.setenv("CHITRA_WATCHD_SESSION_PREFIXES", "boomtown-, boomtown-review-")
     monkeypatch.setenv("CHITRA_WATCHD_EXCLUDE_SESSION_PREFIXES", "boomtown-control")
-    monkeypatch.setenv("CHITRA_WATCHD_REVIEWER_COUNT", "1")
-    monkeypatch.setenv("CHITRA_WATCHD_REVIEWER_COMMAND", "/opt/chitra/bin/review-with-monitor-credentials")
-    monkeypatch.setenv("CHITRA_WATCHD_REVIEWER_MODEL", "operator-cheap-model")
-    monkeypatch.setenv("CHITRA_WATCHD_REASONED_DISPATCH_ENABLED", "false")
 
     config = resolve_config()
 
@@ -420,40 +217,3 @@ def test_resolve_config_uses_chitra_state_and_watchd_environment(monkeypatch: py
     assert config.panes_override == ("%1", "%2")
     assert config.session_prefixes == ("boomtown-", "boomtown-review-")
     assert config.excluded_session_prefixes == ("boomtown-control",)
-    assert config.reviewer_count == 1
-    assert config.reviewer_command == "/opt/chitra/bin/review-with-monitor-credentials"
-    assert config.reviewer_model == "operator-cheap-model"
-    assert config.reasoned_dispatch_enabled is False
-
-
-def test_reviewer_config_precedence_is_cli_then_env_then_pinned_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    defaults = resolve_config(state_dir=tmp_path / "defaults")
-    assert defaults.reviewer_count == 2
-    assert defaults.reviewer_command == "claude"
-    assert defaults.reviewer_model is None
-    assert defaults.reasoned_dispatch_enabled is True
-
-    monkeypatch.setenv("CHITRA_WATCHD_REVIEWER_COUNT", "1")
-    monkeypatch.setenv("CHITRA_WATCHD_REVIEWER_COMMAND", "env-claude")
-    monkeypatch.setenv("CHITRA_WATCHD_REVIEWER_MODEL", "env-model")
-    environment = resolve_config(state_dir=tmp_path / "environment")
-    assert environment.reviewer_count == 1
-    assert environment.reviewer_command == "env-claude"
-    assert environment.reviewer_model == "env-model"
-
-    args = build_arg_parser().parse_args(["--reviewer-count", "3", "--reviewer-command", "cli-claude", "--reviewer-model", "cli-model"])
-    cli = resolve_config(
-        state_dir=tmp_path / "cli",
-        reviewer_count=args.reviewer_count,
-        reviewer_command=args.reviewer_command,
-        reviewer_model=args.reviewer_model,
-    )
-    assert cli.reviewer_count == 3
-    assert cli.reviewer_command == "cli-claude"
-    assert cli.reviewer_model == "cli-model"
-
-
-@pytest.mark.parametrize("reviewer_count", [0, -1])
-def test_resolve_config_rejects_non_positive_reviewer_count(tmp_path: Path, reviewer_count: int) -> None:
-    with pytest.raises(ValueError, match="reviewer_count must be a positive integer"):
-        resolve_config(state_dir=tmp_path, reviewer_count=reviewer_count)
