@@ -39,7 +39,7 @@ jobs:
   publish:
     name: Publish to PyPI
     needs: build
-    runs-on: reticle-ci-heavy
+    runs-on: [self-hosted, reticle-ci-light]
     environment:
       name: pypi
       url: https://pypi.org/project/chitra-monitor/

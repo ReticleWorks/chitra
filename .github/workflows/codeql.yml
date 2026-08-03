@@ -7,11 +7,8 @@ on:
 
 jobs:
   analyze:
-    # EXCEPTION: the self-hosted fleet is Linux/ARM64, while the current
-    # CodeQL CLI release v2.26.2 publishes codeql-linux64.zip (x86_64),
-    # codeql-osx64.zip, and codeql-win64.zip, with no Linux/ARM64 bundle.
-    # Keep this weekly scan on hosted x64 until CodeQL publishes a native
-    # Linux/ARM64 bundle.
+    # GitHub's CodeQL CLI does not support the estate's Linux ARM64 runners.
+    # Keep this weekly scan on hosted x64 rather than dropping the security gate.
     runs-on: ubuntu-latest
     permissions:
       security-events: write
