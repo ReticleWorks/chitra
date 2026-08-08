@@ -20,6 +20,7 @@ Understand how chitra works:
 
 For specific challenges and advanced topics:
 
+- **[boardd](boardd.md)** — Live fleet dashboard: pure reader over the chitra state dir with SSE push and a plain-language board.
 - **[Design notes](DESIGN.md)** — Origin, bounded reasoning boundary, done-condition ownership, distribution, single-writer rule, and extensibility model.
 - **[Evasion taxonomy](evasion-taxonomy.md)** — Dispatch and state-observation attack surfaces.
 - **[Pause and recovery](pause-recovery.md)** — Rate-limit hold mechanics and graceful pause phases.

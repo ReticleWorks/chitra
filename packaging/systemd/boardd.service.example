@@ -1,0 +1,38 @@
+# boardd — live fleet dashboard (DRAFT unit, NOT deployed).
+#
+# Target host: twinridge. boardd is a pure reader over the chitra state dir;
+# it must never gain write access to /var/lib/polyphony-chitra.
+#
+# Deploy checklist (see docs/boardd.md):
+#   - install the app + venv at /opt/boardd (released artifact, not a checkout)
+#   - add a tool-registry entry for boardd in the same PR that lands this unit
+#   - serve on the tailnet only; no public bind
+
+[Unit]
+Description=boardd live fleet dashboard (pure reader over chitra state)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# Dedicated non-privileged user; must NOT be the chitra daemon user.
+User=boardd
+Group=boardd
+Environment=BOARDD_STATE_DIR=/var/lib/polyphony-chitra
+ExecStart=/opt/boardd/venv/bin/uvicorn boardd.app:app --host 100.0.0.0 --port 8480
+# ^ replace 100.0.0.0 with twinridge's tailnet address at deploy time; never 0.0.0.0.
+Restart=on-failure
+RestartSec=3
+
+# Hardening: reader-only posture, enforced by the kernel not by promise.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadOnlyPaths=/var/lib/polyphony-chitra
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

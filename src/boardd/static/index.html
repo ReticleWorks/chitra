@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>boardd</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <span class="mark"><span class="glyph">b</span>boardd</span>
+  <span class="tb-sep"></span>
+  <span class="live-dot pulse" id="live-dot"></span>
+  <span class="tb-state" id="live-state">Connecting&hellip;</span>
+  <span class="tb-move" id="move-sentence"></span>
+  <span class="spacer"></span>
+  <button class="btn quiet" id="retry" hidden>Retry</button>
+  <nav class="tabs" role="tablist">
+    <button class="tab on" id="tab-cockpit" role="tab" aria-selected="true">Cockpit</button>
+    <button class="tab" id="tab-history" role="tab" aria-selected="false">History</button>
+  </nav>
+</header>
+
+<main>
+  <div id="banners"></div>
+
+  <section id="view-cockpit">
+    <section class="zone" id="zone-since">
+      <h3>Since you looked</h3>
+      <div class="card since" id="since-list"></div>
+    </section>
+
+    <section class="zone" id="zone-needs" hidden>
+      <div class="card needsyou" id="needs-card"></div>
+    </section>
+
+    <p class="movesum" id="summary-sentence"></p>
+
+    <section class="lanegrid" id="lanegrid" aria-label="Lanes"></section>
+  </section>
+
+  <section id="view-history" hidden>
+    <p class="hist-legend" id="hist-legend"></p>
+    <div id="hist-groups"></div>
+  </section>
+
+  <footer class="opsfoot" id="opsfoot"></footer>
+</main>
+
+<div class="scrim" id="scrim" hidden></div>
+<aside class="drawer" id="drawer" hidden aria-modal="true" role="dialog"></aside>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

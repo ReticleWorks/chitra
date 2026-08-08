@@ -31,12 +31,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+boardd = [
+    "fastapi>=0.141.1,<1",
+    "uvicorn>=0.52.1,<1",
+    "watchfiles>=1.2.0,<2",
+]
 test = [
+    "chitra-monitor[boardd]",
     "pytest>=9.1.1,<9.2",
     "pytest-cov>=7.1.0",
     "ruff>=0.15.21,<0.16",
     "mypy>=2.2.0,<3",
     "types-PyYAML>=6.0.12.20260518,<7",
+    "httpx>=0.28.1,<1",
 ]
 
 [project.scripts]
@@ -60,7 +67,7 @@ Issues = "https://github.com/ReticleWorks/chitra/issues"
 Changelog = "https://github.com/ReticleWorks/chitra/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/chitra"]
+packages = ["src/chitra", "src/boardd"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -75,3 +82,8 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# The boardd seed generator embeds full-sentence translation pairs; keeping
+# each raw/translated line intact beats wrapping them at 140 columns.
+"tools/gen_boardd_seed.py" = ["E501"]
