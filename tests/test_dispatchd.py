@@ -17,8 +17,9 @@ import chitra.ledger as ledger_mod
 from chitra.dispatch import DISPATCH_VERIFY_WAIT_SECONDS, DispatchOrder, DispatchResult, DispatchStatus, LaneLock, LaneLockError
 from chitra.dispatchd import build_arg_parser, main, process_one_order, requeue_deferred_for_session, resolve_session_prefixes, run_once
 from chitra.goals import GoalRecord, hold_goal, upsert_goal
+from chitra.policy_config import PolicyConfig
 from chitra.reasoning import DecisionAttestation
-from chitra.routing_config import ROUTING_CONFIG_ENV_VAR
+from chitra.routing_config import ROUTING_CONFIG_ENV_VAR, RoutingConfig
 
 
 def _write_order(orders_dir: Path, order: DispatchOrder) -> Path:
@@ -1562,3 +1563,100 @@ def test_missing_routing_config_file_raises_clearly(tmp_path: Path, monkeypatch:
             ledger_key_path=tmp_path / "ledger.key",
             routing_config_path=tmp_path / "does-not-exist.yaml",
         )
+
+
+def test_dispatchd_once_keeps_malformed_config_fail_loud(tmp_path: Path) -> None:
+    config_path = tmp_path / "routing.yaml"
+    config_path.write_text("defaults: [not a mapping: :", encoding="utf-8")
+
+    with pytest.raises(yaml.YAMLError):
+        main(
+            [
+                "--once",
+                "--queue-dir",
+                str(tmp_path / "queue"),
+                "--routing-config-path",
+                str(config_path),
+            ]
+        )
+
+
+def test_run_forever_keeps_last_successful_configs_after_reload_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    good_routing = RoutingConfig(defaults={"code-review": "sonnet"})
+    good_policy = PolicyConfig()
+    routing_loads: list[RoutingConfig | Exception] = [good_routing, ValueError("bad routing edit")]
+    policy_loads: list[PolicyConfig | Exception] = [good_policy, ValueError("bad policy edit")]
+    observed: list[tuple[RoutingConfig | None, PolicyConfig]] = []
+    errors: list[tuple[str, dict[str, Any]]] = []
+
+    class StopDaemonLoop(Exception):
+        pass
+
+    class RecordingLogger:
+        def info(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        def error(self, event: str, **kwargs: Any) -> None:
+            errors.append((event, kwargs))
+
+    def load_routing(*args: Any, **kwargs: Any) -> RoutingConfig:
+        value = routing_loads.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def load_policy(*args: Any, **kwargs: Any) -> PolicyConfig:
+        value = policy_loads.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def capture_run_once(*args: Any, **kwargs: Any) -> list[DispatchResult]:
+        observed.append((kwargs["_preloaded_routing_config"], kwargs["_preloaded_policy"]))
+        if len(observed) == 2:
+            raise StopDaemonLoop
+        return []
+
+    monkeypatch.setattr(dispatchd_mod, "logger", RecordingLogger())
+    monkeypatch.setattr(dispatchd_mod, "load_routing_config", load_routing)
+    monkeypatch.setattr(dispatchd_mod, "load_policy_config", load_policy)
+    monkeypatch.setattr(dispatchd_mod, "run_once", capture_run_once)
+
+    with pytest.raises(StopDaemonLoop):
+        dispatchd_mod.run_forever(tmp_path / "queue", poll_seconds=0)
+
+    assert observed == [(good_routing, good_policy), (good_routing, good_policy)]
+    assert [event for event, _ in errors] == [
+        "dispatchd_routing_config_reload_failed",
+        "dispatchd_policy_config_reload_failed",
+    ]
+    assert all(kwargs["exc_info"] is True for _, kwargs in errors)
+
+
+def test_run_forever_uses_shipped_defaults_when_no_config_has_loaded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    observed: list[tuple[RoutingConfig | None, PolicyConfig]] = []
+
+    class StopDaemonLoop(Exception):
+        pass
+
+    def fail_routing(*args: Any, **kwargs: Any) -> RoutingConfig:
+        raise OSError("routing file is unreadable")
+
+    def fail_policy(*args: Any, **kwargs: Any) -> PolicyConfig:
+        raise ValueError("policy file is invalid")
+
+    def capture_run_once(*args: Any, **kwargs: Any) -> list[DispatchResult]:
+        observed.append((kwargs["_preloaded_routing_config"], kwargs["_preloaded_policy"]))
+        raise StopDaemonLoop
+
+    monkeypatch.setattr(dispatchd_mod, "load_routing_config", fail_routing)
+    monkeypatch.setattr(dispatchd_mod, "load_policy_config", fail_policy)
+    monkeypatch.setattr(dispatchd_mod, "run_once", capture_run_once)
+
+    with pytest.raises(StopDaemonLoop):
+        dispatchd_mod.run_forever(tmp_path / "queue", poll_seconds=0)
+
+    assert observed[0][0] is None
+    assert observed[0][1] == PolicyConfig()

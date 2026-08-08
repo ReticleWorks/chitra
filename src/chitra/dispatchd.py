@@ -128,6 +128,14 @@ logger = structlog.get_logger(__name__)
 DEFAULT_POLL_SECONDS = 1.0
 DEFAULT_LANE_LOCK_RETRY_ATTEMPTS = 20
 
+
+class _ConfigNotPreloaded:
+    """Sentinel that keeps ``None`` available as a real routing default."""
+
+
+_CONFIG_NOT_PRELOADED = _ConfigNotPreloaded()
+
+
 # Sealed allowlist: the only task_types dispatchd itself will honor a
 # caller-set bypass_rate_limit_freeze=True for. Owned here, not by the
 # order -- see this module's docstring.
@@ -961,6 +969,8 @@ def run_once(
     allowed_session_prefixes: tuple[str, ...] = (),
     denied_session_prefixes: tuple[str, ...] = (),
     lane_lock_retry_attempts: int = DEFAULT_LANE_LOCK_RETRY_ATTEMPTS,
+    _preloaded_routing_config: RoutingConfig | None | _ConfigNotPreloaded = _CONFIG_NOT_PRELOADED,
+    _preloaded_policy: PolicyConfig | _ConfigNotPreloaded = _CONFIG_NOT_PRELOADED,
 ) -> list[DispatchResult]:
     """Process every pending order in ``queue_dir/orders`` once, FIFO by mtime.
 
@@ -975,14 +985,25 @@ def run_once(
 
     ``goals_root`` is forwarded to ``process_one_order``'s rate-limit
     freeze/defer check on every order (see that function's docstring).
+
+    ``run_forever`` passes preloaded config values so it can fall back to the
+    last successful load after a bad live edit. Ordinary callers, including
+    ``--once``, leave those private arguments unset and get fail-loud config
+    loading from this function.
     """
     if lane_lock_retry_attempts < 1:
         raise ValueError("lane_lock_retry_attempts must be at least 1")
     queue_dir = queue_dir or default_queue_dir()
     orders_dir, results_dir, processed_dir = _ensure_queue_dirs(queue_dir)
     _reclaim_stale_in_flight(queue_dir)
-    routing_config = load_routing_config(routing_config_path)
-    policy = load_policy_config(policy_config_path)
+    if isinstance(_preloaded_routing_config, _ConfigNotPreloaded):
+        routing_config = load_routing_config(routing_config_path)
+    else:
+        routing_config = _preloaded_routing_config
+    if isinstance(_preloaded_policy, _ConfigNotPreloaded):
+        policy = load_policy_config(policy_config_path)
+    else:
+        policy = _preloaded_policy
     dated: list[tuple[float, Path]] = []
     for order_path in orders_dir.glob("*.json"):
         try:
@@ -1042,10 +1063,42 @@ def run_forever(
     denied_session_prefixes: tuple[str, ...] = (),
     lane_lock_retry_attempts: int = DEFAULT_LANE_LOCK_RETRY_ATTEMPTS,
 ) -> None:
-    """Run the daemon loop: drain the queue, sleep, repeat. Runs until killed."""
+    """Run the daemon loop: drain the queue, sleep, repeat. Runs until killed.
+
+    Config reload errors are logged with their traceback and fall back to the
+    last successfully loaded value for that pass. A fresh daemon with no
+    usable config starts from the shipped routing/policy defaults instead of
+    exiting into a supervisor restart loop.
+    """
     queue_dir = queue_dir or default_queue_dir()
     logger.info("dispatchd_started", queue_dir=str(queue_dir), poll_seconds=poll_seconds)
+    last_routing_config: RoutingConfig | None = None
+    last_policy = PolicyConfig()
     while True:
+        try:
+            routing_config = load_routing_config(routing_config_path)
+        except Exception:  # noqa: BLE001 -- every config-loader error has one safe daemon fallback
+            logger.error(
+                "dispatchd_routing_config_reload_failed",
+                path=str(routing_config_path) if routing_config_path is not None else "CHITRA_ROUTING_CONFIG",
+                exc_info=True,
+            )
+            routing_config = last_routing_config
+        else:
+            last_routing_config = routing_config
+
+        try:
+            policy = load_policy_config(policy_config_path)
+        except Exception:  # noqa: BLE001 -- every config-loader error has one safe daemon fallback
+            logger.error(
+                "dispatchd_policy_config_reload_failed",
+                path=str(policy_config_path) if policy_config_path is not None else "CHITRA_POLICY_CONFIG",
+                exc_info=True,
+            )
+            policy = last_policy
+        else:
+            last_policy = policy
+
         run_once(
             queue_dir,
             lock_dir=lock_dir,
@@ -1060,6 +1113,8 @@ def run_forever(
             allowed_session_prefixes=allowed_session_prefixes,
             denied_session_prefixes=denied_session_prefixes,
             lane_lock_retry_attempts=lane_lock_retry_attempts,
+            _preloaded_routing_config=routing_config,
+            _preloaded_policy=policy,
         )
         time.sleep(poll_seconds)
 
