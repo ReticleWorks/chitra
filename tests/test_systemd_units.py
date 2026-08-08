@@ -22,6 +22,7 @@ def test_shipped_systemd_environment_variables_are_consumed_by_their_entrypoints
     so the matching entrypoint parsers are checked as well.
     """
     expected = {
+        "boardd.service.example": {"BOARDD_STATE_DIR"},
         "chitra-dispatchd.service.example": {"REMOTE_DISPATCH_HOSTS", "CHITRA_LANE_LOCK_DIR"},
         "chitra-ownership-provider.service.example": {"CHITRA_HOST_ID"},
         "chitra-petra.service.example": {"PETRA_HOST_UUID"},
@@ -49,3 +50,7 @@ def test_shipped_systemd_environment_variables_are_consumed_by_their_entrypoints
     petra_source = (REPO_ROOT / "src" / "chitra" / "petra.py").read_text(encoding="utf-8")
     assert "${PETRA_HOST_UUID}" in petra_unit
     assert '"--host-uuid"' in petra_source
+
+    boardd_source = (REPO_ROOT / "src" / "boardd" / "config.py").read_text(encoding="utf-8")
+    for env_name in expected["boardd.service.example"]:
+        assert f'"{env_name}"' in boardd_source
