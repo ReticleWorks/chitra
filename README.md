@@ -54,6 +54,12 @@ chitra installs twelve command-line entrypoints backed by a set of small, single
 **Rendering**
 - `chitra.board` / `chitra.convlog` — a terminal roster of goals and open asks, and an append-only operator-brief conversation log.
 
+**Other shipped modules**
+- `chitra.artifacts`, `chitra.capabilities`, `chitra.goals_cli`, and `chitra.replay_eval` — operator tools for artifact state, capability control, goals, and replay checks.
+- `chitra.ownership`, `chitra.ownership_provider`, and `chitra.petra` — read-only ownership lookup, a fail-closed provider, and an observe-only pressure authority.
+- `chitra._fsio`, `chitra.board_updater`, `chitra.lane_activity`, `chitra.lane_read`, `chitra.lexicon`, `chitra.load_shed`, `chitra.orders`, `chitra.outcomes`, and `chitra.rate_limit_state` — shared queue, state, lane, and load-shed primitives.
+- `chitra.policy_config`, `chitra.reasoned_dispatch`, `chitra.reasoning`, `chitra.recovery`, `chitra.routing_config`, `chitra.state_paths`, and `chitra.taxonomy` — policy, reasoning, recovery, routing, state-path, and taxonomy primitives.
+
 ## Delivering into a tmux pane
 
 Delivery into a live tmux session follows one path:
@@ -70,7 +76,7 @@ For a remote target, each command is the same, ssh-wrapped to run on the actual 
 
 - **Single writer.** `dispatchd` holds a `LaneLock` per session id across each delivery, so two writers can't race to paste into the same session and corrupt its next turn.
 - **Idempotent.** Once a result file exists for an order, it is never redispatched, even across a restart. A crash between paste and result is reconciled with a send-nonce marker plus the same transcript-grep check, not a blind second paste.
-- **Authenticated.** Every successful delivery appends an HMAC-SHA256-signed record to an append-only JSONL ledger; a reader with the signing key can prove a given message was delivered. This is a trusted-host model — anyone who can write to the ledger file can rewrite it — so treat "not in the ledger" as a strong signal, not tamper-proof evidence. See `chitra.ledger.verify_delivery`.
+- **Authenticated.** Every successful delivery appends an HMAC-SHA256-signed record to an append-only JSONL ledger; a reader with the signing key can prove a given message was delivered. Append-only behavior is a convention backed by file permissions, not a hash chain or counter, so a reader cannot detect ledger truncation or edits. Under the trusted-host assumption, "not in the ledger" suggests no chitra delivery; it is not proof of non-delivery. See `chitra.ledger.verify_delivery`.
 
 ## Running the daemons
 
@@ -98,7 +104,7 @@ Each entrypoint is configured with CLI flags (`--help` on any command lists them
 
 The full set — ssh options, triage log paths, transcript globs — is documented per-command via `--help`.
 
-**Routing.** A caller can tag a `DispatchOrder` with an opaque `task_type`. If a routing config is set, `dispatchd` maps that to a `routing_hint` (a model/harness preference the caller's system uses); an explicit `routing_hint` always wins, and chitra carries the hint through to the ledger but never acts on it.
+**Routing.** A caller can tag a `DispatchOrder` with an opaque `task_type`. If a routing config is set, `dispatchd` maps that to a `routing_hint` (a model/harness preference the caller's system uses); an explicit `routing_hint` always wins. chitra carries both fields through `DispatchResult` and, for a successful delivery, the signed ledger; it does not make routing decisions beyond the configured lookup.
 
 ## Install
 
