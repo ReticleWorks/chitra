@@ -13,8 +13,10 @@ StateDirectory=chitra
 # Comma-separated allowlist of remote hostnames dispatchd may target over ssh.
 # Leave empty (the default) to allow local-host delivery only.
 Environment=REMOTE_DISPATCH_HOSTS=
+# LaneLock reads this path when --lock-dir is not supplied.
+Environment=CHITRA_LANE_LOCK_DIR=/var/lib/chitra/locks
 # Fill in the venv path where `pip install chitra-monitor` (or `pip install -e .`) was run.
-ExecStart=/path/to/venv/bin/dispatchd --queue-dir /var/lib/chitra/queue --lock-dir /var/lib/chitra/locks --ledger-path /var/lib/chitra/ledger.jsonl --ledger-key-path /var/lib/chitra/ledger.key
+ExecStart=/path/to/venv/bin/dispatchd --queue-dir /var/lib/chitra/queue --ledger-path /var/lib/chitra/ledger.jsonl --ledger-key-path /var/lib/chitra/ledger.key
 Restart=always
 RestartSec=10
 TimeoutStopSec=45

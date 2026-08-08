@@ -1,0 +1,51 @@
+"""Drift guards for the shipped systemd service examples."""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SYSTEMD_DIR = REPO_ROOT / "packaging" / "systemd"
+_ENVIRONMENT_NAME = re.compile(r"^Environment=(?P<name>[A-Z][A-Z0-9_]*)=", re.MULTILINE)
+
+
+def _environment_names(unit_path: Path) -> set[str]:
+    return set(_ENVIRONMENT_NAME.findall(unit_path.read_text(encoding="utf-8")))
+
+
+def test_shipped_systemd_environment_variables_are_consumed_by_their_entrypoints() -> None:
+    """Every declared service environment value has a code or CLI consumer.
+
+    The dispatch daemon uses its two values directly. The authority examples
+    intentionally expand their host IDs into required command-line arguments,
+    so the matching entrypoint parsers are checked as well.
+    """
+    expected = {
+        "chitra-dispatchd.service.example": {"REMOTE_DISPATCH_HOSTS", "CHITRA_LANE_LOCK_DIR"},
+        "chitra-ownership-provider.service.example": {"CHITRA_HOST_ID"},
+        "chitra-petra.service.example": {"PETRA_HOST_UUID"},
+        "chitra-rate-limit-guard.service.example": set(),
+        "chitra-rate-limit-guard.timer.example": set(),
+        "chitra-triaged.service.example": set(),
+    }
+    actual = {unit_path.name: _environment_names(unit_path) for unit_path in sorted(SYSTEMD_DIR.glob("*.example"))}
+
+    assert actual == expected
+
+    dispatch_unit = (SYSTEMD_DIR / "chitra-dispatchd.service.example").read_text(encoding="utf-8")
+    dispatch_source = (REPO_ROOT / "src" / "chitra" / "dispatch.py").read_text(encoding="utf-8")
+    for env_name in expected["chitra-dispatchd.service.example"]:
+        assert f'_env("{env_name}"' in dispatch_source
+    dispatch_start = next(line for line in dispatch_unit.splitlines() if line.startswith("ExecStart="))
+    assert "--lock-dir" not in dispatch_start
+
+    ownership_unit = (SYSTEMD_DIR / "chitra-ownership-provider.service.example").read_text(encoding="utf-8")
+    ownership_source = (REPO_ROOT / "src" / "chitra" / "ownership_provider.py").read_text(encoding="utf-8")
+    assert "${CHITRA_HOST_ID}" in ownership_unit
+    assert '"--host-id"' in ownership_source
+
+    petra_unit = (SYSTEMD_DIR / "chitra-petra.service.example").read_text(encoding="utf-8")
+    petra_source = (REPO_ROOT / "src" / "chitra" / "petra.py").read_text(encoding="utf-8")
+    assert "${PETRA_HOST_UUID}" in petra_unit
+    assert '"--host-uuid"' in petra_source

@@ -14,11 +14,12 @@ import yaml
 
 import chitra.dispatchd as dispatchd_mod
 import chitra.ledger as ledger_mod
-from chitra.dispatch import DISPATCH_VERIFY_WAIT_SECONDS, DispatchOrder, DispatchResult, DispatchStatus
+from chitra.dispatch import DISPATCH_VERIFY_WAIT_SECONDS, DispatchOrder, DispatchResult, DispatchStatus, LaneLock, LaneLockError
 from chitra.dispatchd import build_arg_parser, main, process_one_order, requeue_deferred_for_session, resolve_session_prefixes, run_once
 from chitra.goals import GoalRecord, hold_goal, upsert_goal
+from chitra.policy_config import PolicyConfig
 from chitra.reasoning import DecisionAttestation
-from chitra.routing_config import ROUTING_CONFIG_ENV_VAR
+from chitra.routing_config import ROUTING_CONFIG_ENV_VAR, RoutingConfig
 
 
 def _write_order(orders_dir: Path, order: DispatchOrder) -> Path:
@@ -223,6 +224,135 @@ def test_blocked_result_does_not_write_a_ledger_entry(tmp_path: Path, monkeypatc
     assert results[0].status == DispatchStatus.BLOCKED
     # Only a real send is signed/logged — a blocked attempt is not a delivery.
     assert not (tmp_path / "ledger.jsonl").exists()
+
+
+def test_lane_lock_timeout_is_retried_then_succeeds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    lock_attempts = {"count": 0}
+    dispatches = {"count": 0}
+
+    def lock_fails_once(self: LaneLock, **kwargs: Any) -> bool:
+        lock_attempts["count"] += 1
+        if lock_attempts["count"] == 1:
+            raise LaneLockError("test lane is busy")
+        self._acquired = True
+        return True
+
+    def fake_dispatch(order: DispatchOrder, **kwargs: Any) -> DispatchResult:
+        dispatches["count"] += 1
+        return DispatchResult(order_id=order.order_id, session_ref=order.session_ref, status=DispatchStatus.SENT)
+
+    monkeypatch.setattr(LaneLock, "acquire", lock_fails_once)
+    monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", fake_dispatch)
+    queue_dir = tmp_path / "queue"
+    order = DispatchOrder(order_id="retry-then-send", session_ref="localhost:s:0.0", nudge="hi")
+    _write_order(queue_dir / "orders", order)
+
+    first = run_once(queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl")
+
+    retry_state = dispatchd_mod._lane_lock_retry_state_path(queue_dir / "deferred", order.order_id)
+    assert [result.status for result in first] == [DispatchStatus.BLOCKED]
+    assert (queue_dir / "deferred" / "retry-then-send.json").exists()
+    assert not (queue_dir / "results" / "retry-then-send.json").exists()
+    assert json.loads(retry_state.read_text(encoding="utf-8")) == {"attempts": 1}
+
+    second = run_once(queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl")
+
+    assert [result.status for result in second] == [DispatchStatus.SENT]
+    assert dispatches["count"] == 1
+    assert (queue_dir / "processed" / "retry-then-send.json").exists()
+    assert (queue_dir / "results" / "retry-then-send.json").exists()
+    assert not retry_state.exists()
+
+
+def test_lane_lock_retry_exhaustion_writes_only_a_terminal_failed_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def always_busy(self: LaneLock, **kwargs: Any) -> bool:
+        raise LaneLockError("test lane is busy")
+
+    monkeypatch.setattr(LaneLock, "acquire", always_busy)
+    queue_dir = tmp_path / "queue"
+    order = DispatchOrder(order_id="retry-exhausted", session_ref="localhost:s:0.0", nudge="hi")
+    _write_order(queue_dir / "orders", order)
+
+    first = run_once(
+        queue_dir,
+        lock_dir=tmp_path / "locks",
+        ledger_path=tmp_path / "ledger.jsonl",
+        lane_lock_retry_attempts=2,
+    )
+    assert [result.status for result in first] == [DispatchStatus.BLOCKED]
+    assert not (queue_dir / "results" / "retry-exhausted.json").exists()
+    second = run_once(
+        queue_dir,
+        lock_dir=tmp_path / "locks",
+        ledger_path=tmp_path / "ledger.jsonl",
+        lane_lock_retry_attempts=2,
+    )
+
+    retry_state = dispatchd_mod._lane_lock_retry_state_path(queue_dir / "deferred", order.order_id)
+    assert [result.status for result in second] == [DispatchStatus.FAILED]
+    assert second[0].reason == "retry-exhausted"
+    assert DispatchResult.model_validate_json((queue_dir / "results" / "retry-exhausted.json").read_text(encoding="utf-8")).reason == (
+        "retry-exhausted"
+    )
+    assert (queue_dir / "processed" / "retry-exhausted.json").exists()
+    assert not (queue_dir / "deferred" / "retry-exhausted.json").exists()
+    assert not retry_state.exists()
+
+
+def test_lane_lock_deferred_requeue_is_atomic_and_runs_after_pending_orders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash after the deferred rename leaves the retryable order pending.
+
+    The first pass simulates a process death after requeueing the retryable
+    order but before it can claim it. A fresh pass then processes it, and the
+    pre-existing pending order remains ahead of it.
+    """
+    queue_dir = tmp_path / "queue"
+    deferred_order = DispatchOrder(order_id="retry-after-crash", session_ref="localhost:s:0.0", nudge="deferred")
+    pending_order = DispatchOrder(order_id="already-pending", session_ref="localhost:s:0.1", nudge="pending")
+    _write_order(queue_dir / "deferred", deferred_order)
+    _write_order(queue_dir / "orders", pending_order)
+    dispatchd_mod._record_lane_lock_retry_attempt(
+        queue_dir / "deferred", deferred_order.order_id, retry_limit=dispatchd_mod.DEFAULT_LANE_LOCK_RETRY_ATTEMPTS
+    )
+
+    seen: list[str] = []
+
+    def crash_after_requeue(order_path: Path, **kwargs: Any) -> DispatchResult | None:
+        seen.append(order_path.stem)
+        if order_path.stem == deferred_order.order_id:
+            raise RuntimeError("simulated crash after deferred requeue")
+        return None
+
+    real_process_one_order = dispatchd_mod.process_one_order
+    monkeypatch.setattr(dispatchd_mod, "process_one_order", crash_after_requeue)
+    with pytest.raises(RuntimeError, match="simulated crash after deferred requeue"):
+        run_once(queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl")
+
+    retry_state = dispatchd_mod._lane_lock_retry_state_path(queue_dir / "deferred", deferred_order.order_id)
+    assert seen == [pending_order.order_id, deferred_order.order_id]
+    assert (queue_dir / "orders" / "retry-after-crash.json").exists()
+    assert not (queue_dir / "deferred" / "retry-after-crash.json").exists()
+    assert json.loads(retry_state.read_text(encoding="utf-8")) == {"attempts": 1}
+
+    monkeypatch.setattr(dispatchd_mod, "process_one_order", real_process_one_order)
+    monkeypatch.setattr(
+        dispatchd_mod,
+        "dispatch_to_tmux",
+        lambda order, **kwargs: DispatchResult(order_id=order.order_id, session_ref=order.session_ref, status=DispatchStatus.SENT),
+    )
+    recovered = run_once(
+        queue_dir,
+        lock_dir=tmp_path / "locks",
+        ledger_path=tmp_path / "ledger.jsonl",
+        ledger_key_path=tmp_path / "ledger.key",
+    )
+
+    assert {result.order_id for result in recovered} == {pending_order.order_id, deferred_order.order_id}
+    assert not retry_state.exists()
 
 
 def test_dispatchd_blocks_orders_outside_its_owned_session_namespace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1365,6 +1495,8 @@ def test_dispatchd_parser_exposes_policy_invalid_order_and_tuning_flags() -> Non
             "120",
             "--lane-lock-timeout-seconds",
             "9",
+            "--lane-lock-retry-attempts",
+            "7",
             "--allow-session-prefix",
             "boomtown-",
             "--deny-session-prefix",
@@ -1379,6 +1511,7 @@ def test_dispatchd_parser_exposes_policy_invalid_order_and_tuning_flags() -> Non
         120.0,
         9.0,
     )
+    assert args.lane_lock_retry_attempts == 7
     assert args.allow_session_prefix == ["boomtown-"]
     assert args.deny_session_prefix == ["monitor"]
 
@@ -1387,6 +1520,7 @@ def test_dispatchd_parser_uses_the_transcript_write_allowance_by_default() -> No
     args = build_arg_parser().parse_args([])
 
     assert args.post_paste_wait_seconds == DISPATCH_VERIFY_WAIT_SECONDS == 15.0
+    assert args.lane_lock_retry_attempts == dispatchd_mod.DEFAULT_LANE_LOCK_RETRY_ATTEMPTS == 20
 
 
 def test_malformed_routing_config_raises_clearly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1429,3 +1563,100 @@ def test_missing_routing_config_file_raises_clearly(tmp_path: Path, monkeypatch:
             ledger_key_path=tmp_path / "ledger.key",
             routing_config_path=tmp_path / "does-not-exist.yaml",
         )
+
+
+def test_dispatchd_once_keeps_malformed_config_fail_loud(tmp_path: Path) -> None:
+    config_path = tmp_path / "routing.yaml"
+    config_path.write_text("defaults: [not a mapping: :", encoding="utf-8")
+
+    with pytest.raises(yaml.YAMLError):
+        main(
+            [
+                "--once",
+                "--queue-dir",
+                str(tmp_path / "queue"),
+                "--routing-config-path",
+                str(config_path),
+            ]
+        )
+
+
+def test_run_forever_keeps_last_successful_configs_after_reload_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    good_routing = RoutingConfig(defaults={"code-review": "sonnet"})
+    good_policy = PolicyConfig()
+    routing_loads: list[RoutingConfig | Exception] = [good_routing, ValueError("bad routing edit")]
+    policy_loads: list[PolicyConfig | Exception] = [good_policy, ValueError("bad policy edit")]
+    observed: list[tuple[RoutingConfig | None, PolicyConfig]] = []
+    errors: list[tuple[str, dict[str, Any]]] = []
+
+    class StopDaemonLoop(Exception):
+        pass
+
+    class RecordingLogger:
+        def info(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        def error(self, event: str, **kwargs: Any) -> None:
+            errors.append((event, kwargs))
+
+    def load_routing(*args: Any, **kwargs: Any) -> RoutingConfig:
+        value = routing_loads.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def load_policy(*args: Any, **kwargs: Any) -> PolicyConfig:
+        value = policy_loads.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def capture_run_once(*args: Any, **kwargs: Any) -> list[DispatchResult]:
+        observed.append((kwargs["_preloaded_routing_config"], kwargs["_preloaded_policy"]))
+        if len(observed) == 2:
+            raise StopDaemonLoop
+        return []
+
+    monkeypatch.setattr(dispatchd_mod, "logger", RecordingLogger())
+    monkeypatch.setattr(dispatchd_mod, "load_routing_config", load_routing)
+    monkeypatch.setattr(dispatchd_mod, "load_policy_config", load_policy)
+    monkeypatch.setattr(dispatchd_mod, "run_once", capture_run_once)
+
+    with pytest.raises(StopDaemonLoop):
+        dispatchd_mod.run_forever(tmp_path / "queue", poll_seconds=0)
+
+    assert observed == [(good_routing, good_policy), (good_routing, good_policy)]
+    assert [event for event, _ in errors] == [
+        "dispatchd_routing_config_reload_failed",
+        "dispatchd_policy_config_reload_failed",
+    ]
+    assert all(kwargs["exc_info"] is True for _, kwargs in errors)
+
+
+def test_run_forever_uses_shipped_defaults_when_no_config_has_loaded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    observed: list[tuple[RoutingConfig | None, PolicyConfig]] = []
+
+    class StopDaemonLoop(Exception):
+        pass
+
+    def fail_routing(*args: Any, **kwargs: Any) -> RoutingConfig:
+        raise OSError("routing file is unreadable")
+
+    def fail_policy(*args: Any, **kwargs: Any) -> PolicyConfig:
+        raise ValueError("policy file is invalid")
+
+    def capture_run_once(*args: Any, **kwargs: Any) -> list[DispatchResult]:
+        observed.append((kwargs["_preloaded_routing_config"], kwargs["_preloaded_policy"]))
+        raise StopDaemonLoop
+
+    monkeypatch.setattr(dispatchd_mod, "load_routing_config", fail_routing)
+    monkeypatch.setattr(dispatchd_mod, "load_policy_config", fail_policy)
+    monkeypatch.setattr(dispatchd_mod, "run_once", capture_run_once)
+
+    with pytest.raises(StopDaemonLoop):
+        dispatchd_mod.run_forever(tmp_path / "queue", poll_seconds=0)
+
+    assert observed[0][0] is None
+    assert observed[0][1] == PolicyConfig()

@@ -13,7 +13,10 @@ concurrency:
 
 jobs:
   test:
-    runs-on: reticle-ci-heavy
+    # GitHub-hosted: chitra is a public repo and the org's self-hosted runner
+    # group does not (and should not) accept public-repo jobs — fork PRs must
+    # never execute on fleet runners. Publish stays self-hosted (publish.yml).
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         python-version: ["3.12", "3.13"]
