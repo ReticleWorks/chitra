@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SYSTEMD_DIR = REPO_ROOT / "packaging" / "systemd"
 _ENVIRONMENT_NAME = re.compile(r"^Environment=(?P<name>[A-Z][A-Z0-9_]*)=", re.MULTILINE)

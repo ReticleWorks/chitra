@@ -1000,10 +1000,7 @@ def run_once(
         routing_config = load_routing_config(routing_config_path)
     else:
         routing_config = _preloaded_routing_config
-    if isinstance(_preloaded_policy, _ConfigNotPreloaded):
-        policy = load_policy_config(policy_config_path)
-    else:
-        policy = _preloaded_policy
+    policy = load_policy_config(policy_config_path) if isinstance(_preloaded_policy, _ConfigNotPreloaded) else _preloaded_policy
     dated: list[tuple[float, Path]] = []
     for order_path in orders_dir.glob("*.json"):
         try:
