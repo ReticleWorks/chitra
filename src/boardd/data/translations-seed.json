@@ -1,0 +1,338 @@
+{
+  "235770e373b6f8cf22d680e2faa1d1526f1455f5bc7e05e631dabe891428a79c": {
+    "raw": "Build the ramble skill (conversation contract, five routes, RCP v1 outbox format) and the sync step that turns flushed batches into dispatchd orders for the monitor.",
+    "text": "Build the Ramble skill — the conversation contract, the five sorting routes, and the version 1 outbox record format — plus the sync step that turns flushed batches into dispatch orders for the fleet monitor."
+  },
+  "eeeb5d3533fd0752616a86e799b7f23ee2d19bf08647f2bf7f9a46cd5b93461a": {
+    "raw": "conversation-contract simulation running with the operator; findings feed the skill draft",
+    "text": "A simulation of the conversation contract is running with the operator. What it finds feeds the skill draft."
+  },
+  "f4df0bb5f0b5e26559c55d837525ee008d5dadee044e860c1fc2b4adc266c592": {
+    "raw": "Give the operator a conversational sorting surface that files governed intents instead of doing work",
+    "text": "Give the operator a conversational sorting surface that files governed intents instead of doing the work itself."
+  },
+  "219bdd6daa463bb7e75334ab847671987b7d3d2ea7b4475d4082ad75e74e38b6": {
+    "raw": "skill merged",
+    "text": "The skill is merged."
+  },
+  "2bf85c654e6b1437092c3ff077d294468611be2c46a6cfaa3c74ed0af1888be4": {
+    "raw": "RCP validator merged in the chitra repo",
+    "text": "The outbox record validator is merged in the chitra repository."
+  },
+  "b25253caad2de484e71aa878265045726f9eca755487741d8d1a872583b64391": {
+    "raw": "a live flushed batch lands as a dispatchd order and the monitor's decision appears in the decision log",
+    "text": "A real flushed batch arrives as a dispatch order, and the monitor's decision shows up in the decision log."
+  },
+  "464b40b6bbdd71d1c2e0198cbf25122ec9c1a2716b019f78d553cc4e6324858c": {
+    "raw": "research route ships disabled until the dispatchd retry fix is applied on twinridge",
+    "text": "The research route ships switched off until the dispatch retry fix lands on twinridge."
+  },
+  "35afe3bc10907f4e15cc6d525e01aa4112dcd4943e27aea5d21da09113ece33d": {
+    "raw": "Build boardd: a tailnet web dashboard reading the chitra state dir, pushing per-change updates, translating agent updates to plain technical English at render time.",
+    "text": "Build boardd: a private-network web dashboard that reads the fleet state directory, pushes each change to the page, and rewrites agent updates into plain technical English as it renders them."
+  },
+  "f98cdd6536672e88446d0919843060381c045a2cbb3aa9cf196446c3e0609151": {
+    "raw": "v3 mockups published with Linear and Vercel derived visual language",
+    "text": "Version 3 mockups are published, using a visual language derived from Linear and Vercel."
+  },
+  "ddad778a726cf49e92f2c70b23a3b84a1bf3d35b02ca4ad622664a1f0e6cce23": {
+    "raw": "awaiting operator acceptance of the v3 visual mockups and go on the build plan",
+    "text": "Waiting for the operator to accept the version 3 mockups and approve the build plan."
+  },
+  "271d70d3f85baccefcb2d91794127df9173a721721dcc4e151bb27f75c81d2cd": {
+    "raw": "Move fleet visibility out of chat onto a glanceable board built for the operator",
+    "text": "Move fleet visibility out of chat and onto a glanceable board built for the operator."
+  },
+  "b4e65899a55863e842baae0c37d783bfdc31a0f647b08e18f2e9e594dafaea12": {
+    "raw": "SSE server deployed on twinridge with a tool-registry entry",
+    "text": "The push-update server is deployed on twinridge and registered in the tool registry."
+  },
+  "3f890d3aaf62ab5abe04fe9385b72a3ac683df79be5c648982f52215846ff337": {
+    "raw": "identical-wording rulings",
+    "text": "A decision request uses identical wording everywhere it appears."
+  },
+  "edae5a37ee8d699406bde26feed1cea87d7789200f709675bce56e20ac2b975a": {
+    "raw": "three degraded states",
+    "text": "The page shows three honest connection states: live, delayed, disconnected."
+  },
+  "05203596a439f79786b336fd788413cf5b33ebc626f57d8c828b1983b575e7a5": {
+    "raw": "15-lane condensed mode",
+    "text": "A condensed layout handles fifteen lanes."
+  },
+  "4e6225043e55b7b8c97bf3e02fe5a17f1fdb99b2aea711b4759a8694758888d7": {
+    "raw": "capped Needs-you zone and change rail",
+    "text": "The needs-you zone and the change list both have size caps."
+  },
+  "fe4784a612fbf38cbf8e643c511b612654cc4c1619e83109aec7b37a9d1ca34f": {
+    "raw": "phone filter",
+    "text": "The phone view has a lane filter."
+  },
+  "c0c900c73edfc6704e8289afb8ca99cd79324ca62bd7637ee3dc993a04b9309e": {
+    "raw": "translation cache with raw fallback",
+    "text": "Translations are cached by line, and the raw line shows when no translation exists."
+  },
+  "b50c1567d289d676b921def33721695676dc06d76282316a7f30eece45ff13d2": {
+    "raw": "JSON state endpoint",
+    "text": "A JSON endpoint serves the full board state."
+  },
+  "0582cc8439a38fb67781151e0a5d923cc110aef06c91df612474a191e92ffa37": {
+    "raw": "artifact board retired after N clean days",
+    "text": "The old artifact board is retired after enough clean days."
+  },
+  "8d4e62e302ad9cdcc8cea60f67df09f63a148eff51c95f1466006a2bdff33b3f": {
+    "raw": "Accept the dashboard direction?",
+    "text": "Do you accept the dashboard direction?"
+  },
+  "5ba288e63a61b519b7ec9e2f7b2b1c9c376ba6315e405d313c8b89eca3e86b66": {
+    "raw": "Go on the five-step build?",
+    "text": "Do you approve the five-step build plan?"
+  },
+  "7c180f306632e07e2d138cec0929fb17193117f1f894e281587da0eaf6abe017": {
+    "raw": "Land chitra PR 27 (blocked-order retry, config-crash survival, unit env drift guard, README fixes) and deploy the fixed daemons to twinridge.",
+    "text": "Land chitra pull request 27 — retrying blocked orders, surviving a bad config, guarding against service environment drift, and README fixes — then deploy the fixed daemons to twinridge."
+  },
+  "00ab7b18bbd752770ae3d35c7f87e228186db205c10a9c2098b8ba7c7c4243f3": {
+    "raw": "merge watcher on CI; checks were queued at last look; deploy step prepared behind the merge",
+    "text": "A watcher is waiting on the merge. The test checks were queued at last look. The deploy step is prepared to run once the merge lands."
+  },
+  "da92c2cab10353d58c5c9a8708449a6981829d09ed34a0048bb0579a0c71382a": {
+    "raw": "Close the silent-loss hole before Ramble's research route ships",
+    "text": "Close the silent-loss hole before Ramble's research route ships."
+  },
+  "f517749cf9cc7c3f1c5f533b8bf37a84b7a68aad00ba3511d18ef5950abb7532": {
+    "raw": "PR 27 merged green",
+    "text": "Pull request 27 is merged with green checks."
+  },
+  "f264395f1bde23a25e3e4c05f45ebf0874da90237911bb0df1bfa0d13029970c": {
+    "raw": "new version deployed to twinridge",
+    "text": "The new version is deployed to twinridge."
+  },
+  "45b141750f6fda81df9c6381c185b185061eb895487d44036e8413b092c7ed9a": {
+    "raw": "a lock-blocked order observed retrying from deferred/ on the live host",
+    "text": "On the live host, an order blocked by a lock is seen retrying from the deferred queue."
+  },
+  "bb05187d4bddae3eb1a8bd636262782e99fb720410e7a9690afb847dfd035135": {
+    "raw": "Give Atlas an incremental ingestion trigger so harvested records load without a manual full-pipeline run.",
+    "text": "Give Atlas a trigger so that finished harvests load into the corpus without someone running the full pipeline by hand."
+  },
+  "88294fd34f17b19503d7a092e8a4d4e452ce18522154df01cb2e552d8f5569aa": {
+    "raw": "no active session since the compute-graph root cause closed; the known gap is that nothing invokes ingestion after harvest",
+    "text": "No session has been active since the compute-graph root cause closed. The known gap stands: nothing starts the loader after a harvest finishes."
+  },
+  "7c235c413f263ced4d9adaed2d5e2ff1c38eb15858c8621030b89de6db85c762": {
+    "raw": "Stop harvests from piling up unloaded; harvest currently retrieves but nothing calls the loader",
+    "text": "Stop harvests from piling up unloaded. Today the harvest retrieves records, but nothing calls the loader."
+  },
+  "6f4fb920beec003f2668bc5bd4902dc978a7bec05bc235c9250b8078404716f1": {
+    "raw": "a harvest completion triggers ingestion automatically",
+    "text": "Finishing a harvest starts the load automatically."
+  },
+  "7126c2c79918edbc56930924244fb17c431b19f042c9ac515a3dc723e623f454": {
+    "raw": "record_id dedup holds",
+    "text": "No two loaded records share a record id."
+  },
+  "1574968f4e7021ed51b8674c5cc3f68fc27d0886f6734ab3532a94b917b0e1df": {
+    "raw": "post-load counts match the harvest manifest",
+    "text": "After loading, the record count matches the harvest manifest."
+  },
+  "e93b170bd210d6f74a4ca7710aae33c70ab933fe175030d9dd83b2f8c969f291": {
+    "raw": "Produce the v2 scenario pack through the scenario pipeline with reviewer notes resolved.",
+    "text": "Produce the version 2 scenario pack through the scenario pipeline, with every reviewer note resolved."
+  },
+  "5121de879be18475d80b706226a46ac9fd7bf82488dc6a523c1dbf8d1a4bc85a": {
+    "raw": "four injects drafted; inject 4 names a real vendor and needs a keep-with-disclaimer or fictionalize call at review",
+    "text": "Four injects are drafted. Inject 4 names a real vendor; at review you decide whether to keep the name with a disclaimer or make it fictional."
+  },
+  "2663b8d0336073518f5508541f0fbc4b91c42bad0dbd56e750277b1dc2a77098": {
+    "raw": "waiting on operator time for inject review",
+    "text": "Waiting for your time to review the injects."
+  },
+  "4d81e8d5053dffa029f6cfbad324d68039766f0c736447786be70424db29490d": {
+    "raw": "Competition-ready scenario pack",
+    "text": "A competition-ready scenario pack."
+  },
+  "c3ba279dd104f0700e390dc12d0ef4f99bb22b580f6088036e69aa2fd040cc02": {
+    "raw": "all injects drafted in template voice",
+    "text": "Every inject is drafted in the template voice."
+  },
+  "f1d84d1d6c2de07f32474d41fd22b2c4434007829e3e1385a71f243892a3625f": {
+    "raw": "legal review notes resolved",
+    "text": "Every legal-review note is resolved."
+  },
+  "7159c5b1ddf75981733125fcd78640eeb04d2992a32e390c7b078e36ddbe82a2": {
+    "raw": "pack delivered to the competition folder",
+    "text": "The pack is delivered to the competition folder."
+  },
+  "af6c1a912c19c0ad620c0b82b19d3bc3736d3851af09bcc0c64225302ca05450": {
+    "raw": "Build a scored corpus of 120 full-text sources on election infrastructure security via the source-harvest pipeline.",
+    "text": "Build a scored collection of 120 full-text sources on election infrastructure security, using the source-harvest pipeline."
+  },
+  "3adde13a59d340be4015f6c6af414df351bf0abfd26f82176fed974e6de25a0c": {
+    "raw": "collectors fetched 87 of 120 candidates; 14 paywalled DOIs queued for the escape ladder; HTML extraction quality flagged low on 9 records",
+    "text": "Collectors have fetched 87 of the 120 candidate sources. Fourteen paywalled journal articles are queued for the paywall-escape steps. Nine web-page records were flagged for low text-extraction quality."
+  },
+  "11ac4e9bfdf56d75e8062dc7df87da32a38895b676d09bf2c7698955b4ab88b3": {
+    "raw": "Primary-source base for the fall research push",
+    "text": "A primary-source base for the fall research push."
+  },
+  "5d784b7559dedb0a20fe4b44605240702ffbb0da5e8dbc3a98f2a7fa49f64d41": {
+    "raw": "120 sources at quality 4 or better indexed",
+    "text": "120 sources scoring quality 4 or better are indexed."
+  },
+  "30f198f23107b1dfad630c3ed861a2dcf85cb15515595824d79a55e331a6d3c3": {
+    "raw": "audit pass complete",
+    "text": "The audit pass is complete."
+  },
+  "36030eae5b2f3ae4997c73dcc6cf4acc436702860d081bf7bddb0a61adbdb544": {
+    "raw": "validation pass over the whole kept set",
+    "text": "The validation pass has run over every kept source."
+  },
+  "28cbbf4ff10f22b19131d0621c3bcfd299a1cd531ece3c331995105b08a2cdc9": {
+    "raw": "final report written",
+    "text": "The final report is written."
+  },
+  "b6176d9d6ba024d944993e5cc9942f58993f88fc736c81650b9ed002249238f4": {
+    "raw": "Revise the workshop paper until every reviewer 2 comment has a written disposition.",
+    "text": "Revise the workshop paper until every one of reviewer 2's comments has a written response."
+  },
+  "05b7727c0bf74626ec0267c5a60082900622a9e6baea3fabd4287a51518945e5": {
+    "raw": "agent reports section 5 rewrite complete; completion audit queued",
+    "text": "The agent reports the section 5 rewrite is complete. The completion audit is queued."
+  },
+  "60ba4296024e56311f580fca8d95a78ea6e71f0ce8c9cb5937b9b5d65f9144c1": {
+    "raw": "Resubmission-ready draft",
+    "text": "A resubmission-ready draft."
+  },
+  "f17326a0a94cfab8a67099568029bdc5ccaae848318fbf1310531a15bdd0811d": {
+    "raw": "all reviewer 2 comments dispositioned",
+    "text": "Every reviewer 2 comment has a written response."
+  },
+  "cf792205a589043700339adcccea76c0f1b47d848e61cc4329bbc55f4d0fc3a3": {
+    "raw": "sections 3 and 5 rewritten",
+    "text": "Sections 3 and 5 are rewritten."
+  },
+  "41aa23d5d2a5204a8a826f591fc0fb7d19413dcf656223c96cd023571ec25b61": {
+    "raw": "gaps pass rerun clean",
+    "text": "The gaps check reruns clean."
+  },
+  "5c037279ea9c6d6446d71facfa9630f05aa79ba764ec8ec1e5616e559b12bc5d": {
+    "raw": "voice-fix pass done",
+    "text": "The voice-fix editing pass is done."
+  },
+  "05eec897e1d017c3df013c54580d0a466b2931569b6dd81ab288a830363efa00": {
+    "raw": "all reviewer 3 optional comments dispositioned",
+    "text": "Every reviewer 3 optional comment has a written response."
+  },
+  "5bfdcfa46ecdcda85896bf9cfac3cb7b9992cbdeaa7de3bd95bb84bc5f2f1580": {
+    "raw": "Keep the Feeds daily digest generating and delivered on schedule.",
+    "text": "Keep the Feeds daily digest generating and arriving on schedule."
+  },
+  "c59d9224dfbf059722fe22f4c333368cccbfd1f9037de407889957cee9863fc9": {
+    "raw": "repair landed; three of seven clean days elapsed",
+    "text": "The repair landed. Three of the seven required clean days have passed."
+  },
+  "558d66dbd0de2d49a4442ec085ddb01243445ad5ee6e6c9ef41bac0bc4cb8a7e": {
+    "raw": "Reliable morning digest",
+    "text": "A reliable morning digest."
+  },
+  "399b064f4747c9748dd29cad75061377da3eaf8e6134195be2dbeb6a2003cf30": {
+    "raw": "seven consecutive on-schedule digests after the repair",
+    "text": "Seven digests in a row arrive on schedule after the repair."
+  },
+  "25c0d2cf2fe796a0c6ecd5ef08be39366200abab6514054be5820945c906e9f3": {
+    "raw": "Compare three embedding models on the corpus sample before the Atlas corpus rebuild.",
+    "text": "Compare three embedding models on the corpus sample before the Atlas corpus is rebuilt."
+  },
+  "129660539a230b430149cc955af602b90053c8809837cda6033bcd3b2b336421": {
+    "raw": "first model finished its sample run; results file verified",
+    "text": "The first model finished its sample run, and the results file is present and checked."
+  },
+  "112ae3640d18c740ed89ad32b52f7677af6ff45e76ac3bb3c30847146220e710": {
+    "raw": "rate-limit window until 18:00; second model queued",
+    "text": "Inside a rate-limit window until 18:00, with the second model queued. This is scheduled, not stuck."
+  },
+  "fad99882b646b1b56cbb3a44b4a53c152692db19d7a3337d14b20a09763ca8a9": {
+    "raw": "Pick the rebuild embedder on evidence, not vibes",
+    "text": "Pick the rebuild's embedding model on evidence, not vibes."
+  },
+  "6f7c764579bfecdaa3b7527d3dd945d1fe26a99f0ee640fdb5f096ec7fc29554": {
+    "raw": "all three models run on the same sample",
+    "text": "All three models have run on the same sample."
+  },
+  "29bdb5fec62707b9f09a04b07e8a729d8334556ba6cfff4a9654fe2e1b665d62": {
+    "raw": "retrieval quality table produced",
+    "text": "The retrieval-quality comparison table is produced."
+  },
+  "c842e2785aebf2b72d9c51b94967003465edb75015f7ec582b5630dd55e51e56": {
+    "raw": "recommendation memo written",
+    "text": "The recommendation memo is written."
+  },
+  "ff511822c3e8735e03d6cd9dd360c74dbb18a8a0dca9408f94cf9ed30529fc64": {
+    "raw": "Backfill the wiki's project pages for the six projects that shipped since July with durable facts and decision records.",
+    "text": "Fill in the wiki's project pages for the six projects shipped since July, with durable facts and decision records."
+  },
+  "369f9c3730e5749f92e9c649c044476622c7092c878570bdc28d820cdf7fe85a": {
+    "raw": "two pages done; blocked because the wiki write path rejects one page over a taxonomy naming collision",
+    "text": "Two pages are done. The lane is blocked: the wiki's write path rejects one page because its name collides with an existing page."
+  },
+  "6b679b8447e08e36e821b4f0cf7bb7e71f02da54d08dc52d3ff238cdf4071cd6": {
+    "raw": "Stop re-deriving project state from scratch in new sessions",
+    "text": "Stop new sessions from re-deriving project state from scratch."
+  },
+  "d80a77b921700248d3311f80ff3e9d1e0f0dd3a6d149c853bd98eeeeded2acc8": {
+    "raw": "six project pages updated",
+    "text": "All six project pages are updated."
+  },
+  "e7c15268aaccf634337bb1fe52a843a00c9ab5b08ac7d24e2ad07064b6fda10b": {
+    "raw": "each cites its digest entries",
+    "text": "Each page cites its digest entries."
+  },
+  "d780bbe724f8c2e821ae2a01a0d1e18845eb84e41d1dd72dbfdbfd73ba59c227": {
+    "raw": "lint clean",
+    "text": "The wiki's style check passes clean."
+  },
+  "6fbcdc4a77009de30223a7280e0edad776ebbcb9da413d777ace01bd6829f8b6": {
+    "raw": "Rename the colliding page 'atlas-compute' to 'atlas-compute-graph', or merge into the existing page?",
+    "text": "Rename the colliding page 'atlas-compute' to 'atlas-compute-graph', or merge it into the existing page?"
+  },
+  "d50d140b20eaac662619d795956d3bac9730fafb182f97f687dfb8b819f6ffad": {
+    "raw": "Collector wave 3 finished: 87 of 120 candidates fetched full-text. Nine HTML records scored below the extraction floor and moved to quality review.",
+    "text": "Collector wave 3 finished: 87 of 120 candidate sources fetched in full text. Nine web-page records scored below the extraction floor and moved to quality review."
+  },
+  "86f04e2a1d7124f2c868464766bd64d634ccaae18adde05d527fceec3a22f7a4": {
+    "raw": "Agent reports the section 5 rewrite is complete. Completion audit queued; not yet verified.",
+    "text": "The agent reports the section 5 rewrite is complete. The completion audit is queued."
+  },
+  "a4815e285e8dd921aaa9a8337b59b69a15a34bb338b9c8023c060f7d12383c06": {
+    "raw": "PR 27 marked ready for review; CI checks queued (two test matrices and the review gate).",
+    "text": "Pull request 27 was marked ready for review. Three checks are queued: two test runs and the review gate."
+  },
+  "c0f54745c33b3055b5175e7ddfd523c404120b0cdc2b40d413c7e207df755739": {
+    "raw": "Wiki write rejected the third page: taxonomy naming collision on 'atlas-compute'. Lane blocked on the operator's naming call.",
+    "text": "The wiki rejected the third page: the name 'atlas-compute' collides with an existing page. The lane is blocked on your naming call."
+  },
+  "704e4b43afb25b85c13a486bfbd3a6e84c326191ccfe4b3ae833bccc7fec40e5": {
+    "raw": "First model's sample run finished; results file present and checked. Lane holds for the rate-limit window until 18:00.",
+    "text": "The first model finished its sample run; the results file is present and checked. The lane holds for a rate-limit window until 18:00."
+  },
+  "4062ddeaa563956a649d03c46a5771435a261514c2eb266b60a4ba8ec3e6aeeb": {
+    "raw": "Visual redesign of the mockup deck completed and published; lane holds for the operator's direction and build decisions.",
+    "text": "The mockup deck's visual redesign is complete and published. The lane holds for your direction and build decisions."
+  },
+  "2ae8c08ff82bdaf9906980c47fb7b1d347ef07465b766b48350e36d51e3d3f59": {
+    "raw": "Third consecutive on-schedule digest since the repair. Four more clean days close the lane.",
+    "text": "The third on-schedule digest in a row since the repair. Four more clean days close the lane."
+  },
+  "b161bac9464203cac0e5171d8017626d1846c1ac85cf47939a0b94fdfae30582": {
+    "raw": "Conversation-contract simulation environment stood up; operator round one started.",
+    "text": "The conversation-contract simulation environment is up, and round one with the operator has started."
+  },
+  "2abf50e6d4a91a50b251bc6a69401a7d61c6640d3679e54e9c26207afe623a75": {
+    "raw": "No change since yesterday. Injects drafted; review not started. The inject 4 vendor-name question waits for review time.",
+    "text": "No change since yesterday. The injects are drafted and review has not started. The inject 4 vendor-name question waits for review time."
+  },
+  "54b43ef216c28c4b7d810cce4e7d9b7bfbe919adac08158c2852559d7d088f57": {
+    "raw": "No activity. Known gap stands: harvests retrieve but nothing calls the loader.",
+    "text": "No activity. The known gap stands: harvests retrieve records, but nothing calls the loader."
+  }
+}

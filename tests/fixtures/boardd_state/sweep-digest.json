@@ -1,0 +1,17 @@
+{
+  "schema": "sim.sweep-digest.v1",
+  "sweep_at": "2026-08-08T16:35:00-04:00",
+  "note": "SIMULATION. Recent meaningful events per lane, newest first, monitor-authored plain summaries.",
+  "events": [
+    {"ts": "16:31", "lane": "tophand:harvest-elec", "text": "Collector wave 3 finished: 87 of 120 candidates fetched full-text. Nine HTML records scored below the extraction floor and moved to quality review."},
+    {"ts": "16:22", "lane": "twinridge:ws-paper", "text": "Agent reports the section 5 rewrite is complete. Completion audit queued; not yet verified."},
+    {"ts": "16:10", "lane": "tophand:chitra-deploy", "text": "PR 27 marked ready for review; CI checks queued (two test matrices and the review gate)."},
+    {"ts": "15:58", "lane": "tophand:wiki-backfill", "text": "Wiki write rejected the third page: taxonomy naming collision on 'atlas-compute'. Lane blocked on the operator's naming call."},
+    {"ts": "15:47", "lane": "renegade:embed-bench", "text": "First model's sample run finished; results file present and checked. Lane holds for the rate-limit window until 18:00."},
+    {"ts": "15:30", "lane": "twinridge:boardd-build", "text": "Visual redesign of the mockup deck completed and published; lane holds for the operator's direction and build decisions."},
+    {"ts": "14:55", "lane": "trailhead:feeds-service", "text": "Third consecutive on-schedule digest since the repair. Four more clean days close the lane."},
+    {"ts": "14:20", "lane": "roundtop:ramble-build", "text": "Conversation-contract simulation environment stood up; operator round one started."},
+    {"ts": "12:40", "lane": "twinridge:c912-scenarios", "text": "No change since yesterday. Injects drafted; review not started. The inject 4 vendor-name question waits for review time."},
+    {"ts": "11:05", "lane": "tophand:atlas-ingest", "text": "No activity. Known gap stands: harvests retrieve but nothing calls the loader."}
+  ]
+}
