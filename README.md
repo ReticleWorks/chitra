@@ -80,7 +80,24 @@ For a remote target, each command is the same, ssh-wrapped to run on the actual 
 
 ## Running the daemons
 
-`dispatchd` and `triaged` run continuously. `chitra-rate-limit-guard` is a one-shot CLI meant to run on a timer. Example systemd units, with placeholder paths and service user, live under [`packaging/systemd/`](packaging/systemd/):
+Trailhead installs one `chitra` Debian package built with `fpm`. The package
+contains one released application virtual environment at `/opt/chitra/venv`,
+the service account, and five core systemd unit files: four shared daemons and
+the `chitra@.service` session-anchor template. Build it with
+`CHITRA_VENV_SOURCE=/path/to/released-venv packaging/build-deb.sh 0.9.0 /path/to/chitra.deb`.
+
+The package daemons read `/etc/chitra/lanes.yaml`. Each declaration supplies
+the lane identity, account, roots, tmux socket and credential bindings. The
+declaration has no model field. The operator selects the model when starting
+the shell in `chitra@<lane>.service`.
+
+The host role enables the shared units once. Adding a lane uses one command:
+
+```bash
+sudo systemctl enable --now chitra@<lane>.service
+```
+
+`chitra-rate-limit-guard` remains a one-shot CLI meant to run on a timer. Example timer units live under [`packaging/systemd/`](packaging/systemd/):
 
 ```bash
 sudo cp packaging/systemd/chitra-rate-limit-guard.service.example /etc/systemd/system/chitra-rate-limit-guard.service
@@ -96,6 +113,7 @@ Each entrypoint is configured with CLI flags (`--help` on any command lists them
 
 | Env var | Default | Notes |
 |---|---|---|
+| `CHITRA_LANES_FILE` | `/etc/chitra/lanes.yaml` | One rendered lane declaration read by the shared daemons. |
 | `CHITRA_STATE_DIR` | `/var/lib/chitra` | Base directory for the queue, ledger, and ledger key |
 | `REMOTE_DISPATCH_HOSTS` | *(empty)* | Comma-separated allowlist of hosts dispatch may target over ssh |
 | `CHITRA_CLAUDE_PROJECTS` | `~/.claude/projects` | Root, or `os.pathsep`-separated list of roots, searched locally for transcript-grep delivery verification. List more than one root when a local session runs under a non-default `CLAUDE_CONFIG_DIR` (e.g. a dedicated persona/harness identity) — its transcripts live under that root's `projects/`, not the default |

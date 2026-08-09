@@ -1,0 +1,21 @@
+[Unit]
+Description=Chitra shared state sweep daemon
+After=chitra-triaged.service
+Requires=chitra-triaged.service
+ConditionPathExists=/etc/chitra/lanes.yaml
+StartLimitIntervalSec=10min
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=chitra
+Group=chitra
+ExecStart=/opt/chitra/venv/bin/python -m chitra.sweepd --lanes-file /etc/chitra/lanes.yaml
+Restart=on-failure
+RestartSec=30s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/chitra /run/chitra
+
+[Install]
+WantedBy=multi-user.target

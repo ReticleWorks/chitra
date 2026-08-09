@@ -19,7 +19,7 @@ import subprocess
 import threading
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -44,6 +44,7 @@ from chitra.goal_enforcement import (
 )
 from chitra.goals import GoalStatus, add_ask, get_goal, list_goals, mark_completion_gate_passed, update_now
 from chitra.lane_activity import LaneActivity, LaneBackend, load_lane_activity, upsert_lane_activity
+from chitra.lane_config import enabled_lanes
 from chitra.policy_config import load_policy_config
 from chitra.reasoned_dispatch import abstaining_oracle, build_reasoned_dispatch
 from chitra.reasoning import Oracle, PrinciplesIndex
@@ -98,6 +99,8 @@ class Pane:
 class WatchdConfig:
     state_dir: Path
     events_log: Path
+    lane_id: str | None = None
+    tmux_socket: Path | None = None
     interval_seconds: float = DEFAULT_INTERVAL_SECONDS
     panes_override: tuple[str, ...] | None = None
     session_prefixes: tuple[str, ...] | None = None
@@ -169,6 +172,14 @@ def _run_command(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, check=False, capture_output=True, text=True)
 
 
+def _tmux_command(command: Sequence[str], tmux_socket: Path | None) -> list[str]:
+    """Add a lane's tmux socket while preserving the legacy default command."""
+    values = list(command)
+    if tmux_socket is None or not values or values[0] != "tmux":
+        return values
+    return [values[0], "-S", str(tmux_socket), *values[1:]]
+
+
 def _pane_backend(command: str) -> LaneBackend:
     """Classify only explicit pane commands; unknown commands remain unknown."""
     lowered = command.lower()
@@ -185,6 +196,7 @@ def list_panes(
     panes_override: Sequence[str] | None = None,
     session_prefixes: Sequence[str] | None = None,
     excluded_session_prefixes: Sequence[str] = (),
+    tmux_socket: Path | None = None,
 ) -> list[Pane]:
     """Enumerate live tmux panes, deduplicated by server-assigned pane ID.
 
@@ -203,13 +215,16 @@ def list_panes(
     excluded = tuple(prefix.strip() for prefix in excluded_session_prefixes if prefix.strip())
 
     result = runner(
-        [
+        _tmux_command(
+            [
             "tmux",
             "list-panes",
             "-a",
             "-F",
             "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{session_attached}\t#{pane_current_command}",
-        ]
+            ],
+            tmux_socket,
+        )
     )
     if result.returncode != 0:
         logger.warning("watchd_list_panes_failed", stderr=result.stderr.strip())
@@ -236,9 +251,16 @@ def list_panes(
     return panes
 
 
-def capture_pane(pane: Pane, *, runner: CommandRunner = _run_command) -> str | None:
+def capture_pane(
+    pane: Pane, *, runner: CommandRunner = _run_command, tmux_socket: Path | None = None
+) -> str | None:
     """Capture one pane, returning ``None`` when it vanished or tmux failed."""
-    result = runner(["tmux", "capture-pane", "-p", "-J", "-t", pane.target, "-S", f"-{CAPTURE_LINES}"])
+    result = runner(
+        _tmux_command(
+            ["tmux", "capture-pane", "-p", "-J", "-t", pane.target, "-S", f"-{CAPTURE_LINES}"],
+            tmux_socket,
+        )
+    )
     if result.returncode != 0:
         logger.info("watchd_capture_failed", pane_id=pane.pane_id, stderr=result.stderr.strip())
         return None
@@ -514,8 +536,9 @@ class Watchd:
             panes_override=self.config.panes_override,
             session_prefixes=self.config.session_prefixes,
             excluded_session_prefixes=self.config.excluded_session_prefixes,
+            tmux_socket=self.config.tmux_socket,
         ):
-            content = capture_pane(pane, runner=self.runner)
+            content = capture_pane(pane, runner=self.runner, tmux_socket=self.config.tmux_socket)
             if content is None:
                 continue
             self._save_raw_capture(pane.pane_id, content)
@@ -545,7 +568,8 @@ class Watchd:
                 continue
             if previous == digest:
                 continue
-            append_event(self.config.events_log, event_line(pane.pane_id, tail), max_log_bytes=self.config.max_log_bytes)
+            event_id = self.config.lane_id or pane.pane_id
+            append_event(self.config.events_log, event_line(event_id, tail), max_log_bytes=self.config.max_log_bytes)
             self.baselines[pane.pane_id] = digest
             emitted += 1
         self._drain_completed_reviews()
@@ -702,9 +726,68 @@ def run_forever(watchd: Watchd, *, stop_event: threading.Event | None = None) ->
         watchd.shutdown()
 
 
+def build_lane_watchers(lanes_file: Path | None, base_config: WatchdConfig) -> tuple[Watchd, ...]:
+    """Build one in-memory watcher per declared lane for one shared process."""
+    watchers: list[Watchd] = []
+    for lane in enabled_lanes(lanes_file):
+        watchers.append(
+            Watchd(
+                replace(
+                    base_config,
+                    lane_id=lane.identifier,
+                    state_dir=lane.state_dir,
+                    events_log=lane.events_log,
+                    tmux_socket=lane.tmux_socket,
+                    session_prefixes=(lane.tmux_session,),
+                    excluded_session_prefixes=(),
+                    goals_root=lane.state_dir,
+                    completion_review_log=lane.state_dir / "completion_reviews.jsonl",
+                    queue_dir=lane.queue_dir,
+                )
+            )
+        )
+    return tuple(watchers)
+
+
+def run_lanes_once(lanes_file: Path | None, base_config: WatchdConfig) -> int:
+    """Poll every enabled lane once and release the short-lived reviewers."""
+    watchers = build_lane_watchers(lanes_file, base_config)
+    try:
+        return sum(watcher.poll_once() for watcher in watchers)
+    finally:
+        for watcher in watchers:
+            watcher.shutdown()
+
+
+def run_lanes_forever(
+    lanes_file: Path | None,
+    base_config: WatchdConfig,
+    *,
+    stop_event: threading.Event | None = None,
+) -> None:
+    """Run one shared watcher process over all enabled lane sockets."""
+    active_stop_event = stop_event or threading.Event()
+    watchers = build_lane_watchers(lanes_file, base_config)
+    logger.info("watchd_started", lanes_file=str(lanes_file), lane_count=len(watchers))
+    try:
+        while not active_stop_event.is_set():
+            for watcher in watchers:
+                watcher.poll_once()
+            active_stop_event.wait(base_config.interval_seconds)
+    finally:
+        for watcher in watchers:
+            watcher.shutdown()
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="watchd", description="Deterministic tmux-pane change emitter for triaged.")
     parser.add_argument("--state-dir", type=Path, default=None, help="Watcher state root (default: CHITRA_STATE_DIR or /var/lib/chitra).")
+    parser.add_argument(
+        "--lanes-file",
+        type=Path,
+        default=None,
+        help="Rendered lane declaration; when set, observe every enabled lane socket.",
+    )
     parser.add_argument(
         "--events-log", type=Path, default=None, help="Events log (default: CHITRA_WATCHD_EVENT_LOG or <state-dir>/events.log)."
     )
@@ -769,6 +852,19 @@ def main(argv: list[str] | None = None) -> int:
         reviewer_model=args.reviewer_model,
         reasoned_dispatch_enabled=args.reasoned_dispatch,
     )
+    if args.lanes_file is not None:
+        if args.once:
+            print(f'{{"emitted": {run_lanes_once(args.lanes_file, config)}}}')
+            return 0
+        stop_event = threading.Event()
+
+        def request_stop(_signum: int, _frame: object) -> None:
+            stop_event.set()
+
+        signal.signal(signal.SIGTERM, request_stop)
+        signal.signal(signal.SIGINT, request_stop)
+        run_lanes_forever(args.lanes_file, config, stop_event=stop_event)
+        return 0
     watcher = Watchd(config)
     if args.once:
         try:

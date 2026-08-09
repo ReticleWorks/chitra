@@ -40,6 +40,7 @@ from pathlib import Path
 import structlog
 
 from chitra._fsio import env_csv, env_path, write_json_atomic
+from chitra.lane_config import enabled_lanes
 
 logger = structlog.get_logger(__name__)
 
@@ -357,9 +358,37 @@ def run_forever(
         time.sleep(poll_seconds)
 
 
+def run_lanes_once(lanes_file: Path | None) -> dict[str, int]:
+    """Process each enabled lane's event log once."""
+    results: dict[str, int] = {}
+    for lane in enabled_lanes(lanes_file):
+        outputs = ReceivingOutputs(
+            queue_file=lane.queue_dir / "queue.tsv",
+            flags_file=lane.flags_path,
+            stats_file=lane.state_dir / "stats.json",
+            alert_state_file=lane.state_dir / "triaged-alert-state.json",
+        )
+        results[lane.identifier] = run_once(
+            lane.events_log,
+            state_file=lane.triage_state_file,
+            triage_log=lane.triage_log,
+            offset_file=lane.state_dir / "triaged.offset",
+            receiving_outputs=outputs,
+        )
+    return results
+
+
+def run_lanes_forever(lanes_file: Path | None, *, poll_seconds: float = DEFAULT_POLL_SECONDS) -> None:
+    """Run one shared triage process over every enabled lane event log."""
+    while True:
+        run_lanes_once(lanes_file)
+        time.sleep(poll_seconds)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="triaged", description="State-transition dedup daemon (chitra phase 0).")
     parser.add_argument("--events-log", type=Path, default=env_path("CHITRA_TRIAGE_EVENTS_LOG", DEFAULT_EVENTS_LOG))
+    parser.add_argument("--lanes-file", type=Path, default=None, help="Rendered lane declaration; when set, process every enabled lane.")
     parser.add_argument("--state-file", type=Path, default=env_path("CHITRA_TRIAGE_STATE_FILE", DEFAULT_STATE_FILE))
     parser.add_argument("--triage-log", type=Path, default=env_path("CHITRA_TRIAGE_LOG", DEFAULT_TRIAGE_LOG))
     parser.add_argument("--queue-file", type=Path, default=None)
@@ -373,6 +402,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    if args.lanes_file is not None:
+        if args.once:
+            print(json.dumps(run_lanes_once(args.lanes_file)))
+            return 0
+        run_lanes_forever(args.lanes_file, poll_seconds=args.poll_seconds)
+        return 0
     outputs = default_receiving_outputs(args.state_file)
     if args.queue_file is not None:
         outputs.queue_file = args.queue_file
