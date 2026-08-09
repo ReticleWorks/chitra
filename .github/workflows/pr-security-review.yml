@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   pr-review:
-    runs-on: reticle-ci-heavy
+    runs-on: ubuntu-latest
     continue-on-error: true # belt-and-suspenders: this workflow must never gate merge
     steps:
       - uses: actions/checkout@v7
