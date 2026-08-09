@@ -10,6 +10,7 @@ an LLM.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import threading
@@ -33,6 +34,7 @@ from chitra.goals import (
     session_host,
     session_name,
 )
+from chitra.lane_config import enabled_lanes
 from chitra.rate_limit_state import Transaction, TransactionPhase, load_load_states, load_transactions
 from chitra.state_paths import state_dir as default_state_dir
 
@@ -465,9 +467,34 @@ def run_forever(config: SweepdConfig, *, stop_event: threading.Event | None = No
         active_stop_event.wait(config.poll_seconds)
 
 
+def run_lanes_once(lanes_file: Path | None) -> dict[str, SweepDigest]:
+    """Build one digest per enabled lane from the shared lane declaration."""
+    results: dict[str, SweepDigest] = {}
+    for lane in enabled_lanes(lanes_file):
+        results[lane.identifier] = run_once(
+            SweepdConfig(
+                state_dir=lane.state_dir,
+                digest_path=lane.sweep_digest_path,
+                snapshot_path=lane.sweep_snapshot_path,
+                flags_path=lane.flags_path,
+                poll_seconds=DEFAULT_POLL_SECONDS,
+            )
+        )
+    return results
+
+
+def run_lanes_forever(lanes_file: Path | None, *, poll_seconds: float = DEFAULT_POLL_SECONDS) -> None:
+    """Run one shared sweep process over every enabled lane state root."""
+    stop_event = threading.Event()
+    while not stop_event.is_set():
+        run_lanes_once(lanes_file)
+        stop_event.wait(poll_seconds)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build the intentionally small daemon CLI."""
     parser = argparse.ArgumentParser(prog="chitra-sweepd", description="Produce compact Chitra fleet-state deltas.")
+    parser.add_argument("--lanes-file", type=Path, default=None, help="Rendered lane declaration; when set, sweep every enabled lane.")
     parser.add_argument("--state-dir", type=Path, default=None)
     parser.add_argument("--digest-path", type=Path, default=None)
     parser.add_argument("--snapshot-path", type=Path, default=None)
@@ -480,6 +507,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """Run the daemon; malformed persisted input deliberately terminates it."""
     args = build_arg_parser().parse_args(argv)
+    if args.lanes_file is not None:
+        if args.once:
+            print(json.dumps(
+                {
+                    key: value.model_dump(mode="json", by_alias=True)
+                    for key, value in run_lanes_once(args.lanes_file).items()
+                }, indent=2))
+            return 0
+        poll_seconds = args.poll_seconds if args.poll_seconds is not None else DEFAULT_POLL_SECONDS
+        if poll_seconds <= 0:
+            raise SystemExit("--poll-seconds must be positive")
+        run_lanes_forever(args.lanes_file, poll_seconds=poll_seconds)
+        return 0
     config = resolve_config(
         state_dir=args.state_dir,
         digest_path=args.digest_path,
