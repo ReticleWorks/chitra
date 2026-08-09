@@ -858,11 +858,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         stop_event = threading.Event()
 
-        def request_stop(_signum: int, _frame: object) -> None:
+        def request_lane_stop(_signum: int, _frame: object) -> None:
             stop_event.set()
 
-        signal.signal(signal.SIGTERM, request_stop)
-        signal.signal(signal.SIGINT, request_stop)
+        signal.signal(signal.SIGTERM, request_lane_stop)
+        signal.signal(signal.SIGINT, request_lane_stop)
         run_lanes_forever(args.lanes_file, config, stop_event=stop_event)
         return 0
     watcher = Watchd(config)

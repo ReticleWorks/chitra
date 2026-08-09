@@ -1262,13 +1262,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.lanes_file is not None:
         if args.once:
-            results = run_lanes_once(
+            lane_results = run_lanes_once(
                 args.lanes_file,
                 routing_config_path=args.routing_config_path,
                 policy_config_path=args.policy_config_path,
                 tuning=tuning,
             )
-            print(json.dumps({key: [item.model_dump(mode="json") for item in value] for key, value in results.items()}, indent=2))
+            print(json.dumps({key: [item.model_dump(mode="json") for item in value] for key, value in lane_results.items()}, indent=2))
             return 0
         run_lanes_forever(
             args.lanes_file,
