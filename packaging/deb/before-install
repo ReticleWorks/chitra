@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+if ! getent group chitra >/dev/null 2>&1; then
+    groupadd --system chitra
+fi
+if ! id chitra >/dev/null 2>&1; then
+    useradd --system --gid chitra --home-dir /var/lib/chitra --shell /usr/sbin/nologin chitra
+fi
+install -d -o chitra -g chitra -m 0750 /var/lib/chitra
+install -d -o chitra -g chitra -m 0750 /run/chitra
+install -d -o root -g root -m 0755 /etc/chitra

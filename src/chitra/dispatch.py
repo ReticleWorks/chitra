@@ -199,6 +199,14 @@ class TmuxInputRunner(Protocol):
     def __call__(self, cmd: list[str], payload: str, *, timeout: int = 20) -> subprocess.CompletedProcess[str]: ...
 
 
+def _with_tmux_socket(argv: Sequence[str], tmux_socket: Path | None) -> list[str]:
+    """Select one lane's tmux server when a lane supplies a socket path."""
+    command = list(argv)
+    if tmux_socket is None or not command or command[0] != "tmux":
+        return command
+    return [command[0], "-S", str(tmux_socket), *command[1:]]
+
+
 def run_cmd(cmd: list[str], payload: str | None = None, *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
     """Run a command with optional stdin, capturing output without raising.
 
@@ -502,6 +510,7 @@ def capture(
     *,
     runner: TmuxRunner | None = None,
     local_extra: set[str] | None = None,
+    tmux_socket: Path | None = None,
 ) -> list[str]:
     """Capture a local or remote tmux pane through ``run_on_host``."""
     start = "-" if lines < 0 else f"-{lines}"
@@ -510,6 +519,7 @@ def capture(
         ["tmux", "capture-pane", "-e", "-p", "-t", pane_id, "-S", start],
         runner=runner,
         local_extra=local_extra,
+        tmux_socket=tmux_socket,
         timeout=8,
     )
     if proc.returncode != 0:
@@ -556,10 +566,11 @@ def run_on_host(
     *,
     runner: TmuxRunner | None = None,
     local_extra: set[str] | None = None,
+    tmux_socket: Path | None = None,
     timeout: int = 20,
 ) -> subprocess.CompletedProcess[str]:
     """Run one argv locally or as a safely quoted command over ssh."""
-    command = list(argv)
+    command = _with_tmux_socket(argv, tmux_socket)
     if host and not is_local_host(host, local_extra):
         command = ssh_command(host, shlex.join(command))
     return (runner or run_cmd)(command, timeout=timeout)
@@ -572,13 +583,14 @@ def capture_dispatch_pane(
     lines: int = DISPATCH_CAPTURE_LINES,
     runner: TmuxRunner | None = None,
     local_extra: set[str] | None = None,
+    tmux_socket: Path | None = None,
 ) -> list[str]:
     """Capture a dispatch pane, locally or remotely.
 
     Local-host detection uses ``is_local_host`` with the supplied
     ``local_extra`` aliases (for tests).
     """
-    return capture(host, pane, lines, runner=runner, local_extra=local_extra)
+    return capture(host, pane, lines, runner=runner, local_extra=local_extra, tmux_socket=tmux_socket)
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +604,7 @@ def pane_in_mode(
     host: str = "",
     runner: TmuxRunner | None = None,
     local_extra: set[str] | None = None,
+    tmux_socket: Path | None = None,
 ) -> bool:
     """Return True if the target pane is in tmux copy-mode (pane_in_mode=1).
 
@@ -611,6 +624,7 @@ def pane_in_mode(
         ["tmux", "display-message", "-p", "-t", pane, "#{pane_in_mode}"],
         runner=runner,
         local_extra=local_extra,
+        tmux_socket=tmux_socket,
         timeout=5,
     )
     return proc.returncode == 0 and proc.stdout.strip() == "1"
@@ -622,6 +636,7 @@ def cancel_copy_mode(
     host: str = "",
     runner: TmuxRunner | None = None,
     local_extra: set[str] | None = None,
+    tmux_socket: Path | None = None,
     wait_seconds: float = PANE_IN_MODE_CANCEL_WAIT_SECONDS,
 ) -> bool:
     """Cancel tmux copy-mode on a pane and wait briefly.
@@ -635,6 +650,7 @@ def cancel_copy_mode(
         ["tmux", "send-keys", "-t", pane, "-X", "cancel"],
         runner=runner,
         local_extra=local_extra,
+        tmux_socket=tmux_socket,
         timeout=5,
     )
     if proc.returncode != 0:
@@ -651,6 +667,7 @@ def ensure_pane_not_in_mode(
     host: str = "",
     runner: TmuxRunner | None = None,
     local_extra: set[str] | None = None,
+    tmux_socket: Path | None = None,
 ) -> bool:
     """Ensure a pane is not in copy-mode; cancel if it is.
 
@@ -660,9 +677,9 @@ def ensure_pane_not_in_mode(
     ``cancel_copy_mode`` so the check runs against the actual target host
     (local or ssh-wrapped) rather than always the local tmux server.
     """
-    if not pane_in_mode(pane, host=host, runner=runner, local_extra=local_extra):
+    if not pane_in_mode(pane, host=host, runner=runner, local_extra=local_extra, tmux_socket=tmux_socket):
         return True
-    return cancel_copy_mode(pane, host=host, runner=runner, local_extra=local_extra)
+    return cancel_copy_mode(pane, host=host, runner=runner, local_extra=local_extra, tmux_socket=tmux_socket)
 
 
 # ---------------------------------------------------------------------------
@@ -676,6 +693,7 @@ def paste_nudge_to_local_tmux(
     *,
     runner: TmuxRunner | None = None,
     input_runner: TmuxInputRunner | None = None,
+    tmux_socket: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Inject a nudge into a local tmux pane using the verified recipe.
 
@@ -688,11 +706,11 @@ def paste_nudge_to_local_tmux(
     run = runner or run_cmd
     run_in = input_runner or run_cmd
     buffer_name = tmux_buffer_name(nudge)
-    load = run_in(["tmux", "load-buffer", "-b", buffer_name, "-"], nudge, timeout=5)
+    load = run_in(_with_tmux_socket(["tmux", "load-buffer", "-b", buffer_name, "-"], tmux_socket), nudge, timeout=5)
     if load.returncode != 0:
         return load
     # NOTE: -p is mandatory here. Without it, newlines act as real Enters.
-    paste = run(["tmux", "paste-buffer", "-p", "-b", buffer_name, "-t", pane], timeout=5)
+    paste = run(_with_tmux_socket(["tmux", "paste-buffer", "-p", "-b", buffer_name, "-t", pane], tmux_socket), timeout=5)
     if paste.returncode != 0:
         return paste
     # Buffer cleanup is housekeeping, not the critical step -- a failure here
@@ -700,32 +718,33 @@ def paste_nudge_to_local_tmux(
     # left uncommitted in the pane (an orphaned draft, exactly the failure
     # mode this package's own draft_scanner exists to catch, caused here by
     # the dispatch path itself). Log and proceed regardless of cleanup result.
-    cleanup = run(["tmux", "delete-buffer", "-b", buffer_name], timeout=5)
+    cleanup = run(_with_tmux_socket(["tmux", "delete-buffer", "-b", buffer_name], tmux_socket), timeout=5)
     if cleanup.returncode != 0:
         logger.warning("tmux_buffer_cleanup_failed", pane=pane, buffer_name=buffer_name, stderr=cleanup.stderr.strip())
-    return run(["tmux", "send-keys", "-t", pane, "Enter"], timeout=5)
+    return run(_with_tmux_socket(["tmux", "send-keys", "-t", pane, "Enter"], tmux_socket), timeout=5)
 
 
-def remote_tmux_paste_command(pane: str, nudge: str) -> str:
+def remote_tmux_paste_command(pane: str, nudge: str, tmux_socket: Path | None = None) -> str:
     """Build the remote paste command string (ssh-safe, single shell line).
 
     Includes ``-p`` on ``paste-buffer`` (bug fix (a)). The command is a
     single shell string suitable for ``ssh target '<command>'``.
     """
     buffer_name = tmux_buffer_name(nudge)
+    tmux = ["tmux"] if tmux_socket is None else ["tmux", "-S", shlex.quote(str(tmux_socket))]
     return " ".join(
         [
             "printf",
             "%s",
             shlex.quote(nudge),
             "|",
-            "tmux",
+            *tmux,
             "load-buffer",
             "-b",
             shlex.quote(buffer_name),
             "-",
             "&&",
-            "tmux",
+            *tmux,
             "paste-buffer",
             "-p",
             "-b",
@@ -733,12 +752,12 @@ def remote_tmux_paste_command(pane: str, nudge: str) -> str:
             "-t",
             shlex.quote(pane),
             "&&",
-            "tmux",
+            *tmux,
             "delete-buffer",
             "-b",
             shlex.quote(buffer_name),
             "&&",
-            "tmux",
+            *tmux,
             "send-keys",
             "-t",
             shlex.quote(pane),
@@ -1034,6 +1053,7 @@ def pane_capture_confirms_nudge(
     lines: int = DISPATCH_CAPTURE_LINES,
     runner: TmuxRunner | None = None,
     local_extra: set[str] | None = None,
+    tmux_socket: Path | None = None,
 ) -> bool:
     """Fallback confirmation: does the delivered nudge marker appear in the
     target pane's recent capture?
@@ -1053,7 +1073,9 @@ def pane_capture_confirms_nudge(
     marker = nudge_confirmation_marker(nudge)
     if not marker:
         return False
-    captured = capture_dispatch_pane(host, pane, lines=lines, runner=runner, local_extra=local_extra)
+    captured = capture_dispatch_pane(
+        host, pane, lines=lines, runner=runner, local_extra=local_extra, tmux_socket=tmux_socket
+    )
     if not captured:
         return False
     text = normalized_dispatch_text(strip_terminal_controls("\n".join(captured)))
@@ -1186,6 +1208,7 @@ def dispatch_to_tmux(
     verify_wait_seconds: float | None = None,
     tuning: DispatchTuning | None = None,
     policy: PolicyConfig | None = None,
+    tmux_socket: Path | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> DispatchResult:
     """Dispatch a nudge into a tmux pane using the verified recipe.
@@ -1254,7 +1277,9 @@ def dispatch_to_tmux(
         return _result(DispatchStatus.BLOCKED, f"remote dispatch to {host} not in allowlist")
 
     # Pre-dispatch idle/draft check (safety net from the source).
-    pre_capture = capture_dispatch_pane(host, pane, lines=tuning.capture_lines, runner=run, local_extra=local_extra)
+    pre_capture = capture_dispatch_pane(
+        host, pane, lines=tuning.capture_lines, runner=run, local_extra=local_extra, tmux_socket=tmux_socket
+    )
     pre_check = pane_input_check(
         pre_capture,
         baseline_hash=order.input_baseline_hash,
@@ -1276,19 +1301,21 @@ def dispatch_to_tmux(
     # target host (local or ssh-wrapped) — checking the local tmux server
     # for a remote target's copy-mode state would report on the wrong tmux
     # server entirely.
-    if not ensure_pane_not_in_mode(pane, host=host, runner=run, local_extra=local_extra):
+    if not ensure_pane_not_in_mode(pane, host=host, runner=run, local_extra=local_extra, tmux_socket=tmux_socket):
         return _result(DispatchStatus.BLOCKED, "blocked: pane in copy-mode and cancel failed")
 
     # Bug fix (a): paste-buffer -p.
     if is_local_host(host, local_extra):
-        proc = paste_nudge_to_local_tmux(pane, order.nudge, runner=run, input_runner=run_in)
+        proc = paste_nudge_to_local_tmux(
+            pane, order.nudge, runner=run, input_runner=run_in, tmux_socket=tmux_socket
+        )
         if proc.returncode != 0:
             return _result(
                 DispatchStatus.FAILED,
                 proc.stderr.strip() or proc.stdout.strip() or f"tmux paste-buffer failed rc={proc.returncode}",
             )
     else:
-        remote_cmd = remote_tmux_paste_command(pane, order.nudge)
+        remote_cmd = remote_tmux_paste_command(pane, order.nudge, tmux_socket=tmux_socket)
         proc = run(ssh_command(host, remote_cmd), timeout=10)
         if proc.returncode != 0:
             return _result(
@@ -1337,6 +1364,7 @@ def dispatch_to_tmux(
         lines=tuning.capture_lines,
         runner=run,
         local_extra=local_extra,
+        tmux_socket=tmux_socket,
     ):
         logger.info(
             "tmux_dispatch_sent_pane_fallback",
