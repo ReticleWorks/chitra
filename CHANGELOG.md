@@ -4,6 +4,8 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-08-10
+
 ### Added
 - A PR security review gate, `chitra.pr_review` / `chitra.pr_reviewd` (new `chitra-pr-review`
   entrypoint). Fetches one pull request via `gh`, runs deterministic blast-radius/diff-size
