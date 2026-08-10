@@ -43,18 +43,16 @@ jobs:
     environment:
       name: pypi
       url: https://pypi.org/project/chitra-monitor/
-    permissions:
-      # Required for OIDC trusted publishing (no API token stored in the repo).
-      id-token: write
     steps:
       - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
 
-      # v1.11+ requests PEP 740 attestations by default when publishing via
-      # trusted publishing (OIDC) — no extra config needed, just don't pin an
-      # older release that predates attestation support.
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          # PyPI attestations require trusted publishing. This repository uses
+          # a project-scoped API token until its PyPI publisher is configured.
+          attestations: false
           print-hash: true
