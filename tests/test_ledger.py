@@ -78,6 +78,23 @@ def test_verify_delivery_returns_none_for_a_message_never_sent(tmp_path: Path) -
     assert found is None
 
 
+def test_verify_delivery_can_require_the_order_id(tmp_path: Path) -> None:
+    key = load_or_create_signing_key(tmp_path / "ledger.key")
+    ledger_path = tmp_path / "ledger.jsonl"
+    append_entry(ledger_path, order_id="o1", session_ref="localhost:s:0.0", tag="[C]", nudge="same text", key=key)
+
+    assert (
+        verify_delivery(
+            ledger_path,
+            key=key,
+            order_id="o2",
+            session_ref="localhost:s:0.0",
+            nudge="same text",
+        )
+        is None
+    )
+
+
 def test_verify_delivery_returns_none_against_empty_ledger(tmp_path: Path) -> None:
     key = load_or_create_signing_key(tmp_path / "ledger.key")
     found = verify_delivery(tmp_path / "does-not-exist.jsonl", key=key, session_ref="localhost:s:0.0", nudge="anything")

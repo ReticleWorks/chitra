@@ -164,9 +164,10 @@ def test_remote_delivery_writes_a_ledger_entry_same_as_local(tmp_path: Path, mon
     assert entry.session_ref == "otherhost:f3:0.0"
 
 
-def test_partially_processed_order_is_not_reprocessed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A result file already existing for an order id means it was already
-    delivered — process_one_order must not re-dispatch, only file-move."""
+def test_partially_processed_order_retries_ledger_proof_without_redelivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A SENT result without its ledger proof is recoverable, not complete."""
 
     call_count = {"n": 0}
 
@@ -183,11 +184,14 @@ def test_partially_processed_order_is_not_reprocessed(tmp_path: Path, monkeypatc
     order = DispatchOrder(order_id="ord-2", session_ref="localhost:s:0.0", nudge="hi")
     order_path = _write_order(orders_dir, order)
 
-    # Simulate a crash AFTER the result was written but BEFORE the order
-    # file was moved to processed/.
+    # Simulate a crash AFTER the result was written but BEFORE the ledger
+    # append or order move. Recovery must retry only the ledger proof.
     results_dir.mkdir(parents=True, exist_ok=True)
     existing_result = DispatchResult(order_id="ord-2", session_ref=order.session_ref, status=DispatchStatus.SENT)
     (results_dir / "ord-2.json").write_text(existing_result.model_dump_json(), encoding="utf-8")
+
+    ledger_path = tmp_path / "ledger.jsonl"
+    ledger_key_path = tmp_path / "ledger.key"
 
     result = process_one_order(
         order_path,
@@ -195,11 +199,16 @@ def test_partially_processed_order_is_not_reprocessed(tmp_path: Path, monkeypatc
         results_dir=results_dir,
         processed_dir=processed_dir,
         lock_dir=tmp_path / "locks",
+        ledger_path=ledger_path,
+        ledger_key_path=ledger_key_path,
     )
 
-    assert result is None  # skipped, not re-dispatched
+    assert result is None  # recovered as a file move, not a new dispatch
     assert call_count["n"] == 0
     assert (processed_dir / "ord-2.json").exists()
+    assert ledger_path.exists()
+    recovered_result = DispatchResult.model_validate_json((results_dir / "ord-2.json").read_text(encoding="utf-8"))
+    assert recovered_result.delivery_ledger_verified is True
 
 
 def test_blocked_result_does_not_write_a_ledger_entry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -411,41 +420,61 @@ def test_dispatchd_session_namespace_environment_is_normalized(monkeypatch: pyte
     assert resolve_session_prefixes(None, env_var="CHITRA_ALLOWED_SESSION_PREFIXES") == ("boomtown-", "design-")
 
 
-def test_ledger_write_failure_does_not_prevent_completion_or_cause_redelivery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Regression test: a ledger append failure after a real successful
-    dispatch must not leave the order un-completed -- that would cause a
-    redelivery (paste the same nudge into the live pane again) on the next
-    pass, exactly the double-delivery the crash-safety design promises
-    never happens."""
+def test_ledger_write_failure_leaves_order_unacknowledged_and_retries_without_redelivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ledger outage cannot turn a successful transport into an ack."""
+
+    dispatches = {"count": 0}
 
     def fake_dispatch(order: DispatchOrder, **kwargs: Any) -> DispatchResult:
+        dispatches["count"] += 1
         return DispatchResult(order_id=order.order_id, session_ref=order.session_ref, status=DispatchStatus.SENT)
 
     def failing_append_entry(*args: Any, **kwargs: Any) -> None:
         raise OSError("simulated disk failure writing the ledger")
 
+    real_append_entry = ledger_mod.append_entry
     monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", fake_dispatch)
     monkeypatch.setattr(ledger_mod, "append_entry", failing_append_entry)
 
     queue_dir = tmp_path / "queue"
     order = DispatchOrder(order_id="ord-4", session_ref="localhost:s:0.0", nudge="hi")
     _write_order(queue_dir / "orders", order)
+    ledger_path = tmp_path / "ledger.jsonl"
+    ledger_key_path = tmp_path / "ledger.key"
 
     results = run_once(
         queue_dir,
         lock_dir=tmp_path / "locks",
-        ledger_path=tmp_path / "ledger.jsonl",
-        ledger_key_path=tmp_path / "ledger.key",
+        ledger_path=ledger_path,
+        ledger_key_path=ledger_key_path,
     )
 
-    assert len(results) == 1
-    assert results[0].status == DispatchStatus.SENT
-    # The order must still be marked complete -- moved and result-written --
-    # even though the ledger write failed. Otherwise the next run_once()
-    # would see it still pending and redeliver it.
+    assert results == []
+    assert dispatches["count"] == 1
     assert not (queue_dir / "orders" / "ord-4.json").exists()
-    assert (queue_dir / "processed" / "ord-4.json").exists()
+    assert (queue_dir / "in_flight" / "ord-4.json").exists()
+    assert not (queue_dir / "processed" / "ord-4.json").exists()
     assert (queue_dir / "results" / "ord-4.json").exists()
+    pending_result = DispatchResult.model_validate_json((queue_dir / "results" / "ord-4.json").read_text(encoding="utf-8"))
+    assert pending_result.status == DispatchStatus.SENT
+    assert pending_result.delivery_ledger_verified is False
+
+    monkeypatch.setattr(ledger_mod, "append_entry", real_append_entry)
+    results = run_once(
+        queue_dir,
+        lock_dir=tmp_path / "locks",
+        ledger_path=ledger_path,
+        ledger_key_path=ledger_key_path,
+    )
+
+    assert results == []  # ledger recovery is an idempotent file completion
+    assert dispatches["count"] == 1
+    assert ledger_path.exists()
+    assert (queue_dir / "processed" / "ord-4.json").exists()
+    recovered_result = DispatchResult.model_validate_json((queue_dir / "results" / "ord-4.json").read_text(encoding="utf-8"))
+    assert recovered_result.delivery_ledger_verified is True
 
 
 # --- rate-limit freeze / durable deferred subqueue (SOL findings #1, #7) ---
@@ -1015,6 +1044,8 @@ def test_result_appearing_while_waiting_for_the_lane_lock_is_caught_under_the_lo
     order = DispatchOrder(order_id="ord-race-under-lock", session_ref="localhost:s:0.0", nudge="hi")
     order_path = _write_order(queue_dir / "orders", order)
     orders_dir, results_dir, processed_dir = dispatchd_mod._ensure_queue_dirs(queue_dir)
+    ledger_path = tmp_path / "ledger.jsonl"
+    ledger_key_path = tmp_path / "ledger.key"
 
     from chitra.dispatch import LaneLock
 
@@ -1031,7 +1062,13 @@ def test_result_appearing_while_waiting_for_the_lane_lock_is_caught_under_the_lo
     monkeypatch.setattr(LaneLock, "acquire", acquire_then_plant_a_concurrent_result)
 
     result = process_one_order(
-        order_path, orders_dir=orders_dir, results_dir=results_dir, processed_dir=processed_dir, lock_dir=tmp_path / "locks"
+        order_path,
+        orders_dir=orders_dir,
+        results_dir=results_dir,
+        processed_dir=processed_dir,
+        lock_dir=tmp_path / "locks",
+        ledger_path=ledger_path,
+        ledger_key_path=ledger_key_path,
     )
 
     assert result is None  # recognized as already-processed, not re-dispatched

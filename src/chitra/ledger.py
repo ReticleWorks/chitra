@@ -281,9 +281,14 @@ def verify_delivery(
     key: bytes,
     session_ref: str,
     nudge: str,
+    order_id: str | None = None,
 ) -> LedgerEntry | None:
     """Return the first ledger entry proving ``nudge`` was delivered to
     ``session_ref`` with a valid signature, or None if no such entry exists.
+
+    When ``order_id`` is supplied, the proof must belong to that order too.
+    This lets queue recovery distinguish a prior identical nudge from the
+    delivery being recovered.
 
     ``None`` is a strong signal under this module's trusted-host threat
     model (chitra only ever appends, so nothing it wrote is missing) but is
@@ -303,6 +308,11 @@ def verify_delivery(
                 entry = LedgerEntry.model_validate_json(line)
             except ValueError:
                 continue
-            if entry.session_ref == session_ref and entry.message_hash == digest and verify_entry(entry, key=key):
+            if (
+                entry.session_ref == session_ref
+                and entry.message_hash == digest
+                and (order_id is None or entry.order_id == order_id)
+                and verify_entry(entry, key=key)
+            ):
                 return entry
     return None
