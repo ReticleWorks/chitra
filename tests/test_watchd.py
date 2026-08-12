@@ -79,6 +79,22 @@ def test_watchd_emits_real_change_but_not_input_box_typing(tmp_path: Path) -> No
     assert text == "CHANGE DETECTED: status: blocked"
 
 
+def test_watchd_writes_a_heartbeat_for_a_quiet_or_empty_pass(tmp_path: Path) -> None:
+    watcher = Watchd(
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"),
+        runner=lambda command: _completed(command, ""),
+    )
+
+    assert watcher.poll_once() == 0
+
+    heartbeat = json.loads((tmp_path / "watchd" / "heartbeat.json").read_text(encoding="utf-8"))
+    assert heartbeat["schema"] == "chitra.watchd.heartbeat.v1"
+    assert heartbeat["pane_count"] == 0
+    assert heartbeat["captured_count"] == 0
+    assert heartbeat["capture_failures"] == 0
+    assert heartbeat["events_emitted"] == 0
+
+
 class _AcceptingReviewer:
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -405,6 +421,7 @@ def test_append_event_rotates_at_max_size_under_lock(tmp_path: Path) -> None:
 def test_resolve_config_uses_chitra_state_and_watchd_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("CHITRA_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("CHITRA_WATCHD_INTERVAL", "2.5")
+    monkeypatch.setenv("CHITRA_WATCHD_HEARTBEAT", str(tmp_path / "heartbeat.json"))
     monkeypatch.setenv("CHITRA_WATCHD_PANES", "%1, %2")
     monkeypatch.setenv("CHITRA_WATCHD_SESSION_PREFIXES", "boomtown-, boomtown-review-")
     monkeypatch.setenv("CHITRA_WATCHD_EXCLUDE_SESSION_PREFIXES", "boomtown-control")
@@ -416,6 +433,7 @@ def test_resolve_config_uses_chitra_state_and_watchd_environment(monkeypatch: py
     config = resolve_config()
 
     assert config.events_log == tmp_path / "state" / "events.log"
+    assert config.heartbeat_path == tmp_path / "heartbeat.json"
     assert config.interval_seconds == 2.5
     assert config.panes_override == ("%1", "%2")
     assert config.session_prefixes == ("boomtown-", "boomtown-review-")
