@@ -26,6 +26,7 @@ from typing import Literal
 
 import structlog
 
+from chitra._fsio import write_json_atomic
 from chitra.completion_gate import (
     CompletionReviewRecord,
     TurnEndAudit,
@@ -57,12 +58,14 @@ PANES_ENV_VAR = "CHITRA_WATCHD_PANES"
 SESSION_PREFIXES_ENV_VAR = "CHITRA_WATCHD_SESSION_PREFIXES"
 EXCLUDED_SESSION_PREFIXES_ENV_VAR = "CHITRA_WATCHD_EXCLUDE_SESSION_PREFIXES"
 MAX_LOG_BYTES_ENV_VAR = "CHITRA_WATCHD_MAX_LOG_BYTES"
+HEARTBEAT_ENV_VAR = "CHITRA_WATCHD_HEARTBEAT"
 REVIEWER_COUNT_ENV_VAR = "CHITRA_WATCHD_REVIEWER_COUNT"
 REVIEWER_COMMAND_ENV_VAR = "CHITRA_WATCHD_REVIEWER_COMMAND"
 REVIEWER_MODEL_ENV_VAR = "CHITRA_WATCHD_REVIEWER_MODEL"
 REASONED_DISPATCH_ENV_VAR = "CHITRA_WATCHD_REASONED_DISPATCH_ENABLED"
 DEFAULT_INTERVAL_SECONDS = 5.0
 DEFAULT_MAX_LOG_BYTES = 5 * 1024 * 1024
+DEFAULT_HEARTBEAT_RELATIVE_PATH = Path("watchd/heartbeat.json")
 DEFAULT_REVIEWER_COUNT = 2
 DEFAULT_REVIEWER_COMMAND = "claude"
 # Default to None so the reviewer inherits the ambient monitor model (ruling 3A:
@@ -110,6 +113,7 @@ class WatchdConfig:
     reviewer_model: str | None = DEFAULT_REVIEWER_MODEL
     queue_dir: Path | None = None
     reasoned_dispatch_enabled: bool = DEFAULT_REASONED_DISPATCH_ENABLED
+    heartbeat_path: Path | None = None
 
     def __post_init__(self) -> None:
         if self.reviewer_count < 1:
@@ -300,6 +304,41 @@ class Watchd:
             raw_path.write_text(content, encoding="utf-8")
         except OSError as exc:
             logger.warning("watchd_raw_capture_write_failed", pane_id=pane_id, path=str(raw_path), error=str(exc))
+
+    def _write_heartbeat(
+        self,
+        *,
+        pane_count: int,
+        captured_count: int,
+        capture_failures: int,
+        emitted: int,
+    ) -> None:
+        """Record a successful sensing pass separately from change events.
+
+        ``events.log`` is intentionally change-only. A quiet lane therefore
+        must not look like a dead watcher. The heartbeat is written after the
+        complete pane pass, so its freshness proves that discovery and
+        capture are still running without inventing triage events.
+        """
+        path = self.config.heartbeat_path or self.config.state_dir / DEFAULT_HEARTBEAT_RELATIVE_PATH
+        try:
+            write_json_atomic(
+                path,
+                {
+                    "schema": "chitra.watchd.heartbeat.v1",
+                    "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "pid": os.getpid(),
+                    "pane_count": pane_count,
+                    "captured_count": captured_count,
+                    "capture_failures": capture_failures,
+                    "events_emitted": emitted,
+                },
+            )
+        except OSError as exc:
+            # A full or unwritable state volume must remain visible in the
+            # journal. The watcher still owns the event path and continues so
+            # a transient heartbeat failure cannot kill observation outright.
+            logger.warning("watchd_heartbeat_write_failed", path=str(path), error=str(exc))
 
     def _session_ref(self, pane: Pane) -> str | None:
         root = self.config.goals_root or self.config.state_dir
@@ -506,18 +545,23 @@ class Watchd:
         """Capture all current panes and emit an event for each real change."""
         self._drain_completed_reviews()
         emitted = 0
+        captured_count = 0
+        capture_failures = 0
         root = self.config.goals_root or self.config.state_dir
         existing_activity = {record.session_ref: record for record in load_lane_activity(root)}
         activity_updates: list[LaneActivity] = []
-        for pane in list_panes(
+        panes = list_panes(
             runner=self.runner,
             panes_override=self.config.panes_override,
             session_prefixes=self.config.session_prefixes,
             excluded_session_prefixes=self.config.excluded_session_prefixes,
-        ):
+        )
+        for pane in panes:
             content = capture_pane(pane, runner=self.runner)
             if content is None:
+                capture_failures += 1
                 continue
+            captured_count += 1
             self._save_raw_capture(pane.pane_id, content)
             digest, tail = normalized_snapshot(content)
             observed_at = datetime.now(UTC).isoformat()
@@ -548,6 +592,12 @@ class Watchd:
             append_event(self.config.events_log, event_line(pane.pane_id, tail), max_log_bytes=self.config.max_log_bytes)
             self.baselines[pane.pane_id] = digest
             emitted += 1
+        self._write_heartbeat(
+            pane_count=len(panes),
+            captured_count=captured_count,
+            capture_failures=capture_failures,
+            emitted=emitted,
+        )
         self._drain_completed_reviews()
         upsert_lane_activity(root, activity_updates)
         return emitted
@@ -619,6 +669,9 @@ def resolve_config(
     """Resolve CLI values, then ``CHITRA_*`` overrides, then generic defaults."""
     configured_state_dir = state_dir or default_state_dir()
     configured_events_log = events_log or Path(_env_value(EVENT_LOG_ENV_VAR) or configured_state_dir / "events.log")
+    configured_heartbeat_path = Path(
+        _env_value(HEARTBEAT_ENV_VAR) or configured_state_dir / DEFAULT_HEARTBEAT_RELATIVE_PATH
+    )
     configured_interval = interval_seconds
     if configured_interval is None:
         raw_interval = _env_value(INTERVAL_ENV_VAR)
@@ -678,6 +731,7 @@ def resolve_config(
     return WatchdConfig(
         state_dir=configured_state_dir,
         events_log=configured_events_log,
+        heartbeat_path=configured_heartbeat_path,
         interval_seconds=configured_interval,
         panes_override=tuple(configured_panes) if configured_panes is not None else None,
         session_prefixes=configured_session_prefixes or None,
