@@ -9,7 +9,7 @@ StartLimitBurst=5
 [Service]
 Type=oneshot
 User=root
-ExecStart=/opt/chitra/venv/bin/chitra-lane-anchor --lanes-file /etc/chitra/lanes.yaml --lane %i start
+ExecStart=/opt/chitra/venv/bin/chitra-lane-anchor --lanes-file /etc/chitra/lanes.yaml --lane %i --host tophand --backend claude --model sonnet start
 ExecStop=/opt/chitra/venv/bin/chitra-lane-anchor --lanes-file /etc/chitra/lanes.yaml --lane %i stop
 RemainAfterExit=yes
 

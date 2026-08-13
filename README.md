@@ -88,8 +88,10 @@ the `chitra@.service` session-anchor template. Build it with
 
 The package daemons read `/etc/chitra/lanes.yaml`. Each declaration supplies
 the lane identity, account, roots, tmux socket and credential bindings. The
-declaration has no model field. The operator selects the model when starting
-the shell in `chitra@<lane>.service`.
+declaration has no model field. `chitra-lane-session` selects Claude Sonnet,
+Claude Opus, or a Codex model at launch and refuses unless the Tophand lane has
+a passing goal-ingestion record and no active usage pause. See
+[`docs/governed-tmux-lanes.md`](docs/governed-tmux-lanes.md).
 
 The host role enables the shared units once. Adding a lane uses one command:
 

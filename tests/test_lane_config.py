@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from chitra.lane_anchor import start_lane
+from chitra.goals import GoalRecord, hold_goal, upsert_goal
+from chitra.lane_anchor import LaneLaunchRefused, ingestion_gate, start_lane
 from chitra.lane_config import load_lanes
 
 
@@ -64,6 +65,18 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
     path = tmp_path / "lanes.yaml"
     path.write_text(yaml.safe_dump(_manifest(tmp_path)), encoding="utf-8")
     lane = load_lanes(path)[0]
+    upsert_goal(
+        lane.state_dir,
+        GoalRecord(
+            session_ref="tophand:alpha:0.0",
+            goal="Implement the governed lane launch contract safely",
+            done_when="All guarded lane launch probes pass locally",
+            intent="Ensure every work lane remains observable and governed throughout execution",
+            scope="Chitra lane launcher and lifecycle integration",
+            source="task-file:lane-architecture",
+            status="working",
+        ),
+    )
     calls: list[list[str]] = []
 
     def runner(command):
@@ -104,8 +117,77 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
             "alpha",
             "-c",
             "/srv/chitra/lanes/alpha",
+            "claude",
+            "--model",
+            "sonnet",
         ],
     ]
+    receipt = __import__("json").loads((lane.state_dir / "lane-launch.json").read_text())
+    assert receipt["session_ref"] == "tophand:alpha:0.0"
+    assert receipt["goal_snapshot"]["source"] == "task-file:lane-architecture"
+    assert "rate_limit_guard" in receipt["lifecycle"]
+
+
+def test_lane_launch_refuses_without_passing_ingestion_record(tmp_path):
+    import yaml
+
+    path = tmp_path / "lanes.yaml"
+    path.write_text(yaml.safe_dump(_manifest(tmp_path)), encoding="utf-8")
+    lane = load_lanes(path)[0]
+
+    with pytest.raises(LaneLaunchRefused, match="no chitra-goals ingestion record"):
+        ingestion_gate(lane)
+
+
+def test_lane_launch_refuses_active_usage_pause(tmp_path):
+    import yaml
+
+    path = tmp_path / "lanes.yaml"
+    path.write_text(yaml.safe_dump(_manifest(tmp_path)), encoding="utf-8")
+    lane = load_lanes(path)[0]
+    upsert_goal(
+        lane.state_dir,
+        GoalRecord(
+            session_ref="tophand:alpha:0.0",
+            goal="Implement the governed lane launch contract safely",
+            done_when="All guarded lane launch probes pass locally",
+            intent="Ensure every work lane remains observable and governed throughout execution",
+            scope="Chitra lane launcher and lifecycle integration",
+            source="task-file:lane-architecture",
+            status="working",
+        ),
+    )
+    hold_goal(lane.state_dir, "tophand:alpha:0.0", reason="rate-limit:provider-window")
+
+    with pytest.raises(LaneLaunchRefused, match="usage-pause hold is active"):
+        ingestion_gate(lane)
+
+
+@pytest.mark.parametrize("model", ["sonnet", "opus"])
+def test_governed_claude_model_selection(model, tmp_path):
+    import yaml
+
+    path = tmp_path / "lanes.yaml"
+    path.write_text(yaml.safe_dump(_manifest(tmp_path)), encoding="utf-8")
+    lane = load_lanes(path)[0]
+    upsert_goal(
+        lane.state_dir,
+        GoalRecord(
+            session_ref="tophand:alpha:0.0",
+            goal="Implement the governed lane launch contract safely",
+            done_when="All guarded lane launch probes pass locally",
+            intent="Ensure every work lane remains observable and governed throughout execution",
+            scope="Chitra lane launcher and lifecycle integration",
+            source="task-file:lane-architecture",
+            status="working",
+        ),
+    )
+    calls = []
+    def runner(command):
+        calls.append(list(command))
+        return subprocess.CompletedProcess(command, 1 if len(calls) == 1 else 0, "", "")
+    assert start_lane(lane, backend="claude", model=model, runner=runner)
+    assert calls[-1][-3:] == ["claude", "--model", model]
 
 
 def test_shared_dispatch_wrapper_uses_only_enabled_lane_roots(tmp_path, monkeypatch):
@@ -157,5 +239,5 @@ def test_package_units_define_four_shared_daemons_and_one_anchor_template():
 
     anchor = (package_root / "chitra@.service").read_text(encoding="utf-8")
     assert "ExecStart=/opt/chitra/venv/bin/chitra-lane-anchor" in anchor
-    assert "--lane %i start" in anchor
-    assert "model" not in anchor.lower()
+    assert "--lane %i --host tophand --backend claude --model sonnet start" in anchor
+    assert "--model sonnet" in anchor
