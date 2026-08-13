@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from chitra.sweepd import load_latest_flags
 from chitra.triaged import ReceivingOutputs, run_once
 
 
@@ -96,6 +97,9 @@ def test_receiving_outputs_publish_parseable_idle_to_queue_and_flags(tmp_path: P
         "IDLE 2026-08-13T12:00:00Z infra-health:0.0 idle: "
         "IDLE target=infra-health:0.0 idle_seconds=30 threshold_seconds=30\n"
     )
+    parsed = load_latest_flags(outputs.flags_file)
+    idle = parsed["infra-health:0.0\x1fidle"]
+    assert idle.message == "IDLE target=infra-health:0.0 idle_seconds=30 threshold_seconds=30"
 
 
 def test_receiving_outputs_persist_alert_dedup_across_transitions(tmp_path: Path) -> None:
