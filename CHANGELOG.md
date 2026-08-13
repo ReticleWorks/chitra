@@ -4,6 +4,14 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-08-13
+
+### Fixed
+- Sweepd accepts every severity documented for `flags.log` (`CRIT` and
+  `IDLE`), preventing an idle event emitted by triaged from crashing the
+  sweep daemon. Mixed-severity and triaged-to-sweepd regression coverage keeps
+  the producer and consumer wire formats compatible.
+
 ## [0.9.7] - 2026-08-13
 
 ### Fixed
