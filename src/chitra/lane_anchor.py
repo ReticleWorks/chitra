@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -16,8 +17,11 @@ from chitra.rate_limit_state import get_transaction
 
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 SANCTIONED_HOST = "tophand"
+SANCTIONED_HOSTS = frozenset({"tophand", "trinity"})
 CLAUDE_MODELS = ("sonnet", "opus")
 BACKENDS = ("claude", "codex")
+CLAUDE_EFFORTS = ("low", "medium", "high", "max")
+CODEX_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 
 
 class LaneLaunchRefused(RuntimeError):
@@ -30,8 +34,8 @@ def session_ref(lane: LaneSpec, host: str = SANCTIONED_HOST) -> str:
 
 def ingestion_gate(lane: LaneSpec, *, host: str = SANCTIONED_HOST) -> GoalRecord:
     """Return the frozen goal source only when every launch gate passes."""
-    if host != SANCTIONED_HOST:
-        raise LaneLaunchRefused("lane launch refused: governed lanes must run on tophand")
+    if host not in SANCTIONED_HOSTS:
+        raise LaneLaunchRefused("lane launch refused: governed lanes must run on tophand or trinity")
     ref = session_ref(lane, host)
     try:
         goal = get_goal(lane.state_dir, ref)
@@ -55,19 +59,35 @@ def ingestion_gate(lane: LaneSpec, *, host: str = SANCTIONED_HOST) -> GoalRecord
     return goal
 
 
-def _agent_command(backend: str, model: str | None) -> list[str]:
+def _agent_command(backend: str, model: str | None, effort: str | None) -> list[str]:
     if backend == "claude":
         if model not in CLAUDE_MODELS:
             raise LaneLaunchRefused("lane launch refused: Claude model must be sonnet or opus")
-        return ["claude", "--model", model]
+        if effort not in CLAUDE_EFFORTS:
+            raise LaneLaunchRefused(
+                "lane launch refused: Claude effort must be low, medium, high, or max"
+            )
+        return ["claude", "--model", model, "--effort", effort]
     if backend == "codex":
+        if effort not in CODEX_EFFORTS:
+            raise LaneLaunchRefused("lane launch refused: unsupported Codex effort")
+        command = ["codex"]
         if model:
-            return ["codex", "--model", model]
-        return ["codex"]
+            command.extend(["--model", model])
+        if effort != "none":
+            command.extend(["--config", f'model_reasoning_effort="{effort}"'])
+        return command
     raise LaneLaunchRefused(f"lane launch refused: unsupported backend {backend!r}")
 
 
-def _write_launch_receipt(lane: LaneSpec, goal: GoalRecord, *, backend: str, model: str | None) -> None:
+def _write_launch_receipt(
+    lane: LaneSpec,
+    goal: GoalRecord,
+    *,
+    backend: str,
+    model: str | None,
+    effort: str | None,
+) -> None:
     snapshot = {name: getattr(goal, name) for name in ("goal", "done_when", "intent", "scope", "source")}
     canonical = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
     payload = {
@@ -80,6 +100,7 @@ def _write_launch_receipt(lane: LaneSpec, goal: GoalRecord, *, backend: str, mod
         "goal_snapshot_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
         "backend": backend,
         "model": model or "backend-default",
+        "effort": effort or "backend-default",
         "lifecycle": ["dispatchd", "watchd", "completion_gate", "goal_enforcement", "draft_scanner", "rate_limit_guard"],
     }
     path = lane.state_dir / "lane-launch.json"
@@ -96,6 +117,8 @@ def _run_as_lane(lane: LaneSpec, command: Sequence[str]) -> list[str]:
         f"HOME={lane.home}",
         f"CLAUDE_CONFIG_DIR={lane.config_dir}",
     ]
+    if os.geteuid() == lane.uid:
+        return ["env", *environment, *command]
     return ["runuser", "--user", lane.account, "--", "env", *environment, *command]
 
 
@@ -108,12 +131,13 @@ def start_lane(
     *,
     backend: str = "claude",
     model: str | None = "sonnet",
+    effort: str | None = "high",
     host: str = SANCTIONED_HOST,
     runner: CommandRunner = _run,
 ) -> bool:
     """Ensure the lane session exists; return whether this call created it."""
     goal = ingestion_gate(lane, host=host)
-    agent_command = _agent_command(backend, model)
+    agent_command = _agent_command(backend, model, effort)
     existing = runner(_run_as_lane(lane, _tmux(lane, "has-session", "-t", lane.tmux_session)))
     if existing.returncode == 0:
         return False
@@ -134,7 +158,7 @@ def start_lane(
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"tmux exited {result.returncode}"
         raise RuntimeError(f"could not create lane {lane.identifier} session: {detail}")
-    _write_launch_receipt(lane, goal, backend=backend, model=model)
+    _write_launch_receipt(lane, goal, backend=backend, model=model, effort=effort)
     return True
 
 
@@ -163,6 +187,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default=SANCTIONED_HOST)
     parser.add_argument("--backend", choices=BACKENDS, default="claude")
     parser.add_argument("--model", default="sonnet")
+    parser.add_argument("--effort", default="high")
     parser.add_argument("action", choices=("start", "stop", "status"))
     return parser
 
@@ -173,7 +198,13 @@ def main(argv: list[str] | None = None) -> int:
     if not lane.enabled and args.action == "start":
         raise SystemExit(f"lane is declared disabled: {lane.identifier}")
     if args.action == "start":
-        start_lane(lane, backend=args.backend, model=args.model, host=args.host)
+        start_lane(
+            lane,
+            backend=args.backend,
+            model=args.model,
+            effort=args.effort,
+            host=args.host,
+        )
         return 0
     if args.action == "stop":
         stop_lane(lane)
