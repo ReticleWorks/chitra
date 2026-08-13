@@ -31,12 +31,14 @@ import structlog
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from chitra._fsio import parse_iso8601
+from chitra.plain_english import require_plain_english
 from chitra.state_paths import default_convlog_path
 
 logger = structlog.get_logger(__name__)
 
 SCHEMA: Literal["chitra.convlog.v2"] = "chitra.convlog.v2"
-type EntryKind = Literal["session_msg", "operator_brief", "operator_ruling", "lane_directive"]
+type EntryKind = Literal["session_msg", "operator_brief", "operator_ruling", "lane_directive", "conversation_resolution"]
+type ConversationResolution = Literal["moot", "superseded"]
 type BriefCategory = Literal["decision", "incident", "milestone", "fyi"]
 type RecommendationBasis = Literal["research", "operator-preference"]
 _BARE_CODENAME = re.compile(r"(?:[A-Za-z]*-?\d+|\d+-\d+)", re.IGNORECASE)
@@ -62,6 +64,11 @@ class BriefOption(BaseModel):
         if not value.strip():
             raise ValueError("must be non-empty")
         return value
+
+    @field_validator("consequence")
+    @classmethod
+    def _consequence_is_plain_english(cls, value: str) -> str:
+        return require_plain_english(value, field="option consequence")
 
 
 class OperatorBrief(BaseModel):
@@ -102,14 +109,19 @@ class OperatorBrief(BaseModel):
     def _stage_not_blank(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("stage must be non-empty")
-        return value
+        return require_plain_english(value, field="stage")
 
     @field_validator("decision")
     @classmethod
     def _decision_not_blank(cls, value: str | None) -> str | None:
         if value is not None and not value.strip():
             raise ValueError("decision must be non-empty when provided")
-        return value
+        return require_plain_english(value, field="decision") if value is not None else None
+
+    @field_validator("recommendation")
+    @classmethod
+    def _recommendation_is_plain_english(cls, value: str) -> str:
+        return require_plain_english(value, field="recommendation") if value.strip() else value
 
     @field_validator("source_quote")
     @classmethod
@@ -165,6 +177,13 @@ class _LaneDirectivePayload(BaseModel):
     order_id: str | None
 
 
+class _ConversationResolutionPayload(BaseModel):
+    state: ConversationResolution
+    basis: str = Field(min_length=1)
+    citation: str = Field(min_length=1)
+    authority: str = Field(min_length=1)
+
+
 @dataclass(frozen=True, slots=True)
 class ConversationThread:
     """The current, derived state of one append-only conversation thread."""
@@ -175,6 +194,7 @@ class ConversationThread:
     latest_brief: OperatorBrief
     latest_brief_at: str
     pending: bool
+    state: Literal["pending", "ruled", "moot", "superseded"]
     entries: tuple[ConversationEntry, ...]
 
 
@@ -209,6 +229,8 @@ def _validated_payload(entry: ConversationEntry) -> dict[str, Any]:
             return _OperatorRulingPayload.model_validate(entry.payload).model_dump(mode="json")
         case "lane_directive":
             return _LaneDirectivePayload.model_validate(entry.payload).model_dump(mode="json")
+        case "conversation_resolution":
+            return _ConversationResolutionPayload.model_validate(entry.payload).model_dump(mode="json")
 
 
 def _grounding_line(brief: OperatorBrief) -> str:
@@ -407,6 +429,29 @@ def append_directive(convlog_path: Path, *, thread_id: str, text: str, order_id:
     )
 
 
+def append_resolution(
+    convlog_path: Path,
+    *,
+    thread_id: str,
+    state: ConversationResolution,
+    basis: str,
+    citation: str,
+    authority: str,
+) -> ConversationEntry:
+    """Retire a thread truthfully when events or a newer decision resolve it."""
+    entries = _require_thread(convlog_path, thread_id)
+    for field_name, value in (("basis", basis), ("citation", citation), ("authority", authority)):
+        if not value.strip():
+            raise ValueError(f"{field_name} must be non-empty")
+    return append_entry(
+        convlog_path,
+        thread_id=thread_id,
+        kind="conversation_resolution",
+        session_ref=entries[-1].session_ref,
+        payload={"state": state, "basis": basis, "citation": citation, "authority": authority},
+    )
+
+
 def _thread_from_entries(thread_id: str, entries: list[ConversationEntry]) -> ConversationThread | None:
     brief_entries = [entry for entry in entries if entry.kind == "operator_brief"]
     if not brief_entries:
@@ -418,13 +463,22 @@ def _thread_from_entries(thread_id: str, entries: list[ConversationEntry]) -> Co
         logger.warning("convlog_invalid_brief_entry", thread_id=thread_id, seq=latest.seq)
         return None
     ruled_after = any(entry.kind == "operator_ruling" and entry.seq > latest.seq for entry in entries)
+    resolutions = [entry for entry in entries if entry.kind == "conversation_resolution" and entry.seq > latest.seq]
+    state: Literal["pending", "ruled", "moot", "superseded"]
+    if resolutions:
+        state = resolutions[-1].payload["state"]
+    elif ruled_after:
+        state = "ruled"
+    else:
+        state = "pending"
     return ConversationThread(
         thread_id=thread_id,
         session_ref=latest.session_ref,
         opened_at=entries[0].at,
         latest_brief=brief,
         latest_brief_at=latest.at,
-        pending=brief.decision is not None and not ruled_after,
+        pending=brief.decision is not None and state == "pending",
+        state=state,
         entries=tuple(entries),
     )
 
@@ -489,6 +543,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     directive_command.add_argument("--text", required=True)
     directive_command.add_argument("--order-id")
 
+    retire_command = commands.add_parser("retire", help="Mark a decision thread as resolved by events or replaced by a newer decision.")
+    add_convlog_path(retire_command)
+    retire_command.add_argument("--thread", action="append", required=True)
+    retire_command.add_argument("--state", choices=("moot", "superseded"), required=True)
+    retire_command.add_argument("--basis", required=True)
+    retire_command.add_argument("--citation", required=True)
+    retire_command.add_argument("--authority", required=True)
+
     pending_command = commands.add_parser("pending", help="Render all unresolved decision briefs.")
     add_convlog_path(pending_command)
 
@@ -530,6 +592,16 @@ def main(argv: list[str] | None = None) -> int:
                 append_ruling(args.convlog_path, thread_id=thread_id, text=args.text, via=args.via)
         elif args.command == "directive":
             append_directive(args.convlog_path, thread_id=args.thread, text=args.text, order_id=args.order_id)
+        elif args.command == "retire":
+            for thread_id in args.thread:
+                append_resolution(
+                    args.convlog_path,
+                    thread_id=thread_id,
+                    state=args.state,
+                    basis=args.basis,
+                    citation=args.citation,
+                    authority=args.authority,
+                )
         elif args.command == "pending":
             threads = pending_threads(args.convlog_path)
             print(render_group(threads) if threads else "No pending decisions.")
@@ -538,8 +610,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(entry.model_dump_json(by_alias=True))
         else:
             for thread in list_threads(args.convlog_path, session_ref=args.session_ref):
-                state = "pending" if thread.pending else "ruled"
-                print(f"{thread.thread_id}\t{thread.session_ref}\t{thread.latest_brief.category}\t{state}\t{thread.opened_at}")
+                print(f"{thread.thread_id}\t{thread.session_ref}\t{thread.latest_brief.category}\t{thread.state}\t{thread.opened_at}")
     except (BriefValidationError, ConversationNotFoundError, OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"chitra-convo: {exc}", file=sys.stderr)
         return 1

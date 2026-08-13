@@ -84,7 +84,7 @@ Trailhead installs one `chitra` Debian package built with `fpm`. The package
 contains one released application virtual environment at `/opt/chitra/venv`,
 the service account, and five core systemd unit files: four shared daemons and
 the `chitra@.service` session-anchor template. Build it with
-`CHITRA_VENV_SOURCE=/path/to/released-venv packaging/build-deb.sh 0.9.1 /path/to/chitra.deb`.
+`CHITRA_VENV_SOURCE=/path/to/released-venv packaging/build-deb.sh 0.9.2 /path/to/chitra.deb`.
 
 The package daemons read `/etc/chitra/lanes.yaml`. Each declaration supplies
 the lane identity, account, roots, tmux socket and credential bindings. The

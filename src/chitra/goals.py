@@ -96,6 +96,7 @@ class GoalRecord:
     created_at: str = ""
     updated_at: str = ""
     open_asks: tuple[str, ...] = ()
+    retired_asks: tuple[dict[str, str], ...] = ()
     needs: str = ""
     hold_reason: str = ""
     resume_at: str = ""
@@ -154,6 +155,18 @@ class GoalRecord:
         if not isinstance(raw_open_asks, list) or not all(isinstance(ask, str) for ask in raw_open_asks):
             raise ValueError("goal record open_asks must be a list of strings")
         normalized["open_asks"] = raw_open_asks
+        raw_retired_asks = payload.get("retired_asks", [])
+        retirement_fields = {"ask", "state", "basis", "citation", "authority", "retired_at"}
+        if not isinstance(raw_retired_asks, list):
+            raise ValueError("goal record retired_asks must be a list of objects")
+        for entry in raw_retired_asks:
+            if not isinstance(entry, dict) or set(entry) != retirement_fields:
+                raise ValueError("goal record retired_asks entries must contain the complete retirement record")
+            if not all(isinstance(value, str) for value in entry.values()):
+                raise ValueError("goal record retired_asks entries must contain strings")
+            if entry["state"] not in ("resolved-by-operator", "retired-by-monitor-with-cited-basis"):
+                raise ValueError("goal record retired ask state is invalid")
+        normalized["retired_asks"] = raw_retired_asks
         goal_version = payload.get("goal_version", 1)
         if not isinstance(goal_version, int) or isinstance(goal_version, bool):
             raise ValueError("goal record goal_version must be an integer")
@@ -364,6 +377,7 @@ def _upsert_goal_locked(
         created_at=existing.created_at if existing is not None else now,
         updated_at=now,
         open_asks=open_asks,
+        retired_asks=rec.retired_asks,
         needs=rec.needs,
         hold_reason=hold_reason,
         resume_at=resume_at,
@@ -600,8 +614,12 @@ def resolve_ask(
     ask: str | None = None,
     index: int | None = None,
     all: bool = False,
+    retired_by: Literal["operator", "monitor"] = "operator",
+    basis: str = "Operator answered the ask.",
+    citation: str = "operator-ruling",
+    authority: str = "operator",
 ) -> GoalRecord:
-    """Explicitly remove one matching ask, one indexed ask, or every ask."""
+    """Retire asks while preserving who decided and the cited basis."""
     selector_count = int(ask is not None) + int(index is not None) + int(all)
     if selector_count != 1:
         raise ValueError("select exactly one of ask, index, or all")
@@ -611,16 +629,31 @@ def resolve_ask(
             raise GoalNotFoundError(session_ref)
         if all:
             remaining: tuple[str, ...] = ()
+            removed = existing.open_asks
         elif ask is not None:
             if ask not in existing.open_asks:
                 raise ValueError("open ask was not found")
             remaining = tuple(item for item in existing.open_asks if item != ask)
+            removed = (ask,)
         else:
             assert index is not None
             if index < 0 or index >= len(existing.open_asks):
                 raise ValueError("open ask index is out of range")
             remaining = existing.open_asks[:index] + existing.open_asks[index + 1 :]
-        stored = _upsert_goal_locked(root, replace(existing, open_asks=remaining), clear_open_asks=True)
+            removed = (existing.open_asks[index],)
+        if retired_by == "monitor" and (not basis.strip() or not citation.strip() or not authority.strip()):
+            raise ValueError("monitor retirement requires a non-empty basis, citation, and authority")
+        state = "retired-by-monitor-with-cited-basis" if retired_by == "monitor" else "resolved-by-operator"
+        retired_at = _utc_now()
+        retirements = tuple(
+            {"ask": item, "state": state, "basis": basis, "citation": citation, "authority": authority, "retired_at": retired_at}
+            for item in removed
+        )
+        stored = _upsert_goal_locked(
+            root,
+            replace(existing, open_asks=remaining, retired_asks=(*existing.retired_asks, *retirements)),
+            clear_open_asks=True,
+        )
     logger.info("goal_mutated", session_ref=stored.session_ref, action="upsert")
     return stored
 

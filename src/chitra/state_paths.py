@@ -35,6 +35,11 @@ def default_convlog_path() -> Path:
     return state_dir() / "conversation.jsonl"
 
 
+def default_decisions_path() -> Path:
+    """Return the default append-only monitor decisions log path."""
+    return state_dir() / "decisions.jsonl"
+
+
 def default_ledger_key_path() -> Path:
     """Return the default HMAC signing-key path."""
     return state_dir() / "ledger.key"
