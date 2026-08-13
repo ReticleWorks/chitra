@@ -120,12 +120,15 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
             "claude",
             "--model",
             "sonnet",
+            "--effort",
+            "high",
         ],
     ]
     receipt = __import__("json").loads((lane.state_dir / "lane-launch.json").read_text())
     assert receipt["session_ref"] == "tophand:alpha:0.0"
     assert receipt["goal_snapshot"]["source"] == "task-file:lane-architecture"
     assert "rate_limit_guard" in receipt["lifecycle"]
+    assert receipt["effort"] == "high"
 
 
 def test_lane_launch_refuses_without_passing_ingestion_record(tmp_path):
@@ -137,6 +140,28 @@ def test_lane_launch_refuses_without_passing_ingestion_record(tmp_path):
 
     with pytest.raises(LaneLaunchRefused, match="no chitra-goals ingestion record"):
         ingestion_gate(lane)
+
+
+def test_trinity_uses_the_same_host_qualified_goal_convention(tmp_path):
+    import yaml
+
+    path = tmp_path / "lanes.yaml"
+    path.write_text(yaml.safe_dump(_manifest(tmp_path)), encoding="utf-8")
+    lane = load_lanes(path)[0]
+    upsert_goal(
+        lane.state_dir,
+        GoalRecord(
+            session_ref="trinity:alpha:0.0",
+            goal="Prove Trinity shares governed lane launch semantics",
+            done_when="The host-qualified goal passes the ingestion gate",
+            intent="Keep the offline development host aligned with Tophand governance",
+            scope="Trinity lane launch configuration only",
+            source="task-file:trinity-parity",
+            status="working",
+        ),
+    )
+
+    assert ingestion_gate(lane, host="trinity").session_ref == "trinity:alpha:0.0"
 
 
 def test_lane_launch_refuses_active_usage_pause(tmp_path):
@@ -186,8 +211,69 @@ def test_governed_claude_model_selection(model, tmp_path):
     def runner(command):
         calls.append(list(command))
         return subprocess.CompletedProcess(command, 1 if len(calls) == 1 else 0, "", "")
-    assert start_lane(lane, backend="claude", model=model, runner=runner)
-    assert calls[-1][-3:] == ["claude", "--model", model]
+    assert start_lane(lane, backend="claude", model=model, effort="max", runner=runner)
+    assert calls[-1][-5:] == ["claude", "--model", model, "--effort", "max"]
+
+
+def test_governed_codex_effort_is_explicit_and_receipted(tmp_path):
+    import json
+
+    import yaml
+
+    path = tmp_path / "lanes.yaml"
+    path.write_text(yaml.safe_dump(_manifest(tmp_path)), encoding="utf-8")
+    lane = load_lanes(path)[0]
+    upsert_goal(
+        lane.state_dir,
+        GoalRecord(
+            session_ref="tophand:alpha:0.0",
+            goal="Exercise one explicit governed Codex model route",
+            done_when="The command and receipt name model and effort",
+            intent="Keep every governed model routing choice explicit and auditable",
+            scope="One disposable governed test lane",
+            source="task-file:codex-effort-test",
+            status="working",
+        ),
+    )
+    calls = []
+
+    def runner(command):
+        calls.append(list(command))
+        return subprocess.CompletedProcess(command, 1 if len(calls) == 1 else 0, "", "")
+
+    assert start_lane(
+        lane,
+        backend="codex",
+        model="gpt-5.6-sol",
+        effort="xhigh",
+        runner=runner,
+    )
+    assert calls[-1][-5:] == [
+        "codex",
+        "--model",
+        "gpt-5.6-sol",
+        "--config",
+        'model_reasoning_effort="xhigh"',
+    ]
+    receipt = json.loads((lane.state_dir / "lane-launch.json").read_text())
+    assert receipt["model"] == "gpt-5.6-sol"
+    assert receipt["effort"] == "xhigh"
+
+
+def test_same_account_launch_does_not_require_runuser(tmp_path, monkeypatch):
+    import yaml
+
+    manifest = _manifest(tmp_path)
+    manifest["lanes"][0]["uid"] = 1000
+    path = tmp_path / "lanes.yaml"
+    path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    lane = load_lanes(path)[0]
+    monkeypatch.setattr("chitra.lane_anchor.os.geteuid", lambda: 1000)
+    from chitra.lane_anchor import _run_as_lane
+
+    command = _run_as_lane(lane, ["tmux", "list-sessions"])
+    assert command[:3] == ["env", "HOME=/home/alpha", "CLAUDE_CONFIG_DIR=/home/alpha/.claude-alpha"]
+    assert "runuser" not in command
 
 
 def test_shared_dispatch_wrapper_uses_only_enabled_lane_roots(tmp_path, monkeypatch):

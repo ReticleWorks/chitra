@@ -4,6 +4,16 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-08-13
+
+### Changed
+- Governed Claude and Codex lane launches now carry an explicit effort into
+  the agent command and the `chitra.lane-launch.v1` receipt.
+- A gateway already running as the declared lane account launches directly,
+  without an unnecessary privileged `runuser` hop.
+- Trinity is accepted as the second sanctioned governed lane host, with the
+  same host-qualified goal gate used by Tophand.
+
 ## [0.9.3] - 2026-08-13
 
 ### Added
