@@ -4,6 +4,15 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-08-13
+
+### Added
+- Watchd accepts an explicit tmux socket from `--tmux-socket` or
+  `CHITRA_WATCHD_TMUX_SOCKET`, plus exact session-name and prefix filters.
+- An unchanged Claude or Codex input row emits one configurable `IDLE` event.
+  Triaged writes it to `queue.tsv` with severity `IDLE` and to `flags.log`
+  with an `IDLE` prefix for bounded monitor consumption.
+
 ## [0.9.4] - 2026-08-13
 
 ### Changed

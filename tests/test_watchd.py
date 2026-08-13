@@ -79,6 +79,56 @@ def test_watchd_emits_real_change_but_not_input_box_typing(tmp_path: Path) -> No
     assert text == "CHANGE DETECTED: status: blocked"
 
 
+def test_watchd_emits_idle_once_after_unchanged_input_row(tmp_path: Path) -> None:
+    now = [100.0]
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "capture-pane":
+            return _completed(command, "status: waiting\n› Add a task\n")
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(
+        WatchdConfig(
+            state_dir=tmp_path,
+            events_log=tmp_path / "events.log",
+            panes_override=("probe:0.0",),
+            idle_threshold_seconds=10,
+        ),
+        runner=runner,
+        clock=lambda: now[0],
+    )
+    assert watcher.poll_once() == 0
+    now[0] = 109.0
+    assert watcher.poll_once() == 0
+    now[0] = 110.0
+    assert watcher.poll_once() == 1
+    now[0] = 120.0
+    assert watcher.poll_once() == 0
+    parsed = parse_event_line((tmp_path / "events.log").read_text(encoding="utf-8"))
+    assert parsed is not None
+    assert parsed[1] == "probe:0.0"
+    assert parsed[2] == "IDLE target=probe:0.0 idle_seconds=10 threshold_seconds=10"
+
+
+def test_watchd_does_not_emit_idle_without_input_row(tmp_path: Path) -> None:
+    now = [100.0]
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "capture-pane":
+            return _completed(command, "status: working\nRunning tests…\n")
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log", panes_override=("active:0.0",), idle_threshold_seconds=5),
+        runner=runner,
+        clock=lambda: now[0],
+    )
+    assert watcher.poll_once() == 0
+    now[0] = 110.0
+    assert watcher.poll_once() == 0
+    assert not (tmp_path / "events.log").exists()
+
+
 class _AcceptingReviewer:
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -407,6 +457,9 @@ def test_resolve_config_uses_chitra_state_and_watchd_environment(monkeypatch: py
     monkeypatch.setenv("CHITRA_WATCHD_INTERVAL", "2.5")
     monkeypatch.setenv("CHITRA_WATCHD_PANES", "%1, %2")
     monkeypatch.setenv("CHITRA_WATCHD_SESSION_PREFIXES", "boomtown-, boomtown-review-")
+    monkeypatch.setenv("CHITRA_WATCHD_SESSION_NAMES", "infra-health, atlas-v5")
+    monkeypatch.setenv("CHITRA_WATCHD_TMUX_SOCKET", "/run/chitra-worker/tmux-1000/default")
+    monkeypatch.setenv("CHITRA_WATCHD_IDLE_THRESHOLD_SECONDS", "30")
     monkeypatch.setenv("CHITRA_WATCHD_EXCLUDE_SESSION_PREFIXES", "boomtown-control")
     monkeypatch.setenv("CHITRA_WATCHD_REVIEWER_COUNT", "1")
     monkeypatch.setenv("CHITRA_WATCHD_REVIEWER_COMMAND", "/opt/chitra/bin/review-with-monitor-credentials")
@@ -419,6 +472,9 @@ def test_resolve_config_uses_chitra_state_and_watchd_environment(monkeypatch: py
     assert config.interval_seconds == 2.5
     assert config.panes_override == ("%1", "%2")
     assert config.session_prefixes == ("boomtown-", "boomtown-review-")
+    assert config.session_names == ("infra-health", "atlas-v5")
+    assert config.tmux_socket == Path("/run/chitra-worker/tmux-1000/default")
+    assert config.idle_threshold_seconds == 30
     assert config.excluded_session_prefixes == ("boomtown-control",)
     assert config.reviewer_count == 1
     assert config.reviewer_command == "/opt/chitra/bin/review-with-monitor-credentials"

@@ -17,6 +17,7 @@ import re
 import signal
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -56,13 +57,17 @@ EVENT_LOG_ENV_VAR = "CHITRA_WATCHD_EVENT_LOG"
 INTERVAL_ENV_VAR = "CHITRA_WATCHD_INTERVAL"
 PANES_ENV_VAR = "CHITRA_WATCHD_PANES"
 SESSION_PREFIXES_ENV_VAR = "CHITRA_WATCHD_SESSION_PREFIXES"
+SESSION_NAMES_ENV_VAR = "CHITRA_WATCHD_SESSION_NAMES"
 EXCLUDED_SESSION_PREFIXES_ENV_VAR = "CHITRA_WATCHD_EXCLUDE_SESSION_PREFIXES"
+TMUX_SOCKET_ENV_VAR = "CHITRA_WATCHD_TMUX_SOCKET"
+IDLE_THRESHOLD_ENV_VAR = "CHITRA_WATCHD_IDLE_THRESHOLD_SECONDS"
 MAX_LOG_BYTES_ENV_VAR = "CHITRA_WATCHD_MAX_LOG_BYTES"
 REVIEWER_COUNT_ENV_VAR = "CHITRA_WATCHD_REVIEWER_COUNT"
 REVIEWER_COMMAND_ENV_VAR = "CHITRA_WATCHD_REVIEWER_COMMAND"
 REVIEWER_MODEL_ENV_VAR = "CHITRA_WATCHD_REVIEWER_MODEL"
 REASONED_DISPATCH_ENV_VAR = "CHITRA_WATCHD_REASONED_DISPATCH_ENABLED"
 DEFAULT_INTERVAL_SECONDS = 5.0
+DEFAULT_IDLE_THRESHOLD_SECONDS = 300.0
 DEFAULT_MAX_LOG_BYTES = 5 * 1024 * 1024
 DEFAULT_REVIEWER_COUNT = 2
 DEFAULT_REVIEWER_COMMAND = "claude"
@@ -103,6 +108,7 @@ class WatchdConfig:
     tmux_socket: Path | None = None
     interval_seconds: float = DEFAULT_INTERVAL_SECONDS
     panes_override: tuple[str, ...] | None = None
+    session_names: tuple[str, ...] | None = None
     session_prefixes: tuple[str, ...] | None = None
     excluded_session_prefixes: tuple[str, ...] = ()
     max_log_bytes: int = DEFAULT_MAX_LOG_BYTES
@@ -113,10 +119,13 @@ class WatchdConfig:
     reviewer_model: str | None = DEFAULT_REVIEWER_MODEL
     queue_dir: Path | None = None
     reasoned_dispatch_enabled: bool = DEFAULT_REASONED_DISPATCH_ENABLED
+    idle_threshold_seconds: float = DEFAULT_IDLE_THRESHOLD_SECONDS
 
     def __post_init__(self) -> None:
         if self.reviewer_count < 1:
             raise ValueError("reviewer_count must be a positive integer")
+        if self.idle_threshold_seconds <= 0:
+            raise ValueError("idle_threshold_seconds must be a positive number")
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,7 +148,7 @@ def normalize(content: str) -> list[str]:
     pane cannot look like a lane state transition.
     """
     lines = content.splitlines()
-    prompt_indices = [index for index, line in enumerate(lines) if line.startswith("❯")]
+    prompt_indices = [index for index, line in enumerate(lines) if line.lstrip().startswith(("❯", "›"))]
     if prompt_indices:
         lines = lines[: prompt_indices[-1]]
 
@@ -163,9 +172,17 @@ def normalized_snapshot(content: str) -> tuple[str, list[str]]:
 def pane_turn_finished(content: str) -> bool:
     """Recognize a stable input prompt after a completed lane turn."""
     lines = content.splitlines()
-    has_prompt = any(line.lstrip().startswith("❯") for line in lines)
+    has_prompt = pane_at_input_row(content)
     active = any(_ACTIVE_TURN_RE.search(line) for line in lines[-12:])
     return has_prompt and not active and bool(normalize(content))
+
+
+def pane_at_input_row(content: str) -> bool:
+    """Return true when a Claude or Codex input row is visible and no turn is active."""
+    lines = content.splitlines()
+    has_prompt = any(line.lstrip().startswith(("❯", "›")) for line in lines[-12:])
+    active = any(_ACTIVE_TURN_RE.search(line) for line in lines[-12:])
+    return has_prompt and not active
 
 
 def _run_command(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -194,6 +211,7 @@ def list_panes(
     *,
     runner: CommandRunner = _run_command,
     panes_override: Sequence[str] | None = None,
+    session_names: Sequence[str] | None = None,
     session_prefixes: Sequence[str] | None = None,
     excluded_session_prefixes: Sequence[str] = (),
     tmux_socket: Path | None = None,
@@ -211,6 +229,7 @@ def list_panes(
     if panes_override is not None:
         return [Pane(pane_id=target, target=target) for target in dict.fromkeys(panes_override) if target]
 
+    allowed = frozenset(name.strip() for name in (session_names or ()) if name.strip())
     included = tuple(prefix.strip() for prefix in (session_prefixes or ()) if prefix.strip())
     excluded = tuple(prefix.strip() for prefix in excluded_session_prefixes if prefix.strip())
 
@@ -240,7 +259,9 @@ def list_panes(
         if not separator or not pane_id or not target or pane_id in seen:
             continue
         session_name, _separator, _pane = target.partition(":")
-        if included and not any(session_name.startswith(prefix) for prefix in included):
+        if (allowed or included) and session_name not in allowed and not any(
+            session_name.startswith(prefix) for prefix in included
+        ):
             continue
         if any(session_name.startswith(prefix) for prefix in excluded):
             continue
@@ -274,6 +295,15 @@ def event_line(lane_id: str, normalized_tail: Sequence[str], *, now: datetime | 
     return f"{timestamp} {lane_id} {text}\n"
 
 
+def idle_event_line(lane_id: str, target: str, idle_seconds: float, threshold_seconds: float) -> str:
+    """Format the stable IDLE wire event consumed and classified by triaged."""
+    timestamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return (
+        f"{timestamp} {lane_id} IDLE target={target} "
+        f"idle_seconds={int(idle_seconds)} threshold_seconds={int(threshold_seconds)}\n"
+    )
+
+
 def append_event(event_log: Path, line: str, *, max_log_bytes: int = DEFAULT_MAX_LOG_BYTES) -> None:
     """Append under an exclusive lock, rotating the legacy-sized log first."""
     event_log.parent.mkdir(parents=True, exist_ok=True)
@@ -299,6 +329,9 @@ class Watchd:
     principles: PrinciplesIndex = field(default_factory=PrinciplesIndex)
     reasoning_oracle: Oracle = abstaining_oracle
     baselines: dict[str, str] = field(default_factory=dict)
+    idle_since: dict[str, float] = field(default_factory=dict)
+    idle_emitted: set[str] = field(default_factory=set)
+    clock: Callable[[], float] = time.monotonic
     reviewed_turns: set[ReviewKey] = field(default_factory=set)
     pending_reviews: dict[ReviewKey, PendingCompletionReview] = field(default_factory=dict)
     _review_executor: ThreadPoolExecutor = field(init=False, repr=False)
@@ -534,6 +567,7 @@ class Watchd:
         for pane in list_panes(
             runner=self.runner,
             panes_override=self.config.panes_override,
+            session_names=self.config.session_names,
             session_prefixes=self.config.session_prefixes,
             excluded_session_prefixes=self.config.excluded_session_prefixes,
             tmux_socket=self.config.tmux_socket,
@@ -549,6 +583,10 @@ class Watchd:
                 self._review_turn_end(pane, content)
             previous = self.baselines.get(pane.pane_id)
             changed = previous is None or previous != digest
+            at_input = pane_at_input_row(content)
+            if changed or not at_input:
+                self.idle_since[pane.pane_id] = self.clock()
+                self.idle_emitted.discard(pane.pane_id)
             if session_ref is not None:
                 prior_activity = existing_activity.get(session_ref)
                 activity_updates.append(
@@ -567,6 +605,16 @@ class Watchd:
                 self.baselines[pane.pane_id] = digest
                 continue
             if previous == digest:
+                idle_for = self.clock() - self.idle_since.setdefault(pane.pane_id, self.clock())
+                if at_input and idle_for >= self.config.idle_threshold_seconds and pane.pane_id not in self.idle_emitted:
+                    event_id = self.config.lane_id or pane.target
+                    append_event(
+                        self.config.events_log,
+                        idle_event_line(event_id, pane.target, idle_for, self.config.idle_threshold_seconds),
+                        max_log_bytes=self.config.max_log_bytes,
+                    )
+                    self.idle_emitted.add(pane.pane_id)
+                    emitted += 1
                 continue
             event_id = self.config.lane_id or pane.pane_id
             append_event(self.config.events_log, event_line(event_id, tail), max_log_bytes=self.config.max_log_bytes)
@@ -632,6 +680,8 @@ def resolve_config(
     events_log: Path | None = None,
     interval_seconds: float | None = None,
     panes_override: Sequence[str] | None = None,
+    tmux_socket: Path | None = None,
+    session_names: Sequence[str] | None = None,
     session_prefixes: Sequence[str] | None = None,
     excluded_session_prefixes: Sequence[str] | None = None,
     max_log_bytes: int | None = None,
@@ -639,6 +689,7 @@ def resolve_config(
     reviewer_command: str | None = None,
     reviewer_model: str | None = None,
     reasoned_dispatch_enabled: bool | None = None,
+    idle_threshold_seconds: float | None = None,
 ) -> WatchdConfig:
     """Resolve CLI values, then ``CHITRA_*`` overrides, then generic defaults."""
     configured_state_dir = state_dir or default_state_dir()
@@ -661,6 +712,12 @@ def resolve_config(
     if configured_panes is None:
         raw_panes = _env_value(PANES_ENV_VAR)
         configured_panes = tuple(item.strip() for item in raw_panes.split(",") if item.strip()) if raw_panes else None
+    configured_tmux_socket = tmux_socket or (Path(raw_socket) if (raw_socket := _env_value(TMUX_SOCKET_ENV_VAR)) else None)
+    configured_session_names = (
+        tuple(name.strip() for name in session_names if name.strip())
+        if session_names is not None
+        else _split_prefixes(_env_value(SESSION_NAMES_ENV_VAR))
+    )
     configured_session_prefixes = (
         tuple(prefix.strip() for prefix in session_prefixes if prefix.strip())
         if session_prefixes is not None
@@ -699,11 +756,21 @@ def resolve_config(
             if raw_reasoned_dispatch is not None
             else DEFAULT_REASONED_DISPATCH_ENABLED
         )
+    configured_idle_threshold = idle_threshold_seconds
+    if configured_idle_threshold is None:
+        raw_idle_threshold = _env_value(IDLE_THRESHOLD_ENV_VAR)
+        configured_idle_threshold = (
+            _positive_float(raw_idle_threshold, name=IDLE_THRESHOLD_ENV_VAR)
+            if raw_idle_threshold
+            else DEFAULT_IDLE_THRESHOLD_SECONDS
+        )
     return WatchdConfig(
         state_dir=configured_state_dir,
         events_log=configured_events_log,
         interval_seconds=configured_interval,
         panes_override=tuple(configured_panes) if configured_panes is not None else None,
+        tmux_socket=configured_tmux_socket,
+        session_names=configured_session_names or None,
         session_prefixes=configured_session_prefixes or None,
         excluded_session_prefixes=configured_excluded_session_prefixes,
         max_log_bytes=configured_max_log_bytes,
@@ -711,6 +778,7 @@ def resolve_config(
         reviewer_command=configured_reviewer_command,
         reviewer_model=configured_reviewer_model,
         reasoned_dispatch_enabled=configured_reasoned_dispatch,
+        idle_threshold_seconds=configured_idle_threshold,
     )
 
 
@@ -738,6 +806,7 @@ def build_lane_watchers(lanes_file: Path | None, base_config: WatchdConfig) -> t
                     state_dir=lane.state_dir,
                     events_log=lane.events_log,
                     tmux_socket=lane.tmux_socket,
+                    session_names=None,
                     session_prefixes=(lane.tmux_session,),
                     excluded_session_prefixes=(),
                     goals_root=lane.state_dir,
@@ -783,6 +852,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="watchd", description="Deterministic tmux-pane change emitter for triaged.")
     parser.add_argument("--state-dir", type=Path, default=None, help="Watcher state root (default: CHITRA_STATE_DIR or /var/lib/chitra).")
     parser.add_argument(
+        "--tmux-socket", type=Path, default=None, help="Explicit tmux socket (default: CHITRA_WATCHD_TMUX_SOCKET)."
+    )
+    parser.add_argument(
+        "--session-name",
+        action="append",
+        default=None,
+        help="Observe only this exact tmux session (repeatable; default: CHITRA_WATCHD_SESSION_NAMES).",
+    )
+    parser.add_argument(
         "--lanes-file",
         type=Path,
         default=None,
@@ -809,6 +887,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--max-log-bytes", type=int, default=None, help="Rotate at this size (default: CHITRA_WATCHD_MAX_LOG_BYTES or 5 MiB)."
+    )
+    parser.add_argument(
+        "--idle-threshold-seconds",
+        type=float,
+        default=None,
+        help="Unchanged input-row interval before IDLE (default: CHITRA_WATCHD_IDLE_THRESHOLD_SECONDS or 300).",
     )
     parser.add_argument(
         "--reviewer-count",
@@ -844,6 +928,8 @@ def main(argv: list[str] | None = None) -> int:
         events_log=args.events_log,
         interval_seconds=args.interval_seconds,
         panes_override=panes_override,
+        tmux_socket=args.tmux_socket,
+        session_names=args.session_name,
         session_prefixes=args.session_prefix,
         excluded_session_prefixes=args.exclude_session_prefix,
         max_log_bytes=args.max_log_bytes,
@@ -851,6 +937,7 @@ def main(argv: list[str] | None = None) -> int:
         reviewer_command=args.reviewer_command,
         reviewer_model=args.reviewer_model,
         reasoned_dispatch_enabled=args.reasoned_dispatch,
+        idle_threshold_seconds=args.idle_threshold_seconds,
     )
     if args.lanes_file is not None:
         if args.once:
