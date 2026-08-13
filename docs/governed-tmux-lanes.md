@@ -1,19 +1,19 @@
-# Governed tmux lanes on Tophand
+# Governed tmux lanes on Tophand and Trinity
 
 Headless Codexman jobs are not lanes. A Chitra lane is one interactive Codex
 or Claude process in its own Tophand tmux session and pane. The launch command
 refuses before creating the session unless `chitra-goals` contains a passing
-record for `tophand:<session>:0.0` with `goal`, `done_when`, `intent`, `scope`,
+record for `<host>:<session>:0.0` (where host is `tophand` or `trinity`) with `goal`, `done_when`, `intent`, `scope`,
 and `source`. It also refuses held or unreadable usage-pause state.
 
 ```bash
-chitra-lane-session --lane atlas --host tophand --backend claude --model sonnet start
-chitra-lane-session --lane editorial --host tophand --backend claude --model opus start
-chitra-lane-session --lane repair --host tophand --backend codex --model gpt-5.6-sol start
+chitra-lane-session --lane atlas --host tophand --backend claude --model sonnet --effort high start
+chitra-lane-session --lane editorial --host tophand --backend claude --model opus --effort max start
+chitra-lane-session --lane repair --host tophand --backend codex --model gpt-5.6-sol --effort xhigh start
 ```
 
 The launcher stores a `chitra.lane-launch.v1` receipt under the lane state
-root. It binds the durable lane ID, session reference, backend/model, goal
+root. It binds the durable lane ID, session reference, backend/model/effort, goal
 version, enrollment time, all five strategic goal fields, and their SHA-256.
 Unreadable launch or tmux state is `UNKNOWN` and cannot count as complete.
 
