@@ -197,11 +197,14 @@ def emit_receiving_event(
     preserving Chitra's stronger transition dedup as the first filter.
     """
     epoch = time.time() if now is None else now
+    is_idle = text.startswith("IDLE ")
     hits = critical_hits(text)
-    severity = "CRIT" if hits else "INFO"
-    signature = ",".join(rule for rule, _ in hits) or "-"
+    severity = "IDLE" if is_idle else ("CRIT" if hits else "INFO")
+    signature = "idle" if is_idle else (",".join(rule for rule, _ in hits) or "-")
     summary = (hits[0][1] if hits else text).replace("\t", " ").replace("\n", " ")[:200]
     _append_line(outputs.queue_file, f"{ts}\t{severity}\t{lane_id}\t{signature}\t{summary}")
+    if is_idle:
+        _append_line(outputs.flags_file, f"IDLE {ts} {lane_id} idle: {summary[:300]}")
     stats["crit_raw"] = _counter(stats.get("crit_raw", 0)) + len(hits)
     for rule, statement in hits:
         key = f"{lane_id}\x1f{rule}"
