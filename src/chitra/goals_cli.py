@@ -126,6 +126,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     selectors.add_argument("--ask")
     selectors.add_argument("--index", type=int)
     selectors.add_argument("--all", action="store_true")
+    resolve_ask_command.add_argument("--retired-by", choices=("operator", "monitor"), default="operator")
+    resolve_ask_command.add_argument("--basis", default="Operator answered the ask.")
+    resolve_ask_command.add_argument("--citation", default="operator-ruling")
+    resolve_ask_command.add_argument("--authority", default="operator")
 
     scan_asks_command = commands.add_parser("scan-asks", help="Extract verbatim open asks from a lane transcript.")
     add_root(scan_asks_command)
@@ -246,7 +250,19 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "add-ask":
             _print_record(goal_store.add_ask(args.root, args.session_ref, args.ask))
         elif args.command == "resolve-ask":
-            _print_record(goal_store.resolve_ask(args.root, args.session_ref, ask=args.ask, index=args.index, all=args.all))
+            _print_record(
+                goal_store.resolve_ask(
+                    args.root,
+                    args.session_ref,
+                    ask=args.ask,
+                    index=args.index,
+                    all=args.all,
+                    retired_by=args.retired_by,
+                    basis=args.basis,
+                    citation=args.citation,
+                    authority=args.authority,
+                )
+            )
         elif args.command == "scan-asks":
             if args.record and args.session_ref is None:
                 raise ValueError("--record requires --session-ref")

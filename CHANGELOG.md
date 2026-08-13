@@ -4,6 +4,16 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-08-13
+
+### Added
+- An append-only `chitra-decisions` log for consequential monitor decisions. Every entry records the time, decision, basis, citation, and authority.
+- Explicit `moot` and `superseded` outcomes for operator conversation threads, with a required basis, citation, and authority.
+- Durable ask-retirement history, including the `retired-by-monitor-with-cited-basis` state.
+
+### Changed
+- Monitor-authored operator briefs, decisions, and retirement reasons now apply deterministic plain-English checks at write time. The checks reject unexplained internal jargon, bare codenames, and sentence fragments. They never gate or rewrite spawned work-session reports, evidence files, transcripts, pull-request text, citations, or verbatim asks.
+
 ## [0.9.2] - 2026-08-13
 
 ### Added
