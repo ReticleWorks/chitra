@@ -120,6 +120,7 @@ _CODEX_TUI_PLACEHOLDER_HINTS: frozenset[str] = frozenset(
         "Check recently modified functions for compatibility",
         "How many files have been modified?",
         "Will this algorithm scale well?",
+        "Ask Codex to do anything",
     }
 )
 # SGR (Select Graphic Rendition) escape — the subset of ANSI escapes that

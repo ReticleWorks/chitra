@@ -4,6 +4,18 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-08-13
+
+### Added
+- A governed Tophand tmux-lane launcher with complete goal-ingestion gating,
+  frozen lane/goal receipts, Claude Sonnet/Opus and Codex model selection,
+  usage-pause refusal, and lifecycle-parity documentation.
+
+### Fixed
+- Codex's `Ask Codex to do anything` composer ghost suggestion is recognized
+  as an idle placeholder instead of an unsubmitted operator draft.
+- Lane status read failures report UNKNOWN instead of false inactivity.
+
 ## [0.9.1] - 2026-08-10
 
 ### Added

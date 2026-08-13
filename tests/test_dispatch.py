@@ -696,6 +696,20 @@ def test_pane_input_check_treats_a_known_codex_hint_at_normal_intensity_as_idle(
     assert check.reason == "idle: Codex TUI input row shows only a placeholder hint"
 
 
+def test_pane_input_check_treats_codex_ghost_suggestion_as_idle() -> None:
+    """Regression: Codex paints this rotating composer placeholder at normal
+    intensity on some terminals; it is not an operator draft."""
+    check = pane_input_check(
+        [
+            "• Ready for input",
+            "\x1b[1m›\x1b[0m Ask Codex to do anything",
+            "  ? for shortcuts                                       100% context left",
+        ]
+    )
+    assert check.ok is True
+    assert check.reason == "idle: Codex TUI input row shows only a placeholder hint"
+
+
 def test_pane_input_check_blocks_an_unknown_normal_intensity_codex_draft() -> None:
     """A normal-intensity row that is not a known hint remains blocked — the
     fail-closed property for real drafts is preserved."""
