@@ -33,7 +33,9 @@ Watchd itself remains responsive; it does not wait for reviewers to finish befor
 watchd \
   --state-dir /var/lib/chitra \
   --events-log /var/lib/chitra/events.log \
+  --tmux-socket /run/chitra-worker/tmux-1000/default \
   --session-prefix agent \
+  --idle-threshold-seconds 300 \
   --interval-seconds 5 \
   --reviewer-count 2 \
   --reviewer-model claude-opus
@@ -47,9 +49,12 @@ Omit `--once` to run continuously. Provide `--once` to run one poll and exit.
 |------|---------|-------|
 | `--state-dir` | `/var/lib/chitra` | Base state directory. |
 | `--events-log` | `$CHITRA_STATE_DIR/events.log` | Where to write pane-change events. |
+| `--tmux-socket` | tmux default | Exact tmux server socket. |
+| `--session-name` | Unset | Exact session allowlist; repeatable. |
 | `--session-prefix` | Unset (all sessions) | Match only sessions starting with this prefix. |
 | `--exclude-session-prefix` | None | Exclude sessions starting with this prefix. |
 | `--interval-seconds` | 5 | Seconds between polls. |
+| `--idle-threshold-seconds` | 300 | Unchanged input-row seconds before one IDLE event. |
 | `--panes` | All visible | Target specific pane references (e.g., `session:window.pane`). |
 | `--reviewer-count` | 2 | Max concurrent LLM reviewer processes. |
 | `--reviewer-model` | `claude` | Model to use for reviewers. |
@@ -64,20 +69,31 @@ Omit `--once` to run continuously. Provide `--once` to run one poll and exit.
 | `CHITRA_WATCHD_EVENT_LOG` | `/var/lib/chitra/events.log` | Path to events log. |
 | `CHITRA_WATCHD_INTERVAL` | 5 | Poll interval in seconds. |
 | `CHITRA_WATCHD_PANES` | None | Target panes (space-separated). |
+| `CHITRA_WATCHD_TMUX_SOCKET` | tmux default | Exact tmux server socket path. |
+| `CHITRA_WATCHD_SESSION_NAMES` | None | Comma-separated exact session allowlist. |
 | `CHITRA_WATCHD_SESSION_PREFIXES` | None | Session prefix filter. |
+| `CHITRA_WATCHD_IDLE_THRESHOLD_SECONDS` | 300 | Unchanged input-row threshold. |
 | `CHITRA_WATCHD_MAX_LOG_BYTES` | 5242880 (5 MiB) | Rotate log at this size. |
 | `CHITRA_WATCHD_REVIEWER_COUNT` | 2 | Max concurrent reviewers. |
 | `CHITRA_WATCHD_REVIEWER_COMMAND` | `claude` | Reviewer CLI. |
 
 ## Events log format
 
-Watchd emits events to an JSONL log. Each line is ISO8601 timestamp, lane ID, and event text:
+Watchd emits one whitespace-delimited event per line: ISO8601 timestamp, lane
+ID, and event text. Idle events have this stable form:
 
 ```
-2025-01-15T12:34:56Z agent-session output_changed
-2025-01-15T12:34:57Z agent-session completion_claimed
-2025-01-15T12:35:02Z agent-session completion_reviewed accept
+2026-08-13T12:00:00Z infra-health:0.0 IDLE target=infra-health:0.0 idle_seconds=300 threshold_seconds=300
 ```
+
+Triaged copies that classification to both receiving feeds:
+
+```
+2026-08-13T12:00:00Z\tIDLE\tinfra-health:0.0\tidle\tIDLE target=infra-health:0.0 idle_seconds=300 threshold_seconds=300
+IDLE 2026-08-13T12:00:00Z infra-health:0.0 idle: IDLE target=infra-health:0.0 idle_seconds=300 threshold_seconds=300
+```
+
+The first line is `queue.tsv`; the second is `flags.log`.
 
 ## Completion reviews
 
