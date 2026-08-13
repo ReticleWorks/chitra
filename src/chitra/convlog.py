@@ -440,9 +440,10 @@ def append_resolution(
 ) -> ConversationEntry:
     """Retire a thread truthfully when events or a newer decision resolve it."""
     entries = _require_thread(convlog_path, thread_id)
-    for field_name, value in (("basis", basis), ("citation", citation), ("authority", authority)):
-        if not value.strip():
-            raise ValueError(f"{field_name} must be non-empty")
+    require_plain_english(basis, field="resolution basis")
+    require_plain_english(authority, field="resolution authority")
+    if not citation.strip():
+        raise ValueError("citation must be non-empty")
     return append_entry(
         convlog_path,
         thread_id=thread_id,

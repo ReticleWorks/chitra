@@ -1,7 +1,9 @@
-"""Deterministic checks for operator-facing plain English.
+"""Deterministic checks for operator-facing text authored by the monitor.
 
-Quoted source material is deliberately not passed through these checks. A
-durable record must preserve its evidence exactly.
+These checks belong only on Chitra monitor write paths, such as decisions,
+briefs, and the monitor's basis for retiring a record. They must never gate or
+rewrite content authored by a spawned work session: reports, evidence files,
+transcripts, pull-request text, citations, and verbatim asks remain unchanged.
 """
 
 from __future__ import annotations

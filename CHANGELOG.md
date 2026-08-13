@@ -12,7 +12,7 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 - Durable ask-retirement history, including the `retired-by-monitor-with-cited-basis` state.
 
 ### Changed
-- Operator briefs and decisions now apply deterministic plain-English checks at write time. The checks reject unexplained internal jargon, bare codenames, and sentence fragments while leaving citations and verbatim source quotes unchanged.
+- Monitor-authored operator briefs, decisions, and retirement reasons now apply deterministic plain-English checks at write time. The checks reject unexplained internal jargon, bare codenames, and sentence fragments. They never gate or rewrite spawned work-session reports, evidence files, transcripts, pull-request text, citations, or verbatim asks.
 
 ## [0.9.2] - 2026-08-13
 

@@ -20,6 +20,7 @@ from pydantic.dataclasses import dataclass as pydantic_dataclass
 from chitra._fsio import locked_json_store, parse_iso8601, write_json_atomic
 from chitra.close_gate import RequiredItem, _recorded_descopes, require_close_inventory
 from chitra.completion_gate import CompletionEvidence
+from chitra.plain_english import require_plain_english
 from chitra.state_paths import state_dir
 
 logger = structlog.get_logger(__name__)
@@ -643,6 +644,9 @@ def resolve_ask(
             removed = (existing.open_asks[index],)
         if retired_by == "monitor" and (not basis.strip() or not citation.strip() or not authority.strip()):
             raise ValueError("monitor retirement requires a non-empty basis, citation, and authority")
+        if retired_by == "monitor":
+            require_plain_english(basis, field="ask-retirement basis")
+            require_plain_english(authority, field="ask-retirement authority")
         state = "retired-by-monitor-with-cited-basis" if retired_by == "monitor" else "resolved-by-operator"
         retired_at = _utc_now()
         retirements = tuple(

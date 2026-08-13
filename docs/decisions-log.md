@@ -21,6 +21,6 @@ chitra-decisions add \
   --authority "The operator ordered this pause on 2026-08-13."
 ```
 
-Run `chitra-decisions list` to print the records in append order. Chitra validates operator-authored fields for complete sentences, unexplained internal jargon, and bare codenames. Citations and verbatim source quotes remain unchanged.
+Run `chitra-decisions list` to print the records in append order. Chitra validates monitor-authored operator fields for complete sentences, unexplained internal jargon, and bare codenames. It does not gate or rewrite content from spawned work sessions, including their reports, evidence files, transcripts, pull-request text, citations, and verbatim asks.
 
 The repository includes [the first backfilled shift entries](decisions-log/2026-08-13.jsonl). They were transcribed from the fleet pause handover and monitor self-audit named in each citation.

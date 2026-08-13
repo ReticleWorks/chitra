@@ -190,6 +190,12 @@ def test_monitor_ask_retirement_requires_cited_basis(tmp_path: Path) -> None:
         resolve_ask(tmp_path, stored.session_ref, all=True, retired_by="monitor", basis="", citation="", authority="")
 
 
+def test_lane_authored_ask_is_preserved_without_plain_english_gate(tmp_path: Path) -> None:
+    stored = upsert_goal(tmp_path, _record())
+    verbatim = "F2 lane blocked pls?"
+    assert add_ask(tmp_path, stored.session_ref, verbatim).open_asks == (verbatim,)
+
+
 def test_load_old_record_without_optional_fields_is_backward_compatible(tmp_path: Path) -> None:
     payload = {
         "schema": "chitra.goals.v1",
