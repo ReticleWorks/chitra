@@ -198,6 +198,26 @@ capabilities:
         params: []
         mutates: true
 
+  - name: decisions-log
+    kind: tool
+    purpose: Keep an append-only record of consequential monitor decisions and their authority.
+    when_to_use: Use immediately after a monitor adjudication, override, redirect, pause, resume, ask retirement, or work-session architecture change.
+    authority:
+      level: record
+      grants:
+        - Append a complete decision, basis, citation, and authority record to the local decisions log.
+        - Read the decisions log in append order.
+      excludes:
+        - Make a decision merely because this recording tool is available.
+        - Rewrite or delete an earlier decision record.
+    default_enabled: true
+    commands:
+      - name: chitra-decisions
+        description: Append or list consequential monitor decisions.
+        argv: [chitra-decisions]
+        params: []
+        mutates: true
+
   - name: rate-limit-guard
     kind: tool
     purpose: >-

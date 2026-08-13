@@ -83,12 +83,13 @@ _GOAL_FIELDS = frozenset(
         "created_at",
         "updated_at",
         "open_asks",
+        "retired_asks",
         "needs",
         "hold_reason",
         "resume_at",
     )
 )
-_GOAL_STRING_FIELDS = _GOAL_FIELDS - {"goal_version", "goal_history", "open_asks"}
+_GOAL_STRING_FIELDS = _GOAL_FIELDS - {"goal_version", "goal_history", "open_asks", "retired_asks"}
 
 
 class ProtocolError(ValueError):
@@ -258,6 +259,20 @@ def _validate_goals_document(raw: bytes, *, host_id: str) -> dict[str, Ownership
             or not all(isinstance(item, str) and len(item.encode("utf-8")) <= MAX_GOAL_STRING_BYTES for item in raw_goal["open_asks"])
         ):
             raise ValueError("managed goal open_asks must be strings")
+        retired_asks = raw_goal["retired_asks"]
+        if not isinstance(retired_asks, list) or len(retired_asks) > MAX_GOAL_HISTORY or not all(
+            isinstance(item, dict)
+            and len(item) == 6
+            and all(
+                isinstance(key, str)
+                and isinstance(value, str)
+                and len(key.encode("utf-8")) <= MAX_IDENTIFIER_BYTES
+                and len(value.encode("utf-8")) <= MAX_GOAL_STRING_BYTES
+                for key, value in item.items()
+            )
+            for item in retired_asks
+        ):
+            raise ValueError("managed goal retired_asks must contain string objects")
         history = raw_goal["goal_history"]
         if not isinstance(history, list) or len(history) > MAX_GOAL_HISTORY or not all(
             isinstance(item, dict)
