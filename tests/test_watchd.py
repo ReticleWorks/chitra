@@ -110,6 +110,44 @@ def test_watchd_emits_idle_once_after_unchanged_input_row(tmp_path: Path) -> Non
     assert parsed[2] == "IDLE target=probe:0.0 idle_seconds=10 threshold_seconds=10"
 
 
+def test_watchd_emits_once_for_each_new_idle_period(tmp_path: Path) -> None:
+    now = [100.0]
+    content = ["status: waiting\n› Add a task\n"]
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "capture-pane":
+            return _completed(command, content[0])
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(
+        WatchdConfig(
+            state_dir=tmp_path,
+            events_log=tmp_path / "events.log",
+            panes_override=("probe:0.0",),
+            idle_threshold_seconds=10,
+        ),
+        runner=runner,
+        clock=lambda: now[0],
+    )
+    assert watcher.poll_once() == 0
+    now[0] = 110.0
+    assert watcher.poll_once() == 1
+
+    content[0] = "status: waiting\n› Add a task\nWorking (1m 2s • esc to interrupt)\n"
+    now[0] = 120.0
+    assert watcher.poll_once() == 0
+    content[0] = "status: waiting\n› Add a task\n"
+    now[0] = 130.0
+    assert watcher.poll_once() == 0
+    now[0] = 140.0
+    assert watcher.poll_once() == 1
+    now[0] = 150.0
+    assert watcher.poll_once() == 0
+
+    idle_events = [line for line in (tmp_path / "events.log").read_text(encoding="utf-8").splitlines() if " IDLE " in line]
+    assert len(idle_events) == 2
+
+
 def test_watchd_does_not_emit_idle_without_input_row(tmp_path: Path) -> None:
     now = [100.0]
 

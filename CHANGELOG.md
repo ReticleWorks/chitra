@@ -4,6 +4,12 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-08-13
+
+### Fixed
+- Watchd clears its per-pane IDLE guard when raw pane content changes or the
+  pane leaves the input row, so each new idle period emits one IDLE event.
+
 ## [0.9.6] - 2026-08-13
 
 ### Changed
