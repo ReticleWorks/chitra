@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.9
+
+- Route remote governed-lane capture and steering through the fixed codexman
+  SSH grant verbs, allowing the draft guard to recognize the Codex 0.147 empty
+  composer without granting raw remote tmux execution.
+
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
 ## [Unreleased]

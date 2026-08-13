@@ -22,6 +22,7 @@ from chitra.dispatch import (
     LaneLockError,
     _remote_transcript_grep_command,
     cancel_copy_mode,
+    capture_dispatch_pane,
     directive_voice_violation,
     dispatch_to_tmux,
     ensure_pane_not_in_mode,
@@ -778,6 +779,32 @@ def test_ssh_command_reads_the_configurable_host_key_and_timeout(monkeypatch: py
         ssh_command("example", "true")
 
 
+def test_ssh_command_can_use_the_narrow_grant_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CHITRA_SSH_RUN_AS", "chitra")
+    command = ssh_command("tophand", "chitra-tmux-capture monitor-probe:0.0")
+    assert command[:6] == ["sudo", "-n", "-u", "chitra", "--", "ssh"]
+
+    monkeypatch.setenv("CHITRA_SSH_RUN_AS", "../../root")
+    with pytest.raises(ValueError, match="valid local account"):
+        ssh_command("tophand", "true")
+
+
+def test_governed_remote_capture_uses_fixed_visibility_verb(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CHITRA_REMOTE_LANE_GRANT", "codexman")
+    runner = FakeRunner(
+        default=fake_completed(
+            0,
+            json.dumps({"ok": True, "content": "old output\n› Use /skills to list available skills\n"}),
+            "",
+        )
+    )
+
+    captured = capture_dispatch_pane("tophand", "monitor-probe:0.0", runner=runner, local_extra=set())
+
+    assert captured[-1] == "› Use /skills to list available skills"
+    assert runner.calls[0][-1] == "chitra-tmux-capture monitor-probe:0.0"
+
+
 # --- dispatch_to_tmux end-to-end (fake runner) ----------------------------
 
 
@@ -880,6 +907,49 @@ def test_dispatch_to_tmux_sends_a_clean_order(tmp_path: Path) -> None:
         sleep=lambda _seconds: None,
     )
     assert result.status == DispatchStatus.SENT
+
+
+def test_dispatch_to_tmux_uses_governed_remote_capture_and_steer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CHITRA_REMOTE_LANE_GRANT", "codexman")
+    delivered = False
+
+    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+        if cmd[-1] == "chitra-tmux-capture monitor-probe:0.0":
+            content = (
+                "ready\nReply with the acceptance marker.\n"
+                if delivered
+                else "ready\n› Use /skills to list available skills\n"
+            )
+            capture_json = json.dumps({"ok": True, "content": content, "truncated": False})
+            return fake_completed(0, capture_json, "")
+        return fake_completed(1, "", "not available through governed grant")
+
+    input_calls: list[tuple[list[str], str]] = []
+
+    def input_runner(cmd: list[str], payload: str, *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+        nonlocal delivered
+        input_calls.append((cmd, payload))
+        delivered = True
+        return fake_completed()
+    order = DispatchOrder(
+        order_id="governed-remote",
+        session_ref="tophand:monitor-probe:0.0",
+        nudge="Reply with the acceptance marker.",
+    )
+
+    result = dispatch_to_tmux(
+        order,
+        runner=runner,
+        input_runner=input_runner,
+        allowed_hosts={"tophand"},
+        local_extra=set(),
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.status == DispatchStatus.SENT
+    assert "pane-capture fallback" in result.reason
+    assert input_calls[0][0][-1] == "chitra-lane-steer monitor-probe"
+    assert input_calls[0][1] == order.nudge
 
 
 def test_dispatch_to_tmux_waits_through_an_observed_slow_transcript_flush(tmp_path: Path) -> None:
