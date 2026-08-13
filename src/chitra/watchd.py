@@ -329,6 +329,7 @@ class Watchd:
     principles: PrinciplesIndex = field(default_factory=PrinciplesIndex)
     reasoning_oracle: Oracle = abstaining_oracle
     baselines: dict[str, str] = field(default_factory=dict)
+    idle_baselines: dict[str, str] = field(default_factory=dict)
     idle_since: dict[str, float] = field(default_factory=dict)
     idle_emitted: set[str] = field(default_factory=set)
     clock: Callable[[], float] = time.monotonic
@@ -584,7 +585,10 @@ class Watchd:
             previous = self.baselines.get(pane.pane_id)
             changed = previous is None or previous != digest
             at_input = pane_at_input_row(content)
-            if changed or not at_input:
+            idle_digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            idle_changed = self.idle_baselines.get(pane.pane_id) != idle_digest
+            self.idle_baselines[pane.pane_id] = idle_digest
+            if idle_changed or not at_input:
                 self.idle_since[pane.pane_id] = self.clock()
                 self.idle_emitted.discard(pane.pane_id)
             if session_ref is not None:
