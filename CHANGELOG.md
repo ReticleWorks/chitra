@@ -4,6 +4,12 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-08-13
+
+### Changed
+- Reserved the next package version for the fleet dispatchd unit correction
+  that preserves the shared worker tmux runtime directory across restarts.
+
 ## [0.9.5] - 2026-08-13
 
 ### Added
