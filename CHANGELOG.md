@@ -20,7 +20,7 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
-## [Unreleased]
+## [0.10.0] - 2026-08-14
 
 ### Added
 
