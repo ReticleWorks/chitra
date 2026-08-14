@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.10
+
+- Preserve watchd's per-idle-period edge semantics through triaged: each new
+  `IDLE` event reaches `queue.tsv` and `flags.log` even when its stable payload
+  is byte-identical to an earlier idle period.
+
 ## 0.9.9
 
 - Route remote governed-lane capture and steering through the fixed codexman

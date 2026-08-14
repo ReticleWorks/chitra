@@ -52,6 +52,19 @@ def test_process_lines_dedups_same_signature_emits_once() -> None:
     assert emitted == 1
 
 
+def test_process_lines_emits_each_edge_triggered_idle_record(tmp_path: Path) -> None:
+    state: dict[str, str] = {}
+    lines = [
+        "2026-08-14T00:40:24Z infra-health:0.0 IDLE target=infra-health:0.0 idle_seconds=30 threshold_seconds=30\n",
+        "2026-08-14T00:46:26Z infra-health:0.0 IDLE target=infra-health:0.0 idle_seconds=30 threshold_seconds=30\n",
+    ]
+
+    emitted = process_lines(lines, state=state, triage_log=tmp_path / "triaged.log")
+
+    assert emitted == 2
+    assert len((tmp_path / "triaged.log").read_text(encoding="utf-8").splitlines()) == 2
+
+
 def test_process_lines_emits_on_actual_transition(tmp_path: Path) -> None:
     triage_log = tmp_path / "triaged.log"
     state: dict[str, str] = {}
