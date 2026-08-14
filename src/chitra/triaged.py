@@ -233,8 +233,13 @@ def process_lines(
     stats: dict[str, object] | None = None,
 ) -> int:
     """Process a batch of new events.log lines against ``state`` (mutated in
-    place). Returns the count of lines that produced a real triage event
-    (i.e. an actual state transition, not a dedup'd repeat)."""
+    place). Returns the count of lines that produced a triage event.
+
+    Ordinary state text is content-deduplicated per lane. IDLE records are
+    already edge-triggered by watchd (one record per idle period), so each new
+    record must pass through even when its stable payload matches a prior idle
+    period. The events-log byte offset still prevents rereading one record.
+    """
     emitted = 0
     active_alert_state = alert_state if alert_state is not None else {}
     active_stats = stats if stats is not None else {}
@@ -245,7 +250,7 @@ def process_lines(
             continue
         ts, lane_id, text = parsed
         sig = state_signature(text)
-        if state.get(lane_id) == sig:
+        if not text.startswith("IDLE ") and state.get(lane_id) == sig:
             continue  # unchanged repeat — dedup'd, no event.
         state[lane_id] = sig
         append_triage_event(triage_log, lane_id, ts, text)
