@@ -297,7 +297,7 @@ def test_enrolled_scope_is_write_once_and_carried_through_later_writes(tmp_path:
     )
 
 
-def test_redirect_now_hold_resume_and_close_preserve_enrollment_anchor(tmp_path: Path) -> None:
+def test_done_when_redirect_refreshes_enrollment_and_later_writes_preserve_it(tmp_path: Path) -> None:
     enrolled = upsert_goal(tmp_path, _record(done_when="both the X client and the Y client pass live validation"))
     redirected = redirect_goal(
         tmp_path,
@@ -310,9 +310,26 @@ def test_redirect_now_hold_resume_and_close_preserve_enrollment_anchor(tmp_path:
     resumed = resume_goal(tmp_path, held.session_ref)
     closed = close_goal(tmp_path, resumed.session_ref, delivered_items=("X client",))
 
-    for record in (redirected, updated, held, resumed, closed):
-        assert record.enrolled_done_when == enrolled.done_when
-        assert record.enrolled_at == enrolled.enrolled_at
+    assert redirected.enrolled_done_when == redirected.done_when
+    assert redirected.enrolled_at == redirected.updated_at
+    assert redirected.enrolled_at != enrolled.enrolled_at
+    for record in (updated, held, resumed, closed):
+        assert record.enrolled_done_when == redirected.done_when
+        assert record.enrolled_at == redirected.enrolled_at
+
+
+def test_redirect_without_done_when_change_preserves_enrollment_anchor(tmp_path: Path) -> None:
+    enrolled = upsert_goal(tmp_path, _record())
+
+    redirected = redirect_goal(
+        tmp_path,
+        enrolled.session_ref,
+        reason="operator narrowed implementation scope",
+        scope="Goal storage and redirect tests only.",
+    )
+
+    assert redirected.enrolled_done_when == enrolled.enrolled_done_when
+    assert redirected.enrolled_at == enrolled.enrolled_at
 
 
 @pytest.mark.parametrize(
