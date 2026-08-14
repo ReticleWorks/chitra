@@ -20,6 +20,14 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.10.1] - 2026-08-14
+
+### Fixed
+
+- Pass Chitra's resolved package root into each governed tmux pane, so the
+  supervised agent starts from an immutable target install without a host-wide
+  Python path shim.
+
 ## [0.10.0] - 2026-08-14
 
 ### Added
