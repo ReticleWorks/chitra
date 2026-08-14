@@ -29,6 +29,7 @@ from chitra.dispatch import (
     find_recent_transcript,
     find_recent_transcript_remote,
     pane_capture_confirms_nudge,
+    governed_capture_target,
     pane_in_mode,
     pane_input_check,
     paste_nudge_to_local_tmux,
@@ -427,6 +428,14 @@ def test_tmux_pane_target_leaves_a_global_pane_id_alone() -> None:
     assert tmux_pane_target("f3", "%42") == "%42"
 
 
+def test_governed_capture_target_normalizes_canonical_dot_pane() -> None:
+    assert governed_capture_target("monitor-probe:0.0") == "monitor-probe:0:0"
+
+
+def test_governed_capture_target_leaves_already_normalized_target_alone() -> None:
+    assert governed_capture_target("monitor-probe:0:0") == "monitor-probe:0:0"
+
+
 def test_dispatch_to_tmux_qualifies_pane_with_session_before_any_tmux_call() -> None:
     """Regression test: capture/paste/etc must never receive a bare pane
     spec — on a host running more than one tmux session, that resolves
@@ -478,6 +487,28 @@ def test_pane_capture_confirms_nudge_false_when_marker_absent() -> None:
     assert (
         pane_capture_confirms_nudge(
             "please check lane f3 status now",
+            host="localhost",
+            pane="f3:0.0",
+            runner=runner,
+            local_extra={"localhost"},
+        )
+        is False
+    )
+
+
+def test_pane_capture_does_not_confirm_marker_still_in_codex_composer() -> None:
+    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+        if cmd[:2] == ["tmux", "capture-pane"]:
+            return fake_completed(
+                0,
+                "older output\n› Reply with exactly STEER_0910_CONSUMED and no other text.\nstatus row\n",
+                "",
+            )
+        return fake_completed(0, "", "")
+
+    assert (
+        pane_capture_confirms_nudge(
+            "Reply with exactly STEER_0910_CONSUMED and no other text.",
             host="localhost",
             pane="f3:0.0",
             runner=runner,
@@ -914,7 +945,7 @@ def test_dispatch_to_tmux_uses_governed_remote_capture_and_steer(monkeypatch: py
     delivered = False
 
     def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        if cmd[-1] == "chitra-tmux-capture monitor-probe:0.0":
+        if cmd[-1] == "chitra-tmux-capture monitor-probe:0:0":
             content = (
                 "ready\nReply with the acceptance marker.\n"
                 if delivered
