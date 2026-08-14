@@ -45,23 +45,25 @@ this is part of the live input box
     assert normalize(content) == ["useful state", "another useful state"]
 
 
-def test_watchd_emits_real_change_but_not_input_box_typing(tmp_path: Path) -> None:
+def test_watchd_emits_semantic_change_but_not_input_box_typing(tmp_path: Path) -> None:
     captures = iter(
         [
-            "status: working\n❯ first operator draft\n",
-            "status: working\n❯ a completely different operator draft\n",
-            "status: blocked\n❯ operator draft remains unsent\n",
+            "Working... esc to interrupt\n❯ first operator draft\n",
+            "Working... esc to interrupt\n❯ a completely different operator draft\n",
+            "Allow command?\nYes\nNo\n❯ operator draft remains unsent\n",
         ]
     )
 
     def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%7\tlane:0.0\t1\tcodex\n")
         if command[1] == "capture-pane":
             return _completed(command, next(captures))
         raise AssertionError(f"unexpected command: {command}")
 
     events_log = tmp_path / "events.log"
     watcher = Watchd(
-        WatchdConfig(state_dir=tmp_path, events_log=events_log, panes_override=("%7",)),
+        WatchdConfig(state_dir=tmp_path, events_log=events_log),
         runner=runner,
     )
 
@@ -70,28 +72,31 @@ def test_watchd_emits_real_change_but_not_input_box_typing(tmp_path: Path) -> No
     assert watcher.poll_once() == 1
     raw_captures = list((tmp_path / "watchd").glob("*.raw"))
     assert len(raw_captures) == 1
-    assert "status: blocked" in raw_captures[0].read_text(encoding="utf-8")
+    assert "Allow command?" in raw_captures[0].read_text(encoding="utf-8")
 
     parsed = parse_event_line(events_log.read_text(encoding="utf-8"))
     assert parsed is not None
     _timestamp, lane_id, text = parsed
-    assert lane_id == "%7"
-    assert text == "CHANGE DETECTED: status: blocked"
+    assert lane_id == "lane:0.0"
+    assert text.startswith("AGENT_STATUS state=blocked needs operator input pane_id=%7")
+    assert "authority=manifest" in text
+    assert "rule=permission_prompt" in text
 
 
-def test_watchd_emits_idle_once_after_unchanged_input_row(tmp_path: Path) -> None:
+def test_watchd_ambiguous_snapshot_defaults_idle_without_delayed_idle_event(tmp_path: Path) -> None:
     now = [100.0]
 
     def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tprobe:0.0\t1\tcodex\n")
         if command[1] == "capture-pane":
-            return _completed(command, "status: waiting\n› Add a task\n")
+            return _completed(command, "unrecognized screen shape\n")
         raise AssertionError(f"unexpected command: {command}")
 
     watcher = Watchd(
         WatchdConfig(
             state_dir=tmp_path,
             events_log=tmp_path / "events.log",
-            panes_override=("probe:0.0",),
             idle_threshold_seconds=10,
         ),
         runner=runner,
@@ -101,20 +106,23 @@ def test_watchd_emits_idle_once_after_unchanged_input_row(tmp_path: Path) -> Non
     now[0] = 109.0
     assert watcher.poll_once() == 0
     now[0] = 110.0
-    assert watcher.poll_once() == 1
+    assert watcher.poll_once() == 0
     now[0] = 120.0
     assert watcher.poll_once() == 0
-    parsed = parse_event_line((tmp_path / "events.log").read_text(encoding="utf-8"))
-    assert parsed is not None
-    assert parsed[1] == "probe:0.0"
-    assert parsed[2] == "IDLE target=probe:0.0 idle_seconds=10 threshold_seconds=10"
+    assert not (tmp_path / "events.log").exists()
+    assert watcher.status_broker is not None
+    status = watcher.status_broker.statuses()[0]
+    assert status.state == "idle"
+    assert status.explain.fallback_reason == "default_known_agent_idle_fallback"
 
 
-def test_watchd_idle_periods_land_twice_in_triaged_queue_and_flags(tmp_path: Path) -> None:
+def test_watchd_semantic_idle_periods_land_twice_in_triaged_queue(tmp_path: Path) -> None:
     now = [100.0]
-    content = ["status: waiting\n› Add a task\n"]
+    content = ["Working... esc to interrupt\n"]
 
     def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tprobe:0.0\t1\tcodex\n")
         if command[1] == "capture-pane":
             return _completed(command, content[0])
         raise AssertionError(f"unexpected command: {command}")
@@ -123,30 +131,33 @@ def test_watchd_idle_periods_land_twice_in_triaged_queue_and_flags(tmp_path: Pat
         WatchdConfig(
             state_dir=tmp_path,
             events_log=tmp_path / "events.log",
-            panes_override=("probe:0.0",),
             idle_threshold_seconds=10,
         ),
         runner=runner,
         clock=lambda: now[0],
     )
     assert watcher.poll_once() == 0
+    content[0] = "status: waiting\n› Add a task\n"
     now[0] = 110.0
     assert watcher.poll_once() == 1
 
-    content[0] = "status: waiting\n› Add a task\nWorking (1m 2s • esc to interrupt)\n"
+    content[0] = "Working (1m 2s • esc to interrupt)\n"
     now[0] = 120.0
-    assert watcher.poll_once() == 0
+    assert watcher.poll_once() == 1
     content[0] = "status: waiting\n› Add a task\n"
     now[0] = 130.0
-    assert watcher.poll_once() == 0
-    now[0] = 140.0
     assert watcher.poll_once() == 1
+    now[0] = 140.0
+    assert watcher.poll_once() == 0
     now[0] = 150.0
     assert watcher.poll_once() == 0
 
-    idle_events = [line for line in (tmp_path / "events.log").read_text(encoding="utf-8").splitlines() if " IDLE " in line]
+    idle_events = [
+        line
+        for line in (tmp_path / "events.log").read_text(encoding="utf-8").splitlines()
+        if "AGENT_STATUS state=idle" in line
+    ]
     assert len(idle_events) == 2
-    assert idle_events[0].split(" ", 2)[2] == idle_events[1].split(" ", 2)[2]
 
     outputs = ReceivingOutputs(
         queue_file=tmp_path / "queue.tsv",
@@ -159,21 +170,27 @@ def test_watchd_idle_periods_land_twice_in_triaged_queue_and_flags(tmp_path: Pat
         state_file=tmp_path / "triaged-state.json",
         triage_log=tmp_path / "triaged.log",
         receiving_outputs=outputs,
-    ) == 2
-    assert [line.split("\t")[1] for line in outputs.queue_file.read_text(encoding="utf-8").splitlines()] == ["IDLE", "IDLE"]
-    assert [line.split(" ", 1)[0] for line in outputs.flags_file.read_text(encoding="utf-8").splitlines()] == ["IDLE", "IDLE"]
+    ) == 3
+    assert [line.split("\t")[1] for line in outputs.queue_file.read_text(encoding="utf-8").splitlines()] == [
+        "INFO",
+        "INFO",
+        "INFO",
+    ]
+    assert not outputs.flags_file.exists()
 
 
 def test_watchd_does_not_emit_idle_without_input_row(tmp_path: Path) -> None:
     now = [100.0]
 
     def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tactive:0.0\t1\tcodex\n")
         if command[1] == "capture-pane":
             return _completed(command, "status: working\nRunning tests…\n")
         raise AssertionError(f"unexpected command: {command}")
 
     watcher = Watchd(
-        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log", panes_override=("active:0.0",), idle_threshold_seconds=5),
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log", idle_threshold_seconds=5),
         runner=runner,
         clock=lambda: now[0],
     )
@@ -271,7 +288,7 @@ def test_poll_once_does_not_block_on_a_slow_reviewer_and_later_drains_it(tmp_pat
 
     def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
         if command[1] == "list-panes":
-            return _completed(command, "%1\tfleet:0.0\n")
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
         if command[1] == "capture-pane":
             # First capture is a mid-turn baseline; every capture after the
             # baseline is the finished completion-claim turn (stable content).
@@ -333,7 +350,7 @@ Live health probe status=200 with 24 requests; /tmp/live-review.log.
 
     def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
         if command[1] == "list-panes":
-            return _completed(command, "%1\tfleet:0.0\n")
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
         if command[1] == "capture-pane":
             return _completed(command, next(captures, _CITED_CLAIM_CAPTURE))
         raise AssertionError(f"unexpected command: {command}")
@@ -368,7 +385,7 @@ def test_rejected_turn_review_enqueues_reasoned_dispatch(tmp_path: Path) -> None
 
     def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
         if command[1] == "list-panes":
-            return _completed(command, "%1\tfleet:0.0\n")
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
         if command[1] == "capture-pane":
             content = _CITED_CLAIM_CAPTURE if state["finished"] else "working on the implementation\nesc to interrupt\n❯\n"
             return _completed(command, content)
@@ -406,11 +423,13 @@ def test_turn_end_without_claim_is_finished_unverified_not_idle_green(tmp_path: 
     goal = _tracked_goal(tmp_path)
     reviewer = _AcceptingReviewer()
 
+    captures = iter(["Working... esc to interrupt\n", "I need the exact release target before continuing.\n❯\n"])
+
     def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
         if command[1] == "list-panes":
-            return _completed(command, "%1\tfleet:0.0\n")
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
         if command[1] == "capture-pane":
-            return _completed(command, "I need the exact release target before continuing.\n❯\n")
+            return _completed(command, next(captures))
         raise AssertionError(f"unexpected command: {command}")
 
     watcher = Watchd(
@@ -418,6 +437,7 @@ def test_turn_end_without_claim_is_finished_unverified_not_idle_green(tmp_path: 
         runner=runner,
         reviewer=reviewer,
     )
+    watcher.poll_once()
     watcher.poll_once()
 
     stored = get_goal(tmp_path, goal.session_ref)

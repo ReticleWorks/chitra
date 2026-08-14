@@ -83,7 +83,8 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
         calls.append(list(command))
         return subprocess.CompletedProcess(command, 1 if len(calls) == 1 else 0, "", "")
 
-    assert start_lane(lane, runner=runner)
+    control_socket = tmp_path / "chitra.sock"
+    assert start_lane(lane, runner=runner, socket_path=control_socket)
     assert calls == [
         [
             "runuser",
@@ -108,6 +109,10 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
             "env",
             "HOME=/home/alpha",
             "CLAUDE_CONFIG_DIR=/home/alpha/.claude-alpha",
+            "CHITRA_LANE_ID=alpha",
+            "CHITRA_SESSION_REF=tophand:alpha:0.0",
+            "CHITRA_PANE_TARGET=alpha:0.0",
+            f"CHITRA_SOCKET_PATH={control_socket}",
             "tmux",
             "-S",
             str(tmp_path / "alpha.sock"),
@@ -117,6 +122,10 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
             "alpha",
             "-c",
             "/srv/chitra/lanes/alpha",
+            __import__("sys").executable,
+            "-m",
+            "chitra.pane_exec",
+            "--",
             "claude",
             "--model",
             "sonnet",
@@ -129,6 +138,13 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
     assert receipt["goal_snapshot"]["source"] == "task-file:lane-architecture"
     assert "rate_limit_guard" in receipt["lifecycle"]
     assert receipt["effort"] == "high"
+    assert receipt["identity_env"] == {
+        "CHITRA_LANE_ID": "alpha",
+        "CHITRA_SESSION_REF": "tophand:alpha:0.0",
+        "CHITRA_PANE_ID": "runtime:TMUX_PANE",
+        "CHITRA_PANE_TARGET": "alpha:0.0",
+        "CHITRA_SOCKET_PATH": str(control_socket),
+    }
 
 
 def test_lane_launch_refuses_without_passing_ingestion_record(tmp_path):

@@ -1,0 +1,61 @@
+schema_version = 1
+agent = "codex"
+version = "2026.08.14.1"
+
+[[rules]]
+id = "permission_prompt"
+state = "blocked"
+priority = 1000
+region = "bottom"
+lines = 24
+blocker_kind = "permission"
+any = [
+  { kind = "regex", value = "Allow command\\?\\s*(?:\\n|.){0,160}(?:Yes|Allow)" },
+  { kind = "contains", value = "press enter to confirm or esc to cancel" },
+]
+
+[[rules]]
+id = "trust_directory"
+state = "blocked"
+priority = 950
+region = "whole"
+lines = 20
+blocker_kind = "approval"
+all = [
+  { kind = "contains", value = "Do you trust the contents of this directory?" },
+  { kind = "regex", value = "(?:Yes|No|Continue|Cancel)" },
+]
+
+[[rules]]
+id = "visible_question"
+state = "blocked"
+priority = 900
+region = "bottom"
+lines = 20
+blocker_kind = "question"
+any = [
+  { kind = "contains", value = "enter to submit answer" },
+  { kind = "contains", value = "enter to submit all" },
+]
+
+[[rules]]
+id = "working_spinner"
+state = "working"
+priority = 500
+region = "bottom"
+lines = 8
+any = [
+  { kind = "regex", value = "(?:esc to interrupt|thinking|working(?:…|\\.\\.\\.)|running(?:…|\\.\\.\\.))" },
+  { kind = "line_regex", value = "^[•◦]\\s+Working" },
+]
+
+[[rules]]
+id = "input_row"
+state = "idle"
+priority = 100
+region = "bottom"
+lines = 12
+any = [
+  { kind = "line_regex", value = "^\\s*›" },
+  { kind = "line_regex", value = "^\\s*❯" },
+]

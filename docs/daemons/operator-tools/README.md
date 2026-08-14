@@ -5,7 +5,8 @@ CLI utilities and watchers for managing sessions, enforcing goals, tracking poli
 ## Goal Management and Monitoring
 
 - **[chitra-goals](goals-cli.md)** — Enroll sessions, query status, close goals, hold and resume sessions, track open asks, and render the operator board.
-- **[watchd](watchd.md)** — Completion reviewer. Watches tmux panes for completion claims and launches isolated LLM reviewer processes to judge whether claims match frozen goals.
+- **[watchd](watchd.md)** — Semantic-status and completion-review daemon. It combines lifecycle reports with declarative screen manifests, serves the local coordination socket, and launches isolated LLM reviewers only for completion claims.
+- **`chitra-agent`** — Lifecycle report, status explanation, semantic wait, and API-schema client for Watchd's local socket.
 
 ## State and Policy Tracking
 

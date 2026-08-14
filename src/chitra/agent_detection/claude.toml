@@ -1,0 +1,59 @@
+schema_version = 1
+agent = "claude"
+version = "2026.08.14.1"
+
+[[rules]]
+id = "permission_prompt"
+state = "blocked"
+priority = 1000
+region = "bottom"
+lines = 24
+blocker_kind = "permission"
+all = [{ kind = "regex", value = "Do you want to (?:proceed|allow|approve)" }]
+any = [
+  { kind = "line_regex", value = "^\\s*(?:❯\\s*)?1\\. Yes(?:$|,)" },
+  { kind = "contains", value = "Esc to cancel" },
+]
+
+[[rules]]
+id = "tool_approval_choices"
+state = "blocked"
+priority = 950
+region = "bottom"
+lines = 24
+blocker_kind = "approval"
+all = [
+  { kind = "line_regex", value = "^\\s*(?:❯\\s*)?1\\. (?:Allow|Approve)" },
+  { kind = "line_regex", value = "^\\s*[23]\\. (?:Deny|Reject|Cancel|No)" },
+]
+
+[[rules]]
+id = "visible_question"
+state = "blocked"
+priority = 900
+region = "bottom"
+lines = 20
+blocker_kind = "question"
+all = [
+  { kind = "regex", value = "(?:Enter to select|Type your answer)" },
+  { kind = "regex", value = "(?:Esc to cancel|↑/↓ to navigate)" },
+]
+
+[[rules]]
+id = "working_spinner"
+state = "working"
+priority = 500
+region = "bottom"
+lines = 8
+all = [{ kind = "regex", value = "(?:esc to interrupt|thinking|working(?:…|\\.\\.\\.)|running(?:…|\\.\\.\\.))" }]
+
+[[rules]]
+id = "input_row"
+state = "idle"
+priority = 100
+region = "bottom"
+lines = 12
+any = [
+  { kind = "line_regex", value = "^\\s*❯" },
+  { kind = "line_regex", value = "^\\s*›" },
+]
