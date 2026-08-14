@@ -833,7 +833,7 @@ def test_governed_remote_capture_uses_fixed_visibility_verb(monkeypatch: pytest.
     captured = capture_dispatch_pane("tophand", "monitor-probe:0.0", runner=runner, local_extra=set())
 
     assert captured[-1] == "› Use /skills to list available skills"
-    assert runner.calls[0][-1] == "chitra-tmux-capture monitor-probe:0.0"
+    assert runner.calls[0][-1] == "chitra-tmux-capture monitor-probe:0:0"
 
 
 # --- dispatch_to_tmux end-to-end (fake runner) ----------------------------
