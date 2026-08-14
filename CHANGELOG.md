@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.11
+
+- Normalize canonical remote pane targets at the governed grant boundary and
+  fail closed when pane fallback sees the steer text still in an agent's
+  composer instead of consumed into the transcript.
+
 ## 0.9.10
 
 - Preserve watchd's per-idle-period edge semantics through triaged: each new
