@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -30,10 +31,17 @@ PANE_ID_ENV_VAR = "CHITRA_PANE_ID"
 PANE_TARGET_ENV_VAR = "CHITRA_PANE_TARGET"
 SOCKET_PATH_ENV_VAR = "CHITRA_SOCKET_PATH"
 PYTHONPATH_ENV_VAR = "PYTHONPATH"
+STARTUP_SURVIVAL_CHECKS = 5
+STARTUP_SURVIVAL_INTERVAL_SECONDS = 0.5
+TEMPORARY_FAILURE_EXIT = 75
 
 
 class LaneLaunchRefused(RuntimeError):
     """A mechanical launch gate refused an unsafe lane start."""
+
+
+class LaneStartupFailed(RuntimeError):
+    """The agent process exited before its lane session became durable."""
 
 
 def session_ref(lane: LaneSpec, host: str = SANCTIONED_HOST) -> str:
@@ -143,6 +151,30 @@ def _tmux(lane: LaneSpec, *arguments: str) -> list[str]:
     return ["tmux", "-S", str(lane.tmux_socket), *arguments]
 
 
+def _session_absent(result: subprocess.CompletedProcess[str]) -> bool:
+    combined = f"{result.stderr or ''}\n{result.stdout or ''}".lower()
+    return result.returncode == 1 and any(
+        marker in combined
+        for marker in ("can't find session", "session not found", "no server running")
+    )
+
+
+def _require_startup_survival(lane: LaneSpec, *, runner: CommandRunner) -> None:
+    probe = _run_as_lane(lane, _tmux(lane, "has-session", "-t", lane.tmux_session))
+    for check in range(STARTUP_SURVIVAL_CHECKS):
+        result = runner(probe)
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or f"tmux exited {result.returncode}"
+            if _session_absent(result):
+                raise LaneStartupFailed(
+                    f"lane {lane.identifier} session exited during startup; "
+                    "no launch receipt was written; retry is safe"
+                )
+            raise RuntimeError(f"could not verify lane {lane.identifier} startup: {detail}")
+        if check + 1 < STARTUP_SURVIVAL_CHECKS:
+            time.sleep(STARTUP_SURVIVAL_INTERVAL_SECONDS)
+
+
 def _pane_pythonpath() -> str:
     """Keep the launched pane on the same Chitra runtime as this process."""
     package_root = str(Path(__file__).resolve().parent.parent)
@@ -198,6 +230,7 @@ def start_lane(
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"tmux exited {result.returncode}"
         raise RuntimeError(f"could not create lane {lane.identifier} session: {detail}")
+    _require_startup_survival(lane, runner=runner)
     _write_launch_receipt(
         lane,
         goal,
@@ -214,7 +247,7 @@ def stop_lane(lane: LaneSpec, *, runner: CommandRunner = _run) -> bool:
     result = runner(_run_as_lane(lane, _tmux(lane, "kill-session", "-t", lane.tmux_session)))
     if result.returncode == 0:
         return True
-    if "session not found" in (result.stderr or "").lower():
+    if _session_absent(result):
         return False
     detail = result.stderr.strip() or result.stdout.strip() or f"tmux exited {result.returncode}"
     raise RuntimeError(f"could not stop lane {lane.identifier} session: {detail}")
@@ -246,14 +279,18 @@ def main(argv: list[str] | None = None) -> int:
     if not lane.enabled and args.action == "start":
         raise SystemExit(f"lane is declared disabled: {lane.identifier}")
     if args.action == "start":
-        start_lane(
-            lane,
-            backend=args.backend,
-            model=args.model,
-            effort=args.effort,
-            host=args.host,
-            socket_path=args.socket_path,
-        )
+        try:
+            start_lane(
+                lane,
+                backend=args.backend,
+                model=args.model,
+                effort=args.effort,
+                host=args.host,
+                socket_path=args.socket_path,
+            )
+        except LaneStartupFailed as exc:
+            print(f"LaneStartupFailed: {exc}", file=sys.stderr)
+            return TEMPORARY_FAILURE_EXIT
         return 0
     if args.action == "stop":
         stop_lane(lane)
@@ -262,8 +299,7 @@ def main(argv: list[str] | None = None) -> int:
     if result.returncode == 0:
         print("active")
         return 0
-    combined = (result.stderr + result.stdout).lower()
-    if result.returncode == 1 and ("session not found" in combined or "no server running" in combined):
+    if _session_absent(result):
         print("inactive")
         return 1
     print("UNKNOWN: tmux session state could not be verified")

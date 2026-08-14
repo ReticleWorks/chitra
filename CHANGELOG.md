@@ -20,6 +20,17 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.10.2] - 2026-08-14
+
+### Fixed
+
+- Delay governed launch receipts until the new tmux session survives its
+  startup window. An agent that exits during startup now returns temporary
+  failure code 75 without writing a false-success receipt, so callers can
+  retry that one failure class safely.
+- Recognize tmux's `can't find session` response as an inactive lane during
+  status and stop operations.
+
 ## [0.10.1] - 2026-08-14
 
 ### Fixed
