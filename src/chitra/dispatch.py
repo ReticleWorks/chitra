@@ -306,6 +306,19 @@ def tmux_pane_target(session: str, pane: str) -> str:
     return f"{session}:{pane}"
 
 
+def governed_capture_target(pane: str) -> str:
+    """Translate tmux's ``session:window.pane`` into the grant contract.
+
+    The forced-command visibility surface deliberately accepts only colon
+    delimited numeric target components.  Keep native tmux spelling everywhere
+    else and normalize only at the governed SSH boundary.
+    """
+    match = re.fullmatch(r"(?P<session>[A-Za-z0-9_.-]+):(?P<window>[0-9]{1,3})\.(?P<pane>[0-9]{1,3})", pane)
+    if match is None:
+        return pane
+    return f"{match.group('session')}:{match.group('window')}:{match.group('pane')}"
+
+
 # ---------------------------------------------------------------------------
 # Text normalization helpers (mirrors of the source)
 # ---------------------------------------------------------------------------
@@ -515,8 +528,9 @@ def capture(
 ) -> list[str]:
     """Capture a local or remote tmux pane through ``run_on_host``."""
     if host and not is_local_host(host, local_extra) and _env("CHITRA_REMOTE_LANE_GRANT") == "codexman":
+        grant_target = governed_capture_target(pane_id)
         proc = (runner or run_cmd)(
-            ssh_command(host, f"chitra-tmux-capture {shlex.quote(pane_id)}"), timeout=8
+            ssh_command(host, f"chitra-tmux-capture {shlex.quote(grant_target)}"), timeout=8
         )
         if proc.returncode != 0:
             return []
@@ -1098,6 +1112,14 @@ def pane_capture_confirms_nudge(
     )
     if not captured:
         return False
+    # A marker visible in the active composer is an unsubmitted draft, not
+    # delivery evidence.  Fail closed before considering older scrollback.
+    for row_parser in (_codex_tui_input_row, _claude_code_input_row):
+        input_row = row_parser(captured)
+        if input_row is not None:
+            _input_line, draft, _raw_line = input_row
+            if marker in normalized_dispatch_text(draft):
+                return False
     text = normalized_dispatch_text(strip_terminal_controls("\n".join(captured)))
     return marker in text
 
