@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from chitra.goals import GoalRecord, hold_goal, upsert_goal
-from chitra.lane_anchor import LaneLaunchRefused, ingestion_gate, start_lane
+from chitra.lane_anchor import LaneLaunchRefused, _pane_pythonpath, ingestion_gate, start_lane
 from chitra.lane_config import load_lanes
 
 
@@ -128,6 +128,8 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
             "CHITRA_PANE_TARGET=alpha:0.0",
             "-e",
             f"CHITRA_SOCKET_PATH={control_socket}",
+            "-e",
+            f"PYTHONPATH={_pane_pythonpath()}",
             "-s",
             "alpha",
             "-c",
@@ -206,6 +208,7 @@ def test_lane_identity_reaches_a_new_session_on_an_existing_tmux_server(
         f"pathlib.Path({str(proof_path)!r}).write_text(json.dumps({{key: os.environ.get(key) for key in {keys!r}}}))"
     )
     monkeypatch.setattr("chitra.lane_anchor._agent_command", lambda *_args: [sys.executable, "-c", proof_code])
+    monkeypatch.delenv("PYTHONPATH", raising=False)
     control_socket = tmp_path / "control.sock"
     subprocess.run(
         ["tmux", "-S", str(lane.tmux_socket), "new-session", "-d", "-s", "keeper", "sleep 30"],
