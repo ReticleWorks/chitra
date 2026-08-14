@@ -14,7 +14,7 @@ from chitra.dispatch import DispatchOrder
 from chitra.goal_enforcement import ReviewerVerdict, ReviewFinding
 from chitra.goals import GoalRecord, get_goal, upsert_goal
 from chitra.lane_activity import load_lane_activity
-from chitra.triaged import parse_event_line
+from chitra.triaged import ReceivingOutputs, parse_event_line, run_once
 from chitra.watchd import (
     Pane,
     Watchd,
@@ -110,7 +110,7 @@ def test_watchd_emits_idle_once_after_unchanged_input_row(tmp_path: Path) -> Non
     assert parsed[2] == "IDLE target=probe:0.0 idle_seconds=10 threshold_seconds=10"
 
 
-def test_watchd_emits_once_for_each_new_idle_period(tmp_path: Path) -> None:
+def test_watchd_idle_periods_land_twice_in_triaged_queue_and_flags(tmp_path: Path) -> None:
     now = [100.0]
     content = ["status: waiting\n› Add a task\n"]
 
@@ -146,6 +146,22 @@ def test_watchd_emits_once_for_each_new_idle_period(tmp_path: Path) -> None:
 
     idle_events = [line for line in (tmp_path / "events.log").read_text(encoding="utf-8").splitlines() if " IDLE " in line]
     assert len(idle_events) == 2
+    assert idle_events[0].split(" ", 2)[2] == idle_events[1].split(" ", 2)[2]
+
+    outputs = ReceivingOutputs(
+        queue_file=tmp_path / "queue.tsv",
+        flags_file=tmp_path / "flags.log",
+        stats_file=tmp_path / "stats.json",
+        alert_state_file=tmp_path / "alerts.json",
+    )
+    assert run_once(
+        tmp_path / "events.log",
+        state_file=tmp_path / "triaged-state.json",
+        triage_log=tmp_path / "triaged.log",
+        receiving_outputs=outputs,
+    ) == 2
+    assert [line.split("\t")[1] for line in outputs.queue_file.read_text(encoding="utf-8").splitlines()] == ["IDLE", "IDLE"]
+    assert [line.split(" ", 1)[0] for line in outputs.flags_file.read_text(encoding="utf-8").splitlines()] == ["IDLE", "IDLE"]
 
 
 def test_watchd_does_not_emit_idle_without_input_row(tmp_path: Path) -> None:
