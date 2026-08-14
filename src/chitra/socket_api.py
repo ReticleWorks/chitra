@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import secrets
 import socket
 import socketserver
+import stat
 import subprocess
 import threading
 import time
@@ -21,15 +23,22 @@ from chitra._fsio import write_json_atomic
 from chitra.agent_runtime import AgentStatusBroker, PaneStatus, StatusRuntimeError
 from chitra.agent_status import AgentState
 from chitra.api_protocol import API_PROTOCOL_VERSION, ProtocolError, api_schema, parse_subscriptions
+from chitra.api_protocol import MAX_WAIT_MS as MAX_WAIT_MS
 
 DEFAULT_SOCKET_PATH = Path("/run/chitra/chitra.sock")
 SOCKET_PATH_ENV_VAR = "CHITRA_SOCKET_PATH"
 HANDOFF_SCHEMA = "chitra.live-handoff.v1"
 OWNERSHIP_SCHEMA = "chitra.server-ownership.v1"
 MAX_REQUEST_BYTES = 1024 * 1024
-MAX_WAIT_MS = 86_400_000
 HANDOFF_TTL_SECONDS = 30.0
+CONNECTION_LIVENESS_INTERVAL_SECONDS = 0.25
+SOCKET_PROBE_TIMEOUT_SECONDS = 0.25
 PaneVerifier = Callable[[PaneStatus], bool]
+ConnectionProbe = Callable[[], bool]
+
+
+class _ClientDisconnected(Exception):
+    """Stop a blocking handler after its peer closes the connection."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +91,13 @@ class ApiRuntime:
     def set_shutdown_callback(self, callback: Callable[[], None]) -> None:
         self._shutdown_callback = callback
 
-    def dispatch(self, method: str, params: object) -> dict[str, object]:
+    def dispatch(
+        self,
+        method: str,
+        params: object,
+        *,
+        connection_alive: ConnectionProbe | None = None,
+    ) -> dict[str, object]:
         self._expire_handoff()
         if method == "ping":
             self._empty_params(params)
@@ -114,7 +129,7 @@ class ApiRuntime:
                 raise ProtocolError("not_found", "pane status not found")
             return {"type": "agent_explain", "pane_id": pane_id, "explain": explain.to_dict()}
         if method == "agent.wait":
-            return self._agent_wait(params)
+            return self._agent_wait(params, connection_alive=connection_alive or (lambda: True))
         if method == "server.snapshot":
             self._empty_params(params)
             return {"type": "session_snapshot", "snapshot": self.broker.handoff_snapshot()}
@@ -128,7 +143,7 @@ class ApiRuntime:
             raise ProtocolError("invalid_request", "events.subscribe requires a streaming connection")
         raise ProtocolError("method_not_found", f"unknown method: {method}")
 
-    def _agent_wait(self, params: object) -> dict[str, object]:
+    def _agent_wait(self, params: object, *, connection_alive: ConnectionProbe) -> dict[str, object]:
         raw = self._params(params, allowed={"pane_id", "until", "timeout_ms"})
         pane_id = self._required_text(raw, "pane_id")
         raw_until = raw.get("until")
@@ -137,17 +152,24 @@ class ApiRuntime:
             value not in ("idle", "working", "blocked", "done", "unknown") for value in values
         ):
             raise ProtocolError("invalid_params", "until must be a state string or non-empty state array")
-        timeout_ms = raw.get("timeout_ms")
-        if timeout_ms is not None and (
-            isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms < 0 or timeout_ms > MAX_WAIT_MS
-        ):
+        timeout_ms = raw.get("timeout_ms", MAX_WAIT_MS)
+        if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms < 0 or timeout_ms > MAX_WAIT_MS:
             raise ProtocolError("invalid_params", f"timeout_ms must be between 0 and {MAX_WAIT_MS}")
-        timeout_seconds = None if timeout_ms is None else timeout_ms / 1000
+        deadline = time.monotonic() + timeout_ms / 1000
         until = frozenset(cast(AgentState, value) for value in values)
-        status = self.broker.wait_for_status(pane_id, until, timeout_seconds)
-        if status is None:
-            raise ProtocolError("timeout", "agent wait timed out")
-        return {"type": "agent_wait", "pane": status.to_dict(), "until": sorted(until)}
+        while True:
+            if not connection_alive():
+                raise _ClientDisconnected
+            remaining = max(0.0, deadline - time.monotonic())
+            status = self.broker.wait_for_status(
+                pane_id,
+                until,
+                min(CONNECTION_LIVENESS_INTERVAL_SECONDS, remaining),
+            )
+            if status is not None:
+                return {"type": "agent_wait", "pane": status.to_dict(), "until": sorted(until)}
+            if time.monotonic() >= deadline:
+                raise ProtocolError("timeout", "agent wait timed out")
 
     def _prepare_handoff(self, params: object) -> dict[str, object]:
         raw = self._params(params, allowed={"target_pid", "state_dir", "expected_protocol"})
@@ -322,21 +344,46 @@ class ApiRuntime:
 class _ThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 128
 
     def __init__(self, socket_path: Path, runtime: ApiRuntime) -> None:
         self.runtime = runtime
+        self._handler_lock = threading.Lock()
+        self._active_handlers = 0
         super().__init__(str(socket_path), _RequestHandler)
+
+    @property
+    def active_handler_count(self) -> int:
+        with self._handler_lock:
+            return self._active_handlers
+
+    def process_request_thread(
+        self,
+        request: socket.socket | tuple[bytes, socket.socket],
+        client_address: object,
+    ) -> None:
+        with self._handler_lock:
+            self._active_handlers += 1
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._handler_lock:
+                self._active_handlers -= 1
 
 
 class _RequestHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         server = cast(_ThreadingUnixServer, self.server)
+        seen_request_ids: set[str] = set()
         while True:
             line = self.rfile.readline(MAX_REQUEST_BYTES + 1)
             if not line:
                 return
-            if len(line) > MAX_REQUEST_BYTES or not line.endswith(b"\n"):
+            if len(line) > MAX_REQUEST_BYTES:
                 self._write({"id": None, "error": {"code": "invalid_request", "message": "request line is too large"}})
+                return
+            if not line.endswith(b"\n"):
+                self._write({"id": None, "error": {"code": "invalid_request", "message": "request line is incomplete"}})
                 return
             request_id: str | None = None
             try:
@@ -347,44 +394,70 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                 if not isinstance(request_id_value, str) or not request_id_value:
                     raise ProtocolError("invalid_request", "request id must be a non-empty string")
                 request_id = request_id_value
+                if request_id in seen_request_ids:
+                    raise ProtocolError("duplicate_id", "request id must be unique within a connection")
+                seen_request_ids.add(request_id)
                 method = payload.get("method")
                 if not isinstance(method, str) or not method:
                     raise ProtocolError("invalid_request", "request method must be a non-empty string")
                 if method == "events.subscribe":
                     self._subscribe(request_id, payload.get("params"), server.runtime.broker)
                     return
-                result = server.runtime.dispatch(method, payload.get("params"))
-                self._write({"id": request_id, "result": result})
+                result = server.runtime.dispatch(
+                    method,
+                    payload.get("params"),
+                    connection_alive=self._connection_alive,
+                )
+                if not self._write({"id": request_id, "result": result}):
+                    return
+            except _ClientDisconnected:
+                return
             except ProtocolError as exc:
-                self._write({"id": request_id, "error": {"code": exc.code, "message": exc.message}})
+                if not self._write({"id": request_id, "error": {"code": exc.code, "message": exc.message}}):
+                    return
             except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                self._write({"id": request_id, "error": {"code": "invalid_json", "message": str(exc)}})
+                if not self._write({"id": request_id, "error": {"code": "invalid_json", "message": str(exc)}}):
+                    return
             except (StatusRuntimeError, OSError, ValueError) as exc:
-                self._write({"id": request_id, "error": {"code": "state_unavailable", "message": str(exc)}})
+                if not self._write({"id": request_id, "error": {"code": "state_unavailable", "message": str(exc)}}):
+                    return
 
     def _subscribe(self, request_id: str, params: object, broker: AgentStatusBroker) -> None:
         subscriptions = parse_subscriptions(params)
         last_seq = max((event.seq for event in broker.events_after(0)), default=0)
-        self._write(
+        if not self._write(
             {
                 "id": request_id,
                 "result": {"type": "event_subscription", "active": True, "subscription_count": len(subscriptions)},
             }
-        )
-        while True:
-            events = broker.wait_for_event(last_seq, timeout_seconds=1.0)
+        ):
+            return
+        while self._connection_alive():
+            events = broker.wait_for_event(last_seq, timeout_seconds=CONNECTION_LIVENESS_INTERVAL_SECONDS)
             for event in events:
                 last_seq = max(last_seq, event.seq)
-                if any(subscription.matches(event) for subscription in subscriptions):
-                    try:
-                        self._write({"id": request_id, "event": event.to_dict()})
-                    except (BrokenPipeError, ConnectionResetError):
-                        return
+                if any(subscription.matches(event) for subscription in subscriptions) and not self._write(
+                    {"id": request_id, "event": event.to_dict()}
+                ):
+                    return
 
-    def _write(self, payload: dict[str, object]) -> None:
+    def _connection_alive(self) -> bool:
+        try:
+            pending = cast(bytes, self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT))
+        except (BlockingIOError, InterruptedError):
+            return True
+        except OSError:
+            return False
+        return pending != b""
+
+    def _write(self, payload: dict[str, object]) -> bool:
         line = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
-        self.wfile.write(line)
-        self.wfile.flush()
+        try:
+            self.wfile.write(line)
+            self.wfile.flush()
+        except OSError:
+            return False
+        return True
 
 
 class ControlServer:
@@ -401,10 +474,51 @@ class ControlServer:
         if self._server is not None:
             raise RuntimeError("control server is already bound")
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        self._recover_stale_socket()
         self._server = _ThreadingUnixServer(self.socket_path, self.runtime)
         os.chmod(self.socket_path, 0o600)
         self._bound_inode = self.socket_path.stat().st_ino
         self.runtime.set_shutdown_callback(self.shutdown)
+
+    @property
+    def active_handler_count(self) -> int:
+        server = self._server
+        return 0 if server is None else server.active_handler_count
+
+    def _recover_stale_socket(self) -> None:
+        try:
+            existing = self.socket_path.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(existing.st_mode):
+            raise RuntimeError(f"refusing to replace non-socket path: {self.socket_path}")
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(SOCKET_PROBE_TIMEOUT_SECONDS)
+        try:
+            probe.connect(str(self.socket_path))
+        except ConnectionRefusedError:
+            pass
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            if exc.errno == errno.ECONNREFUSED:
+                pass
+            else:
+                raise OSError(
+                    errno.EADDRINUSE,
+                    f"cannot prove existing control socket is stale: {self.socket_path}: {exc}",
+                ) from exc
+        else:
+            raise OSError(errno.EADDRINUSE, f"live control server already owns socket: {self.socket_path}")
+        finally:
+            probe.close()
+        try:
+            current = self.socket_path.lstat()
+        except FileNotFoundError:
+            return
+        if (current.st_dev, current.st_ino, current.st_mode) != (existing.st_dev, existing.st_ino, existing.st_mode):
+            raise RuntimeError(f"refusing to replace changed socket path: {self.socket_path}")
+        self.socket_path.unlink()
 
     def start(self) -> None:
         if self._server is None:
@@ -428,6 +542,10 @@ class ControlServer:
         server.shutdown()
         server.server_close()
         self._server = None
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
         try:
             if self._bound_inode is not None and self.socket_path.stat().st_ino == self._bound_inode:
                 self.socket_path.unlink()
@@ -481,6 +599,13 @@ class SocketClient:
         return cast(dict[str, object], result)
 
 
-def request(socket_path: Path, request_id: str, method: str, params: dict[str, object]) -> dict[str, object]:
-    with SocketClient(socket_path) as client:
+def request(
+    socket_path: Path,
+    request_id: str,
+    method: str,
+    params: dict[str, object],
+    *,
+    timeout: float = 10.0,
+) -> dict[str, object]:
+    with SocketClient(socket_path, timeout=timeout) as client:
         return client.request(request_id, method, params)

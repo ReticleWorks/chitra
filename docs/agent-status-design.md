@@ -19,7 +19,7 @@ MIT-licensed architecture; it does not copy Herdr's Rust runtime.
 | Workspace, tab, and pane | Governed lane, tmux target, and server-unique tmux pane ID |
 | Server-owned terminal process | Process owned by the existing tmux server |
 | Lifecycle hook authority | Integration report sent to Chitra's local socket |
-| Screen detection manifest | Chitra TOML manifest evaluated against `watchd`'s live bottom-buffer capture |
+| Screen detection manifest | Chitra TOML manifest evaluated against `watchd`'s bounded recent pane capture |
 | Agent `done` | Chitra's completion gate reached `done-pending-close` |
 | Live PTY transfer | Transfer of Chitra's status authority, API socket, and ownership lease; tmux already keeps the pane process alive |
 
@@ -38,8 +38,8 @@ authority shared by `watchd` and the local socket server.
 2. While that report remains bound to the same pane and session, it is
    authoritative. `watchd` still captures the pane for completion evidence,
    but it skips manifest classification for status.
-3. Without an integration authority, `watchd` evaluates the active local or
-   bundled TOML manifest against the live bottom buffer.
+3. Without integration authority, `watchd` evaluates the active local or
+   bundled TOML manifest against a bounded capture of recent pane lines.
 4. If no rule matches, the pane is `idle` with
    `default_known_agent_idle_fallback`. An unknown agent is also idle, with
    `unknown_agent_idle_fallback`.
@@ -57,7 +57,9 @@ Screen-derived `blocked` requires a matched rule whose `blocker_kind` is
 `approval`, `question`, or `permission`. The manifest parser rejects a blocked
 rule without one of those values. A conforming manifest must match stable UI
 controls, so incidental words such as "blocked", "error", or "waiting" do not
-produce blocked status by themselves.
+produce blocked status by themselves. Blocked rules may inspect only their
+configured bottom lines, never the whole capture and its scrollback. An
+anchored live working footer suppresses older blocker-shaped text above it.
 
 An authoritative integration may report blocked without a screen rule. That
 is the purpose of the higher authority tier. Explain output identifies that
@@ -74,6 +76,9 @@ The socket defaults to `/run/chitra/chitra.sock` and can be changed with
 `CHITRA_SOCKET_PATH` or `watchd --socket-path`. It is mode `0600` and uses one
 JSON object per newline. Every request requires `id`, `method`, and `params`.
 Every response and subscription event echoes the request ID.
+Request IDs must be unique within one connection; separate clients have
+independent ID namespaces. A missing wait timeout defaults to the server's
+maximum of 86,400,000 milliseconds, and larger values are rejected.
 
 Public methods include:
 
@@ -136,8 +141,9 @@ server socket. The source and replacement use this fail-closed protocol:
 4. The old socket path is retained as a rollback point. The replacement socket
    is moved into the canonical path, then the source commits an fsync-backed,
    monotonically increasing ownership lease.
-5. The replacement reads the lease back. The old server shuts down. Tmux pane
-   processes continue unchanged.
+5. The source writes and fsyncs the lease before returning the commit response.
+   The replacement performs no new fallible validation after that response.
+   The old server shuts down, and tmux pane processes continue unchanged.
 
 Any missing, corrupt, mismatched, or unverifiable state is
 `handoff_unknown`. Before commit, the old server thaws and remains the owner.

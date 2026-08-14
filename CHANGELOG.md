@@ -44,6 +44,17 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   Operators must ship compatible manifest provisioning and lifecycle hooks
   with the package update; see `docs/watchd-status-migration.md`.
 
+### Fixed
+
+- Anchor screen-derived blockers to live bottom controls, use exact answer
+  tokens, and let a live working footer suppress stale prompt text.
+- Bound `agent.wait` by default, align the CLI timeout, and reap wait and
+  subscription handlers when clients disconnect.
+- Recover verified stale crash sockets while continuing to refuse a socket
+  held by a live server.
+- Validate handoff state before broker mutation, keep the replacement alive
+  after commit, and inject supervised identity with `tmux new-session -e`.
+
 ## [0.9.8] - 2026-08-13
 
 ### Fixed

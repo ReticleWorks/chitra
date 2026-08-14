@@ -3,10 +3,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from chitra.agent_cli import main
+from chitra.agent_cli import build_arg_parser, main
 from chitra.agent_runtime import AgentStatusBroker
 from chitra.agent_status import ManifestRepository
-from chitra.socket_api import ApiRuntime, ControlServer
+from chitra.socket_api import MAX_WAIT_MS, ApiRuntime, ControlServer
+
+
+def test_wait_cli_default_matches_server_maximum() -> None:
+    args = build_arg_parser().parse_args(["wait", "--pane-id", "%1", "--until", "done"])
+
+    assert args.timeout_ms == MAX_WAIT_MS
 
 
 def test_offline_explain_and_schema_output(tmp_path: Path, capsys) -> None:

@@ -51,6 +51,76 @@ all = [{ kind = "contains", value = "error" }]
         )
 
 
+def test_blocked_rule_cannot_search_the_whole_capture_scrollback() -> None:
+    with pytest.raises(ManifestError, match="live bottom region"):
+        parse_manifest(
+            """
+schema_version = 1
+agent = "codex"
+version = "test"
+
+[[rules]]
+id = "stale_prompt"
+state = "blocked"
+region = "whole"
+blocker_kind = "approval"
+all = [{ kind = "contains", value = "Do you trust this directory?" }]
+""",
+            source="test",
+            source_kind="local",
+        )
+
+
+def test_stale_answered_codex_prompt_with_live_spinner_is_not_blocked() -> None:
+    result = classify_snapshot(
+        """Do you trust the contents of this directory?
+  1. Yes
+  2. No
+Trust recorded; the task cannot be cancelled now.
+• Working (12s • esc to interrupt)
+""",
+        agent="codex",
+        repository=ManifestRepository(),
+    )
+
+    assert result.state == "working"
+    assert result.matched_rule == "working_spinner"
+    assert result.blocker_kind is None
+
+
+def test_echoed_claude_permission_text_with_live_spinner_is_not_blocked() -> None:
+    result = classify_snapshot(
+        """I will ask: Do you want to proceed with this change?
+Esc to cancel
+✻ Working… esc to interrupt
+""",
+        agent="claude",
+        repository=ManifestRepository(),
+    )
+
+    assert result.state == "working"
+    assert result.matched_rule == "working_spinner"
+    assert result.blocker_kind is None
+
+
+def test_answer_tokens_require_case_sensitive_whole_words() -> None:
+    repository = ManifestRepository()
+
+    embedded = classify_snapshot(
+        "Do you trust the contents of this directory?\nThe task cannot continue yet.\n",
+        agent="codex",
+        repository=repository,
+    )
+    lowercase = classify_snapshot(
+        "Do you trust the contents of this directory?\n  1. yes\n  2. no\n",
+        agent="codex",
+        repository=repository,
+    )
+
+    assert embedded.state != "blocked"
+    assert lowercase.state != "blocked"
+
+
 def test_local_manifest_overrides_bundled_and_invalid_override_falls_back_idle(tmp_path: Path) -> None:
     local = tmp_path / "agent-detection"
     local.mkdir()

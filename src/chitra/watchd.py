@@ -83,7 +83,6 @@ DEFAULT_REVIEWER_MODEL: str | None = None
 DEFAULT_REVIEW_MAX_WORKERS = 2
 DEFAULT_REASONED_DISPATCH_ENABLED = True
 CAPTURE_LINES = 60
-NORMALIZED_TAIL_LINES = 25
 
 _VOLATILE_LINE_RE = re.compile(
     r"^[\s]*[·✻✽✳✢✶*●○◐◯]|tokens\b|🪟|⏵⏵|esc to interrupt|ctrl\+b|^─+$|^[\s]*$|Press up to edit|globalVersion: [0-9.]+"
@@ -166,13 +165,6 @@ def normalize(content: str) -> list[str]:
         if line:
             normalized.append(line)
     return normalized
-
-
-def normalized_snapshot(content: str) -> tuple[str, list[str]]:
-    """Return the stable digest and retained normalized tail for a capture."""
-    tail = normalize(content)[-NORMALIZED_TAIL_LINES:]
-    text = "\n".join(tail)
-    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest(), tail
 
 
 def pane_turn_finished(content: str, *, previous_state: AgentState | None, current_state: AgentState) -> bool:
@@ -294,15 +286,6 @@ def event_line(lane_id: str, normalized_tail: Sequence[str], *, now: datetime | 
     timestamp = (now or datetime.now(UTC)).isoformat().replace("+00:00", "Z")
     text = "CHANGE DETECTED: " + " | ".join(normalized_tail)
     return f"{timestamp} {lane_id} {text}\n"
-
-
-def idle_event_line(lane_id: str, target: str, idle_seconds: float, threshold_seconds: float) -> str:
-    """Format the stable IDLE wire event consumed and classified by triaged."""
-    timestamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-    return (
-        f"{timestamp} {lane_id} IDLE target={target} "
-        f"idle_seconds={int(idle_seconds)} threshold_seconds={int(threshold_seconds)}\n"
-    )
 
 
 def status_event_line(status: PaneStatus, *, now: datetime | None = None) -> str:

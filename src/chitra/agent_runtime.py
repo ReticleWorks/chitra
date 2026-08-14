@@ -213,6 +213,15 @@ class StatusEvent:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ValidatedHandoffSnapshot:
+    """A fully parsed snapshot that has not mutated the replacement broker."""
+
+    seq: int
+    panes: tuple[PaneStatus, ...]
+    lifecycle_reports: tuple[LifecycleReport, ...]
+
+
 def _object(payload: object, *, name: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"{name} must be an object")
@@ -564,8 +573,8 @@ class AgentStatusBroker:
                 ],
             }
 
-    def import_handoff_snapshot(self, payload: object) -> None:
-        """Replace empty replacement-server state with a validated snapshot."""
+    def validate_handoff_snapshot(self, payload: object) -> ValidatedHandoffSnapshot:
+        """Parse and cross-check a handoff snapshot without changing broker state."""
         raw = _object(payload, name="handoff snapshot")
         _exact_fields(raw, {"schema", "seq", "panes", "lifecycle_reports"}, name="handoff snapshot")
         if raw.get("schema") != STATUS_SNAPSHOT_SCHEMA:
@@ -577,8 +586,8 @@ class AgentStatusBroker:
         reports = raw.get("lifecycle_reports")
         if not isinstance(panes, list) or not isinstance(reports, list):
             raise ValueError("handoff snapshot panes and lifecycle_reports must be arrays")
-        parsed_panes = [PaneStatus.from_dict(item) for item in panes]
-        parsed_reports = [LifecycleReport.from_dict(item) for item in reports]
+        parsed_panes = tuple(PaneStatus.from_dict(item) for item in panes)
+        parsed_reports = tuple(LifecycleReport.from_dict(item) for item in reports)
         if len({status.pane_id for status in parsed_panes}) != len(parsed_panes):
             raise ValueError("handoff snapshot pane ids must be unique")
         if len({report.pane_id for report in parsed_reports}) != len(parsed_reports):
@@ -597,14 +606,29 @@ class AgentStatusBroker:
                 or report.session_ref not in (None, status.session_ref)
             ):
                 raise ValueError("handoff integration authority does not match pane status")
+        return ValidatedHandoffSnapshot(seq=seq, panes=parsed_panes, lifecycle_reports=parsed_reports)
+
+    def import_validated_handoff_snapshot(self, snapshot: ValidatedHandoffSnapshot) -> None:
+        """Atomically apply a previously validated snapshot to an empty broker."""
         with self._condition:
             if self._statuses or self._lifecycle or self._seq:
                 raise StatusRuntimeError("replacement status broker is not empty")
-            self._statuses = {status.pane_id: status for status in parsed_panes}
-            self._lifecycle = {report.pane_id: report for report in parsed_reports}
-            self._seq = seq
-            self._persist()
+            self._statuses = {status.pane_id: status for status in snapshot.panes}
+            self._lifecycle = {report.pane_id: report for report in snapshot.lifecycle_reports}
+            self._seq = snapshot.seq
+            try:
+                self._persist()
+            except Exception:
+                self._statuses.clear()
+                self._lifecycle.clear()
+                self._seq = 0
+                self._condition.notify_all()
+                raise
             self._condition.notify_all()
+
+    def import_handoff_snapshot(self, payload: object) -> None:
+        """Validate, then atomically replace empty replacement-server state."""
+        self.import_validated_handoff_snapshot(self.validate_handoff_snapshot(payload))
 
     def _ensure_mutable(self) -> None:
         if self._frozen:

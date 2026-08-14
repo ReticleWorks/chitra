@@ -9,21 +9,21 @@ priority = 1000
 region = "bottom"
 lines = 24
 blocker_kind = "permission"
-any = [
-  { kind = "regex", value = "Allow command\\?\\s*(?:\\n|.){0,160}(?:Yes|Allow)" },
-  { kind = "contains", value = "press enter to confirm or esc to cancel" },
+all = [
+  { kind = "contains", value = "Allow command?", case_sensitive = true },
+  { kind = "line_regex", value = "^\\s*(?:›\\s*)?(?:[0-9]+\\.\\s*)?(?:Yes|Allow(?: once)?)\\b", case_sensitive = true },
 ]
 
 [[rules]]
 id = "trust_directory"
 state = "blocked"
 priority = 950
-region = "whole"
-lines = 20
+region = "bottom"
+lines = 24
 blocker_kind = "approval"
 all = [
-  { kind = "contains", value = "Do you trust the contents of this directory?" },
-  { kind = "regex", value = "(?:Yes|No|Continue|Cancel)" },
+  { kind = "contains", value = "Do you trust the contents of this directory?", case_sensitive = true },
+  { kind = "line_regex", value = "^\\s*(?:›\\s*)?(?:[0-9]+\\.\\s*)?(?:Yes|No|Continue|Cancel)\\b", case_sensitive = true },
 ]
 
 [[rules]]
@@ -45,8 +45,9 @@ priority = 500
 region = "bottom"
 lines = 8
 any = [
-  { kind = "regex", value = "(?:esc to interrupt|thinking|working(?:…|\\.\\.\\.)|running(?:…|\\.\\.\\.))" },
-  { kind = "line_regex", value = "^[•◦]\\s+Working" },
+  { kind = "line_regex", value = "^\\s*[•◦✻✽✳✢✶*●○◐◯].*\\b(?:esc to interrupt|Working|Thinking|Running)\\b", case_sensitive = true },
+  { kind = "line_regex", value = "^\\s*(?:Working|Thinking|Running)(?:…|\\.\\.\\.|\\s*\\().*\\besc to interrupt\\b", case_sensitive = true },
+  { kind = "line_regex", value = "^\\s*esc to interrupt\\s*$", case_sensitive = true },
 ]
 
 [[rules]]

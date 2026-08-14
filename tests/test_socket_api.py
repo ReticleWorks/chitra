@@ -4,6 +4,7 @@ import json
 import socket
 import stat
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,15 @@ def _server(tmp_path: Path) -> tuple[AgentStatusBroker, ControlServer, Path]:
     return broker, server, socket_path
 
 
+def _wait_until(predicate, *, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        threading.Event().wait(0.01)
+    return predicate()
+
+
 def test_ndjson_responses_echo_ids_and_schema_covers_all_wire_shapes(tmp_path: Path) -> None:
     _broker, server, socket_path = _server(tmp_path)
     try:
@@ -38,6 +48,12 @@ def test_ndjson_responses_echo_ids_and_schema_covers_all_wire_shapes(tmp_path: P
         assert "error_response" in schema
         assert "emitted_event" in schema
         assert "subscription_event" in schema
+        assert schema["methods"]["agent.wait"]["params"]["timeout_ms"] == {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": socket_api.MAX_WAIT_MS,
+            "default": socket_api.MAX_WAIT_MS,
+        }
     finally:
         server.shutdown()
 
@@ -54,6 +70,79 @@ def test_invalid_request_error_retains_available_request_id(tmp_path: Path) -> N
             "id": "bad-1",
             "error": {"code": "method_not_found", "message": "unknown method: missing"},
         }
+    finally:
+        server.shutdown()
+
+
+def test_partial_request_line_is_rejected_after_client_finishes_writing(tmp_path: Path) -> None:
+    _broker, server, socket_path = _server(tmp_path)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(socket_path))
+            client.sendall(b'{"id":"partial","method":"ping","params":{}}')
+            client.shutdown(socket.SHUT_WR)
+            response = json.loads(client.makefile("rb").readline())
+        assert response == {
+            "id": None,
+            "error": {"code": "invalid_request", "message": "request line is incomplete"},
+        }
+    finally:
+        server.shutdown()
+
+
+def test_oversized_request_line_is_rejected_without_parsing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(socket_api, "MAX_REQUEST_BYTES", 64)
+    _broker, server, socket_path = _server(tmp_path)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(socket_path))
+            client.sendall(b"x" * 65)
+            response = json.loads(client.makefile("rb").readline())
+        assert response == {
+            "id": None,
+            "error": {"code": "invalid_request", "message": "request line is too large"},
+        }
+    finally:
+        server.shutdown()
+
+
+def test_duplicate_request_id_is_rejected_within_one_connection(tmp_path: Path) -> None:
+    _broker, server, socket_path = _server(tmp_path)
+    request_line = b'{"id":"same","method":"ping","params":{}}\n'
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(socket_path))
+            reader = client.makefile("rb")
+            client.sendall(request_line + request_line)
+            first = json.loads(reader.readline())
+            second = json.loads(reader.readline())
+        assert first["result"]["type"] == "pong"
+        assert second == {
+            "id": "same",
+            "error": {"code": "duplicate_id", "message": "request id must be unique within a connection"},
+        }
+    finally:
+        server.shutdown()
+
+
+def test_concurrent_clients_have_independent_request_id_namespaces(tmp_path: Path) -> None:
+    _broker, server, socket_path = _server(tmp_path)
+    barrier = threading.Barrier(8)
+    results: list[str] = []
+
+    def ping() -> None:
+        barrier.wait()
+        with SocketClient(socket_path) as client:
+            results.append(str(client.request("shared-id", "ping", {})["type"]))
+
+    threads = [threading.Thread(target=ping) for _ in range(8)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert all(not thread.is_alive() for thread in threads)
+        assert results == ["pong"] * 8
     finally:
         server.shutdown()
 
@@ -123,6 +212,55 @@ def test_agent_wait_done_is_semantic_and_event_driven(tmp_path: Path) -> None:
         assert result[0]["type"] == "agent_wait"
         assert result[0]["pane"]["agent_status"] == "done"  # type: ignore[index]
     finally:
+        server.shutdown()
+
+
+def test_agent_wait_omitted_timeout_uses_server_maximum(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(socket_api, "MAX_WAIT_MS", 20)
+    _broker, server, socket_path = _server(tmp_path)
+    try:
+        started = time.monotonic()
+        with SocketClient(socket_path, timeout=1.0) as client, pytest.raises(
+            ProtocolError, match="timed out"
+        ) as exc_info:
+            client.request("wait-default", "agent.wait", {"pane_id": "%1", "until": "done"})
+        assert exc_info.value.code == "timeout"
+        assert time.monotonic() - started < 1.0
+    finally:
+        server.shutdown()
+
+
+def test_agent_wait_handler_exits_when_client_disconnects(tmp_path: Path) -> None:
+    _broker, server, socket_path = _server(tmp_path)
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.connect(str(socket_path))
+        client.sendall(b'{"id":"wait-gone","method":"agent.wait","params":{"pane_id":"%1","until":"done"}}\n')
+        assert _wait_until(lambda: server.active_handler_count == 1)
+        client.close()
+        assert _wait_until(lambda: server.active_handler_count == 0)
+    finally:
+        client.close()
+        server.shutdown()
+
+
+def test_subscription_handler_exits_when_client_disconnects(tmp_path: Path) -> None:
+    _broker, server, socket_path = _server(tmp_path)
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.connect(str(socket_path))
+        reader = client.makefile("rb")
+        client.sendall(
+            b'{"id":"sub-gone","method":"events.subscribe","params":{"subscriptions":'
+            b'[{"type":"pane.agent_status_changed"}]}}\n'
+        )
+        assert json.loads(reader.readline())["result"]["active"] is True
+        assert _wait_until(lambda: server.active_handler_count == 1)
+        reader.close()
+        client.close()
+        assert _wait_until(lambda: server.active_handler_count == 0)
+    finally:
+        client.close()
         server.shutdown()
 
 
@@ -196,3 +334,19 @@ def test_control_server_refuses_to_unlink_an_existing_owner_socket(tmp_path: Pat
     finally:
         first.shutdown()
         second.shutdown()
+
+
+def test_control_server_recovers_a_stale_crash_socket(tmp_path: Path) -> None:
+    socket_path = tmp_path / "chitra.sock"
+    crashed = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    crashed.bind(str(socket_path))
+    crashed.close()
+
+    broker = AgentStatusBroker(tmp_path / "state", ManifestRepository())
+    server = ControlServer(socket_path, ApiRuntime(broker))
+    try:
+        server.start()
+        with SocketClient(socket_path) as client:
+            assert client.request("after-crash", "ping", {})["type"] == "pong"
+    finally:
+        server.shutdown()

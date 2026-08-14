@@ -14,12 +14,14 @@ Those signals mixed screen activity with semantic status.
 After this release:
 
 - Lifecycle integrations are authoritative for their exact pane and session.
-- Otherwise, a local or bundled TOML manifest classifies the bottom-buffer
-  snapshot as idle, working, or blocked.
+- Otherwise, a local or bundled TOML manifest classifies a bounded recent pane
+  capture as idle, working, or blocked. The capture can contain scrollback;
+  blocked rules are therefore limited to configured bottom lines.
 - Unknown or unmatched screen shapes are idle. Only recognized visible
   approval, question, or permission rules produce screen-derived blocked.
-- The events log emits `AGENT_STATUS` only when semantic status or authority
-  changes. Composer typing and unrelated output changes do not emit status.
+- The events log emits `AGENT_STATUS` when semantic state, status authority or
+  source, agent identity, pane target, session, lane, or tmux socket changes.
+  Composer typing and unrelated output changes do not emit status.
 - Completion review begins on a semantic working-to-idle transition at a
   visible input row. A quiet screen alone is not a turn boundary.
 - `done` comes only from Chitra's completion gate.
@@ -68,6 +70,19 @@ to `AGENT_STATUS` or the socket subscription API.
 Do not deploy the source version first and add manifests later. A known agent
 with no matching rule safely appears idle, but that would hide working state
 until provisioning catches up.
+
+## Crash recovery
+
+On normal startup, Watchd probes an existing control-socket path before bind.
+If a live server accepts the probe, startup refuses to replace its socket. If
+the path is a socket left by an unclean exit and the probe gets connection
+refused, Watchd verifies that the path did not change, unlinks that stale
+socket, and binds normally. A non-socket path or an indeterminate probe still
+fails closed and needs operator inspection.
+
+No manual unlink is needed for the verified stale-socket case. Do not remove a
+socket merely because a process identifier looks stale; the bind probe is the
+ownership check.
 
 ## Local override path
 

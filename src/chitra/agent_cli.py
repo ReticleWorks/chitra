@@ -9,7 +9,7 @@ from pathlib import Path
 
 from chitra.agent_status import ManifestRepository, classify_snapshot
 from chitra.api_protocol import api_schema
-from chitra.socket_api import default_socket_path, request
+from chitra.socket_api import MAX_WAIT_MS, default_socket_path, request
 
 
 def _env(name: str) -> str | None:
@@ -53,7 +53,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     wait = commands.add_parser("wait", help="Block until a pane reaches semantic state.")
     wait.add_argument("--pane-id", default=None)
     wait.add_argument("--until", choices=("idle", "working", "blocked", "done", "unknown"), required=True)
-    wait.add_argument("--timeout-ms", type=int, default=None)
+    wait.add_argument("--timeout-ms", type=int, default=MAX_WAIT_MS)
 
     schema = commands.add_parser("schema", help="Print the full local socket JSON Schema document.")
     schema.add_argument("--output", type=Path, default=None)
@@ -108,10 +108,16 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.command == "wait":
-            params = {"pane_id": _pane_id(args.pane_id), "until": args.until}
-            if args.timeout_ms is not None:
-                params["timeout_ms"] = args.timeout_ms
-            _print(request(socket_path, "cli:wait", "agent.wait", params))
+            params = {"pane_id": _pane_id(args.pane_id), "until": args.until, "timeout_ms": args.timeout_ms}
+            _print(
+                request(
+                    socket_path,
+                    "cli:wait",
+                    "agent.wait",
+                    params,
+                    timeout=max(10.0, args.timeout_ms / 1000 + 1.0),
+                )
+            )
             return 0
         schema = api_schema()
         rendered = json.dumps(schema, indent=2, sort_keys=True) + "\n"

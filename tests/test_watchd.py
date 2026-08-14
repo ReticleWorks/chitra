@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from chitra.agent_runtime import AgentStatusBroker
+from chitra.agent_status import ManifestRepository
 from chitra.dispatch import DispatchOrder
 from chitra.goal_enforcement import ReviewerVerdict, ReviewFinding
 from chitra.goals import GoalRecord, get_goal, upsert_goal
@@ -21,10 +23,10 @@ from chitra.watchd import (
     WatchdConfig,
     append_event,
     build_arg_parser,
-    event_line,
     list_panes,
     normalize,
     resolve_config,
+    status_event_line,
 )
 
 
@@ -504,15 +506,21 @@ def test_list_panes_can_isolate_a_session_namespace() -> None:
     ]
 
 
-def test_event_line_matches_triaged_reader_contract() -> None:
-    line = event_line("%9", ["state: waiting", "needs operator input"])
+def test_status_event_line_matches_triaged_reader_contract(tmp_path: Path) -> None:
+    broker = AgentStatusBroker(tmp_path, ManifestRepository())
+    event = broker.report_agent(pane_id="%9", source="test", agent="codex", state="blocked")
+    assert event is not None
+    line = status_event_line(event.pane)
 
     parsed = parse_event_line(line)
     assert parsed is not None
     timestamp, lane_id, text = parsed
     assert timestamp.endswith("Z")
     assert lane_id == "%9"
-    assert text == "CHANGE DETECTED: state: waiting | needs operator input"
+    assert text == (
+        "AGENT_STATUS state=blocked needs operator input pane_id=%9 target=%9 "
+        "agent=codex authority=integration source=test rule=none fallback=none"
+    )
 
 
 def test_append_event_rotates_at_max_size_under_lock(tmp_path: Path) -> None:

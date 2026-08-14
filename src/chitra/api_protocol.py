@@ -8,6 +8,7 @@ from typing import Any, Literal, cast
 from chitra.agent_runtime import STATUS_EVENT_TYPE, StatusEvent
 
 API_PROTOCOL_VERSION = 1
+MAX_WAIT_MS = 86_400_000
 MAX_SUBSCRIPTIONS = 64
 MAX_PREDICATE_DEPTH = 8
 MAX_PREDICATE_TERMS = 64
@@ -235,7 +236,12 @@ def api_schema() -> dict[str, object]:
             "agent.explain": {"request": request_base, "result_type": "agent_explain"},
             "agent.wait": {
                 "request": request_base,
-                "params": {"required": ["pane_id", "until"], "until": {"enum": state_enum}, "optional": ["timeout_ms"]},
+                "params": {
+                    "required": ["pane_id", "until"],
+                    "until": {"enum": state_enum},
+                    "optional": ["timeout_ms"],
+                    "timeout_ms": {"type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS, "default": MAX_WAIT_MS},
+                },
                 "result_type": "agent_wait",
             },
             "events.subscribe": {

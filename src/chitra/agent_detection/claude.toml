@@ -9,10 +9,9 @@ priority = 1000
 region = "bottom"
 lines = 24
 blocker_kind = "permission"
-all = [{ kind = "regex", value = "Do you want to (?:proceed|allow|approve)" }]
-any = [
-  { kind = "line_regex", value = "^\\s*(?:❯\\s*)?1\\. Yes(?:$|,)" },
-  { kind = "contains", value = "Esc to cancel" },
+all = [
+  { kind = "regex", value = "Do you want to (?:proceed|allow|approve)" },
+  { kind = "line_regex", value = "^\\s*(?:❯\\s*)?1\\. Yes\\b(?:$|,)", case_sensitive = true },
 ]
 
 [[rules]]
@@ -23,8 +22,8 @@ region = "bottom"
 lines = 24
 blocker_kind = "approval"
 all = [
-  { kind = "line_regex", value = "^\\s*(?:❯\\s*)?1\\. (?:Allow|Approve)" },
-  { kind = "line_regex", value = "^\\s*[23]\\. (?:Deny|Reject|Cancel|No)" },
+  { kind = "line_regex", value = "^\\s*(?:❯\\s*)?1\\. (?:Allow|Approve)\\b", case_sensitive = true },
+  { kind = "line_regex", value = "^\\s*[23]\\. (?:Deny|Reject|Cancel|No)\\b", case_sensitive = true },
 ]
 
 [[rules]]
@@ -45,7 +44,11 @@ state = "working"
 priority = 500
 region = "bottom"
 lines = 8
-all = [{ kind = "regex", value = "(?:esc to interrupt|thinking|working(?:…|\\.\\.\\.)|running(?:…|\\.\\.\\.))" }]
+any = [
+  { kind = "line_regex", value = "^\\s*[•◦✻✽✳✢✶*●○◐◯].*\\b(?:esc to interrupt|Working|Thinking|Running)\\b", case_sensitive = true },
+  { kind = "line_regex", value = "^\\s*(?:Working|Thinking|Running)(?:…|\\.\\.\\.|\\s*\\().*\\besc to interrupt\\b", case_sensitive = true },
+  { kind = "line_regex", value = "^\\s*esc to interrupt\\s*$", case_sensitive = true },
+]
 
 [[rules]]
 id = "input_row"

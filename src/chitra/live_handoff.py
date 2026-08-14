@@ -47,17 +47,18 @@ def _validate_manifest(
     verified_ids = manifest.get("verified_pane_ids")
     if not isinstance(verified_ids, list) or any(not isinstance(value, str) for value in verified_ids):
         raise LiveHandoffError("handoff verified_pane_ids is invalid")
-    broker.import_handoff_snapshot(status_snapshot)
-    imported_ids = [status.pane_id for status in broker.statuses()]
+    validated_snapshot = broker.validate_handoff_snapshot(status_snapshot)
+    imported_ids = [status.pane_id for status in validated_snapshot.panes]
     if sorted(verified_ids) != sorted(imported_ids):
         raise LiveHandoffError("handoff verified panes do not match imported state")
-    for status in broker.statuses():
+    for status in validated_snapshot.panes:
         try:
             verified = runtime.pane_verifier(status)
         except OSError:
             verified = False
         if not verified:
             raise LiveHandoffError(f"replacement cannot verify live pane {status.pane_id}; state is UNKNOWN")
+    broker.import_validated_handoff_snapshot(validated_snapshot)
     return manifest
 
 
@@ -101,31 +102,27 @@ def perform_live_handoff(
             manifest = _validate_manifest(
                 prepared.get("manifest"), runtime=replacement_runtime, broker=replacement_runtime.broker
             )
+            receipt = {
+                "schema": HANDOFF_SCHEMA,
+                "generation": manifest["generation"],
+                "source_pid": manifest["source_pid"],
+                "owner_pid": replacement_runtime.process_id,
+                "verified_pane_ids": manifest["verified_pane_ids"],
+                "status": "transferred",
+            }
             os.replace(canonical_socket, backup_socket)
             os.replace(temporary_socket, canonical_socket)
             renamed = True
             replacement_server.socket_path = canonical_socket
-            commit = source.request(
+            source.request(
                 "handoff:commit",
                 "server.handoff.commit",
                 {"token": token, "target_pid": replacement_runtime.process_id},
             )
-            if commit.get("type") != "handoff_committed":
-                raise LiveHandoffError("source server did not commit live ownership")
             committed = True
         with contextlib.suppress(FileNotFoundError):
             backup_socket.unlink()
-        ownership: object = json.loads(replacement_runtime.ownership_path.read_text(encoding="utf-8"))
-        if not isinstance(ownership, dict) or ownership.get("owner_pid") != replacement_runtime.process_id:
-            raise LiveHandoffError("committed ownership lease did not read back for the replacement pid")
-        return {
-            "schema": HANDOFF_SCHEMA,
-            "generation": manifest["generation"],
-            "source_pid": manifest["source_pid"],
-            "owner_pid": replacement_runtime.process_id,
-            "verified_pane_ids": manifest["verified_pane_ids"],
-            "status": "transferred",
-        }
+        return receipt
     except (ConnectionError, LiveHandoffError, OSError, ProtocolError, ValueError) as exc:
         if token is not None and not committed:
             try:

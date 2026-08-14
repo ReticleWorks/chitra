@@ -165,6 +165,11 @@ def start_lane(
         f"{PANE_TARGET_ENV_VAR}={lane.tmux_session}:0.0",
         f"{SOCKET_PATH_ENV_VAR}={control_socket}",
     )
+    tmux_environment = tuple(
+        argument
+        for assignment in identity_environment
+        for argument in ("-e", assignment)
+    )
     supervised_command = [sys.executable, "-m", "chitra.pane_exec", "--", *agent_command]
     command = _run_as_lane(
         lane,
@@ -172,13 +177,13 @@ def start_lane(
             lane,
             "new-session",
             "-d",
+            *tmux_environment,
             "-s",
             lane.tmux_session,
             "-c",
             str(lane.workdir),
             *supervised_command,
         ),
-        extra_environment=identity_environment,
     )
     result = runner(command)
     if result.returncode != 0:

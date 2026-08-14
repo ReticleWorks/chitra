@@ -1,7 +1,7 @@
 # Agent detection manifest format
 
 Chitra agent detection manifests are strict TOML documents. They classify a
-captured live bottom buffer without calling an LLM. Unknown fields, invalid
+bounded recent pane capture without calling an LLM. Unknown fields, invalid
 types, unsupported states, excessive sizes, and blocked rules without a typed
 blocker kind reject the manifest.
 
@@ -43,8 +43,8 @@ Each `[[rules]]` table accepts only these fields:
 | `id` | string | Yes | Unique identifier matching `^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$`. |
 | `state` | string | Yes | `idle`, `working`, or `blocked`. |
 | `priority` | integer | No | Higher values run first. Default `0`. File order breaks ties. |
-| `region` | string | No | `bottom` or `whole`. Default `bottom`. |
-| `lines` | integer | No | Bottom-region line count, from 1 to 200. Default `20`. |
+| `region` | string | No | `bottom` or `whole`. Default `bottom`. Blocked rules must use `bottom`. |
+| `lines` | integer | No | Bottom-region line count, from 1 to 200. Default `20`; ignored by `whole`. |
 | `blocker_kind` | string | For blocked | `approval`, `question`, or `permission`. Forbidden on other states. |
 | `all` | matcher array | Conditionally | Every matcher must match. |
 | `any` | matcher array | Conditionally | At least one matcher must match. |
@@ -56,7 +56,9 @@ rule when one of its matchers succeeds. Each array may contain at most 32
 matchers.
 
 Chitra evaluates every rule for explain output. The first matched rule in
-descending priority order authors status.
+descending priority order authors status, except that an anchored live
+working rule suppresses a simultaneous blocked match from older text above
+the working footer.
 
 ## Matcher fields
 
@@ -68,7 +70,10 @@ Each matcher is an inline table or TOML table with these fields:
 | `value` | string | Yes | Literal text or Python regular expression, at most 512 characters. |
 | `case_sensitive` | boolean | No | Default `false`. |
 
-`contains` searches the selected region. `regex` searches the region with
+`bottom` selects the requested number of final lines. `whole` selects the
+entire bounded Watchd capture, which can include recent scrollback, and is
+therefore forbidden for blocked rules. `contains` searches the selected
+region. `regex` searches the region with
 multiline behavior. `line_regex` applies the expression to each line
 separately. Chitra truncates detection input to the most recent 64 KiB before
 matching.
@@ -80,12 +85,13 @@ careful expression.
 
 ## Strict blocked contract
 
-A screen rule may set `state = "blocked"` only when it also declares a
-recognized `blocker_kind`. The matched text must be a visible approval,
-question, or permission interface. The parser verifies the declared type, but
-it cannot decide whether an arbitrary regular expression truly describes that
-interface. Manifest authors must reject broad rules based on an error keyword,
-a status sentence, or mere silence. Local manifests are trusted configuration.
+A screen rule may set `state = "blocked"` only when it uses the live `bottom`
+region and declares a recognized `blocker_kind`. Its matchers must require an
+anchored approval, question, or permission control, including exact answer
+tokens where the interface supplies them. Broad matches on prompt prose,
+scrollback, an error word, a status sentence, or silence are invalid uses of
+the contract. A simultaneous anchored working footer wins over older blocker
+text in the capture.
 
 When no rule matches a known agent, Chitra returns idle with
 `default_known_agent_idle_fallback`. This is a safety bias, not evidence that
@@ -106,12 +112,8 @@ region = "bottom"
 lines = 20
 blocker_kind = "permission"
 all = [
-  { kind = "contains", value = "Allow command?" },
-  { kind = "contains", value = "Esc to cancel" },
-]
-any = [
-  { kind = "line_regex", value = "^\\s*(?:›\\s*)?1\\. Allow once" },
-  { kind = "line_regex", value = "^\\s*(?:›\\s*)?1\\. Yes" },
+  { kind = "contains", value = "Allow command?", case_sensitive = true },
+  { kind = "line_regex", value = "^\\s*(?:›\\s*)?1\\. (?:Allow once|Yes)\\b", case_sensitive = true },
 ]
 not = [{ kind = "contains", value = "Permission already granted" }]
 
@@ -120,8 +122,7 @@ id = "working"
 state = "working"
 priority = 500
 any = [
-  { kind = "contains", value = "esc to interrupt" },
-  { kind = "line_regex", value = "^[•◦]\\s+Working" },
+  { kind = "line_regex", value = "^\\s*[•◦].*\\b(?:esc to interrupt|Working)\\b", case_sensitive = true },
 ]
 
 [[rules]]

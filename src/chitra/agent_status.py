@@ -310,6 +310,8 @@ def _parse_rule(value: object, *, index: int) -> ManifestRule:
         blocker_kind = cast(BlockerKind, blocker_kind_raw)
     if state == "blocked" and blocker_kind is None:
         raise ManifestError(f"{path}.blocked rules require blocker_kind")
+    if state == "blocked" and region == "whole":
+        raise ManifestError(f"{path}.blocked rules must use the live bottom region")
     if state != "blocked" and blocker_kind is not None:
         raise ManifestError(f"{path}.blocker_kind is valid only for blocked rules")
     all_matchers = _parse_matchers(raw, "all", path=path)
@@ -432,12 +434,20 @@ def classify_snapshot(snapshot: str, *, agent: str, repository: ManifestReposito
             evaluated_rules=(),
         )
     evaluations: list[RuleEvaluation] = []
-    matched_rule: ManifestRule | None = None
+    matched_rules: list[ManifestRule] = []
     for rule in manifest.rules:
         evaluation = rule.evaluate(bounded_snapshot)
         evaluations.append(evaluation)
-        if matched_rule is None and evaluation.matched:
-            matched_rule = rule
+        if evaluation.matched:
+            matched_rules.append(rule)
+    matched_rule = matched_rules[0] if matched_rules else None
+    if matched_rule is not None and matched_rule.state == "blocked":
+        # A live working footer is newer evidence than blocker-shaped text
+        # retained above it in the bounded capture. Working rules therefore
+        # suppress a simultaneous screen-derived blocker match regardless of
+        # manifest priority. Bundled working rules are anchored to live footer
+        # shapes so ordinary prose cannot trigger this override.
+        matched_rule = next((rule for rule in matched_rules if rule.state == "working"), matched_rule)
     if matched_rule is None:
         return DetectionExplain(
             agent=agent,
