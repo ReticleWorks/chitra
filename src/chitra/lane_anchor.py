@@ -29,6 +29,7 @@ SESSION_REF_ENV_VAR = "CHITRA_SESSION_REF"
 PANE_ID_ENV_VAR = "CHITRA_PANE_ID"
 PANE_TARGET_ENV_VAR = "CHITRA_PANE_TARGET"
 SOCKET_PATH_ENV_VAR = "CHITRA_SOCKET_PATH"
+PYTHONPATH_ENV_VAR = "PYTHONPATH"
 
 
 class LaneLaunchRefused(RuntimeError):
@@ -142,6 +143,13 @@ def _tmux(lane: LaneSpec, *arguments: str) -> list[str]:
     return ["tmux", "-S", str(lane.tmux_socket), *arguments]
 
 
+def _pane_pythonpath() -> str:
+    """Keep the launched pane on the same Chitra runtime as this process."""
+    package_root = str(Path(__file__).resolve().parent.parent)
+    inherited = os.environ.get(PYTHONPATH_ENV_VAR, "")
+    return f"{package_root}{os.pathsep}{inherited}" if inherited else package_root
+
+
 def start_lane(
     lane: LaneSpec,
     *,
@@ -165,9 +173,10 @@ def start_lane(
         f"{PANE_TARGET_ENV_VAR}={lane.tmux_session}:0.0",
         f"{SOCKET_PATH_ENV_VAR}={control_socket}",
     )
+    pane_environment = (*identity_environment, f"{PYTHONPATH_ENV_VAR}={_pane_pythonpath()}")
     tmux_environment = tuple(
         argument
-        for assignment in identity_environment
+        for assignment in pane_environment
         for argument in ("-e", assignment)
     )
     supervised_command = [sys.executable, "-m", "chitra.pane_exec", "--", *agent_command]
