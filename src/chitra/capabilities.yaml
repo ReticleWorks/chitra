@@ -179,6 +179,26 @@ capabilities:
         params: []
         mutates: true
 
+  - name: agent-status
+    kind: tool
+    purpose: Report and inspect deterministic semantic state for a supervised pane.
+    when_to_use: Use from a supervised agent lifecycle hook or an operator diagnostic against the local Watchd socket.
+    authority:
+      level: record
+      grants:
+        - Report lifecycle state for an exact pane and inspect, wait for, or explain semantic state.
+        - Print the local socket protocol schema.
+      excludes:
+        - Send input, grant approval, or decide whether an agent should be blocked.
+        - Bypass completion review or claim permission from status alone.
+    default_enabled: true
+    commands:
+      - name: chitra-agent
+        description: Report, explain, wait for, or inspect deterministic pane status.
+        argv: [chitra-agent]
+        params: []
+        mutates: true
+
   - name: capability-management
     kind: tool
     purpose: Inspect and reversibly record per-capability runtime toggles.

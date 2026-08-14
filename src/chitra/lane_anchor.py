@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from chitra._fsio import write_json_atomic
 from chitra.goals import RATE_LIMIT_HOLD_REASON_PREFIX, GoalRecord, check_specification, get_goal
 from chitra.lane_config import LaneSpec, load_lanes
 from chitra.rate_limit_state import get_transaction
+from chitra.socket_api import default_socket_path
 
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 SANCTIONED_HOST = "tophand"
@@ -22,6 +24,11 @@ CLAUDE_MODELS = ("sonnet", "opus")
 BACKENDS = ("claude", "codex")
 CLAUDE_EFFORTS = ("low", "medium", "high", "max")
 CODEX_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
+LANE_ID_ENV_VAR = "CHITRA_LANE_ID"
+SESSION_REF_ENV_VAR = "CHITRA_SESSION_REF"
+PANE_ID_ENV_VAR = "CHITRA_PANE_ID"
+PANE_TARGET_ENV_VAR = "CHITRA_PANE_TARGET"
+SOCKET_PATH_ENV_VAR = "CHITRA_SOCKET_PATH"
 
 
 class LaneLaunchRefused(RuntimeError):
@@ -87,6 +94,7 @@ def _write_launch_receipt(
     backend: str,
     model: str | None,
     effort: str | None,
+    socket_path: Path,
 ) -> None:
     snapshot = {name: getattr(goal, name) for name in ("goal", "done_when", "intent", "scope", "source")}
     canonical = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
@@ -101,6 +109,13 @@ def _write_launch_receipt(
         "backend": backend,
         "model": model or "backend-default",
         "effort": effort or "backend-default",
+        "identity_env": {
+            LANE_ID_ENV_VAR: lane.identifier,
+            SESSION_REF_ENV_VAR: goal.session_ref,
+            PANE_ID_ENV_VAR: "runtime:TMUX_PANE",
+            PANE_TARGET_ENV_VAR: f"{lane.tmux_session}:0.0",
+            SOCKET_PATH_ENV_VAR: str(socket_path),
+        },
         "lifecycle": ["dispatchd", "watchd", "completion_gate", "goal_enforcement", "draft_scanner", "rate_limit_guard"],
     }
     path = lane.state_dir / "lane-launch.json"
@@ -112,10 +127,11 @@ def _run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, check=False, capture_output=True, text=True)
 
 
-def _run_as_lane(lane: LaneSpec, command: Sequence[str]) -> list[str]:
+def _run_as_lane(lane: LaneSpec, command: Sequence[str], *, extra_environment: Sequence[str] = ()) -> list[str]:
     environment = [
         f"HOME={lane.home}",
         f"CLAUDE_CONFIG_DIR={lane.config_dir}",
+        *extra_environment,
     ]
     if os.geteuid() == lane.uid:
         return ["env", *environment, *command]
@@ -133,32 +149,54 @@ def start_lane(
     model: str | None = "sonnet",
     effort: str | None = "high",
     host: str = SANCTIONED_HOST,
+    socket_path: Path | None = None,
     runner: CommandRunner = _run,
 ) -> bool:
     """Ensure the lane session exists; return whether this call created it."""
     goal = ingestion_gate(lane, host=host)
     agent_command = _agent_command(backend, model, effort)
+    control_socket = socket_path or default_socket_path()
     existing = runner(_run_as_lane(lane, _tmux(lane, "has-session", "-t", lane.tmux_session)))
     if existing.returncode == 0:
         return False
+    identity_environment = (
+        f"{LANE_ID_ENV_VAR}={lane.identifier}",
+        f"{SESSION_REF_ENV_VAR}={goal.session_ref}",
+        f"{PANE_TARGET_ENV_VAR}={lane.tmux_session}:0.0",
+        f"{SOCKET_PATH_ENV_VAR}={control_socket}",
+    )
+    tmux_environment = tuple(
+        argument
+        for assignment in identity_environment
+        for argument in ("-e", assignment)
+    )
+    supervised_command = [sys.executable, "-m", "chitra.pane_exec", "--", *agent_command]
     command = _run_as_lane(
         lane,
         _tmux(
             lane,
             "new-session",
             "-d",
+            *tmux_environment,
             "-s",
             lane.tmux_session,
             "-c",
             str(lane.workdir),
-            *agent_command,
+            *supervised_command,
         ),
     )
     result = runner(command)
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"tmux exited {result.returncode}"
         raise RuntimeError(f"could not create lane {lane.identifier} session: {detail}")
-    _write_launch_receipt(lane, goal, backend=backend, model=model, effort=effort)
+    _write_launch_receipt(
+        lane,
+        goal,
+        backend=backend,
+        model=model,
+        effort=effort,
+        socket_path=control_socket,
+    )
     return True
 
 
@@ -188,6 +226,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backend", choices=BACKENDS, default="claude")
     parser.add_argument("--model", default="sonnet")
     parser.add_argument("--effort", default="high")
+    parser.add_argument("--socket-path", type=Path, default=None)
     parser.add_argument("action", choices=("start", "stop", "status"))
     return parser
 
@@ -204,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             effort=args.effort,
             host=args.host,
+            socket_path=args.socket_path,
         )
         return 0
     if args.action == "stop":
