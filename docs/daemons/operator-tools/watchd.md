@@ -1,31 +1,64 @@
-# watchd — Completion Reviewer
+# watchd — Semantic Status and Completion Review
 
-Watchd watches tmux panes for session activity and completion claims. When a session claims it is done, watchd launches isolated LLM reviewer processes to judge whether the claim matches the frozen goal. **This is where chitra makes real LLM calls.**
+Watchd classifies supervised tmux panes, publishes semantic status, and runs
+isolated completion reviewers. Status classification is deterministic. The
+completion reviewer is the only part of this path that calls an LLM.
 
-## What it does
+## Status authority
 
-**On each poll interval:**
+Watchd resolves each pane through one ordered authority chain:
 
-1. List all tmux panes matching the session prefix filter.
-2. For each pane:
-   - Capture its current content.
-   - Compute a SHA256 hash of the content.
-   - If the hash differs from the last known state, a change occurred. Emit an event.
-   - If the pane shows a completion claim marker, enqueue a completion review.
-3. For each pending review:
-   - Spawn an isolated `claude -p` reviewer process (bounded concurrency, default max 2 running at once).
-   - Pass the frozen goal and the pane content to the reviewer.
-   - Wait for the verdict: accept, reject, or unavailable.
-   - Record the verdict to completion_reviews.jsonl.
+1. A lifecycle integration report for the exact pane and session is
+   authoritative. Watchd skips screen classification for that pane.
+2. Otherwise, Watchd evaluates a local agent-detection TOML manifest.
+3. Without a local override, Watchd evaluates the bundled manifest.
+4. An unmatched or unknown screen is idle, with an explicit fallback label.
 
-The reviewer processes are isolated. They run on their own and never:
+A screen can be blocked only when a manifest matches a recognized visible
+approval, question, or permission interface. Ambiguous output is idle. See
+[Agent detection manifests](../../agent-detection-manifests.md) for the full
+format and precedence rules.
 
-- Draft chitra's messages.
-- Mutate chitra's state.
-- Bypass operator gates.
-- Share context with other reviewers.
+## Poll and completion behavior
 
-Watchd itself remains responsive; it does not wait for reviewers to finish before continuing to poll.
+On each interval, Watchd lists the allowed panes, captures each live bottom
+buffer, and updates the shared semantic-status broker. It writes an
+`AGENT_STATUS` event when status or authority changes. Unrelated screen edits
+do not author semantic status.
+
+When a pane moves from working to idle at a visible input row, Watchd checks
+for a completion claim. It submits a matching claim to an isolated reviewer,
+records the result in `completion_reviews.jsonl`, and publishes `done` only
+when the completion gate reaches `done-pending-close`.
+
+Reviewers never draft Chitra messages, mutate Chitra state, bypass operator
+gates, or share context with another reviewer. Watchd remains responsive while
+they run.
+
+## Local coordination socket
+
+The continuously running daemon serves a mode-`0600` Unix socket at
+`/run/chitra/chitra.sock` by default. The protocol is newline-delimited JSON.
+Every request has an `id`; responses and subscription events echo it.
+
+Common commands are:
+
+```bash
+chitra-agent report --source codex-hook --agent codex --state working
+chitra-agent explain --pane-id "$CHITRA_PANE_ID"
+chitra-agent wait --pane-id "$CHITRA_PANE_ID" --until done --timeout-ms 600000
+chitra-agent schema --output chitra-api.schema.json
+```
+
+`chitra-agent` reads `CHITRA_PANE_ID`, `CHITRA_SESSION_REF`, and
+`CHITRA_SOCKET_PATH` when the matching arguments are omitted. Use
+`chitra-agent clear-authority` when an integration intentionally stops
+reporting for a pane.
+
+The socket also supports persistent `events.subscribe` requests with typed
+pane, session, lane, agent, and status filters. See
+[Semantic agent status](../../agent-status-design.md) for the request examples,
+predicate operators, wait semantics, and schema.
 
 ## CLI usage
 
@@ -35,130 +68,86 @@ watchd \
   --events-log /var/lib/chitra/events.log \
   --tmux-socket /run/chitra-worker/tmux-1000/default \
   --session-prefix agent \
-  --idle-threshold-seconds 300 \
+  --agent-manifest-dir /etc/chitra/agent-detection \
+  --socket-path /run/chitra/chitra.sock \
   --interval-seconds 5 \
-  --reviewer-count 2 \
-  --reviewer-model claude-opus
+  --reviewer-count 2
 ```
 
-Omit `--once` to run continuously. Provide `--once` to run one poll and exit.
+Omit `--once` to run continuously. `--once` performs one deterministic screen
+classification pass and exits; it does not serve the socket.
 
 ## Key flags
 
 | Flag | Default | Notes |
-|------|---------|-------|
-| `--state-dir` | `/var/lib/chitra` | Base state directory. |
-| `--events-log` | `$CHITRA_STATE_DIR/events.log` | Where to write pane-change events. |
+|---|---|---|
+| `--state-dir` | `/var/lib/chitra` | Status snapshots, completion records, and ownership lease. |
+| `--events-log` | `$CHITRA_STATE_DIR/events.log` | Semantic status transition log. |
 | `--tmux-socket` | tmux default | Exact tmux server socket. |
 | `--session-name` | Unset | Exact session allowlist; repeatable. |
-| `--session-prefix` | Unset (all sessions) | Match only sessions starting with this prefix. |
-| `--exclude-session-prefix` | None | Exclude sessions starting with this prefix. |
-| `--interval-seconds` | 5 | Seconds between polls. |
-| `--idle-threshold-seconds` | 300 | Unchanged input-row seconds before one IDLE event. |
-| `--panes` | All visible | Target specific pane references (e.g., `session:window.pane`). |
-| `--reviewer-count` | 2 | Max concurrent LLM reviewer processes. |
-| `--reviewer-model` | `claude` | Model to use for reviewers. |
-| `--reviewer-command` | `claude` | CLI command to invoke (e.g., `claude`, `codex`). |
-| `--reasoned-dispatch` | false | Enable reasoned dispatch on rejection. |
-| `--once` | False | Run one poll and exit. |
+| `--session-prefix` | Unset | Observe sessions with this prefix; repeatable. |
+| `--agent-manifest-dir` | Chitra config directory | Local TOML overrides. |
+| `--socket-path` | `/run/chitra/chitra.sock` | Local coordination socket. |
+| `--handoff-from` | Unset | Replace the compatible server at this socket after verified handoff. |
+| `--interval-seconds` | `5` | Seconds between observations. |
+| `--panes` | All allowed | Controlled comma-separated target override. |
+| `--reviewer-count` | `2` | Maximum concurrent LLM reviewer processes. |
+| `--reviewer-model` | Ambient | Optional isolated reviewer model override. |
+| `--once` | False | Observe once without starting the socket server. |
+
+`--idle-threshold-seconds` remains accepted for one migration window, but it
+does not author status. Remove it from service configuration.
 
 ## Environment variables
 
 | Variable | Default | Notes |
-|----------|---------|-------|
-| `CHITRA_WATCHD_EVENT_LOG` | `/var/lib/chitra/events.log` | Path to events log. |
-| `CHITRA_WATCHD_INTERVAL` | 5 | Poll interval in seconds. |
-| `CHITRA_WATCHD_PANES` | None | Target panes (space-separated). |
-| `CHITRA_WATCHD_TMUX_SOCKET` | tmux default | Exact tmux server socket path. |
-| `CHITRA_WATCHD_SESSION_NAMES` | None | Comma-separated exact session allowlist. |
-| `CHITRA_WATCHD_SESSION_PREFIXES` | None | Session prefix filter. |
-| `CHITRA_WATCHD_IDLE_THRESHOLD_SECONDS` | 300 | Unchanged input-row threshold. |
-| `CHITRA_WATCHD_MAX_LOG_BYTES` | 5242880 (5 MiB) | Rotate log at this size. |
-| `CHITRA_WATCHD_REVIEWER_COUNT` | 2 | Max concurrent reviewers. |
+|---|---|---|
+| `CHITRA_SOCKET_PATH` | `/run/chitra/chitra.sock` | Local coordination socket. |
+| `CHITRA_AGENT_MANIFEST_DIR` | Chitra config directory | Local manifest overrides. |
+| `CHITRA_WATCHD_EVENT_LOG` | `/var/lib/chitra/events.log` | Semantic event log. |
+| `CHITRA_WATCHD_INTERVAL` | `5` | Poll interval in seconds. |
+| `CHITRA_WATCHD_PANES` | Unset | Comma-separated target override. |
+| `CHITRA_WATCHD_TMUX_SOCKET` | tmux default | Exact tmux server socket. |
+| `CHITRA_WATCHD_SESSION_NAMES` | Unset | Comma-separated exact session allowlist. |
+| `CHITRA_WATCHD_SESSION_PREFIXES` | Unset | Session prefix filter. |
+| `CHITRA_WATCHD_MAX_LOG_BYTES` | `5242880` | Rotate the event log at this size. |
+| `CHITRA_WATCHD_REVIEWER_COUNT` | `2` | Maximum concurrent reviewers. |
 | `CHITRA_WATCHD_REVIEWER_COMMAND` | `claude` | Reviewer CLI. |
 
-## Events log format
+## Event format
 
-Watchd emits one whitespace-delimited event per line: ISO8601 timestamp, lane
-ID, and event text. Idle events have this stable form:
+Watchd writes one whitespace-delimited record per semantic transition. It does
+not copy pane content into the event:
 
-```
-2026-08-13T12:00:00Z infra-health:0.0 IDLE target=infra-health:0.0 idle_seconds=300 threshold_seconds=300
-```
-
-Triaged copies that classification to both receiving feeds:
-
-```
-2026-08-13T12:00:00Z\tIDLE\tinfra-health:0.0\tidle\tIDLE target=infra-health:0.0 idle_seconds=300 threshold_seconds=300
-IDLE 2026-08-13T12:00:00Z infra-health:0.0 idle: IDLE target=infra-health:0.0 idle_seconds=300 threshold_seconds=300
+```text
+2026-08-14T12:00:00Z lane AGENT_STATUS state=blocked needs operator input pane_id=%17 target=lane:0.0 agent=codex authority=manifest source=package:codex.toml rule=permission_prompt fallback=none
 ```
 
-The first line is `queue.tsv`; the second is `flags.log`.
+`triaged` and `sweepd` continue to consume the timestamp, lane identifier, and
+opaque event text. Consumers of the former `CHANGE DETECTED` and delayed
+`IDLE` records must migrate. See
+[Watchd status migration](../../watchd-status-migration.md).
 
-## Completion reviews
+## Live handoff
 
-Watchd spawns a reviewer process for each completion claim. The reviewer reads:
-
-- The session's frozen goal.
-- The session's current pane output.
-
-The reviewer outputs a verdict:
-
-- **accept:** The output satisfies the goal.
-- **reject:** The output does not satisfy the goal (e.g., uses deferral language like "future work").
-- **unavailable:** The reviewer could not run or could not decide.
-
-The verdict is recorded to `completion_reviews.jsonl` with a timestamp, goal state, and reasoning (if available).
-
-## Common tasks
-
-**Watch a single session:**
+To replace a compatible running server without restarting tmux panes, start
+the replacement with:
 
 ```bash
-watchd --session-prefix my-agent --interval-seconds 5
+watchd --lanes-file /etc/chitra/lanes.yaml \
+  --handoff-from /run/chitra/chitra.sock
 ```
 
-**Run as a systemd service (continuous):**
+The source and replacement verify the state directory, protocol, checksummed
+snapshot, target process, exact live tmux pane IDs, socket switch, and durable
+ownership lease. Any missing or mismatched proof is `handoff_unknown`; before
+commit, the source thaws and retains ownership. Existing clients reconnect
+after a successful handoff.
 
-See `packaging/systemd/chitra-watchd.service.example` in the repo.
+## See also
 
-**View completion verdicts:**
-
-```bash
-cat /var/lib/chitra/completion_reviews.jsonl | jq .
-```
-
-**See pane-change events:**
-
-```bash
-tail -f /var/lib/chitra/events.log
-```
-
-## Reviewer process isolation
-
-Each reviewer is a subprocess:
-
-```bash
-claude -p << 'EOF'
-Goal: <frozen goal>
-
-Session output:
-<pane content>
-
-Is the session output complete against the goal?
-EOF
-```
-
-The reviewer never:
-
-- Sees chitra's internal state.
-- Receives context from other reviewers.
-- Drafts messages to the session.
-- Has access to operator gates or credentials.
-
-The verdict goes back to watchd as structured output (accept/reject) and is recorded to the completion_reviews.jsonl log.
-
-## See Also
-
-- **[Concepts — Goal Enforcement](../../concepts/README.md#goal-enforcement-and-completion-review)** — How completion review fits into chitra's architecture.
-- **[Design notes — Bounded reasoning boundary](../../DESIGN.md#bounded-reasoning-boundary)** — Why reviewers are isolated.
+- [Semantic agent status](../../agent-status-design.md)
+- [Agent detection manifests](../../agent-detection-manifests.md)
+- [Watchd status migration](../../watchd-status-migration.md)
+- [Goal enforcement](../../concepts/README.md#goal-enforcement-and-completion-review)
+- [Bounded reasoning boundary](../../DESIGN.md#bounded-reasoning-boundary)

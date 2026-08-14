@@ -47,10 +47,10 @@ EOF
 chitra-goals roster --format box
 ```
 
-**Monitor a session:**
+**Explain a supervised session's status:**
 
 ```bash
-watchd --session-prefix my-agent --interval-seconds 5
+chitra-agent explain --pane-id %17
 ```
 
 **Check account usage:**

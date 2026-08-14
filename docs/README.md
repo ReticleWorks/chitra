@@ -1,5 +1,11 @@
 # Chitra Documentation
 
+## Agent coordination and status
+
+- [Semantic agent status, coordination API, and live handoff](agent-status-design.md)
+- [Migration from Watchd screen-change inference](watchd-status-migration.md)
+- [Agent detection manifest format](agent-detection-manifests.md)
+
 Chitra delivers messages to long-running LLM agent sessions in tmux and watches their state. Everything on the delivery, queueing, ledger, and state-tracking path is deterministic — Python with zero LLM calls. The one deliberate exception is goal enforcement: when a watched session claims it is done, chitra launches isolated Claude reviewer processes to check that claim against the session's frozen goal. The reviewers never draft chitra's messages, and their verdicts stay in chitra's own logs.
 
 ## Getting started

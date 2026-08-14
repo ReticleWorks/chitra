@@ -62,6 +62,7 @@ chitra-pr-review = "chitra.pr_reviewd:main"
 chitra-lane-anchor = "chitra.lane_anchor:main"
 chitra-lane-session = "chitra.lane_anchor:main"
 chitra-decisions = "chitra.decisions:main"
+chitra-agent = "chitra.agent_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/ReticleWorks/chitra"

@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import json
+import os
+import pwd
+import shutil
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -83,7 +89,8 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
         calls.append(list(command))
         return subprocess.CompletedProcess(command, 1 if len(calls) == 1 else 0, "", "")
 
-    assert start_lane(lane, runner=runner)
+    control_socket = tmp_path / "chitra.sock"
+    assert start_lane(lane, runner=runner, socket_path=control_socket)
     assert calls == [
         [
             "runuser",
@@ -113,10 +120,22 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
             str(tmp_path / "alpha.sock"),
             "new-session",
             "-d",
+            "-e",
+            "CHITRA_LANE_ID=alpha",
+            "-e",
+            "CHITRA_SESSION_REF=tophand:alpha:0.0",
+            "-e",
+            "CHITRA_PANE_TARGET=alpha:0.0",
+            "-e",
+            f"CHITRA_SOCKET_PATH={control_socket}",
             "-s",
             "alpha",
             "-c",
             "/srv/chitra/lanes/alpha",
+            __import__("sys").executable,
+            "-m",
+            "chitra.pane_exec",
+            "--",
             "claude",
             "--model",
             "sonnet",
@@ -129,6 +148,94 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
     assert receipt["goal_snapshot"]["source"] == "task-file:lane-architecture"
     assert "rate_limit_guard" in receipt["lifecycle"]
     assert receipt["effort"] == "high"
+    assert receipt["identity_env"] == {
+        "CHITRA_LANE_ID": "alpha",
+        "CHITRA_SESSION_REF": "tophand:alpha:0.0",
+        "CHITRA_PANE_ID": "runtime:TMUX_PANE",
+        "CHITRA_PANE_TARGET": "alpha:0.0",
+        "CHITRA_SOCKET_PATH": str(control_socket),
+    }
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required for the environment delivery proof")
+def test_lane_identity_reaches_a_new_session_on_an_existing_tmux_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import yaml
+
+    account = pwd.getpwuid(os.geteuid()).pw_name
+    manifest = _manifest(tmp_path)
+    manifest["lanes"][0].update(
+        {
+            "account": account,
+            "uid": os.geteuid(),
+            "home": str(tmp_path / "home"),
+            "workdir": str(tmp_path / "workdir"),
+            "config_dir": str(tmp_path / "config"),
+        }
+    )
+    for directory in (tmp_path / "home", tmp_path / "workdir", tmp_path / "config"):
+        directory.mkdir()
+    path = tmp_path / "lanes.yaml"
+    path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    lane = load_lanes(path)[0]
+    upsert_goal(
+        lane.state_dir,
+        GoalRecord(
+            session_ref="tophand:alpha:0.0",
+            goal="Prove identity reaches a new pane on an existing tmux server",
+            done_when="The pane writes every injected identity variable and its runtime pane ID",
+            intent="Keep governed agent identity exact across tmux server reuse",
+            scope="One disposable local tmux server",
+            source="task-file:tmux-environment",
+            status="working",
+        ),
+    )
+    proof_path = tmp_path / "pane-environment.json"
+    keys = [
+        "CHITRA_LANE_ID",
+        "CHITRA_SESSION_REF",
+        "CHITRA_PANE_ID",
+        "CHITRA_PANE_TARGET",
+        "CHITRA_SOCKET_PATH",
+        "TMUX_PANE",
+    ]
+    proof_code = (
+        "import json,os,pathlib; "
+        f"pathlib.Path({str(proof_path)!r}).write_text(json.dumps({{key: os.environ.get(key) for key in {keys!r}}}))"
+    )
+    monkeypatch.setattr("chitra.lane_anchor._agent_command", lambda *_args: [sys.executable, "-c", proof_code])
+    control_socket = tmp_path / "control.sock"
+    subprocess.run(
+        ["tmux", "-S", str(lane.tmux_socket), "new-session", "-d", "-s", "keeper", "sleep 30"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        assert start_lane(lane, socket_path=control_socket)
+        deadline = time.monotonic() + 5.0
+        while not proof_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert proof_path.exists()
+        proof = json.loads(proof_path.read_text(encoding="utf-8"))
+        assert proof == {
+            "CHITRA_LANE_ID": "alpha",
+            "CHITRA_SESSION_REF": "tophand:alpha:0.0",
+            "CHITRA_PANE_ID": proof["TMUX_PANE"],
+            "CHITRA_PANE_TARGET": "alpha:0.0",
+            "CHITRA_SOCKET_PATH": str(control_socket),
+            "TMUX_PANE": proof["TMUX_PANE"],
+        }
+        assert proof["TMUX_PANE"].startswith("%")
+    finally:
+        subprocess.run(
+            ["tmux", "-S", str(lane.tmux_socket), "kill-server"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
 
 
 def test_lane_launch_refuses_without_passing_ingestion_record(tmp_path):
