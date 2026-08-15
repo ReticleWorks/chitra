@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from chitra.goals import GoalRecord, hold_goal, upsert_goal
+from chitra.goals import GoalRecord, hold_goal, redirect_goal, upsert_goal
 from chitra.lane_anchor import LaneLaunchRefused, LaneStartupFailed, _pane_pythonpath, ingestion_gate, start_lane
 from chitra.lane_config import load_lanes
 
@@ -316,6 +316,36 @@ def test_trinity_uses_the_same_host_qualified_goal_convention(tmp_path):
     )
 
     assert ingestion_gate(lane, host="trinity").session_ref == "trinity:alpha:0.0"
+
+
+def test_done_when_redirect_refreshes_snapshot_for_relaunch(tmp_path):
+    import yaml
+
+    path = tmp_path / "lanes.yaml"
+    path.write_text(yaml.safe_dump(_manifest(tmp_path)), encoding="utf-8")
+    lane = load_lanes(path)[0]
+    enrolled = upsert_goal(
+        lane.state_dir,
+        GoalRecord(
+            session_ref="tophand:alpha:0.0",
+            goal="Implement the governed lane launch contract safely",
+            done_when="All guarded lane launch probes pass locally",
+            intent="Ensure every work lane remains observable and governed throughout execution",
+            scope="Chitra lane launcher and lifecycle integration",
+            source="task-file:lane-architecture",
+            status="working",
+        ),
+    )
+
+    redirected = redirect_goal(
+        lane.state_dir,
+        enrolled.session_ref,
+        reason="operator revised the live acceptance condition",
+        done_when="The redirected live launch and completion probes pass",
+    )
+
+    assert redirected.enrolled_done_when == redirected.done_when
+    assert ingestion_gate(lane) == redirected
 
 
 def test_lane_launch_refuses_active_usage_pause(tmp_path):
