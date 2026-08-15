@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import json
+import os
+import pwd
+import shutil
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
 
 from chitra.goals import GoalRecord, hold_goal, redirect_goal, upsert_goal
-from chitra.lane_anchor import LaneLaunchRefused, ingestion_gate, start_lane
+from chitra.lane_anchor import LaneLaunchRefused, LaneStartupFailed, _pane_pythonpath, ingestion_gate, start_lane
 from chitra.lane_config import load_lanes
 
 
@@ -31,6 +37,11 @@ def _manifest(tmp_path):
             }
         ]
     }
+
+
+@pytest.fixture(autouse=True)
+def _fast_startup_survival_checks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("chitra.lane_anchor.STARTUP_SURVIVAL_INTERVAL_SECONDS", 0)
 
 
 def test_lane_manifest_is_one_explicit_contract(tmp_path):
@@ -83,8 +94,9 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
         calls.append(list(command))
         return subprocess.CompletedProcess(command, 1 if len(calls) == 1 else 0, "", "")
 
-    assert start_lane(lane, runner=runner)
-    assert calls == [
+    control_socket = tmp_path / "chitra.sock"
+    assert start_lane(lane, runner=runner, socket_path=control_socket)
+    assert calls[:2] == [
         [
             "runuser",
             "--user",
@@ -113,10 +125,24 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
             str(tmp_path / "alpha.sock"),
             "new-session",
             "-d",
+            "-e",
+            "CHITRA_LANE_ID=alpha",
+            "-e",
+            "CHITRA_SESSION_REF=tophand:alpha:0.0",
+            "-e",
+            "CHITRA_PANE_TARGET=alpha:0.0",
+            "-e",
+            f"CHITRA_SOCKET_PATH={control_socket}",
+            "-e",
+            f"PYTHONPATH={_pane_pythonpath()}",
             "-s",
             "alpha",
             "-c",
             "/srv/chitra/lanes/alpha",
+            __import__("sys").executable,
+            "-m",
+            "chitra.pane_exec",
+            "--",
             "claude",
             "--model",
             "sonnet",
@@ -124,11 +150,102 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
             "high",
         ],
     ]
+    assert calls[2:] == [calls[0]] * 5
     receipt = __import__("json").loads((lane.state_dir / "lane-launch.json").read_text())
     assert receipt["session_ref"] == "tophand:alpha:0.0"
     assert receipt["goal_snapshot"]["source"] == "task-file:lane-architecture"
     assert "rate_limit_guard" in receipt["lifecycle"]
     assert receipt["effort"] == "high"
+    assert receipt["identity_env"] == {
+        "CHITRA_LANE_ID": "alpha",
+        "CHITRA_SESSION_REF": "tophand:alpha:0.0",
+        "CHITRA_PANE_ID": "runtime:TMUX_PANE",
+        "CHITRA_PANE_TARGET": "alpha:0.0",
+        "CHITRA_SOCKET_PATH": str(control_socket),
+    }
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required for the environment delivery proof")
+def test_lane_identity_reaches_a_new_session_on_an_existing_tmux_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import yaml
+
+    account = pwd.getpwuid(os.geteuid()).pw_name
+    manifest = _manifest(tmp_path)
+    manifest["lanes"][0].update(
+        {
+            "account": account,
+            "uid": os.geteuid(),
+            "home": str(tmp_path / "home"),
+            "workdir": str(tmp_path / "workdir"),
+            "config_dir": str(tmp_path / "config"),
+        }
+    )
+    for directory in (tmp_path / "home", tmp_path / "workdir", tmp_path / "config"):
+        directory.mkdir()
+    path = tmp_path / "lanes.yaml"
+    path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    lane = load_lanes(path)[0]
+    upsert_goal(
+        lane.state_dir,
+        GoalRecord(
+            session_ref="tophand:alpha:0.0",
+            goal="Prove identity reaches a new pane on an existing tmux server",
+            done_when="The pane writes every injected identity variable and its runtime pane ID",
+            intent="Keep governed agent identity exact across tmux server reuse",
+            scope="One disposable local tmux server",
+            source="task-file:tmux-environment",
+            status="working",
+        ),
+    )
+    proof_path = tmp_path / "pane-environment.json"
+    keys = [
+        "CHITRA_LANE_ID",
+        "CHITRA_SESSION_REF",
+        "CHITRA_PANE_ID",
+        "CHITRA_PANE_TARGET",
+        "CHITRA_SOCKET_PATH",
+        "TMUX_PANE",
+    ]
+    proof_code = (
+        "import json,os,pathlib,time; "
+        f"pathlib.Path({str(proof_path)!r}).write_text(json.dumps({{key: os.environ.get(key) for key in {keys!r}}})); "
+        "time.sleep(5)"
+    )
+    monkeypatch.setattr("chitra.lane_anchor._agent_command", lambda *_args: [sys.executable, "-c", proof_code])
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    control_socket = tmp_path / "control.sock"
+    subprocess.run(
+        ["tmux", "-S", str(lane.tmux_socket), "new-session", "-d", "-s", "keeper", "sleep 30"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        assert start_lane(lane, socket_path=control_socket)
+        deadline = time.monotonic() + 5.0
+        while not proof_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert proof_path.exists()
+        proof = json.loads(proof_path.read_text(encoding="utf-8"))
+        assert proof == {
+            "CHITRA_LANE_ID": "alpha",
+            "CHITRA_SESSION_REF": "tophand:alpha:0.0",
+            "CHITRA_PANE_ID": proof["TMUX_PANE"],
+            "CHITRA_PANE_TARGET": "alpha:0.0",
+            "CHITRA_SOCKET_PATH": str(control_socket),
+            "TMUX_PANE": proof["TMUX_PANE"],
+        }
+        assert proof["TMUX_PANE"].startswith("%")
+    finally:
+        subprocess.run(
+            ["tmux", "-S", str(lane.tmux_socket), "kill-server"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
 
 
 def test_lane_launch_refuses_without_passing_ingestion_record(tmp_path):
@@ -140,6 +257,43 @@ def test_lane_launch_refuses_without_passing_ingestion_record(tmp_path):
 
     with pytest.raises(LaneLaunchRefused, match="no chitra-goals ingestion record"):
         ingestion_gate(lane)
+
+
+def test_lane_startup_death_returns_temporary_failure_without_receipt(tmp_path, monkeypatch, capsys):
+    import yaml
+
+    from chitra import lane_anchor
+
+    path = tmp_path / "lanes.yaml"
+    path.write_text(yaml.safe_dump(_manifest(tmp_path)), encoding="utf-8")
+    lane = load_lanes(path)[0]
+    upsert_goal(
+        lane.state_dir,
+        GoalRecord(
+            session_ref="tophand:alpha:0.0",
+            goal="Retry a lane whose agent database is temporarily locked",
+            done_when="No false receipt is written and the caller receives temporary failure",
+            intent="Make governed lane startup retry behavior safe and explicit",
+            scope="One disposable governed test lane",
+            source="task-file:startup-death-test",
+            status="working",
+        ),
+    )
+    results = iter(
+        [
+            subprocess.CompletedProcess([], 1, "", "can't find session: alpha"),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 1, "", "can't find session: alpha"),
+        ]
+    )
+
+    with pytest.raises(LaneStartupFailed, match="no launch receipt was written; retry is safe"):
+        start_lane(lane, runner=lambda _command: next(results))
+    assert not (lane.state_dir / "lane-launch.json").exists()
+
+    monkeypatch.setattr(lane_anchor, "start_lane", lambda *_args, **_kwargs: (_ for _ in ()).throw(LaneStartupFailed("locked")))
+    assert lane_anchor.main(["--lanes-file", str(path), "--lane", "alpha", "start"]) == 75
+    assert capsys.readouterr().err == "LaneStartupFailed: locked\n"
 
 
 def test_trinity_uses_the_same_host_qualified_goal_convention(tmp_path):
@@ -242,7 +396,8 @@ def test_governed_claude_model_selection(model, tmp_path):
         calls.append(list(command))
         return subprocess.CompletedProcess(command, 1 if len(calls) == 1 else 0, "", "")
     assert start_lane(lane, backend="claude", model=model, effort="max", runner=runner)
-    assert calls[-1][-5:] == ["claude", "--model", model, "--effort", "max"]
+    new_session = next(command for command in calls if "new-session" in command)
+    assert new_session[-5:] == ["claude", "--model", model, "--effort", "max"]
 
 
 def test_governed_codex_effort_is_explicit_and_receipted(tmp_path):
@@ -278,7 +433,8 @@ def test_governed_codex_effort_is_explicit_and_receipted(tmp_path):
         effort="xhigh",
         runner=runner,
     )
-    assert calls[-1][-5:] == [
+    new_session = next(command for command in calls if "new-session" in command)
+    assert new_session[-5:] == [
         "codex",
         "--model",
         "gpt-5.6-sol",

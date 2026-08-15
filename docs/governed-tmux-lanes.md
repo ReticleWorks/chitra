@@ -27,12 +27,35 @@ for the lane session reference. The coordinator reads the resulting transcript
 and result ledger, waits, and sends its own follow-up; a human is never the
 message bus.
 
+## Injected lane identity
+
+The agent process receives identity from the launch path rather than having to
+search tmux state:
+
+| Variable | Value |
+|---|---|
+| `CHITRA_LANE_ID` | Durable lane identifier from the lane declaration. |
+| `CHITRA_SESSION_REF` | Host-qualified session reference used by Chitra ledgers. |
+| `CHITRA_PANE_ID` | Exact server-unique tmux pane ID, such as `%17`. |
+| `CHITRA_PANE_TARGET` | Stable tmux target, such as `lane-name:0.0`. |
+| `CHITRA_SOCKET_PATH` | Local Watchd coordination socket. |
+
+The launcher supplies the durable values when it creates the session. Tmux
+sets `TMUX_PANE` after creating the pane. Chitra's process wrapper validates
+that runtime value, exports it as `CHITRA_PANE_ID`, and then replaces itself
+with the selected agent process. A lifecycle hook can therefore call
+`chitra-agent report` or `chitra-agent wait` without guessing its coordinates.
+
+See [Semantic agent status](agent-status-design.md) for socket methods and live
+handoff, and [Agent detection manifests](agent-detection-manifests.md) for the
+screen fallback.
+
 ## Herdr coordination contract
 
 | Contract point | Chitra mapping | Coverage after this change |
 |---|---|---|
 | One agent in each pane | Manifest lane identity plus `chitra-lane-session` | Enforced: one dedicated tmux session and primary pane per lane. |
-| Coordinator assigns, waits, reads, and follows up itself | `dispatchd`, signed results/ledger, transcripts, `watchd`, `lane_activity` | Transport and observation are covered. Coordinator scheduling remains caller policy; Chitra does not run an LLM coordinator. |
+| Coordinator assigns, waits, reads, and follows up itself | `dispatchd`, signed results/ledger, transcripts, `agent.wait`, and typed status subscriptions | Deterministic transport, semantic waiting, and observation are covered. Coordinator scheduling remains caller policy; Chitra does not run an LLM coordinator. |
 | One outcome, deliverable, check, allowed changes, forbidden changes | Goal ingestion fields plus dispatch brief | Partly covered. Outcome/check map to `goal`/`done_when`; intent/scope/source are required. A typed brief field split for “may change” and “must not touch” remains a gap. Put both boundaries explicitly in `scope` until that schema lands. |
 | Read-only reviewers share a workspace; every writer gets a worktree | Lane brief/scope and immutable lane identity | Documented contract only. Chitra does not create or verify Git worktrees or filesystem write permissions yet. |
 | Executor/reviewer pair with role swap | Two lane identities and normal steering orders | Supported as a coordination pattern, not enforced. Role assignment/swap has no typed state yet. |

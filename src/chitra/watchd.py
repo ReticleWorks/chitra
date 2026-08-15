@@ -1,4 +1,4 @@
-"""watchd — deterministic tmux-pane change emitter for ``chitra.triaged``.
+"""watchd — deterministic semantic pane-status emitter for ``chitra.triaged``.
 
 The events log remains a small wire contract consumed by ``chitra.triaged``.
 At a detected turn-end, this watcher also forces the deterministic completion
@@ -27,6 +27,8 @@ from typing import Literal
 
 import structlog
 
+from chitra.agent_runtime import AgentStatusBroker, PaneStatus, StatusRuntimeError
+from chitra.agent_status import AgentState, ManifestRepository
 from chitra.completion_gate import (
     CompletionReviewRecord,
     TurnEndAudit,
@@ -46,9 +48,11 @@ from chitra.goal_enforcement import (
 from chitra.goals import GoalStatus, add_ask, get_goal, list_goals, mark_completion_gate_passed, update_now
 from chitra.lane_activity import LaneActivity, LaneBackend, load_lane_activity, upsert_lane_activity
 from chitra.lane_config import enabled_lanes
+from chitra.live_handoff import perform_live_handoff
 from chitra.policy_config import load_policy_config
 from chitra.reasoned_dispatch import abstaining_oracle, build_reasoned_dispatch
 from chitra.reasoning import Oracle, PrinciplesIndex
+from chitra.socket_api import ApiRuntime, ControlServer, default_socket_path
 from chitra.state_paths import state_dir as default_state_dir
 
 logger = structlog.get_logger(__name__)
@@ -61,6 +65,7 @@ SESSION_NAMES_ENV_VAR = "CHITRA_WATCHD_SESSION_NAMES"
 EXCLUDED_SESSION_PREFIXES_ENV_VAR = "CHITRA_WATCHD_EXCLUDE_SESSION_PREFIXES"
 TMUX_SOCKET_ENV_VAR = "CHITRA_WATCHD_TMUX_SOCKET"
 IDLE_THRESHOLD_ENV_VAR = "CHITRA_WATCHD_IDLE_THRESHOLD_SECONDS"
+MANIFEST_DIR_ENV_VAR = "CHITRA_AGENT_MANIFEST_DIR"
 MAX_LOG_BYTES_ENV_VAR = "CHITRA_WATCHD_MAX_LOG_BYTES"
 REVIEWER_COUNT_ENV_VAR = "CHITRA_WATCHD_REVIEWER_COUNT"
 REVIEWER_COMMAND_ENV_VAR = "CHITRA_WATCHD_REVIEWER_COMMAND"
@@ -78,14 +83,11 @@ DEFAULT_REVIEWER_MODEL: str | None = None
 DEFAULT_REVIEW_MAX_WORKERS = 2
 DEFAULT_REASONED_DISPATCH_ENABLED = True
 CAPTURE_LINES = 60
-NORMALIZED_TAIL_LINES = 25
 
 _VOLATILE_LINE_RE = re.compile(
     r"^[\s]*[·✻✽✳✢✶*●○◐◯]|tokens\b|🪟|⏵⏵|esc to interrupt|ctrl\+b|^─+$|^[\s]*$|Press up to edit|globalVersion: [0-9.]+"
 )
 _TIMING_CHROME_RE = re.compile(r"\([0-9]+m? ?[0-9]*s?[^)]*\)")
-_ACTIVE_TURN_RE = re.compile(r"esc to interrupt|thinking|working…|working\.\.\.|running…|running\.\.\.", re.I)
-
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 ReviewKey = tuple[str, str]
 
@@ -119,6 +121,9 @@ class WatchdConfig:
     reviewer_model: str | None = DEFAULT_REVIEWER_MODEL
     queue_dir: Path | None = None
     reasoned_dispatch_enabled: bool = DEFAULT_REASONED_DISPATCH_ENABLED
+    manifest_dir: Path | None = None
+    socket_path: Path = field(default_factory=default_socket_path)
+    handoff_from: Path | None = None
     idle_threshold_seconds: float = DEFAULT_IDLE_THRESHOLD_SECONDS
 
     def __post_init__(self) -> None:
@@ -162,27 +167,15 @@ def normalize(content: str) -> list[str]:
     return normalized
 
 
-def normalized_snapshot(content: str) -> tuple[str, list[str]]:
-    """Return the stable digest and retained normalized tail for a capture."""
-    tail = normalize(content)[-NORMALIZED_TAIL_LINES:]
-    text = "\n".join(tail)
-    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest(), tail
-
-
-def pane_turn_finished(content: str) -> bool:
-    """Recognize a stable input prompt after a completed lane turn."""
-    lines = content.splitlines()
-    has_prompt = pane_at_input_row(content)
-    active = any(_ACTIVE_TURN_RE.search(line) for line in lines[-12:])
-    return has_prompt and not active and bool(normalize(content))
+def pane_turn_finished(content: str, *, previous_state: AgentState | None, current_state: AgentState) -> bool:
+    """Recognize a semantic working-to-idle boundary at a visible input row."""
+    return previous_state == "working" and current_state == "idle" and pane_at_input_row(content) and bool(normalize(content))
 
 
 def pane_at_input_row(content: str) -> bool:
-    """Return true when a Claude or Codex input row is visible and no turn is active."""
+    """Return true when a Claude or Codex input row is visible."""
     lines = content.splitlines()
-    has_prompt = any(line.lstrip().startswith(("❯", "›")) for line in lines[-12:])
-    active = any(_ACTIVE_TURN_RE.search(line) for line in lines[-12:])
-    return has_prompt and not active
+    return any(line.lstrip().startswith(("❯", "›")) for line in lines[-12:])
 
 
 def _run_command(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -295,13 +288,18 @@ def event_line(lane_id: str, normalized_tail: Sequence[str], *, now: datetime | 
     return f"{timestamp} {lane_id} {text}\n"
 
 
-def idle_event_line(lane_id: str, target: str, idle_seconds: float, threshold_seconds: float) -> str:
-    """Format the stable IDLE wire event consumed and classified by triaged."""
-    timestamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-    return (
-        f"{timestamp} {lane_id} IDLE target={target} "
-        f"idle_seconds={int(idle_seconds)} threshold_seconds={int(threshold_seconds)}\n"
+def status_event_line(status: PaneStatus, *, now: datetime | None = None) -> str:
+    """Format one semantic status transition for the legacy triaged log."""
+    timestamp = (now or datetime.now(UTC)).isoformat().replace("+00:00", "Z")
+    source = status.source or "none"
+    matched_rule = status.explain.matched_rule or "none"
+    fallback = status.explain.fallback_reason or "none"
+    attention = " needs operator input" if status.state == "blocked" else ""
+    text = (
+        f"AGENT_STATUS state={status.state}{attention} pane_id={status.pane_id} target={status.target} "
+        f"agent={status.agent} authority={status.authority} source={source} rule={matched_rule} fallback={fallback}"
     )
+    return f"{timestamp} {status.lane_id} {text}\n"
 
 
 def append_event(event_log: Path, line: str, *, max_log_bytes: int = DEFAULT_MAX_LOG_BYTES) -> None:
@@ -328,10 +326,9 @@ class Watchd:
     reviewer: BehaviorReviewer | None = None
     principles: PrinciplesIndex = field(default_factory=PrinciplesIndex)
     reasoning_oracle: Oracle = abstaining_oracle
-    baselines: dict[str, str] = field(default_factory=dict)
-    idle_baselines: dict[str, str] = field(default_factory=dict)
-    idle_since: dict[str, float] = field(default_factory=dict)
-    idle_emitted: set[str] = field(default_factory=set)
+    status_broker: AgentStatusBroker | None = None
+    status_revisions: dict[str, int] = field(default_factory=dict)
+    status_states: dict[str, AgentState] = field(default_factory=dict)
     clock: Callable[[], float] = time.monotonic
     reviewed_turns: set[ReviewKey] = field(default_factory=set)
     pending_reviews: dict[ReviewKey, PendingCompletionReview] = field(default_factory=dict)
@@ -339,6 +336,11 @@ class Watchd:
     _review_executor_shutdown: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.status_broker is None:
+            self.status_broker = AgentStatusBroker(
+                self.config.state_dir,
+                ManifestRepository(self.config.manifest_dir),
+            )
         self._review_executor = ThreadPoolExecutor(
             max_workers=DEFAULT_REVIEW_MAX_WORKERS,
             thread_name_prefix="chitra-watchd-review",
@@ -410,6 +412,16 @@ class Watchd:
                 now=summary,
                 last_verified=datetime.now(UTC).isoformat(),
             )
+            assert self.status_broker is not None
+            current = next(
+                (item for item in self.status_broker.statuses() if item.pane_id == pending.pane_id),
+                None,
+            )
+            self.status_broker.report_completion(
+                pane_id=pending.pane_id,
+                session_ref=pending.session_ref,
+                agent=current.agent if current is not None else "unknown",
+            )
         else:
             update_now(
                 root,
@@ -458,17 +470,26 @@ class Watchd:
 
     def _drain_completed_reviews(self) -> None:
         """Collect ready futures without waiting; all shared-state writes stay here."""
+        assert self.status_broker is not None
+        if self.status_broker.frozen:
+            return
         for key, pending in list(self.pending_reviews.items()):
             if not pending.future.done():
                 continue
-            del self.pending_reviews[key]
             try:
                 review_signal = pending.future.result()
             except Exception as exc:  # noqa: BLE001 - any reviewer failure must fail closed
                 review_error = str(exc) or type(exc).__name__
-                self._finalize_turn_review(pending, review_signal=None, review_error=review_error)
+                try:
+                    self._finalize_turn_review(pending, review_signal=None, review_error=review_error)
+                except StatusRuntimeError:
+                    continue
             else:
-                self._finalize_turn_review(pending, review_signal=review_signal)
+                try:
+                    self._finalize_turn_review(pending, review_signal=review_signal)
+                except StatusRuntimeError:
+                    continue
+            del self.pending_reviews[key]
 
     def _review_turn_end(self, pane: Pane, content: str) -> None:
         """Run the cheap gate inline and schedule completion review off-thread."""
@@ -559,8 +580,11 @@ class Watchd:
         )
 
     def poll_once(self) -> int:
-        """Capture all current panes and emit an event for each real change."""
+        """Capture panes and emit only semantic status transitions."""
         self._drain_completed_reviews()
+        assert self.status_broker is not None
+        if self.status_broker.frozen:
+            return 0
         emitted = 0
         root = self.config.goals_root or self.config.state_dir
         existing_activity = {record.session_ref: record for record in load_lane_activity(root)}
@@ -577,20 +601,26 @@ class Watchd:
             if content is None:
                 continue
             self._save_raw_capture(pane.pane_id, content)
-            digest, tail = normalized_snapshot(content)
             observed_at = datetime.now(UTC).isoformat()
             session_ref = self._session_ref(pane)
-            if pane_turn_finished(content):
+            try:
+                self.status_broker.observe(
+                    pane_id=pane.pane_id,
+                    target=pane.target,
+                    session_ref=session_ref,
+                    lane_id=self.config.lane_id or pane.target,
+                    detected_agent=pane.backend,
+                    snapshot=content,
+                    tmux_socket=self.config.tmux_socket,
+                )
+            except StatusRuntimeError:
+                break
+            status = next(item for item in self.status_broker.statuses() if item.pane_id == pane.pane_id)
+            previous_state = self.status_states.get(pane.pane_id)
+            previous_revision = self.status_revisions.get(pane.pane_id)
+            changed = previous_revision is None or previous_revision != status.revision
+            if pane_turn_finished(content, previous_state=previous_state, current_state=status.state):
                 self._review_turn_end(pane, content)
-            previous = self.baselines.get(pane.pane_id)
-            changed = previous is None or previous != digest
-            at_input = pane_at_input_row(content)
-            idle_digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            idle_changed = self.idle_baselines.get(pane.pane_id) != idle_digest
-            self.idle_baselines[pane.pane_id] = idle_digest
-            if idle_changed or not at_input:
-                self.idle_since[pane.pane_id] = self.clock()
-                self.idle_emitted.discard(pane.pane_id)
             if session_ref is not None:
                 prior_activity = existing_activity.get(session_ref)
                 activity_updates.append(
@@ -605,25 +635,17 @@ class Watchd:
                         else ("unknown" if prior_activity is None else prior_activity.backend),
                     )
                 )
-            if previous is None:
-                self.baselines[pane.pane_id] = digest
+            self.status_states[pane.pane_id] = status.state
+            self.status_revisions[pane.pane_id] = status.revision
+            if previous_revision is None:
                 continue
-            if previous == digest:
-                idle_for = self.clock() - self.idle_since.setdefault(pane.pane_id, self.clock())
-                if at_input and idle_for >= self.config.idle_threshold_seconds and pane.pane_id not in self.idle_emitted:
-                    event_id = self.config.lane_id or pane.target
-                    append_event(
-                        self.config.events_log,
-                        idle_event_line(event_id, pane.target, idle_for, self.config.idle_threshold_seconds),
-                        max_log_bytes=self.config.max_log_bytes,
-                    )
-                    self.idle_emitted.add(pane.pane_id)
-                    emitted += 1
-                continue
-            event_id = self.config.lane_id or pane.pane_id
-            append_event(self.config.events_log, event_line(event_id, tail), max_log_bytes=self.config.max_log_bytes)
-            self.baselines[pane.pane_id] = digest
-            emitted += 1
+            if changed:
+                append_event(
+                    self.config.events_log,
+                    status_event_line(status),
+                    max_log_bytes=self.config.max_log_bytes,
+                )
+                emitted += 1
         self._drain_completed_reviews()
         upsert_lane_activity(root, activity_updates)
         return emitted
@@ -693,6 +715,9 @@ def resolve_config(
     reviewer_command: str | None = None,
     reviewer_model: str | None = None,
     reasoned_dispatch_enabled: bool | None = None,
+    manifest_dir: Path | None = None,
+    socket_path: Path | None = None,
+    handoff_from: Path | None = None,
     idle_threshold_seconds: float | None = None,
 ) -> WatchdConfig:
     """Resolve CLI values, then ``CHITRA_*`` overrides, then generic defaults."""
@@ -768,6 +793,9 @@ def resolve_config(
             if raw_idle_threshold
             else DEFAULT_IDLE_THRESHOLD_SECONDS
         )
+    configured_manifest_dir = manifest_dir
+    if configured_manifest_dir is None and (raw_manifest_dir := _env_value(MANIFEST_DIR_ENV_VAR)) is not None:
+        configured_manifest_dir = Path(raw_manifest_dir)
     return WatchdConfig(
         state_dir=configured_state_dir,
         events_log=configured_events_log,
@@ -782,13 +810,46 @@ def resolve_config(
         reviewer_command=configured_reviewer_command,
         reviewer_model=configured_reviewer_model,
         reasoned_dispatch_enabled=configured_reasoned_dispatch,
+        manifest_dir=configured_manifest_dir,
+        socket_path=socket_path or default_socket_path(),
+        handoff_from=handoff_from,
         idle_threshold_seconds=configured_idle_threshold,
     )
+
+
+def _start_control_server(
+    broker: AgentStatusBroker,
+    config: WatchdConfig,
+    stop_event: threading.Event,
+) -> ControlServer:
+    runtime = ApiRuntime(broker)
+    if config.handoff_from is None:
+        server = ControlServer(config.socket_path, runtime)
+        server.start()
+    else:
+        temporary_socket = config.handoff_from.with_name(
+            f".{config.handoff_from.name}.handoff-new-{os.getpid()}"
+        )
+        server = ControlServer(temporary_socket, runtime)
+        perform_live_handoff(
+            canonical_socket=config.handoff_from,
+            replacement_server=server,
+            replacement_runtime=runtime,
+        )
+
+    def stop_replacement() -> None:
+        stop_event.set()
+        server.shutdown()
+
+    runtime.set_shutdown_callback(stop_replacement)
+    return server
 
 
 def run_forever(watchd: Watchd, *, stop_event: threading.Event | None = None) -> None:
     """Run until a SIGTERM/SIGINT handler (or caller) requests a clean stop."""
     stop_event = stop_event or threading.Event()
+    assert watchd.status_broker is not None
+    server = _start_control_server(watchd.status_broker, watchd.config, stop_event)
     logger.info("watchd_started", events_log=str(watchd.config.events_log), interval_seconds=watchd.config.interval_seconds)
     try:
         while not stop_event.is_set():
@@ -796,9 +857,15 @@ def run_forever(watchd: Watchd, *, stop_event: threading.Event | None = None) ->
             stop_event.wait(watchd.config.interval_seconds)
     finally:
         watchd.shutdown()
+        server.shutdown()
 
 
-def build_lane_watchers(lanes_file: Path | None, base_config: WatchdConfig) -> tuple[Watchd, ...]:
+def build_lane_watchers(
+    lanes_file: Path | None,
+    base_config: WatchdConfig,
+    *,
+    status_broker: AgentStatusBroker | None = None,
+) -> tuple[Watchd, ...]:
     """Build one in-memory watcher per declared lane for one shared process."""
     watchers: list[Watchd] = []
     for lane in enabled_lanes(lanes_file):
@@ -816,7 +883,8 @@ def build_lane_watchers(lanes_file: Path | None, base_config: WatchdConfig) -> t
                     goals_root=lane.state_dir,
                     completion_review_log=lane.state_dir / "completion_reviews.jsonl",
                     queue_dir=lane.queue_dir,
-                )
+                ),
+                status_broker=status_broker,
             )
         )
     return tuple(watchers)
@@ -840,7 +908,9 @@ def run_lanes_forever(
 ) -> None:
     """Run one shared watcher process over all enabled lane sockets."""
     active_stop_event = stop_event or threading.Event()
-    watchers = build_lane_watchers(lanes_file, base_config)
+    broker = AgentStatusBroker(base_config.state_dir, ManifestRepository(base_config.manifest_dir))
+    watchers = build_lane_watchers(lanes_file, base_config, status_broker=broker)
+    server = _start_control_server(broker, base_config, active_stop_event)
     logger.info("watchd_started", lanes_file=str(lanes_file), lane_count=len(watchers))
     try:
         while not active_stop_event.is_set():
@@ -850,6 +920,7 @@ def run_lanes_forever(
     finally:
         for watcher in watchers:
             watcher.shutdown()
+        server.shutdown()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -896,7 +967,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--idle-threshold-seconds",
         type=float,
         default=None,
-        help="Unchanged input-row interval before IDLE (default: CHITRA_WATCHD_IDLE_THRESHOLD_SECONDS or 300).",
+        help="Deprecated compatibility option; semantic manifests now author idle status.",
+    )
+    parser.add_argument(
+        "--agent-manifest-dir",
+        type=Path,
+        default=None,
+        help="Local TOML manifest overrides (default: CHITRA_AGENT_MANIFEST_DIR).",
+    )
+    parser.add_argument(
+        "--socket-path",
+        type=Path,
+        default=None,
+        help="Local NDJSON control socket (default: CHITRA_SOCKET_PATH or /run/chitra/chitra.sock).",
+    )
+    parser.add_argument(
+        "--handoff-from",
+        type=Path,
+        default=None,
+        help="Replace the running watchd server at this socket after a verified live handoff.",
     )
     parser.add_argument(
         "--reviewer-count",
@@ -941,6 +1030,9 @@ def main(argv: list[str] | None = None) -> int:
         reviewer_command=args.reviewer_command,
         reviewer_model=args.reviewer_model,
         reasoned_dispatch_enabled=args.reasoned_dispatch,
+        manifest_dir=args.agent_manifest_dir,
+        socket_path=args.socket_path,
+        handoff_from=args.handoff_from,
         idle_threshold_seconds=args.idle_threshold_seconds,
     )
     if args.lanes_file is not None:

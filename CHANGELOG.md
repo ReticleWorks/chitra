@@ -20,7 +20,59 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
-## [Unreleased]
+## [0.10.2] - 2026-08-14
+
+### Fixed
+
+- Delay governed launch receipts until the new tmux session survives its
+  startup window. An agent that exits during startup now returns temporary
+  failure code 75 without writing a false-success receipt, so callers can
+  retry that one failure class safely.
+- Recognize tmux's `can't find session` response as an inactive lane during
+  status and stop operations.
+
+## [0.10.1] - 2026-08-14
+
+### Fixed
+
+- Pass Chitra's resolved package root into each governed tmux pane, so the
+  supervised agent starts from an immutable target install without a host-wide
+  Python path shim.
+
+## [0.10.0] - 2026-08-14
+
+### Added
+
+- A deterministic semantic agent-status broker with authoritative integration
+  reports, local and bundled TOML screen manifests, strict blocked rules, and
+  evidence-rich explain output.
+- A mode-`0600` newline-delimited JSON socket with correlated request IDs,
+  typed status subscriptions, bounded event predicates, blocking semantic
+  waits, and a self-describing JSON Schema document.
+- Governed lanes now inject `CHITRA_LANE_ID`, `CHITRA_SESSION_REF`,
+  `CHITRA_PANE_ID`, `CHITRA_PANE_TARGET`, and `CHITRA_SOCKET_PATH` into the
+  agent process.
+- A validate, switch, and commit live-handoff protocol transfers Watchd's
+  status state and socket ownership while tmux keeps pane processes running.
+
+### Changed
+
+- **Breaking:** Watchd no longer treats pane-content hashes, a fixed active
+  regular expression, or an unchanged input row as semantic status. It emits
+  `AGENT_STATUS` transitions from lifecycle reports or manifests instead.
+  Operators must ship compatible manifest provisioning and lifecycle hooks
+  with the package update; see `docs/watchd-status-migration.md`.
+
+### Fixed
+
+- Anchor screen-derived blockers to live bottom controls, use exact answer
+  tokens, and let a live working footer suppress stale prompt text.
+- Bound `agent.wait` by default, align the CLI timeout, and reap wait and
+  subscription handlers when clients disconnect.
+- Recover verified stale crash sockets while continuing to refuse a socket
+  held by a live server.
+- Validate handoff state before broker mutation, keep the replacement alive
+  after commit, and inject supervised identity with `tmux new-session -e`.
 
 ## [0.9.8] - 2026-08-13
 

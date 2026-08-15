@@ -1,5 +1,5 @@
 [Unit]
-Description=Chitra shared tmux watcher
+Description=Chitra semantic agent-status and completion watcher
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=/etc/chitra/lanes.yaml
