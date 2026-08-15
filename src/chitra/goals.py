@@ -303,6 +303,7 @@ def _upsert_goal_locked(
     *,
     clear_open_asks: bool = False,
     allow_strategic_change: bool = False,
+    allow_enrollment_refresh: bool = False,
     allow_goal_metadata_change: bool = False,
     allow_done_transition: bool = False,
     mutation_time: str | None = None,
@@ -329,12 +330,16 @@ def _upsert_goal_locked(
         if rec.lane_id.strip() and rec.lane_id.strip() != existing.lane_id:
             raise GoalValidationError("lane_id is immutable once a goal is enrolled")
         lane_id = existing.lane_id
-        if rec.enrolled_done_when and rec.enrolled_done_when != existing.enrolled_done_when:
-            raise EnrolledScopeImmutableError("enrolled_done_when is immutable once a goal is enrolled")
-        if rec.enrolled_at and rec.enrolled_at != existing.enrolled_at:
-            raise EnrolledScopeImmutableError("enrolled_at is immutable once a goal is enrolled")
-        enrolled_done_when = existing.enrolled_done_when
-        enrolled_at = existing.enrolled_at
+        if allow_enrollment_refresh:
+            enrolled_done_when = rec.done_when
+            enrolled_at = now
+        else:
+            if rec.enrolled_done_when and rec.enrolled_done_when != existing.enrolled_done_when:
+                raise EnrolledScopeImmutableError("enrolled_done_when is immutable once a goal is enrolled")
+            if rec.enrolled_at and rec.enrolled_at != existing.enrolled_at:
+                raise EnrolledScopeImmutableError("enrolled_at is immutable once a goal is enrolled")
+            enrolled_done_when = existing.enrolled_done_when
+            enrolled_at = existing.enrolled_at
     else:
         if rec.lane_id.strip() and rec.lane_id.strip() != derived_lane_id:
             raise GoalValidationError("lane_id must be derived from the durable session name")
@@ -449,6 +454,7 @@ def redirect_goal(
             root,
             candidate,
             allow_strategic_change=True,
+            allow_enrollment_refresh=redirected.done_when.strip() != existing.done_when.strip(),
             allow_goal_metadata_change=True,
             mutation_time=revised_at,
         )

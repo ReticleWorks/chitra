@@ -70,7 +70,7 @@ def test_initial_round_requires_unanimous_isolated_acceptance(tmp_path: Path) ->
     assert (tmp_path / "goal_reviews.jsonl").exists()
 
 
-def test_frozen_goal_uses_immutable_enrollment_condition_after_redirect(tmp_path: Path) -> None:
+def test_frozen_goal_uses_redirect_refreshed_enrollment_condition(tmp_path: Path) -> None:
     enrolled = _goal(tmp_path)
     redirected = redirect_goal(
         tmp_path,
@@ -81,7 +81,8 @@ def test_frozen_goal_uses_immutable_enrollment_condition_after_redirect(tmp_path
 
     frozen = freeze_goal(redirected)
 
-    assert frozen.done_when == enrolled.done_when
+    assert frozen.done_when == redirected.done_when
+    assert frozen.done_when != enrolled.done_when
 
 
 def test_initial_round_can_be_configured_to_one_reviewer(tmp_path: Path) -> None:
