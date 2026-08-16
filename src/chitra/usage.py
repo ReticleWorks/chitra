@@ -34,6 +34,9 @@ CodexProcessFactory = Callable[..., subprocess.Popen[str]]
 CodexClock = Callable[[], float]
 DEFAULT_USAGE_POLICY = UsagePolicy()
 DEFAULT_CODEX_AUTH_PATH = Path.home() / ".codex" / "auth.json"
+# Above this reset horizon a Codex window is the weekly one, whatever slot the
+# provider reported it in. See ``effective_windows``.
+CODEX_LONG_WINDOW_HORIZON_SECONDS = 6 * 3600
 
 
 def _codex_snapshot_timeout_secs() -> float:
@@ -223,18 +226,54 @@ def read_snapshots(
     return snapshots
 
 
+def effective_windows(snapshot: UsageSnapshot) -> tuple[UsageWindow | None, UsageWindow | None]:
+    """Return this snapshot's (short, long) windows by what they actually are.
+
+    For Claude the slots mean what they say. Codex does not keep that promise.
+    Read live on tophand 2026-08-16: a capped Codex account reported its
+    *weekly* cap in the ``primary`` slot -- 100% used, resetting 2026-08-20 --
+    while ``secondary`` was null. chitra maps ``primary`` to ``five_hour``, so
+    a weekly threshold applied by slot name would have watched an empty slot
+    and never fired, which is the failure this whole change exists to prevent.
+
+    A window is therefore classified by its own reset horizon. Nothing that
+    resets more than six hours out is a five-hour window, whichever slot the
+    provider chose to put it in.
+    """
+    if snapshot.kind != "codex":
+        return snapshot.five_hour, snapshot.seven_day
+    reading = int(_parse_utc_timestamp(snapshot.ts).timestamp())
+    short: UsageWindow | None = None
+    long_window: UsageWindow | None = None
+    for window in (snapshot.five_hour, snapshot.seven_day):
+        if window is None:
+            continue
+        if window.resets_at - reading > CODEX_LONG_WINDOW_HORIZON_SECONDS:
+            if long_window is None or window.pct > long_window.pct:
+                long_window = window
+        elif short is None or window.pct > short.pct:
+            short = window
+    return short, long_window
+
+
 def _binding_window(
-    five_hour: UsageWindow | None,
-    seven_day: UsageWindow | None,
+    short: UsageWindow | None,
+    long_window: UsageWindow | None,
     *,
-    five_hour_threshold: float,
-    seven_day_threshold: float,
+    short_threshold: float,
+    long_threshold: float,
 ) -> Literal["", "5h", "7d"]:
+    """Return which window binds, as the internal short/long token pair.
+
+    ``5h`` and ``7d`` name the short and long window respectively. For Codex
+    the long window is the weekly one; ``chitra.usage_export`` renders it under
+    each provider's own vocabulary.
+    """
     candidates: list[tuple[float, Literal["5h", "7d"]]] = []
-    if five_hour is not None and five_hour.pct >= five_hour_threshold:
-        candidates.append((five_hour.pct - five_hour_threshold, "5h"))
-    if seven_day is not None and seven_day.pct >= seven_day_threshold:
-        candidates.append((seven_day.pct - seven_day_threshold, "7d"))
+    if short is not None and short.pct >= short_threshold:
+        candidates.append((short.pct - short_threshold, "5h"))
+    if long_window is not None and long_window.pct >= long_threshold:
+        candidates.append((long_window.pct - long_threshold, "7d"))
     if not candidates:
         return ""
     return max(candidates, key=lambda item: (item[0], item[1] == "7d"))[1]
@@ -245,23 +284,32 @@ def evaluate(
     *,
     policy: UsagePolicy | None = None,
 ) -> Verdict:
-    """Return the pure deterministic policy verdict for one snapshot."""
+    """Return the pure deterministic policy verdict for one snapshot.
+
+    Thresholds are selected per provider. A Codex weekly cap is a hard wall
+    with a multi-day reset, so it pauses lower than Claude's seven-day window
+    degrading; the windows themselves are identified by
+    ``effective_windows`` rather than by the slot the provider used.
+    """
     configured = DEFAULT_USAGE_POLICY if policy is None else policy
+    short, long_window = effective_windows(snapshot)
+    pause_short, pause_long = configured.pause_thresholds(snapshot.kind)
+    warn_short, warn_long = configured.warn_thresholds(snapshot.kind)
     pause_binding = _binding_window(
-        snapshot.five_hour,
-        snapshot.seven_day,
-        five_hour_threshold=configured.pause_5h_pct,
-        seven_day_threshold=configured.pause_7d_pct,
+        short,
+        long_window,
+        short_threshold=pause_short,
+        long_threshold=pause_long,
     )
     if pause_binding:
-        window = snapshot.five_hour if pause_binding == "5h" else snapshot.seven_day
+        window = short if pause_binding == "5h" else long_window
         assert window is not None
         return Verdict(level="pause", binding_window=pause_binding, resume_at_epoch=window.resets_at)
     warn_binding = _binding_window(
-        snapshot.five_hour,
-        snapshot.seven_day,
-        five_hour_threshold=configured.warn_5h_pct,
-        seven_day_threshold=configured.warn_7d_pct,
+        short,
+        long_window,
+        short_threshold=warn_short,
+        long_threshold=warn_long,
     )
     if warn_binding:
         return Verdict(level="approaching", binding_window=warn_binding, resume_at_epoch=0)
@@ -269,12 +317,13 @@ def evaluate(
 
 
 def _verdict_binding_pct(snapshot: UsageSnapshot, verdict: Verdict) -> float:
+    short, long_window = effective_windows(snapshot)
     if verdict.binding_window == "5h":
-        assert snapshot.five_hour is not None
-        return snapshot.five_hour.pct
+        assert short is not None
+        return short.pct
     if verdict.binding_window == "7d":
-        assert snapshot.seven_day is not None
-        return snapshot.seven_day.pct
+        assert long_window is not None
+        return long_window.pct
     return 0
 
 

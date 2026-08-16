@@ -23,6 +23,12 @@ from chitra.usage_export import (
 )
 
 NOW = datetime(2026, 8, 16, 13, 0, tzinfo=UTC)
+# Reset epochs are relative to NOW, because a Codex window is identified by how
+# far out it resets rather than by the slot the provider used. SHORT_RESET is
+# two hours ahead. LONG_RESET is the real weekly reset the capped tophand
+# account reported on 2026-08-16, three and a half days ahead.
+SHORT_RESET = 1_786_892_400
+LONG_RESET = 1_787_197_053
 POLICY = UsagePolicy()
 
 
@@ -39,8 +45,8 @@ def _claude_snapshot(
         ts=ts,
         session_id=session_id,
         tmux_session="fleet-1",
-        five_hour=UsageWindow(pct=five_hour_pct, resets_at=1_755_600_000),
-        seven_day=UsageWindow(pct=seven_day_pct, resets_at=1_755_660_000),
+        five_hour=UsageWindow(pct=five_hour_pct, resets_at=SHORT_RESET),
+        seven_day=UsageWindow(pct=seven_day_pct, resets_at=LONG_RESET),
         account=account,
     )
 
@@ -63,12 +69,12 @@ def _export(
         account="agent@example.com",
         captured_at=captured_at,
         reading_ts=captured_at,
-        five_hour=UsageWindow(pct=12.0, resets_at=1_755_600_000),
-        long_window=UsageWindow(pct=34.0, resets_at=1_755_660_000),
+        five_hour=UsageWindow(pct=12.0, resets_at=SHORT_RESET),
+        long_window=UsageWindow(pct=34.0, resets_at=LONG_RESET),
         verdict="pause" if verdict == "pause" else "ok",
         policy_rev=policy_revision(POLICY),
         binding_window="weekly" if backend == "codex" and verdict == "pause" else "",
-        resume_at_epoch=1_755_660_000 if verdict == "pause" else 0,
+        resume_at_epoch=LONG_RESET if verdict == "pause" else 0,
         sessions_total=1,
         sessions_fresh=1,
     )
@@ -114,7 +120,7 @@ def test_claude_export_reports_the_most_severe_fresh_session(tmp_path: Path) -> 
 
     assert export.verdict == "pause"
     assert export.binding_window == "5h"
-    assert export.resume_at_epoch == 1_755_600_000
+    assert export.resume_at_epoch == SHORT_RESET
     assert export.sessions_total == 2
     assert export.sessions_fresh == 2
     assert export.error == ""
@@ -161,8 +167,8 @@ def test_codex_export_evaluates_the_reading(monkeypatch: pytest.MonkeyPatch) -> 
         ts=NOW.isoformat(),
         session_id="codex-account",
         tmux_session="",
-        five_hour=UsageWindow(pct=20.0, resets_at=1_755_600_000),
-        seven_day=UsageWindow(pct=99.0, resets_at=1_755_660_000),
+        five_hour=UsageWindow(pct=20.0, resets_at=SHORT_RESET),
+        seven_day=UsageWindow(pct=99.0, resets_at=LONG_RESET),
         account="agent@example.com",
     )
     monkeypatch.setattr(usage_export, "codex_snapshot", lambda **_kwargs: snapshot)
@@ -171,7 +177,7 @@ def test_codex_export_evaluates_the_reading(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert export.verdict == "pause"
     assert export.binding_window == "weekly"
-    assert export.resume_at_epoch == 1_755_660_000
+    assert export.resume_at_epoch == LONG_RESET
 
 
 def test_write_export_is_atomic_and_keeps_bounded_history(tmp_path: Path) -> None:
@@ -245,7 +251,7 @@ def test_fleet_read_carries_the_pause_resume_time(tmp_path: Path) -> None:
 
     assert codex.verdict == "pause"
     assert codex.binding_window == "weekly"
-    assert codex.to_dict()["resume_at_iso"] == datetime.fromtimestamp(1_755_660_000, UTC).isoformat()
+    assert codex.to_dict()["resume_at_iso"] == datetime.fromtimestamp(LONG_RESET, UTC).isoformat()
 
 
 def test_fleet_read_rejects_a_missing_directory(tmp_path: Path) -> None:

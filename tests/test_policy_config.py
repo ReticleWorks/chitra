@@ -40,8 +40,13 @@ def test_unconfigured_policy_is_the_current_shipped_behavior(monkeypatch: pytest
         "pause_7d_pct": 95.0,
         "warn_5h_pct": 80.0,
         "warn_7d_pct": 90.0,
+        "codex_pause_5h_pct": 92.0,
+        "codex_pause_weekly_pct": 90.0,
+        "codex_warn_5h_pct": 80.0,
+        "codex_warn_weekly_pct": 85.0,
         "max_running": None,
         "auto_resume": True,
+        "auto_transfer": True,
     }
     assert policy.load == LoadPolicy()
     assert policy.pr_review == PRReviewPolicy()
