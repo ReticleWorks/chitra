@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,6 +31,7 @@ from chitra.adjudication import (
     resolve_merge_rights,
     resolve_usage,
     split_claim_text,
+    unwrap_json_object,
 )
 from chitra.capabilities import CapabilityManifest
 from chitra.convlog import ConversationEntry
@@ -393,6 +395,14 @@ def test_an_escalation_that_would_not_read_plainly_is_discarded() -> None:
     )
     outcome = adjudicate(claim, _context(), EvidenceSources(), adjudicator=_FixedAdjudicator(reply), now=NOW)
     assert outcome.verdict == "undetermined"
+    assert "would not read plainly" in outcome.basis
+    assert "lane" in outcome.basis
+
+
+def test_the_reasoning_prompt_states_the_vocabulary_rule_it_is_judged_against() -> None:
+    """The word that tripped the readability gate in a live run is now ruled out up front."""
+    prompt = ClaudeProcessAdjudicator._prompt(_claim("A note."), _context(), ())
+    assert 'say "work session", never "lane"' in prompt
 
 
 def test_a_reasoning_stage_that_cannot_run_leaves_the_claim_open() -> None:
@@ -505,6 +515,147 @@ def test_only_the_recent_slice_of_a_recorded_history_is_read(tmp_path: Path) -> 
     tail = read_transcript_tail(path, max_bytes=64)
     assert "first line that must not be quoted" not in tail
     assert len(tail) <= 64
+
+
+def test_the_reasoning_process_is_granted_no_tools_and_no_memory() -> None:
+    """The instruction not to fetch anything must be enforced, not just asked for."""
+    captured: list[list[str]] = []
+
+    def _runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(command)
+        reply = AdjudicatorReply(
+            claim_id=_claim("A plain progress note.").claim_id,
+            verdict="operator-required",
+            escalation="Do you want to spend money on a second storage volume?",
+            escalation_class="spend",
+        )
+        return subprocess.CompletedProcess(command, 0, reply.model_dump_json(), "")
+
+    adjudicator = ClaudeProcessAdjudicator(runner=_runner)
+    adjudicator.adjudicate(_claim("A plain progress note."), _context(), ())
+    command = captured[0]
+    assert "--no-session-persistence" in command
+    assert command[command.index("--allowed-tools") + 1] == ""
+
+
+def test_a_reasoning_process_that_exits_non_zero_is_an_error() -> None:
+    def _runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 1, "", "the model was unavailable")
+
+    with pytest.raises(AdjudicatorProcessError, match="the model was unavailable"):
+        ClaudeProcessAdjudicator(runner=_runner).adjudicate(_claim("A note."), _context(), ())
+
+
+#: The exact packaging a real model used on 2026-08-16, which the strict parser
+#: rejected until the unwrapping below existed.
+REAL_FENCED_REPLY = (
+    '```json\n{\n  "claim_id": "{claim_id}",\n  "verdict": "operator-required",\n'
+    '  "escalation": "Do you want to spend money on a second storage volume?",\n'
+    '  "escalation_class": "spend"\n}\n```'
+)
+
+
+@pytest.mark.parametrize(
+    ("packaged", "expected"),
+    [
+        ('{"a": 1}', '{"a": 1}'),
+        ('```json\n{"a": 1}\n```', '{"a": 1}'),
+        ('```\n{"a": 1}\n```', '{"a": 1}'),
+        ('Here is the answer:\n{"a": 1}\n', '{"a": 1}'),
+        ("not json at all", "not json at all"),
+    ],
+)
+def test_the_usual_packaging_is_removed_before_the_reply_is_read(packaged: str, expected: str) -> None:
+    assert unwrap_json_object(packaged) == expected
+
+
+def test_a_fenced_reply_from_a_real_model_is_accepted() -> None:
+    claim = _claim("A plain progress note.")
+    payload = REAL_FENCED_REPLY.replace("{claim_id}", claim.claim_id)
+
+    def _runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, payload, "")
+
+    reply = ClaudeProcessAdjudicator(runner=_runner).adjudicate(claim, _context(), ())
+    assert reply.verdict == "operator-required"
+    assert reply.escalation_class == "spend"
+
+
+def test_unwrapping_never_rescues_a_reply_that_breaks_the_contract() -> None:
+    """Tolerating packaging must not tolerate a wrong answer."""
+    claim = _claim("A plain progress note.")
+    payload = (
+        f'```json\n{{"claim_id": "{claim.claim_id}", "verdict": "operator-required", '
+        '"escalation": "Something needs you."}\n```'
+    )
+
+    def _runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, payload, "")
+
+    with pytest.raises(AdjudicatorProcessError, match="unusable answer"):
+        ClaudeProcessAdjudicator(runner=_runner).adjudicate(claim, _context(), ())
+
+
+def test_a_null_directive_on_an_escalation_is_read_as_absent() -> None:
+    """Seen in a live run: the unused field comes back null rather than empty."""
+    reply = AdjudicatorReply.model_validate(
+        {
+            "claim_id": "sha256:0",
+            "verdict": "operator-required",
+            "directive": None,
+            "escalation": "Do you want to spend money on a second storage volume?",
+            "escalation_class": "spend",
+        }
+    )
+    assert reply.directive == ""
+    assert reply.escalation_class == "spend"
+
+
+def test_an_empty_escalation_class_on_a_refusal_is_read_as_absent() -> None:
+    """Seen in a live run: the unused field comes back as an empty string."""
+    reply = AdjudicatorReply.model_validate(
+        {
+            "claim_id": "sha256:0",
+            "verdict": "false-block",
+            "directive": "Continue against the recorded goal.",
+            "escalation": "",
+            "escalation_class": "",
+            "citations": ["the recorded scope line"],
+        }
+    )
+    assert reply.escalation_class is None
+    assert reply.verdict == "false-block"
+
+
+def test_normalizing_empty_fields_never_rescues_a_broken_answer() -> None:
+    with pytest.raises(ValueError, match="presence, spend, or a change of scope"):
+        AdjudicatorReply.model_validate(
+            {
+                "claim_id": "sha256:0",
+                "verdict": "operator-required",
+                "directive": None,
+                "escalation": "Something needs you.",
+                "escalation_class": "",
+            }
+        )
+    with pytest.raises(ValueError, match="must cite what refuted it"):
+        AdjudicatorReply.model_validate(
+            {
+                "claim_id": "sha256:0",
+                "verdict": "false-block",
+                "directive": "Continue against the recorded goal.",
+                "escalation_class": None,
+                "citations": None,
+            }
+        )
+
+
+def test_a_reasoning_process_that_answers_with_prose_is_an_error() -> None:
+    def _runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, "I think this one probably needs the operator.", "")
+
+    with pytest.raises(AdjudicatorProcessError, match="unusable answer"):
+        ClaudeProcessAdjudicator(runner=_runner).adjudicate(_claim("A note."), _context(), ())
 
 
 def test_the_reasoning_prompt_carries_every_layer_and_the_claim() -> None:
