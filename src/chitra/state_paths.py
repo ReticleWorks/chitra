@@ -48,3 +48,8 @@ def default_ledger_key_path() -> Path:
 def default_queue_hygiene_log_path() -> Path:
     """Return the append-only queue-hygiene audit log path."""
     return state_dir() / "queue_hygiene.jsonl"
+
+
+def default_adjudication_log_path() -> Path:
+    """Return the append-only blocker-adjudication record path."""
+    return state_dir() / "adjudications.jsonl"
