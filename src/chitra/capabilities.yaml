@@ -350,3 +350,31 @@ capabilities:
         argv: [polyphony-chitra-merged]
         params: []
         mutates: true
+
+  - name: blocker-adjudication
+    kind: daemon
+    purpose: >-
+      Settle a work session's report that it is blocked, against recorded evidence, so only a
+      question about physical presence, spend, or a change of agreed scope reaches the operator.
+    when_to_use: >-
+      Run as the supervised adjudication daemon once the operator has lifted the hold on wave two.
+      It ships disabled, so the converge installs it without arming it.
+    authority:
+      level: act
+      grants:
+        - Read goal records, the decisions log, the operator conversation log, the capability manifest, the exported usage tree, and recorded session histories.
+        - Write one dispatch order carrying a directive back to the session that reported the obstacle.
+        - Retire the reported obstacle from that session's goal record, recorded as the monitor's own retirement.
+        - Append one adjudication decision to the decisions log, and one operator brief when the question is genuinely about presence, spend, or scope.
+      excludes:
+        - Merge, approve, or modify pull requests.
+        - Change any strategic goal field.
+        - Write to a tmux pane directly, or send anything the delivery guard would refuse.
+        - Raise anything to the operator outside physical presence, spend, and a change of agreed scope.
+    default_enabled: false
+    commands:
+      - name: chitra-adjudicatord
+        description: Start the obstacle adjudication daemon.
+        argv: [chitra-adjudicatord]
+        params: []
+        mutates: true

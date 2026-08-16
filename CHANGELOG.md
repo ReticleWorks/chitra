@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- A reported obstacle is now settled before it becomes a question for the
+  operator. `chitra-adjudicatord` reads every open ask and every recorded
+  `needs` line, resolves the mechanically checkable ones against the capability
+  manifest, the recorded decisions and rulings, the exported usage tree, and the
+  session's own history, and hands the rest to one bounded reasoning process.
+  A refuted obstacle becomes a cited directive back to the session and the ask
+  is retired. Only physical presence, spend, and a change of agreed scope reach
+  the operator. The capability ships disabled.
+
 - The short interview from the monitor doctrine is now code. A goal record that
   fails its specification check is repaired from its own primary source, the
   derived values are marked presumed and recorded for correction, and the work
