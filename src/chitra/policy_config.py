@@ -12,6 +12,7 @@ import yaml
 from pydantic import BaseModel, Field, model_validator
 
 from chitra.lexicon import COMPLETION_DEFERRAL_PHRASES
+from chitra.merge import DEFAULT_HOLD_LABELS
 
 logger = structlog.get_logger(__name__)
 
@@ -276,7 +277,10 @@ class MergePolicyConfig(BaseModel):
 
     allowed_repos: list[str] = Field(default_factory=list)
     lane_authors: list[str] = Field(default_factory=list)
-    hold_label: str = "chitra-hold"
+    # Every label that stops a merge. Repositories do not share one convention,
+    # and a brake wired to a label the repository never applies is not a brake.
+    # Matching more labels can only refuse more, so both known spellings ship on.
+    hold_labels: list[str] = Field(default_factory=lambda: list(DEFAULT_HOLD_LABELS))
     # The login a merge must be attributed to. Blank means "any app identity",
     # which is still not "any identity": a personal token is refused either way
     # by chitra.merge.decide.
@@ -294,8 +298,11 @@ class MergePolicyConfig(BaseModel):
         for repo in self.allowed_repos:
             if repo.count("/") != 1 or repo.startswith("/") or repo.endswith("/"):
                 raise ValueError(f"allowed_repos entries must be owner/name, got {repo!r}")
-        if not self.hold_label.strip():
-            raise ValueError("hold_label must be non-empty; an unnamed hold cannot be honored")
+        if not self.hold_labels:
+            raise ValueError("hold_labels must name at least one label; a merge nobody can stop is not acceptable")
+        for label in self.hold_labels:
+            if not label.strip() or label != label.strip():
+                raise ValueError("hold_labels entries must be non-empty and unpadded")
         if self.poll_seconds < 5:
             raise ValueError("poll_seconds must be at least 5")
         if self.enabled and not self.allowed_repos:

@@ -236,7 +236,9 @@ def test_merge_is_off_and_allows_nothing_until_an_operator_configures_it() -> No
     assert policy.enabled is False
     assert policy.allowed_repos == []
     assert policy.lane_authors == []
-    assert policy.hold_label == "chitra-hold"
+    # Both conventions ship on. A brake wired only to a label the repository
+    # never applies would not stop anything there.
+    assert policy.hold_labels == ["chitra-hold", "hold"]
 
 
 def test_merge_policy_rejects_a_repository_that_is_not_owner_slash_name() -> None:
@@ -255,8 +257,13 @@ def test_merge_policy_rejects_being_enabled_with_nothing_allowlisted() -> None:
 
 
 def test_merge_policy_rejects_an_unnamed_hold_label() -> None:
-    with pytest.raises(ValueError, match="hold_label"):
-        MergePolicyConfig(hold_label="  ")
+    with pytest.raises(ValueError, match="non-empty and unpadded"):
+        MergePolicyConfig(hold_labels=["  "])
+
+
+def test_merge_policy_refuses_to_leave_a_merge_with_no_brake_at_all() -> None:
+    with pytest.raises(ValueError, match="at least one label"):
+        MergePolicyConfig(hold_labels=[])
 
 
 def test_merge_policy_reads_from_policy_yaml(tmp_path: Path) -> None:

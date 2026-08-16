@@ -18,7 +18,7 @@ APP = GitHubIdentity(login="polyphony-automation[bot]", kind="app", source="test
 POLICY = MergePolicy(
     allowed_repos=("ReticleWorks/chitra",),
     lane_authors=("lane-bot",),
-    hold_label="chitra-hold",
+    hold_labels=("chitra-hold", "hold"),
     app_login="polyphony-automation[bot]",
 )
 
