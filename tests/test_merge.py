@@ -28,7 +28,7 @@ PAT = GitHubIdentity(login="lean-wintermute", kind="user", source="test")
 POLICY = MergePolicy(
     allowed_repos=("ReticleWorks/chitra",),
     lane_authors=("lane-bot",),
-    hold_label="chitra-hold",
+    hold_labels=("chitra-hold", "hold"),
     app_login="polyphony-automation[bot]",
 )
 
@@ -77,6 +77,10 @@ def test_a_fully_green_lane_pull_request_is_allowed() -> None:
         ({"repo": "someone/else"}, "repo_not_allowlisted"),
         ({"author": "a-person"}, "author_not_a_lane"),
         ({"labels": ("chitra-hold",)}, "hold_label_present"),
+        # The label ReticleWorks/chitra actually uses. A brake wired only to
+        # chitra-hold would not have stopped anything in that repository.
+        ({"labels": ("hold",)}, "hold_label_present"),
+        ({"labels": ("enhancement", "hold")}, "hold_label_present"),
         ({"state": "CLOSED"}, "already_closed"),
         ({"is_draft": True}, "draft"),
         ({"mergeable": "CONFLICTING"}, "not_mergeable"),
@@ -100,6 +104,26 @@ def test_a_personal_access_token_may_not_merge_even_when_everything_else_is_gree
 def test_an_app_with_the_wrong_login_may_not_merge() -> None:
     other_app = GitHubIdentity(login="some-other-app[bot]", kind="app", source="test")
     assert decide(make_state(), POLICY, other_app).reason == "identity_not_app"
+
+
+def test_the_shipped_hold_labels_cover_the_convention_repositories_actually_use() -> None:
+    """Found the hard way: chitra labels a held pull request `hold`, and the
+    original default was `chitra-hold`, a label that repository does not have.
+    """
+    from chitra.merge import DEFAULT_HOLD_LABELS
+
+    assert "hold" in DEFAULT_HOLD_LABELS
+    assert "chitra-hold" in DEFAULT_HOLD_LABELS
+
+
+def test_the_reported_hold_reason_names_the_label_that_was_actually_set() -> None:
+    decision = decide(make_state(labels=("hold",)), POLICY, APP)
+    assert decision.reason == "hold_label_present"
+    assert decision.detail.startswith("hold is set")
+
+
+def test_an_unrelated_label_does_not_hold_a_pull_request() -> None:
+    assert decide(make_state(labels=("enhancement", "python")), POLICY, APP).allowed
 
 
 def test_an_empty_lane_allowlist_qualifies_nobody() -> None:
