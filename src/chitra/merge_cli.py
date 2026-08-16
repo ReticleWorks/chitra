@@ -32,7 +32,15 @@ def merge_ledger_path(root: Path) -> Path:
 
 
 def policy_from_config(path: Path | None) -> MergePolicy:
-    """Build the merge policy from the operator's policy.yaml."""
+    """Build the merge policy from the operator's policy.yaml.
+
+    ``merge.enabled`` is not read here. It governs whether the daemon runs on
+    its own, not whether a person may take the step by hand; running this
+    command is itself the authorization. Everything the daemon is forbidden
+    to do -- an unlisted repository, a non-app identity, a held label -- is
+    still forbidden here, because the refusals live in the decision, not in
+    the switch.
+    """
     configured = load_policy_config(path).merge
     return MergePolicy(
         allowed_repos=tuple(configured.allowed_repos),
