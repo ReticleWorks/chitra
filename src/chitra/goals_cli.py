@@ -81,6 +81,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     hold_command.add_argument("--reason", required=True)
     hold_command.add_argument("--resume-at", default="")
 
+    transfer_command = commands.add_parser(
+        "transfer",
+        help="Hold a lane and scaffold its successor on the other backend. Writes records only; check still gates launch.",
+    )
+    add_root(transfer_command)
+    transfer_command.add_argument("--session-ref", required=True)
+    transfer_command.add_argument("--to-backend", required=True, choices=("claude", "codex"))
+    transfer_command.add_argument("--digest", required=True, help="Handoff digest id the successor reads for its context.")
+    transfer_command.add_argument("--reason", required=True, help="Hold reason, e.g. rate-limit:codex-weekly-hard-cap.")
+    transfer_command.add_argument("--resume-at", default="", help="When the held original becomes due again.")
+
     resume_command = commands.add_parser("resume", help="Return an explicitly held lane to working state.")
     add_root(resume_command)
     resume_command.add_argument("--session-ref", required=True)
@@ -191,6 +202,17 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "hold":
             _print_record(goal_store.hold_goal(args.root, args.session_ref, reason=args.reason, resume_at=args.resume_at))
+        elif args.command == "transfer":
+            held, successor = goal_store.transfer_goal(
+                args.root,
+                args.session_ref,
+                to_backend=args.to_backend,
+                digest=args.digest,
+                reason=args.reason,
+                resume_at=args.resume_at,
+            )
+            _print_record(held)
+            _print_record(successor)
         elif args.command == "resume":
             _print_record(goal_store.resume_goal(args.root, args.session_ref))
         elif args.command == "redirect":
