@@ -34,6 +34,9 @@ CodexProcessFactory = Callable[..., subprocess.Popen[str]]
 CodexClock = Callable[[], float]
 DEFAULT_USAGE_POLICY = UsagePolicy()
 DEFAULT_CODEX_AUTH_PATH = Path.home() / ".codex" / "auth.json"
+# Above this reset horizon a Codex window is the weekly one, whatever slot the
+# provider reported it in. See ``effective_windows``.
+CODEX_LONG_WINDOW_HORIZON_SECONDS = 6 * 3600
 
 
 def _codex_snapshot_timeout_secs() -> float:
@@ -221,6 +224,36 @@ def read_snapshots(
         age_seconds = (current - _parse_utc_timestamp(snapshot.ts)).total_seconds()
         snapshots.append((snapshot, age_seconds <= staleness_seconds))
     return snapshots
+
+
+def effective_windows(snapshot: UsageSnapshot) -> tuple[UsageWindow | None, UsageWindow | None]:
+    """Return this snapshot's (short, long) windows by what they actually are.
+
+    For Claude the slots mean what they say. Codex does not keep that promise.
+    Read live on tophand 2026-08-16: a capped Codex account reported its
+    *weekly* cap in the ``primary`` slot -- 100% used, resetting 2026-08-20 --
+    while ``secondary`` was null. chitra maps ``primary`` to ``five_hour``, so
+    a weekly threshold applied by slot name would have watched an empty slot
+    and never fired, which is the failure this whole change exists to prevent.
+
+    A window is therefore classified by its own reset horizon. Nothing that
+    resets more than six hours out is a five-hour window, whichever slot the
+    provider chose to put it in.
+    """
+    if snapshot.kind != "codex":
+        return snapshot.five_hour, snapshot.seven_day
+    reading = int(_parse_utc_timestamp(snapshot.ts).timestamp())
+    short: UsageWindow | None = None
+    long_window: UsageWindow | None = None
+    for window in (snapshot.five_hour, snapshot.seven_day):
+        if window is None:
+            continue
+        if window.resets_at - reading > CODEX_LONG_WINDOW_HORIZON_SECONDS:
+            if long_window is None or window.pct > long_window.pct:
+                long_window = window
+        elif short is None or window.pct > short.pct:
+            short = window
+    return short, long_window
 
 
 def _binding_window(
