@@ -295,3 +295,58 @@ capabilities:
         argv: [chitra-pr-review]
         params: []
         mutates: true
+
+  - name: failover
+    kind: tool
+    purpose: >-
+      Expose the rate-limit guard's own pause and resume steps as verbs a person can run:
+      show the plan, start the pause for one lane, start the resume for one lane.
+    when_to_use: Run by hand when an operator needs to see or take a failover step now, rather than waiting for the guard's next timed sweep.
+    authority:
+      level: act
+      grants:
+        - Report what the guard would pause and resume right now, changing nothing.
+        - Start a pause transaction for one named lane that the guard's own planner already qualified.
+        - Start a resume transaction for one held lane whose window has reset and whose fresh usage reads ok.
+      excludes:
+        - Pause or resume a lane the guard's planner refused -- there is one decision path, and this command does not overrule it.
+        - Clear a hold directly; a hold clears only on a confirmed resume delivery.
+        - Override an operator- or throttle-held lane.
+    default_enabled: true
+    commands:
+      - name: chitra-failover
+        description: Evaluate, start, or reverse a rate-limit lane pause using the guard's own planner.
+        argv: [chitra-failover]
+        params: []
+        mutates: true
+
+  - name: auto-merge
+    kind: tool
+    purpose: >-
+      Merge lane-authored pull requests that are verifiably green, on repositories an operator
+      allowlisted, under the automation app's identity, recording every attempt and refusal.
+    when_to_use: Run the daemon under systemd to merge continuously, or the single-pull-request verb by hand to see the same decision for one pull request.
+    authority:
+      level: act
+      grants:
+        - Read one pull request's merge state through the GitHub GraphQL API.
+        - Merge one allowlisted, lane-authored, non-draft pull request whose merge state is clean and whose check rollup succeeded.
+        - Append an identity-stamped ledger line for every merge and every refusal.
+        - Tell the one lane whose goal names that pull request that it merged.
+      excludes:
+        - Merge under any identity other than the configured GitHub App.
+        - Read, write, or work around branch protection.
+        - Merge a pull request carrying the hold label, or one whose checks are merely non-required failures.
+        - Merge more than one pull request at a time in a single repository.
+    default_enabled: false
+    commands:
+      - name: chitra-merge
+        description: Verify one pull request against the merge policy and merge it when it qualifies.
+        argv: [chitra-merge]
+        params: []
+        mutates: true
+      - name: polyphony-chitra-merged
+        description: Poll allowlisted repositories and merge lane-authored pull requests that qualify.
+        argv: [polyphony-chitra-merged]
+        params: []
+        mutates: true

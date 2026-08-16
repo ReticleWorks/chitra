@@ -265,6 +265,44 @@ class PRReviewPolicy(BaseModel):
         return self
 
 
+class MergePolicyConfig(BaseModel):
+    """What the auto-merge path may touch, and on whose behalf.
+
+    Every list defaults to empty, and empty means "nothing qualifies". A merge
+    daemon that shipped a permissive default would be one bad deploy away from
+    merging a repository nobody chose, so the safe state is refusing everything
+    until an operator names what is allowed.
+    """
+
+    allowed_repos: list[str] = Field(default_factory=list)
+    lane_authors: list[str] = Field(default_factory=list)
+    hold_label: str = "chitra-hold"
+    # The login a merge must be attributed to. Blank means "any app identity",
+    # which is still not "any identity": a personal token is refused either way
+    # by chitra.merge.decide.
+    app_login: str = ""
+    poll_seconds: float = 120.0
+    enabled: bool = False
+
+    @model_validator(mode="after")
+    def validate_merge_policy(self) -> Self:
+        """Reject a configuration that could not merge safely."""
+        for name in ("allowed_repos", "lane_authors"):
+            for value in getattr(self, name):
+                if not value.strip() or value != value.strip():
+                    raise ValueError(f"{name} entries must be non-empty and unpadded")
+        for repo in self.allowed_repos:
+            if repo.count("/") != 1 or repo.startswith("/") or repo.endswith("/"):
+                raise ValueError(f"allowed_repos entries must be owner/name, got {repo!r}")
+        if not self.hold_label.strip():
+            raise ValueError("hold_label must be non-empty; an unnamed hold cannot be honored")
+        if self.poll_seconds < 5:
+            raise ValueError("poll_seconds must be at least 5")
+        if self.enabled and not self.allowed_repos:
+            raise ValueError("merge is enabled but no repository is allowlisted")
+        return self
+
+
 class PolicyConfig(BaseModel):
     """The complete optional policy.yaml schema."""
 
@@ -275,6 +313,7 @@ class PolicyConfig(BaseModel):
     pause: PausePolicy = Field(default_factory=PausePolicy)
     load: LoadPolicy = Field(default_factory=LoadPolicy)
     pr_review: PRReviewPolicy = Field(default_factory=PRReviewPolicy)
+    merge: MergePolicyConfig = Field(default_factory=MergePolicyConfig)
 
 
 def resolve_guidance(config: PolicyConfig, cwd: Path) -> Path | None:
