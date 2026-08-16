@@ -27,12 +27,20 @@ from pathlib import Path
 from typing import Final
 
 from chitra.goals import GOAL_STATUSES
+from chitra.goals import SCHEMA as CURRENT_GOALS_SCHEMA
+from chitra.goals import SUPPORTED_SCHEMAS as SUPPORTED_GOALS_SCHEMAS
 from chitra.state_paths import state_dir as default_state_dir
 
 QUERY_SCHEMA: Final = "chitra.ownership.query.v1"
 RESULT_SCHEMA: Final = "chitra.ownership.result.v1"
 ERROR_SCHEMA: Final = "chitra.protocol-error.v1"
-GOALS_SCHEMA: Final = "chitra.goals.v1"
+# The schema a freshly built marker records. Reads accept every schema
+# chitra.goals itself accepts, so a document written by a host that has not
+# upgraded yet still answers authoritatively. Pinning one literal here meant
+# the goals v2 bump silently turned every answer into a non-authoritative
+# "unknown": the provider kept working and simply stopped knowing anything.
+GOALS_SCHEMA: Final = CURRENT_GOALS_SCHEMA
+GOALS_SCHEMAS: Final = SUPPORTED_GOALS_SCHEMAS
 MANAGED_MARKER_SCHEMA: Final = "chitra.ownership-managed.v1"
 PROVIDER_ID: Final = "chitra"
 MAX_MESSAGE_BYTES: Final = 64 * 1024
@@ -87,6 +95,8 @@ _GOAL_FIELDS = frozenset(
         "needs",
         "hold_reason",
         "resume_at",
+        "successor_of",
+        "transferred_to",
     )
 )
 _GOAL_STRING_FIELDS = _GOAL_FIELDS - {"goal_version", "goal_history", "open_asks", "retired_asks"}
@@ -194,6 +204,10 @@ def managed_marker_for_state(
         raise ValueError("host_id and boot_id must be non-empty")
     if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
         raise ValueError("generation must be a positive integer")
+    # This helper stays pure: it does not parse the bytes it binds. The
+    # sha256 below is what ties the marker to this exact document, and the
+    # read path accepts any goals schema chitra.goals accepts, so the value
+    # recorded here is a label rather than a gate.
     return {
         "schema": MANAGED_MARKER_SCHEMA,
         "goals_schema": GOALS_SCHEMA,
@@ -229,8 +243,8 @@ def _validate_goals_document(raw: bytes, *, host_id: str) -> dict[str, Ownership
     payload = _load_json_bytes(raw, description="goals state")
     if not isinstance(payload, dict) or set(payload) != {"schema", "updated_at", "goals"}:
         raise ValueError("goals state must contain exactly schema, updated_at, and goals")
-    if payload["schema"] != GOALS_SCHEMA:
-        raise ValueError("goals state schema is not chitra.goals.v1")
+    if payload["schema"] not in GOALS_SCHEMAS:
+        raise ValueError(f"goals state schema is not one of: {', '.join(GOALS_SCHEMAS)}")
     parse_timestamp(payload["updated_at"], field="goals.updated_at")
     raw_goals = payload["goals"]
     if not isinstance(raw_goals, list) or len(raw_goals) > MAX_GOALS:
@@ -411,7 +425,11 @@ def load_managed_state(
         generation = generation_value
         heartbeat = _nonempty_string(marker, "manager_heartbeat_at", maximum=64)
         heartbeat_at = parse_timestamp(heartbeat, field="manager_heartbeat_at")
-        if marker["schema"] != MANAGED_MARKER_SCHEMA or marker["goals_schema"] != GOALS_SCHEMA:
+        # Any goals schema chitra.goals accepts is accepted here. The digest
+        # below is what actually binds this marker to these bytes, and the
+        # schema lives inside those bytes, so pinning one literal bought no
+        # safety and cost every answer during a version bump.
+        if marker["schema"] != MANAGED_MARKER_SCHEMA or marker["goals_schema"] not in GOALS_SCHEMAS:
             raise ValueError("managed marker schema is not canonical")
         if marker["complete"] is not True:
             return ManagedState.unknown("state_partial", generation=generation, manager_heartbeat_at=heartbeat)
