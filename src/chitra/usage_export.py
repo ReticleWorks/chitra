@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import socket
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -38,6 +39,12 @@ EXPORT_SCHEMA = "chitra.usage-export.v1"
 ExportBackend = Literal["claude", "codex"]
 ExportVerdict = Literal["ok", "approaching", "pause", "unknown"]
 FleetVerdict = Literal["ok", "approaching", "pause", "unknown", "stale-export", "missing-export", "invalid-export"]
+
+#: Verdicts that mean the reading itself failed, rather than reporting a
+#: capacity level. These say nothing about how loaded a host is; they say the
+#: monitor cannot see it, which is the condition that cost two days of a capped
+#: lane in August 2026.
+INCIDENT_VERDICTS: frozenset[str] = frozenset({"stale-export", "missing-export", "invalid-export"})
 
 EXPORT_BACKENDS: tuple[ExportBackend, ...] = ("claude", "codex")
 
@@ -455,12 +462,19 @@ def read_fleet_exports(
     *,
     stale_after_seconds: int = DEFAULT_STALE_AFTER_SECONDS,
     now: datetime | None = None,
+    expect_hosts: Sequence[str] = (),
 ) -> list[FleetExportVerdict]:
     """Read every host's exports and return one verdict per host and backend.
 
     Both backends are reported for every host directory present.  A file that
     is absent, old, or unparseable becomes its own verdict, so a dead export
     timer surfaces as an incident on that host rather than as a quiet gap.
+
+    ``expect_hosts`` closes the gap one level up.  Without it this function can
+    only report on hosts that have a directory, so a host whose export timer
+    was never installed produces no verdict at all -- invisible rather than
+    incident, which is the same silence the export exists to remove.  A named
+    host with no directory reads as ``missing-export`` for both backends.
     """
     if stale_after_seconds < 0:
         raise ValueError("stale_after_seconds must be non-negative")
@@ -470,6 +484,18 @@ def read_fleet_exports(
     if not fleet_dir.is_dir():
         raise ValueError(f"fleet usage directory does not exist: {fleet_dir}")
     results: list[FleetExportVerdict] = []
+    present = {path.name for path in fleet_dir.iterdir() if path.is_dir()}
+    for host in sorted(set(expect_hosts) - present):
+        for backend in EXPORT_BACKENDS:
+            results.append(
+                _incident(
+                    host=host,
+                    backend=backend,
+                    verdict="missing-export",
+                    error=f"{host} was expected to publish usage and has never written any export directory",
+                    path=fleet_dir / host / f"{backend}.json",
+                )
+            )
     for host_dir in sorted(path for path in fleet_dir.iterdir() if path.is_dir()):
         for backend in EXPORT_BACKENDS:
             path = host_dir / f"{backend}.json"
