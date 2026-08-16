@@ -295,8 +295,12 @@ def status_event_line(status: PaneStatus, *, now: datetime | None = None) -> str
     matched_rule = status.explain.matched_rule or "none"
     fallback = status.explain.fallback_reason or "none"
     attention = " needs operator input" if status.state == "blocked" else ""
+    # The resume time is the one fact the response protocol cannot reconstruct
+    # from the pane later, because the banner scrolls away. Carry it on the
+    # event or lose it.
+    resume = f" resume_at={status.explain.resume_at}" if status.explain.resume_at else ""
     text = (
-        f"AGENT_STATUS state={status.state}{attention} pane_id={status.pane_id} target={status.target} "
+        f"AGENT_STATUS state={status.state}{attention}{resume} pane_id={status.pane_id} target={status.target} "
         f"agent={status.agent} authority={status.authority} source={source} rule={matched_rule} fallback={fallback}"
     )
     return f"{timestamp} {status.lane_id} {text}\n"
