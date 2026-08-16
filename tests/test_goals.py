@@ -99,7 +99,7 @@ def test_store_round_trip_and_atomic_write(tmp_path: Path) -> None:
     assert load_goals(tmp_path) == [stored]
     assert not list(tmp_path.glob("*.tmp"))
     payload = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
-    assert payload["schema"] == "chitra.goals.v1"
+    assert payload["schema"] == "chitra.goals.v2"
     assert payload["goals"][0]["needs"] == "you: run the interview"
     assert payload["goals"][0]["goal_version"] == 1
     assert payload["goals"][0]["goal_history"] == []
