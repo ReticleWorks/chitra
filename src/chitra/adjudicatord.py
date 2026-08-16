@@ -43,6 +43,7 @@ from chitra.adjudication import (
     decision_entry,
     escalation_brief,
     load_evidence_sources,
+    split_claim_text,
 )
 from chitra.capabilities import CapabilityDisabledError, CapabilityError, require_enabled
 from chitra.convlog import BriefValidationError, open_thread
@@ -98,6 +99,7 @@ class AdjudicatordConfig:
     decisions_path: Path
     adjudication_log_path: Path
     fleet_usage_dir: Path | None
+    manifest_path: Path | None
     transcript_root: Path | None
     poll_seconds: float
     dry_run: bool
@@ -134,6 +136,7 @@ def resolve_config(
     decisions_path: Path | None = None,
     adjudication_log_path: Path | None = None,
     fleet_usage_dir: Path | None = None,
+    manifest_path: Path | None = None,
     transcript_root: Path | None = None,
     poll_seconds: float | None = None,
     dry_run: bool = False,
@@ -153,6 +156,7 @@ def resolve_config(
         decisions_path=decisions_path or default_decisions_path(),
         adjudication_log_path=adjudication_log_path or default_adjudication_log_path(),
         fleet_usage_dir=fleet_usage_dir,
+        manifest_path=manifest_path,
         transcript_root=transcript_root,
         poll_seconds=resolved_poll,
         dry_run=dry_run,
@@ -173,16 +177,17 @@ def collect_claims(records: Sequence[GoalRecord], *, now: datetime | None = None
     claims: list[BlockerClaim] = []
     for record in records:
         for ask in record.open_asks:
-            if ask.startswith(PRESUMED_ASK_PREFIX):
+            if ask.startswith(PRESUMED_ASK_PREFIX) or not ask.strip():
                 continue
-            if ask.strip():
+            for part in split_claim_text(ask):
                 claims.append(
-                    BlockerClaim(session_ref=record.session_ref, text=ask.strip(), origin="open_ask", observed_at=observed_at)
+                    BlockerClaim(session_ref=record.session_ref, text=part, origin="open_ask", observed_at=observed_at)
                 )
         if record.needs.strip():
-            claims.append(
-                BlockerClaim(session_ref=record.session_ref, text=record.needs.strip(), origin="needs", observed_at=observed_at)
-            )
+            for part in split_claim_text(record.needs):
+                claims.append(
+                    BlockerClaim(session_ref=record.session_ref, text=part, origin="needs", observed_at=observed_at)
+                )
     return claims
 
 
@@ -377,6 +382,7 @@ def run_once(
         decisions_path=config.decisions_path,
         fleet_usage_dir=config.fleet_usage_dir,
         transcripts=transcripts,
+        manifest_path=config.manifest_path,
     )
 
     already = 0
@@ -461,6 +467,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adjudication-log-path", type=Path, default=None)
     parser.add_argument("--fleet-usage-dir", type=Path, default=None, help="Shared usage directory written by the export timer.")
     parser.add_argument("--transcript-root", type=Path, default=None, help="Directory holding one recorded history per work session.")
+    parser.add_argument(
+        "--manifest-path",
+        type=Path,
+        default=None,
+        help="Read this capability manifest instead of the shipped one, to see what a proposed manifest would decide.",
+    )
     parser.add_argument("--poll-seconds", type=float, default=None)
     parser.add_argument("--program", default=DEFAULT_PROGRAM, help="Plain-language program name used on any operator brief.")
     parser.add_argument("--authority", default=DEFAULT_AUTHORITY)
@@ -488,6 +500,7 @@ def main(argv: list[str] | None = None) -> int:
             decisions_path=args.decisions_path,
             adjudication_log_path=args.adjudication_log_path,
             fleet_usage_dir=args.fleet_usage_dir,
+            manifest_path=args.manifest_path,
             transcript_root=args.transcript_root,
             poll_seconds=args.poll_seconds,
             dry_run=args.dry_run,
