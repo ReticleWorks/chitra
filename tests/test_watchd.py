@@ -466,7 +466,7 @@ def test_list_panes_uses_live_tmux_enumeration_and_deduplicates_pane_id() -> Non
             "list-panes",
             "-a",
             "-F",
-            "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{session_attached}\t#{pane_current_command}",
+            "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{session_attached}\t#{pane_current_command}\t#{pane_pipe}",
         ]
     ]
 

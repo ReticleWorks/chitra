@@ -61,6 +61,11 @@ _STATIC_CRITICAL_RULES = (
     # cost roughly two days in August 2026. It leads the rule list so that when
     # it fires it takes the queue line's summary slot.
     ("rate_limited_hard", re.compile(r"\bAGENT_STATUS state=rate_limited_hard\b")),
+    # A lane whose transcript stopped growing is invisible to every file-based
+    # liveness check that reads it. An atlas-v5 respawn dropped its pipe on
+    # 2026-08-15 and nothing noticed for twenty-five hours, because a pane with
+    # a dead pipe looks exactly like a healthy one.
+    ("transcript_pipe_stale", re.compile(r"\bTRANSCRIPT_PIPE_STALE\b")),
     ("merge_landed", re.compile(r'^\s*REVIEW_VERDICT: (CLEAN|ISSUES)\s*$|"state":\s*"MERGED"|\bMerged #\d|\bPR #?\d+ (was )?merged', re.I)),
     ("crash", re.compile(r"Traceback \(most recent call last\)|panic:|\bfatal(:| error)", re.I)),
     ("ci_red", re.compile(r"CI .*(failure|failed|red)|required check.*fail", re.I)),
