@@ -14,12 +14,22 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from chitra._fsio import write_json_atomic
-from chitra.goals import RATE_LIMIT_HOLD_REASON_PREFIX, GoalRecord, check_specification, get_goal
+from chitra.goals import (
+    RATE_LIMIT_HOLD_REASON_PREFIX,
+    GoalNotFoundError,
+    GoalRecord,
+    GoalValidationError,
+    check_specification,
+    get_goal,
+)
+from chitra.interview import RepairOutcome, presumptive_repair
 from chitra.lane_config import LaneSpec, load_lanes
 from chitra.rate_limit_state import get_transaction
 from chitra.socket_api import default_socket_path
 
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+#: Repairs one failing goal record in place and reports what it could settle.
+SpecificationRepair = Callable[[Path, str], RepairOutcome]
 SANCTIONED_HOST = "tophand"
 SANCTIONED_HOSTS = frozenset({"tophand", "trinity"})
 # The name chitra.watchd's transcript-pipe liveness check looks for. The two
@@ -53,8 +63,21 @@ def session_ref(lane: LaneSpec, host: str = SANCTIONED_HOST) -> str:
     return f"{host}:{lane.tmux_session}:0.0"
 
 
-def ingestion_gate(lane: LaneSpec, *, host: str = SANCTIONED_HOST) -> GoalRecord:
-    """Return the frozen goal source only when every launch gate passes."""
+def ingestion_gate(
+    lane: LaneSpec,
+    *,
+    host: str = SANCTIONED_HOST,
+    repair: SpecificationRepair | None = presumptive_repair,
+) -> GoalRecord:
+    """Return the frozen goal source only when every launch gate passes.
+
+    A record that fails the specification check is first handed to ``repair``,
+    which derives what the record's own primary source supports, marks those
+    values presumed, and re-checks. This is the short interview the monitor
+    doctrine has always required, in its presumptive form: derive, mark, start,
+    and invite correction, rather than refuse the launch and wait. Pass
+    ``repair=None`` to get the older behaviour of refusing outright.
+    """
     if host not in SANCTIONED_HOSTS:
         raise LaneLaunchRefused("lane launch refused: governed lanes must run on tophand or trinity")
     ref = session_ref(lane, host)
@@ -65,6 +88,14 @@ def ingestion_gate(lane: LaneSpec, *, host: str = SANCTIONED_HOST) -> GoalRecord
     if goal is None:
         raise LaneLaunchRefused("lane launch refused: no chitra-goals ingestion record")
     issues = check_specification(goal)
+    if issues and repair is not None:
+        try:
+            outcome = repair(lane.state_dir, ref)
+        except (GoalNotFoundError, GoalValidationError, OSError, ValueError) as exc:
+            raise LaneLaunchRefused(f"lane launch refused: ingestion gate repair failed: {exc}") from exc
+        if outcome.record is not None:
+            goal = outcome.record
+        issues = list(outcome.remaining_issues)
     if issues:
         raise LaneLaunchRefused("lane launch refused: ingestion gate failed: " + "; ".join(issues))
     if goal.lane_id != lane.tmux_session or goal.enrolled_done_when != goal.done_when:

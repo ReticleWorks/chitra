@@ -12,6 +12,7 @@ from chitra import goals as goal_store
 from chitra._fsio import parse_iso8601
 from chitra.artifacts import list_unreviewed_artifacts
 from chitra.close_gate import lint_done_when
+from chitra.interview import presumptive_repair
 from chitra.lane_read import extract_open_asks, read_last_assistant_message
 from chitra.policy_config import load_policy_config, resolve_guidance
 from chitra.state_paths import state_dir
@@ -116,6 +117,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     check_command = commands.add_parser("check", help="Check whether a lane meets the specification threshold.")
     add_root(check_command)
     check_command.add_argument("--session-ref", required=True)
+    check_command.add_argument(
+        "--repair",
+        action="store_true",
+        help="On a failing check, derive the missing values from the record's own primary source, mark them presumed, and re-check.",
+    )
 
     guidance_command = commands.add_parser("guidance", help="Locate canonical operator guidance for a working directory.")
     guidance_command.add_argument("--cwd", type=Path, required=True)
@@ -243,6 +249,13 @@ def main(argv: list[str] | None = None) -> int:
             if found_record is None:
                 raise goal_store.GoalNotFoundError(args.session_ref)
             specification_issues = goal_store.check_specification(found_record)
+            if specification_issues and args.repair:
+                outcome = presumptive_repair(args.root, args.session_ref)
+                for presumption in outcome.presumptions:
+                    print(f"presumed {presumption.field} from {presumption.derived_from}: {presumption.value}")
+                for unanswered in outcome.unanswered:
+                    print(f"unanswered: {unanswered.question.question} ({unanswered.reason})")
+                specification_issues = list(outcome.remaining_issues)
             if specification_issues:
                 print("\n".join(specification_issues))
                 return 1
