@@ -23,6 +23,7 @@ from chitra.adjudication import (
     classify_claim,
     decision_entry,
     escalation_brief,
+    grants_merging,
     read_transcript_tail,
     resolve_approval,
     resolve_capability_denial,
@@ -133,6 +134,36 @@ def test_merge_claim_is_left_open_when_no_capability_grants_merging() -> None:
     assert resolution.verdict == "undetermined"
     assert resolution.evidence
     assert not resolution.directive
+
+
+@pytest.mark.parametrize(
+    ("authority_line", "expected"),
+    [
+        ("Merge one allowlisted, lane-authored, non-draft pull request whose merge state is clean.", True),
+        ("Merge, approve, or modify pull requests.", True),
+        ("Merges a green pull request on the operator's behalf.", True),
+        ("Read one pull request's merge state through the GitHub GraphQL API.", False),
+        ("Report the merge status of every open pull request.", False),
+        ("Author or edit any code in the reviewed pull request.", False),
+    ],
+)
+def test_only_a_line_that_performs_a_merge_counts_as_granting_one(authority_line: str, expected: bool) -> None:
+    assert grants_merging(authority_line) is expected
+
+
+def test_reading_merge_state_does_not_make_a_capability_a_merge_route() -> None:
+    """Wave one's auto-merge entry reads merge state and also merges.
+
+    Only the second line may arm the resolver, so a future read-only capability
+    cannot make this refuse a merge claim the fleet genuinely cannot perform.
+    """
+    sources = EvidenceSources(
+        manifest=_manifest(
+            grants=["Read one pull request's merge state through the GitHub GraphQL API."],
+            excludes=["Merge, approve, or modify pull requests."],
+        )
+    )
+    assert resolve_merge_rights(_claim("I cannot merge the pull request."), sources).verdict == "undetermined"
 
 
 def test_merge_claim_is_left_open_when_the_manifest_is_unreadable() -> None:
