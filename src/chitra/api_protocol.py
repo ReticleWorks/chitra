@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 from chitra.agent_runtime import STATUS_EVENT_TYPE, StatusEvent
+from chitra.agent_status import AGENT_STATES
 
 API_PROTOCOL_VERSION = 1
 MAX_WAIT_MS = 86_400_000
@@ -170,7 +171,7 @@ def parse_subscriptions(params: object) -> tuple[EventSubscription, ...]:
         if event_type != STATUS_EVENT_TYPE:
             raise ProtocolError("invalid_params", f"unsupported subscription type: {event_type}")
         agent_status = _text(item, "agent_status", name=f"subscriptions[{index}]")
-        if agent_status not in (None, "idle", "working", "blocked", "done", "unknown"):
+        if agent_status is not None and agent_status not in AGENT_STATES:
             raise ProtocolError("invalid_params", "agent_status filter is invalid")
         predicate = parse_predicate(item["where"]) if "where" in item else None
         subscriptions.append(
@@ -189,7 +190,7 @@ def parse_subscriptions(params: object) -> tuple[EventSubscription, ...]:
 
 def api_schema() -> dict[str, object]:
     """Return the bundled discovery document for requests and wire shapes."""
-    state_enum = ["idle", "working", "blocked", "done", "unknown"]
+    state_enum = list(AGENT_STATES)
     request_base = {
         "type": "object",
         "required": ["id", "method", "params"],

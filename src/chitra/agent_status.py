@@ -12,15 +12,25 @@ import os
 import re
 import tomllib
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 from typing import Any, Literal, cast
 
-AgentState = Literal["idle", "working", "blocked", "done", "unknown"]
-ManifestState = Literal["idle", "working", "blocked"]
+AgentState = Literal["idle", "working", "blocked", "done", "unknown", "rate_limited_hard", "rate_limited_warn"]
+ManifestState = Literal["idle", "working", "blocked", "rate_limited_hard", "rate_limited_warn"]
 MatcherKind = Literal["contains", "regex", "line_regex"]
 ManifestSourceKind = Literal["local", "bundled"]
 BlockerKind = Literal["approval", "question", "permission"]
+
+MANIFEST_STATES = ("idle", "working", "blocked", "rate_limited_hard", "rate_limited_warn")
+AGENT_STATES = ("idle", "working", "blocked", "done", "unknown", "rate_limited_hard", "rate_limited_warn")
+# A pane that has hit a provider cap still draws its input row, so without a
+# state of its own it classifies as idle. That is exactly how a Codex lane sat
+# on a weekly hard cap for roughly two days: the monitor saw idle and had no
+# reason to look closer. These two states are therefore never overridden by
+# another rule that also matched.
+RATE_LIMITED_STATES = frozenset({"rate_limited_hard", "rate_limited_warn"})
 
 DEFAULT_KNOWN_AGENT_IDLE_FALLBACK = "default_known_agent_idle_fallback"
 UNKNOWN_AGENT_IDLE_FALLBACK = "unknown_agent_idle_fallback"
@@ -35,6 +45,45 @@ SUPPORTED_REGIONS = frozenset({"whole", "bottom"})
 SUPPORTED_BLOCKER_KINDS = frozenset({"approval", "question", "permission"})
 _AGENT_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _RULE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+
+# "…or try again at Aug 19th, 2026 11:37 PM." — the tail of the Codex hard-cap
+# banner. The date is the one thing in the banner an operator can act on, so it
+# is parsed out rather than left in prose.
+_RESUME_AT_RE = re.compile(r"try again at\s+(?P<when>[^.\n]+?)\s*[.\n]", re.IGNORECASE)
+_ORDINAL_RE = re.compile(r"(?<=\d)(?:st|nd|rd|th)\b", re.IGNORECASE)
+_RESUME_AT_FORMATS = (
+    "%b %d, %Y %I:%M %p",
+    "%B %d, %Y %I:%M %p",
+    "%b %d %Y %I:%M %p",
+    "%B %d %Y %I:%M %p",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%dT%H:%M",
+)
+
+
+def parse_resume_at(text: str) -> str | None:
+    """Return the banner's resume time as an ISO8601-UTC string, or None.
+
+    The banner carries no timezone and no seconds. It is rendered in the pane's
+    own local time, so it is read in the host's local zone and converted; the
+    result is therefore minute-precision. When a provider also reports a
+    ``resets_at`` epoch -- Codex does, through ``chitra-usage`` -- that reading
+    is the more precise one and should win. This exists for the case the
+    incident actually presented: a capped pane on screen and no usage reading
+    for that host at all.
+    """
+    match = _RESUME_AT_RE.search(text)
+    if match is None:
+        return None
+    raw = _ORDINAL_RE.sub("", " ".join(match.group("when").split()))
+    for pattern in _RESUME_AT_FORMATS:
+        try:
+            parsed = datetime.strptime(raw, pattern)
+        except ValueError:
+            continue
+        local = parsed.astimezone() if parsed.tzinfo is None else parsed
+        return local.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    return None
 
 
 def default_manifest_dir() -> Path:
@@ -172,6 +221,10 @@ class DetectionExplain:
     screen_detection_skip_reason: str | None
     evaluated_rules: tuple[RuleEvaluation, ...]
     warning: str | None = None
+    # Set only for rate_limited_hard, and only when the banner named a time.
+    # A cap with no readable resume time still reports the state; the response
+    # protocol then has to source the time from the provider reading instead.
+    resume_at: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -188,6 +241,7 @@ class DetectionExplain:
             "screen_detection_skip_reason": self.screen_detection_skip_reason,
             "evaluated_rules": [evaluation.to_dict() for evaluation in self.evaluated_rules],
             "warning": self.warning,
+            "resume_at": self.resume_at,
         }
 
 
@@ -294,8 +348,8 @@ def _parse_rule(value: object, *, index: int) -> ManifestRule:
     if _RULE_ID_RE.fullmatch(identifier) is None:
         raise ManifestError(f"{path}.id must be a safe diagnostic identifier")
     state = _text(raw, "state", path=path)
-    if state not in ("idle", "working", "blocked"):
-        raise ManifestError(f"{path}.state must be idle, working, or blocked")
+    if state not in MANIFEST_STATES:
+        raise ManifestError(f"{path}.state must be one of: {', '.join(MANIFEST_STATES)}")
     region = raw.get("region", "bottom")
     if region not in SUPPORTED_REGIONS:
         raise ManifestError(f"{path}.region must be whole or bottom")
@@ -441,7 +495,15 @@ def classify_snapshot(snapshot: str, *, agent: str, repository: ManifestReposito
         if evaluation.matched:
             matched_rules.append(rule)
     matched_rule = matched_rules[0] if matched_rules else None
-    if matched_rule is not None and matched_rule.state == "blocked":
+    # A capped pane draws an input row and can even still show a working
+    # footer from the turn that hit the wall, so both an idle and a working
+    # rule can match at the same time. Neither is the state that matters:
+    # until the cap lifts the lane is going nowhere, and calling it idle is
+    # what made the last one invisible for two days.
+    rate_limited = next((rule for rule in matched_rules if rule.state in RATE_LIMITED_STATES), None)
+    if rate_limited is not None:
+        matched_rule = rate_limited
+    elif matched_rule is not None and matched_rule.state == "blocked":
         # A live working footer is newer evidence than blocker-shaped text
         # retained above it in the bounded capture. Working rules therefore
         # suppress a simultaneous screen-derived blocker match regardless of
@@ -473,6 +535,11 @@ def classify_snapshot(snapshot: str, *, agent: str, repository: ManifestReposito
         matched_rule=matched_rule.identifier,
         blocker_kind=matched_rule.blocker_kind,
         fallback_reason=None,
+        resume_at=(
+            parse_resume_at(matched_rule.region_text(bounded_snapshot))
+            if matched_rule.state == "rate_limited_hard"
+            else None
+        ),
         screen_detection_skipped=False,
         screen_detection_skip_reason=None,
         evaluated_rules=tuple(evaluations),
