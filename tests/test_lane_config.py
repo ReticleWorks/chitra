@@ -150,7 +150,16 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
             "high",
         ],
     ]
-    assert calls[2:] == [calls[0]] * 5
+    assert calls[2:-1] == [calls[0]] * 5
+    # The launch arms the transcript pipe before it writes the receipt, so a
+    # lane is never recorded as governed while nothing is recording it.
+    assert calls[-1][-5:] == [
+        "pipe-pane",
+        "-o",
+        "-t",
+        "alpha:0.0",
+        f"cat >> {lane.state_dir / 'tmux-transcript.log'}",
+    ]
     receipt = __import__("json").loads((lane.state_dir / "lane-launch.json").read_text())
     assert receipt["session_ref"] == "tophand:alpha:0.0"
     assert receipt["goal_snapshot"]["source"] == "task-file:lane-architecture"
