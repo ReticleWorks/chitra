@@ -625,6 +625,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_STALE_AFTER_SECONDS,
         help="Age at which a fleet export counts as stale (default: two export intervals).",
     )
+    evaluate_command.add_argument(
+        "--expect-host",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help="Name a host that must be publishing. One with no export directory reads as missing-export, not as nothing. Repeatable.",
+    )
+    evaluate_command.add_argument(
+        "--fail-on-incident",
+        action="store_true",
+        help="Exit non-zero when any host reads stale-export, missing-export, or invalid-export.",
+    )
     evaluate_command.add_argument("--policy-config", type=Path)
 
     policy_command = commands.add_parser("policy", help="Print the effective usage policy as JSON.")
@@ -650,12 +662,32 @@ def _run_export(args: argparse.Namespace) -> None:
         print(json.dumps({**export.to_dict(), "path": str(path)}, sort_keys=True))
 
 
-def _run_fleet_evaluate(args: argparse.Namespace) -> None:
-    """Render one verdict line per host and backend from the shared tree."""
-    from chitra.usage_export import read_fleet_exports
+def _run_fleet_evaluate(args: argparse.Namespace) -> int:
+    """Render one verdict line per host and backend from the shared tree.
 
-    for verdict in read_fleet_exports(args.fleet_dir, stale_after_seconds=args.stale_after_seconds):
+    Returns the exit status. Without ``--fail-on-incident`` this is always 0
+    and the caller reads the lines; with it, an unreadable host makes the
+    command fail, so a systemd oneshot can carry the alarm rather than needing
+    something else to parse the output and notice.
+    """
+    from chitra.usage_export import INCIDENT_VERDICTS, read_fleet_exports
+
+    incidents = 0
+    for verdict in read_fleet_exports(
+        args.fleet_dir,
+        stale_after_seconds=args.stale_after_seconds,
+        expect_hosts=args.expect_host,
+    ):
         print(json.dumps(verdict.to_dict(), sort_keys=True))
+        if verdict.verdict in INCIDENT_VERDICTS:
+            incidents += 1
+    if incidents and args.fail_on_incident:
+        print(
+            f"chitra-usage: {incidents} host/backend reading(s) could not be trusted; the monitor is blind to them",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -666,7 +698,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "evaluate" and args.fleet_dir is not None:
             if args.dir is not None:
                 raise ValueError("pass either --dir or --fleet-dir, not both")
-            _run_fleet_evaluate(args)
+            return _run_fleet_evaluate(args)
         elif args.command == "read-claude":
             snapshots = read_snapshots(args.dir, staleness_seconds=args.staleness_seconds)
             payload = [_snapshot_with_fresh(snapshot, fresh) for snapshot, fresh in snapshots]
