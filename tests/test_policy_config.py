@@ -12,6 +12,7 @@ from chitra.policy_config import (
     POLICY_CONFIG_ENV_VAR,
     GuidancePolicy,
     LoadPolicy,
+    MergePolicyConfig,
     PolicyConfig,
     PRReviewPolicy,
     UsagePolicy,
@@ -228,3 +229,54 @@ def test_resolve_guidance_uses_longest_component_boundary_prefix_and_default(tmp
 def test_guidance_policy_rejects_empty_document_values() -> None:
     with pytest.raises(ValueError, match="canonical_decisions values"):
         GuidancePolicy(canonical_decisions={"default": ""})
+
+
+def test_merge_is_off_and_allows_nothing_until_an_operator_configures_it() -> None:
+    policy = PolicyConfig().merge
+    assert policy.enabled is False
+    assert policy.allowed_repos == []
+    assert policy.lane_authors == []
+    assert policy.hold_label == "chitra-hold"
+
+
+def test_merge_policy_rejects_a_repository_that_is_not_owner_slash_name() -> None:
+    with pytest.raises(ValueError, match="owner/name"):
+        MergePolicyConfig(allowed_repos=["chitra"])
+
+
+def test_merge_policy_rejects_padded_or_empty_entries() -> None:
+    with pytest.raises(ValueError, match="non-empty and unpadded"):
+        MergePolicyConfig(lane_authors=[" lane-bot"])
+
+
+def test_merge_policy_rejects_being_enabled_with_nothing_allowlisted() -> None:
+    with pytest.raises(ValueError, match="no repository is allowlisted"):
+        MergePolicyConfig(enabled=True)
+
+
+def test_merge_policy_rejects_an_unnamed_hold_label() -> None:
+    with pytest.raises(ValueError, match="hold_label"):
+        MergePolicyConfig(hold_label="  ")
+
+
+def test_merge_policy_reads_from_policy_yaml(tmp_path: Path) -> None:
+    path = tmp_path / "policy.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "merge": {
+                    "enabled": True,
+                    "allowed_repos": ["ReticleWorks/chitra"],
+                    "lane_authors": ["lane-bot"],
+                    "app_login": "polyphony-automation[bot]",
+                    "poll_seconds": 300,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    merge = load_policy_config(path).merge
+    assert merge.enabled is True
+    assert merge.allowed_repos == ["ReticleWorks/chitra"]
+    assert merge.app_login == "polyphony-automation[bot]"
+    assert merge.poll_seconds == 300
