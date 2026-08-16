@@ -29,6 +29,7 @@ from chitra.adjudication import (
     resolve_capability_denial,
     resolve_merge_rights,
     resolve_usage,
+    split_claim_text,
 )
 from chitra.capabilities import CapabilityManifest
 from chitra.convlog import ConversationEntry
@@ -449,6 +450,53 @@ def test_an_escalation_renders_into_the_existing_operator_brief() -> None:
     assert brief.category == "decision"
     assert brief.decision == "Do you want to spend money on a second storage volume?"
     assert brief.source_quote == ["Should we buy a second storage volume?"]
+
+
+#: Verbatim from the conductor-audit goal record on 2026-08-16. Four questions
+#: with four different answers, recorded as one line. A dry run against real
+#: fleet state adjudicated the whole thing as one claim, which is the defect
+#: split_claim_text exists to fix.
+REAL_FOUR_ASK_NEEDS = (
+    "Four operator answers, all at the end of the evidence file: (1) Slack export or read-only "
+    "token for D0B8CQVUQSC and C0B7NDQSFV2 covering 2-14 Aug, the only way to close the "
+    "delivery-record gap since the governed slack.conversations.history call is refused; "
+    "(2) whether the proposed warden actuator is wanted, since it would give a read-only "
+    "component restart authority; (3) whether to add the audit account to adm on tophand, "
+    "without which the ansible-pull failure cause stays unreadable; (4) whether the "
+    "observability floor should go fleet-wide or tophand-only is deliberate."
+)
+
+
+def test_a_real_recorded_line_carrying_four_asks_becomes_four_claims() -> None:
+    parts = split_claim_text(REAL_FOUR_ASK_NEEDS)
+    assert len(parts) == 4
+    assert all(part.startswith("Four operator answers, all at the end of the evidence file:") for part in parts)
+    assert "Slack export" in parts[0]
+    assert "warden actuator" in parts[1]
+    assert "audit account to adm" in parts[2]
+    assert "observability floor" in parts[3]
+    assert "warden actuator" not in parts[0]
+
+
+def test_one_ask_stays_one_claim() -> None:
+    assert split_claim_text("Can you merge the pull request?") == ["Can you merge the pull request?"]
+
+
+def test_a_stray_reference_number_never_splits_a_sentence() -> None:
+    text = "The check failed on run (3) of the retry loop and I cannot get past it."
+    assert split_claim_text(text) == [text]
+
+
+def test_numbering_that_does_not_run_from_one_is_left_alone() -> None:
+    text = "See (2) above and (5) below for the detail that blocks this."
+    assert split_claim_text(text) == [text]
+
+
+def test_a_line_leading_numbered_list_is_split_by_the_existing_reader() -> None:
+    text = "Open asks:\n1. Grant the token for the export.\n2. Confirm the restart authority.\n"
+    parts = split_claim_text(text)
+    assert len(parts) == 2
+    assert "Grant the token" in parts[0]
 
 
 def test_only_the_recent_slice_of_a_recorded_history_is_read(tmp_path: Path) -> None:

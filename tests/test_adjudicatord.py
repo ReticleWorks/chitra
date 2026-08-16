@@ -160,6 +160,66 @@ def test_a_second_pass_settles_nothing_new(tmp_path: Path) -> None:
     assert second.undetermined == 0
 
 
+def test_a_proposed_manifest_can_be_dry_run_before_it_lands(tmp_path: Path) -> None:
+    """An operator can see what a manifest would decide before merging it.
+
+    This is how wave one's auto-merge capability was checked against this
+    resolver ahead of time: point the dry run at that branch's manifest and read
+    the verdict it would produce.
+    """
+    manifest = tmp_path / "proposed.yaml"
+    manifest.write_text(
+        "schema: chitra.capabilities.v1\n"
+        "capabilities:\n"
+        "  - name: auto-merge\n"
+        "    kind: daemon\n"
+        "    purpose: Land green pull requests without a person in the path.\n"
+        "    when_to_use: Run as the supervised merge daemon.\n"
+        "    authority:\n"
+        "      level: act\n"
+        "      grants:\n"
+        "        - Read one pull request's merge state through the GitHub GraphQL API.\n"
+        "        - Merge one allowlisted, lane-authored, non-draft pull request whose merge state is clean.\n"
+        "      excludes:\n"
+        "        - Author or edit any code in the reviewed pull request.\n"
+        "    default_enabled: true\n"
+        "    commands:\n"
+        "      - name: chitra-merge\n"
+        "        description: Merge one pull request.\n"
+        "        argv: [chitra-merge]\n"
+        "        params: []\n"
+        "        mutates: true\n",
+        encoding="utf-8",
+    )
+    _record(tmp_path, needs="I cannot merge the pull request without you doing it for me.")
+    config = resolve_config(
+        state_dir=tmp_path,
+        queue_dir=tmp_path / "queue",
+        convlog_path=tmp_path / "conversation.jsonl",
+        decisions_path=tmp_path / "decisions.jsonl",
+        adjudication_log_path=tmp_path / "adjudications.jsonl",
+        manifest_path=manifest,
+    )
+    report = run_once(config, adjudicator=None, now=NOW)
+    assert report.refused == 1
+    recorded = [json.loads(line) for line in (tmp_path / "adjudications.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert recorded[0]["verdict"] == "fleet-doable"
+    assert "chitra-merge" in recorded[0]["directive"]
+
+
+def test_the_shipped_manifest_does_not_claim_a_merge_route_it_lacks(tmp_path: Path) -> None:
+    """Until a merge capability lands, a merge claim stays undetermined."""
+    _record(tmp_path, needs="I cannot merge the pull request without you doing it for me.")
+    config = resolve_config(
+        state_dir=tmp_path,
+        queue_dir=tmp_path / "queue",
+        convlog_path=tmp_path / "conversation.jsonl",
+        decisions_path=tmp_path / "decisions.jsonl",
+        adjudication_log_path=tmp_path / "adjudications.jsonl",
+    )
+    assert run_once(config, adjudicator=None, now=NOW).undetermined == 1
+
+
 def test_a_non_positive_interval_is_refused() -> None:
     with pytest.raises(ValueError, match="poll_seconds"):
         resolve_config(poll_seconds=0)

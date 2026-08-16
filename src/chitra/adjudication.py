@@ -36,6 +36,7 @@ from chitra.capabilities import Capability, CapabilityManifest, load_manifest
 from chitra.convlog import ConversationEntry, OperatorBrief, read_entries
 from chitra.decisions import DecisionEntry, read_decisions
 from chitra.goals import GoalRecord, lane_id_from_session_ref, session_host
+from chitra.lane_read import extract_open_asks
 from chitra.lexicon import OPERATOR_GATE_PATTERNS
 from chitra.plain_english import plain_english_issues
 from chitra.usage_export import FleetExportVerdict, read_fleet_exports
@@ -132,6 +133,11 @@ RULING_MATCH_MIN_RATIO = 0.34
 #: carry no denial wording, to count as the session having done the thing before.
 TRANSCRIPT_MATCH_MIN_TERMS = 2
 TRANSCRIPT_QUOTE_MAX_CHARS = 300
+
+#: Inline numbering, the shape recorded lines actually use for several asks.
+_INLINE_ENUMERATION = re.compile(r"\((\d{1,2})\)\s")
+#: How much lead-in text each split-out ask keeps, so it still reads in context.
+CLAIM_PREAMBLE_MAX_CHARS = 160
 
 #: Recorded session histories run to megabytes. Only the most recent slice is
 #: read, so this module cannot become the reason a sweep exhausts memory.
@@ -245,6 +251,39 @@ class Adjudication(_FrozenModel):
     @property
     def reaches_operator(self) -> bool:
         return self.verdict == "operator-required"
+
+
+def split_claim_text(text: str) -> list[str]:
+    """Split one recorded line that carries several numbered asks.
+
+    A single ``needs`` line in the wild routinely carries four separate
+    questions with four different answers. Adjudicating them as one lump forces
+    one verdict on all of them, so a single question that genuinely needs the
+    operator drags the other three up with it — exactly the pattern this daemon
+    exists to end.
+
+    Line-leading numbered lists are split by the reader the doctrine already
+    names for extracting asks verbatim. Inline ``(1) ... (2) ...`` numbering,
+    which is the shape recorded lines actually use, is split here, and only when
+    the numbers run consecutively from one, so a stray reference cannot break a
+    sentence in half. Each part keeps the lead-in text, because a question read
+    without its context reads worse, not better.
+    """
+    listed = extract_open_asks(text)
+    if len(listed) >= 2:
+        return listed
+    markers = list(_INLINE_ENUMERATION.finditer(text))
+    if len(markers) < 2:
+        return [text.strip()]
+    if [int(marker.group(1)) for marker in markers] != list(range(1, len(markers) + 1)):
+        return [text.strip()]
+    preamble = text[: markers[0].start()].strip()[:CLAIM_PREAMBLE_MAX_CHARS]
+    parts: list[str] = []
+    for index, marker in enumerate(markers):
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
+        item = text[marker.start() : end].strip().rstrip(";,")
+        parts.append(f"{preamble} {item}".strip() if preamble else item)
+    return parts
 
 
 def read_transcript_tail(path: Path, *, max_bytes: int = DEFAULT_TRANSCRIPT_TAIL_BYTES) -> str:
