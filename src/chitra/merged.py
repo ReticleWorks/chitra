@@ -199,7 +199,7 @@ def run_once(
     if not policy.allowed_repos:
         LOGGER.info("no repositories are allowlisted for merge; nothing to do")
         return []
-    identity = resolve_identity(runner=runner)
+    identity = resolve_identity(expected_app_login=policy.app_login, runner=runner)
     records: list[MergeRecord] = []
     for repo in policy.allowed_repos:
         try:

@@ -70,7 +70,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> int:
     policy = policy_from_config(args.policy_config)
     root = args.state_dir or default_state_dir()
-    identity = resolve_identity()
+    identity = resolve_identity(expected_app_login=policy.app_login)
     state = fetch_state(args.repo, args.pr)
     with repo_merge_lock(root / "merge-locks", args.repo) as held:
         if not held:

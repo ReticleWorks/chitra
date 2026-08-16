@@ -277,25 +277,45 @@ def fetch_state(repo: str, number: int, *, runner: GhRunner = run_gh) -> PullReq
     )
 
 
-def resolve_identity(*, runner: GhRunner = run_gh) -> GitHubIdentity:
+def resolve_identity(*, expected_app_login: str = "", runner: GhRunner = run_gh) -> GitHubIdentity:
     """Return the identity the configured token actually acts as.
 
-    An installation token for a GitHub App answers ``/user`` with a bot login
-    and type ``Bot``. A personal access token answers with a human ``User``.
-    Nothing here upgrades a user token into an app identity, and the caller
-    refuses to merge unless this reports an app.
+    ``/installation/repositories`` is the discriminator, not ``/user``. An
+    installation token cannot call ``/user`` at all -- GitHub answers 403
+    "Resource not accessible by integration" -- so asking ``/user`` first can
+    only ever recognise a personal token, and fails closed on the one identity
+    this daemon requires. Measured against the real credential on 2026-08-16;
+    no fixture would have shown it.
+
+    A 200 from ``/installation/repositories`` therefore proves an installation
+    token. A personal token is refused there and is identified through
+    ``/user`` instead.
+
+    One honest limit. An installation token does not carry its own app's login
+    in any response it is permitted to make, so ``login`` here is the
+    configured expectation rather than a reading, and ``source`` says exactly
+    that. The login that is genuinely *measured* is recorded after a merge,
+    from the pull request's own ``merged_by`` -- see ``merge``.
     """
+    installation = runner(["gh", "api", "/installation/repositories", "--jq", ".total_count"])
+    if installation.returncode == 0:
+        return GitHubIdentity(
+            login=expected_app_login or "unnamed-app[bot]",
+            kind="app",
+            source="gh api /installation/repositories (installation token confirmed; login from policy)",
+        )
     result = runner(["gh", "api", "user", "--jq", "[.login, .type] | @tsv"])
     if result.returncode != 0:
-        raise IdentityError(f"could not resolve the acting GitHub identity: {result.stderr.strip()}")
+        raise IdentityError(
+            "could not resolve the acting GitHub identity: it is not an installation token "
+            f"({installation.stderr.strip()}) and /user failed ({result.stderr.strip()})"
+        )
     parts = result.stdout.strip().split("\t")
     login = parts[0] if parts else ""
     account_type = parts[1] if len(parts) > 1 else ""
     if not login:
         raise IdentityError("the GitHub API returned no login for the configured token")
-    kind: Literal["app", "user", "unknown"] = (
-        "app" if account_type == "Bot" or login.endswith("[bot]") else "user" if account_type == "User" else "unknown"
-    )
+    kind: Literal["app", "user", "unknown"] = "user" if account_type == "User" else "unknown"
     return GitHubIdentity(login=login, kind=kind, source="gh api user")
 
 
@@ -335,6 +355,10 @@ class MergeRecord:
     merged: bool
     merge_commit: str
     dry_run: bool
+    # Who GitHub says actually merged it, read back after the fact. The
+    # identity above is what the daemon believed it was; this is what happened.
+    # Empty on every refusal and every dry run, because nothing happened.
+    merged_by: str = ""
     at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
 
     def to_dict(self) -> dict[str, object]:
@@ -348,6 +372,7 @@ class MergeRecord:
             "head_oid": self.head_oid,
             "merged": self.merged,
             "merge_commit": self.merge_commit,
+            "merged_by": self.merged_by,
             "dry_run": self.dry_run,
             "decision": self.decision.to_dict(),
             # The identity is stamped on every line, refusals included. A
@@ -427,5 +452,25 @@ def merge(
         identity=identity,
         merged=True,
         merge_commit=state.head_oid,
+        merged_by=merged_by(state, runner=runner),
         dry_run=False,
     )
+
+
+def merged_by(state: PullRequestState, *, runner: GhRunner = run_gh) -> str:
+    """Read back which account GitHub recorded as having merged.
+
+    This is the only identity in the record that is measured rather than
+    configured, which is exactly why it is worth reading. A merge attributed to
+    a human when the ledger claims an app is the failure this answers, and it
+    cannot be answered before the merge.
+
+    A failure to read it is not a failure to merge -- the merge already
+    happened -- so this returns an empty string rather than raising.
+    """
+    owner, name = _split_repo(state.repo)
+    result = runner(["gh", "api", f"/repos/{owner}/{name}/pulls/{state.number}", "--jq", '.merged_by.login // ""'])
+    if result.returncode != 0:
+        logger.warning("merge_merged_by_unreadable", repo=state.repo, number=state.number, stderr=result.stderr.strip())
+        return ""
+    return result.stdout.strip()
