@@ -112,7 +112,16 @@ _DENIAL_MARKERS = re.compile(
     re.IGNORECASE,
 )
 
-_MERGE_GRANT = re.compile(r"\bmerg\w*", re.IGNORECASE)
+# "Merge one allowlisted pull request" grants merging. "Read one pull request's
+# merge state" does not. Manifest authority lines are imperative sentences, so
+# the noun phrases are removed first and only a merging verb counts.
+_MERGE_NOUN_PHRASE = re.compile(r"\bmerge[-\s](?:state|status|queue|conflict|base|commit|sha|method)\w*", re.IGNORECASE)
+_MERGE_ACTION = re.compile(r"\bmerg(?:e|es|ed|ing)\b", re.IGNORECASE)
+
+
+def grants_merging(authority_line: str) -> bool:
+    """Whether one declared authority line permits performing a merge."""
+    return bool(_MERGE_ACTION.search(_MERGE_NOUN_PHRASE.sub(" ", authority_line)))
 
 #: How much of a claim's distinctive vocabulary a recorded ruling must share
 #: before the ruling is treated as already covering that claim.
@@ -360,7 +369,7 @@ def _merge_capabilities(manifest: CapabilityManifest) -> tuple[Capability, ...]:
     return tuple(
         capability
         for capability in manifest.capabilities
-        if any(_MERGE_GRANT.search(grant) for grant in capability.authority.grants)
+        if any(grants_merging(grant) for grant in capability.authority.grants)
     )
 
 
@@ -403,7 +412,7 @@ def resolve_merge_rights(claim: BlockerClaim, sources: EvidenceSources) -> Resol
     excluding = tuple(
         capability
         for capability in sources.manifest.capabilities
-        if any(_MERGE_GRANT.search(exclusion) for exclusion in capability.authority.excludes)
+        if any(grants_merging(exclusion) for exclusion in capability.authority.excludes)
     )
     evidence = tuple(
         Evidence(
