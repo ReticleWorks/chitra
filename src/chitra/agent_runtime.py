@@ -13,9 +13,12 @@ from typing import Any, Literal, cast
 
 from chitra._fsio import write_json_atomic
 from chitra.agent_status import (
+    AGENT_STATES,
+    MANIFEST_STATES,
     AgentState,
     DetectionExplain,
     ManifestRepository,
+    ManifestState,
     classify_snapshot,
     completion_explain,
     integration_explain,
@@ -147,7 +150,7 @@ class PaneStatus:
             name="pane status",
         )
         state = _required_text(raw, "agent_status", name="pane status")
-        if state not in ("idle", "working", "blocked", "done", "unknown"):
+        if state not in AGENT_STATES:
             raise ValueError("pane status agent_status is invalid")
         authority = _required_text(raw, "authority", name="pane status")
         if authority not in ("integration", "manifest", "fallback", "completion"):
@@ -275,11 +278,12 @@ def detection_explain_from_dict(payload: object) -> DetectionExplain:
             "screen_detection_skip_reason",
             "evaluated_rules",
             "warning",
+            "resume_at",
         },
         name="detection explain",
     )
     state = _required_text(raw, "state", name="detection explain")
-    if state not in ("idle", "working", "blocked", "done", "unknown"):
+    if state not in AGENT_STATES:
         raise ValueError("detection explain state is invalid")
     authority = _required_text(raw, "authority", name="detection explain")
     if authority not in ("integration", "manifest", "fallback", "completion"):
@@ -319,7 +323,7 @@ def detection_explain_from_dict(payload: object) -> DetectionExplain:
             name=f"detection explain evaluated_rules[{index}]",
         )
         eval_state = _required_text(evaluation, "state", name="rule evaluation")
-        if eval_state not in ("idle", "working", "blocked"):
+        if eval_state not in MANIFEST_STATES:
             raise ValueError("rule evaluation state is invalid")
         priority = evaluation.get("priority")
         region_lines = evaluation.get("region_lines")
@@ -345,7 +349,7 @@ def detection_explain_from_dict(payload: object) -> DetectionExplain:
         evaluations.append(
             RuleEvaluation(
                 rule_id=_required_text(evaluation, "rule_id", name="rule evaluation"),
-                state=cast(Literal["idle", "working", "blocked"], eval_state),
+                state=cast(ManifestState, eval_state),
                 priority=priority,
                 region=_required_text(evaluation, "region", name="rule evaluation"),
                 region_lines=region_lines,
@@ -369,6 +373,7 @@ def detection_explain_from_dict(payload: object) -> DetectionExplain:
         screen_detection_skip_reason=_optional_text(raw, "screen_detection_skip_reason", name="detection explain"),
         evaluated_rules=tuple(evaluations),
         warning=_optional_text(raw, "warning", name="detection explain"),
+        resume_at=_optional_text(raw, "resume_at", name="detection explain"),
     )
 
 
