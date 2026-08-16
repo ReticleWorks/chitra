@@ -673,6 +673,30 @@ class AdjudicatorReply(BaseModel):
     escalation_class: EscalationClass | None = None
     citations: tuple[str, ...] = ()
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_unused_fields(cls, payload: object) -> object:
+        """Treat an empty answer field as absent, however it was spelled.
+
+        A live run found two harmless spellings for "this field does not apply
+        here": a null directive on an escalation, and an empty escalation_class
+        on a refusal. Both mean the same thing as leaving the field out, and
+        rejecting them threw away correct decisions. Only emptiness is
+        normalized. The contract below still runs, so a reply that actually
+        breaks it is still refused.
+        """
+        if not isinstance(payload, dict):
+            return payload
+        normalized = dict(payload)
+        for field in ("directive", "escalation"):
+            if normalized.get(field) is None:
+                normalized[field] = ""
+        if isinstance(normalized.get("escalation_class"), str) and not normalized["escalation_class"].strip():
+            normalized["escalation_class"] = None
+        if normalized.get("citations") is None:
+            normalized["citations"] = ()
+        return normalized
+
     @model_validator(mode="after")
     def validate_reply(self) -> AdjudicatorReply:
         if self.verdict in REFUSING_VERDICTS:
@@ -726,12 +750,20 @@ _ADJUDICATOR_INSTRUCTION = (
     "A refusing verdict needs a directive addressed to the session and at least one citation drawn from the "
     "supplied material. An escalation needs exactly one line and an escalation_class of presence, spend, or "
     "scope-change, and no directive. Preserve claim_id exactly. Write plain sentences and never quote or "
-    "impersonate the operator."
+    "impersonate the operator. Write for a reader outside this system: say \"work session\", never \"lane\". "
+    "Output the JSON object on its own, with no code fence and no other text."
 )
 
 
 class ClaudeProcessAdjudicator:
-    """Run one fresh, bounded ``claude -p`` process for a single claim."""
+    """Run one fresh, bounded ``claude -p`` process for a single claim.
+
+    The process is granted no tools at all. Everything it may decide from is in
+    the prompt, so it has nothing legitimate to read, run, or fetch, and the
+    instruction not to fetch anything is enforced rather than merely asked for.
+    Session persistence is off, so one claim's process cannot carry state into
+    the next one's.
+    """
 
     def __init__(
         self,
@@ -760,7 +792,17 @@ class ClaudeProcessAdjudicator:
         return _ADJUDICATOR_INSTRUCTION + "\nINPUT=" + json.dumps(request, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
     def adjudicate(self, claim: BlockerClaim, context: AdjudicationContext, evidence: Sequence[Evidence]) -> AdjudicatorReply:
-        command = [self.command, "-p", self._prompt(claim, context, evidence), "--output-format", "text"]
+        command = [
+            self.command,
+            "-p",
+            self._prompt(claim, context, evidence),
+            "--output-format",
+            "text",
+            "--no-session-persistence",
+            # No tools. Every fact it may use is already in the prompt.
+            "--allowed-tools",
+            "",
+        ]
         if self.model is not None:
             command.extend(["--model", self.model])
         try:
@@ -771,9 +813,32 @@ class ClaudeProcessAdjudicator:
             detail = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
             raise AdjudicatorProcessError(f"the adjudicator process failed: {detail}")
         try:
-            return AdjudicatorReply.model_validate_json(completed.stdout.strip())
+            return AdjudicatorReply.model_validate_json(unwrap_json_object(completed.stdout))
         except ValueError as exc:
             raise AdjudicatorProcessError(f"the adjudicator process returned an unusable answer: {exc}") from exc
+
+
+_FENCED_BLOCK = re.compile(r"```(?:json)?\s*(?P<body>.*?)```", re.DOTALL)
+
+
+def unwrap_json_object(text: str) -> str:
+    """Return the JSON object in a reply, with its usual packaging removed.
+
+    A live run found the reason this is needed: the answer comes back correct
+    but wrapped in a fenced code block, which a strict parser rejects. Two
+    deviations are tolerated and no more — a code fence, and prose either side
+    of the object. Anything else still fails, because the reply contract is what
+    keeps a malformed answer from reaching a person as if it were a decision.
+    """
+    stripped = text.strip()
+    fenced = _FENCED_BLOCK.search(stripped)
+    if fenced is not None:
+        stripped = fenced.group("body").strip()
+    if stripped.startswith("{"):
+        return stripped
+    opening = stripped.find("{")
+    closing = stripped.rfind("}")
+    return stripped[opening : closing + 1] if 0 <= opening < closing else stripped
 
 
 def _reply_text_issues(reply: AdjudicatorReply) -> tuple[str, ...]:
@@ -811,8 +876,18 @@ def adjudicate(
         return first
     issues = _reply_text_issues(reply)
     if issues:
+        # Fail closed, but say what actually happened. The evidence was fine and
+        # the wording was not, and a record that blamed the evidence would send
+        # whoever reads it looking in the wrong place.
         logger.warning("adjudication_stage_two_unreadable", claim_id=claim.claim_id, issues=list(issues))
-        return first
+        return first.model_copy(
+            update={
+                "basis": (
+                    "a reasoned answer was produced but its wording would not read plainly to a person, "
+                    f"so it was not used: {'; '.join(issues)}."
+                )
+            }
+        )
     evidence = (
         *first.evidence,
         *(
