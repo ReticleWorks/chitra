@@ -28,6 +28,7 @@ from chitra.usage import (
     UsageWindow,
     Verdict,
     codex_snapshot,
+    effective_windows,
     evaluate,
     read_snapshots,
 )
@@ -322,14 +323,19 @@ def build_codex_export(
             error=str(exc),
         )
     verdict = evaluate(snapshot, policy=policy)
+    # Each window is filed under the key it actually is, not the slot Codex
+    # reported it in. A capped account puts its weekly cap in ``primary``,
+    # which chitra maps to ``five_hour``; writing that under "5h" would tell
+    # the monitor a five-hour window resets three days from now.
+    short, long_window = effective_windows(snapshot)
     return UsageExport(
         host=host,
         backend="codex",
         account=snapshot.account,
         captured_at=captured,
         reading_ts=snapshot.ts,
-        five_hour=snapshot.five_hour,
-        long_window=snapshot.seven_day,
+        five_hour=short,
+        long_window=long_window,
         verdict=cast(ExportVerdict, verdict.level),
         policy_rev=policy_rev,
         binding_window=_binding_key("codex", verdict.binding_window),

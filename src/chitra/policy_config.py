@@ -55,29 +55,71 @@ class DispatchPolicy(BaseModel):
 
 
 class UsagePolicy(BaseModel):
-    """Operator-configurable thresholds and concurrency controls for usage."""
+    """Operator-configurable thresholds and concurrency controls for usage.
+
+    Claude and Codex get separate ladders because the long windows do not
+    behave alike. Claude's seven-day window degrades service; Codex's weekly
+    window is a hard cap with a multi-day reset, and one lane spent roughly
+    two days of its week sitting behind that cap in August 2026. So the Codex
+    weekly pause sits at 90, below Claude's 95: margin is cheaper than dead
+    time when the wall lasts days.
+    """
 
     pause_5h_pct: float = 92.0
     pause_7d_pct: float = 95.0
     warn_5h_pct: float = 80.0
     warn_7d_pct: float = 90.0
+    codex_pause_5h_pct: float = 92.0
+    codex_pause_weekly_pct: float = 90.0
+    codex_warn_5h_pct: float = 80.0
+    codex_warn_weekly_pct: float = 85.0
     max_running: int | None = None
     auto_resume: bool = True
+    # Whether a lane that reaches a pause verdict, or that watchd sees capped,
+    # may be transferred to the other backend without an operator ruling. The
+    # escalation cases -- irreversible or security-material work mid-flight,
+    # or both backends capped -- go up as a brief regardless of this knob.
+    auto_transfer: bool = True
 
     @model_validator(mode="after")
     def validate_thresholds(self) -> Self:
         """Reject impossible usage-policy values at configuration load time."""
-        for name in ("pause_5h_pct", "pause_7d_pct", "warn_5h_pct", "warn_7d_pct"):
+        for name in (
+            "pause_5h_pct",
+            "pause_7d_pct",
+            "warn_5h_pct",
+            "warn_7d_pct",
+            "codex_pause_5h_pct",
+            "codex_pause_weekly_pct",
+            "codex_warn_5h_pct",
+            "codex_warn_weekly_pct",
+        ):
             value = getattr(self, name)
             if not 0 < value <= 100:
                 raise ValueError(f"{name} must be greater than 0 and at most 100")
-        if self.warn_5h_pct > self.pause_5h_pct:
-            raise ValueError("warn_5h_pct must not exceed pause_5h_pct")
-        if self.warn_7d_pct > self.pause_7d_pct:
-            raise ValueError("warn_7d_pct must not exceed pause_7d_pct")
+        for warn_name, pause_name in (
+            ("warn_5h_pct", "pause_5h_pct"),
+            ("warn_7d_pct", "pause_7d_pct"),
+            ("codex_warn_5h_pct", "codex_pause_5h_pct"),
+            ("codex_warn_weekly_pct", "codex_pause_weekly_pct"),
+        ):
+            if getattr(self, warn_name) > getattr(self, pause_name):
+                raise ValueError(f"{warn_name} must not exceed {pause_name}")
         if self.max_running is not None and self.max_running < 1:
             raise ValueError("max_running must be at least 1 when set")
         return self
+
+    def pause_thresholds(self, kind: str) -> tuple[float, float]:
+        """Return this provider's (short-window, long-window) pause thresholds."""
+        if kind == "codex":
+            return self.codex_pause_5h_pct, self.codex_pause_weekly_pct
+        return self.pause_5h_pct, self.pause_7d_pct
+
+    def warn_thresholds(self, kind: str) -> tuple[float, float]:
+        """Return this provider's (short-window, long-window) warn thresholds."""
+        if kind == "codex":
+            return self.codex_warn_5h_pct, self.codex_warn_weekly_pct
+        return self.warn_5h_pct, self.warn_7d_pct
 
 
 class GuidancePolicy(BaseModel):
