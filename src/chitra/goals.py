@@ -62,6 +62,15 @@ SUPPORTED_SCHEMAS = ("chitra.goals.v2", "chitra.goals.v1")
 # queue) need to agree on.
 RATE_LIMIT_HOLD_REASON_PREFIX = "rate-limit:"
 LOAD_SHED_HOLD_REASON_PREFIX = "load-shed:"
+# Shared open_asks convention: an ask starting with this prefix records a
+# strategic value that chitra.interview derived from a primary source and
+# presumed, so the work could start immediately instead of waiting for an
+# answer. It is a standing invitation to correct that value, not a question
+# blocking anything. goals.py stays decision-free -- this is only the string
+# convention its writers and readers must agree on (chitra.interview writes
+# it; chitra.adjudicatord reads it so a presumption is never adjudicated as
+# a reported obstacle, and the board renders it for correction).
+PRESUMED_ASK_PREFIX = "presumed:"
 DONE_STATUSES = frozenset(("done-pending-verification", "done-pending-close"))
 LEGACY_ENROLLED_AT = "1970-01-01T00:00:00+00:00"
 

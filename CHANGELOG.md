@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- The short interview from the monitor doctrine is now code. A goal record that
+  fails its specification check is repaired from its own primary source, the
+  derived values are marked presumed and recorded for correction, and the work
+  starts immediately instead of waiting. A completion condition is never
+  presumed, and a question the source cannot answer is reported unanswered.
+  `chitra-goals check --repair` runs it by hand; the launch gate runs it before
+  it refuses.
+
 ## 0.9.11
 
 - Normalize canonical remote pane targets at the governed grant boundary and
