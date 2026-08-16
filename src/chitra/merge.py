@@ -442,6 +442,7 @@ def merge(
     )
     if result.returncode != 0:
         raise MergeError(f"gh pr merge failed for {state.repo}#{state.number}: {result.stderr.strip()}")
+    outcome = merge_outcome(state, runner=runner)
     return MergeRecord(
         repo=state.repo,
         number=state.number,
@@ -451,26 +452,52 @@ def merge(
         decision=decision,
         identity=identity,
         merged=True,
-        merge_commit=state.head_oid,
-        merged_by=merged_by(state, runner=runner),
+        merge_commit=outcome.merge_commit,
+        merged_by=outcome.merged_by,
         dry_run=False,
     )
 
 
-def merged_by(state: PullRequestState, *, runner: GhRunner = run_gh) -> str:
-    """Read back which account GitHub recorded as having merged.
+@dataclass(frozen=True, slots=True)
+class MergeOutcome:
+    """What GitHub recorded after a merge, read back rather than assumed."""
 
-    This is the only identity in the record that is measured rather than
-    configured, which is exactly why it is worth reading. A merge attributed to
-    a human when the ledger claims an app is the failure this answers, and it
-    cannot be answered before the merge.
+    merged_by: str
+    merge_commit: str
 
-    A failure to read it is not a failure to merge -- the merge already
-    happened -- so this returns an empty string rather than raising.
+
+def merge_outcome(state: PullRequestState, *, runner: GhRunner = run_gh) -> MergeOutcome:
+    """Read back who merged and which commit resulted.
+
+    Both are read, neither is inferred. A squash merge creates a NEW commit, so
+    the merged head is not the merge commit: recording the head under that name
+    would put a commit sha in the ledger that does not exist on the base branch.
+    Observed on the first real merge, 2026-08-16 -- head
+    ``185959d1``, actual merge commit ``e4823048``.
+
+    ``merged_by`` is the only identity in the record that is measured rather
+    than configured, which is why it is worth a second call. A merge attributed
+    to a human while the ledger claims an app is the failure it answers, and it
+    cannot be answered before the merge happens.
+
+    A failure to read either is not a failure to merge -- the merge already
+    happened -- so this returns what it has rather than raising.
     """
     owner, name = _split_repo(state.repo)
-    result = runner(["gh", "api", f"/repos/{owner}/{name}/pulls/{state.number}", "--jq", '.merged_by.login // ""'])
+    result = runner(
+        [
+            "gh",
+            "api",
+            f"/repos/{owner}/{name}/pulls/{state.number}",
+            "--jq",
+            '[(.merged_by.login // ""), (.merge_commit_sha // "")] | @tsv',
+        ]
+    )
     if result.returncode != 0:
-        logger.warning("merge_merged_by_unreadable", repo=state.repo, number=state.number, stderr=result.stderr.strip())
-        return ""
-    return result.stdout.strip()
+        logger.warning("merge_outcome_unreadable", repo=state.repo, number=state.number, stderr=result.stderr.strip())
+        return MergeOutcome(merged_by="", merge_commit="")
+    parts = result.stdout.strip().split("\t")
+    return MergeOutcome(
+        merged_by=parts[0] if parts else "",
+        merge_commit=parts[1] if len(parts) > 1 else "",
+    )

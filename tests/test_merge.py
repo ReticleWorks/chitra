@@ -258,18 +258,27 @@ def test_a_merge_is_pinned_to_the_commit_the_decision_was_made_against() -> None
 
 def test_a_merge_records_who_github_says_actually_merged_it() -> None:
     """The one identity in the record that is measured, not configured."""
-    runner = fake_runner(stdout="polyphony-automation[bot]\n")
+    runner = fake_runner(stdout="polyphony-automation[bot]\te4823048\n")
     record = merge(make_state(), POLICY, APP, runner=runner)
     assert record.merged_by == "polyphony-automation[bot]"
     assert record.to_dict()["merged_by"] == "polyphony-automation[bot]"
 
 
-def test_an_unreadable_merged_by_does_not_undo_a_merge_that_happened() -> None:
-    calls: list[list[str]] = []
+def test_the_recorded_merge_commit_is_the_resulting_one_not_the_merged_head() -> None:
+    """A squash merge creates a new commit, so the head is not the merge commit.
 
+    Recording the head under that name would put a sha in the ledger that does
+    not exist on the base branch. Observed on the first real merge.
+    """
+    runner = fake_runner(stdout="polyphony-automation[bot]\te4823048\n")
+    record = merge(make_state(), POLICY, APP, runner=runner)
+    assert record.head_oid == "a" * 40
+    assert record.merge_commit == "e4823048"
+
+
+def test_an_unreadable_outcome_does_not_undo_a_merge_that_happened() -> None:
     def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
         parts = list(command)
-        calls.append(parts)
         # The merge succeeds; only the read-back afterwards fails.
         if parts[1:3] == ["api", "/repos/ReticleWorks/chitra/pulls/7"]:
             return subprocess.CompletedProcess(parts, 1, "", "rate limited")
@@ -278,12 +287,14 @@ def test_an_unreadable_merged_by_does_not_undo_a_merge_that_happened() -> None:
     record = merge(make_state(), POLICY, APP, runner=runner)
     assert record.merged is True
     assert record.merged_by == ""
+    assert record.merge_commit == ""
 
 
-def test_a_refusal_records_no_merged_by_because_nothing_happened() -> None:
+def test_a_refusal_records_no_outcome_because_nothing_happened() -> None:
     record = merge(make_state(is_draft=True), POLICY, APP, runner=fake_runner())
     assert record.merged is False
     assert record.merged_by == ""
+    assert record.merge_commit == ""
 
 
 def test_a_rejected_merge_raises_instead_of_reporting_success() -> None:
