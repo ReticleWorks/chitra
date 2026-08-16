@@ -30,7 +30,13 @@ logger = structlog.get_logger(__name__)
 GhRunner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 
 MERGE_LEDGER_SCHEMA = "chitra.merge-ledger.v1"
-DEFAULT_HOLD_LABEL = "chitra-hold"
+# Every label that stops a merge, not one. The brake has to match whatever the
+# repository already uses, and repositories do not agree: ReticleWorks/chitra
+# labels a held pull request `hold`, while the default here was `chitra-hold`,
+# a label that does not exist in that repository at all. A brake wired to a
+# label nobody applies is not a brake. Matching more labels can only ever
+# refuse more, so the safe direction is to recognise every convention in use.
+DEFAULT_HOLD_LABELS: tuple[str, ...] = ("chitra-hold", "hold")
 # Only CLEAN is accepted. GitHub also merges UNSTABLE, which means a
 # non-required check is failing; that is a judgement about which checks matter,
 # and this daemon does not make it. BEHIND means the branch has not been
@@ -120,11 +126,16 @@ class MergePolicy:
 
     allowed_repos: tuple[str, ...] = ()
     lane_authors: tuple[str, ...] = ()
-    hold_label: str = DEFAULT_HOLD_LABEL
+    hold_labels: tuple[str, ...] = DEFAULT_HOLD_LABELS
     app_login: str = ""
 
     def allows_repo(self, repo: str) -> bool:
         return repo in self.allowed_repos
+
+    def holds_on(self, labels: Sequence[str]) -> str:
+        """Return the first hold label present, or empty when none is."""
+        held = [label for label in self.hold_labels if label in labels]
+        return held[0] if held else ""
 
     def allows_author(self, author: str) -> bool:
         # An empty lane list means "no author qualifies", not "every author
@@ -161,8 +172,8 @@ def decide(state: PullRequestState, policy: MergePolicy, identity: GitHubIdentit
         )
     if not policy.allows_author(state.author):
         return MergeDecision(False, "author_not_a_lane", f"{state.author} is not a declared lane author")
-    if policy.hold_label and policy.hold_label in state.labels:
-        return MergeDecision(False, "hold_label_present", f"{policy.hold_label} is set, so a person has taken this one")
+    if held := policy.holds_on(state.labels):
+        return MergeDecision(False, "hold_label_present", f"{held} is set, so a person has taken this one")
     if state.state.upper() != "OPEN":
         return MergeDecision(False, "already_closed", f"pull request state is {state.state}")
     if state.is_draft:
