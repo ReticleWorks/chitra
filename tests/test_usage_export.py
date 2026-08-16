@@ -239,6 +239,36 @@ def test_fleet_read_never_returns_a_silent_unknown_for_a_dead_timer(tmp_path: Pa
     assert verdicts[0].age_seconds == 48 * 3600
 
 
+def test_a_host_that_never_exported_is_invisible_unless_it_is_expected(tmp_path: Path) -> None:
+    """The gap this closes: no directory means no verdict at all, not an incident."""
+    write_export(tmp_path, _export(host="twinridge", captured_at=NOW.isoformat()), keep_history=False, now=NOW)
+
+    assert {item.host for item in read_fleet_exports(tmp_path, now=NOW)} == {"twinridge"}
+
+
+def test_an_expected_host_that_never_exported_reads_as_missing(tmp_path: Path) -> None:
+    write_export(tmp_path, _export(host="twinridge", captured_at=NOW.isoformat()), keep_history=False, now=NOW)
+
+    verdicts = {
+        (item.host, item.backend): item for item in read_fleet_exports(tmp_path, now=NOW, expect_hosts=["tophand", "trinity"])
+    }
+
+    for host in ("tophand", "trinity"):
+        for backend in ("claude", "codex"):
+            assert verdicts[(host, backend)].verdict == "missing-export"
+            assert "has never written any export directory" in verdicts[(host, backend)].error
+    # The host that is exporting is still read on its own evidence.
+    assert verdicts[("twinridge", "codex")].verdict == "ok"
+
+
+def test_expecting_a_host_that_is_already_present_does_not_duplicate_it(tmp_path: Path) -> None:
+    write_export(tmp_path, _export(host="tophand", captured_at=NOW.isoformat()), keep_history=False, now=NOW)
+
+    verdicts = [item for item in read_fleet_exports(tmp_path, now=NOW, expect_hosts=["tophand"]) if item.backend == "codex"]
+
+    assert [item.verdict for item in verdicts] == ["ok"]
+
+
 def test_fleet_read_carries_the_pause_resume_time(tmp_path: Path) -> None:
     write_export(
         tmp_path,
@@ -306,3 +336,41 @@ def test_evaluate_rejects_both_directory_flags(tmp_path: Path, capsys: pytest.Ca
 def test_evaluate_requires_one_directory_flag(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["evaluate"]) == 1
     assert "--fleet-dir" in capsys.readouterr().err
+
+
+def test_an_incident_is_still_only_reported_without_the_fail_flag(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    write_export(tmp_path, _export(host="tophand", captured_at=datetime.now(UTC).isoformat()), keep_history=False)
+
+    # tophand's claude export is missing, and this still exits 0. A reader that
+    # wants the lines gets them; only --fail-on-incident turns them into an alarm.
+    assert main(["evaluate", "--fleet-dir", str(tmp_path)]) == 0
+    assert "missing-export" in capsys.readouterr().out
+
+
+def test_fail_on_incident_exits_non_zero_so_a_oneshot_can_carry_the_alarm(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_export(tmp_path, _export(host="tophand", captured_at=datetime.now(UTC).isoformat()), keep_history=False)
+
+    assert main(["evaluate", "--fleet-dir", str(tmp_path), "--fail-on-incident"]) == 1
+    assert "the monitor is blind to them" in capsys.readouterr().err
+
+
+def test_fail_on_incident_exits_zero_when_every_host_reads_cleanly(tmp_path: Path) -> None:
+    now = datetime.now(UTC).isoformat()
+    for backend in ("claude", "codex"):
+        write_export(tmp_path, _export(host="tophand", backend=backend, captured_at=now), keep_history=False)
+
+    assert main(["evaluate", "--fleet-dir", str(tmp_path), "--fail-on-incident"]) == 0
+
+
+def test_an_expected_host_with_no_directory_fails_the_check(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A host whose export timer was never installed must not read as silence."""
+    now = datetime.now(UTC).isoformat()
+    for backend in ("claude", "codex"):
+        write_export(tmp_path, _export(host="tophand", backend=backend, captured_at=now), keep_history=False)
+
+    exit_code = main(["evaluate", "--fleet-dir", str(tmp_path), "--expect-host", "trinity", "--fail-on-incident"])
+
+    assert exit_code == 1
+    assert "trinity" in capsys.readouterr().out
