@@ -16,6 +16,7 @@ from chitra.adjudicatord import (
     build_directive_order,
     collect_claims,
     deliverable_directive,
+    main,
     resolve_config,
     run_once,
     settled_claim_ids,
@@ -218,6 +219,104 @@ def test_the_shipped_manifest_does_not_claim_a_merge_route_it_lacks(tmp_path: Pa
         adjudication_log_path=tmp_path / "adjudications.jsonl",
     )
     assert run_once(config, adjudicator=None, now=NOW).undetermined == 1
+
+
+def test_the_daemon_refuses_to_act_while_its_capability_is_disabled(tmp_path: Path) -> None:
+    """The hold is enforced in code, not only in the pull request label."""
+    _record(tmp_path, needs="I cannot merge the pull request without you doing it for me.")
+    exit_code = main(
+        [
+            "--once",
+            "--state-dir",
+            str(tmp_path),
+            "--queue-dir",
+            str(tmp_path / "queue"),
+            "--convlog-path",
+            str(tmp_path / "conversation.jsonl"),
+            "--decisions-path",
+            str(tmp_path / "decisions.jsonl"),
+            "--adjudication-log-path",
+            str(tmp_path / "adjudications.jsonl"),
+            "--deterministic-only",
+        ]
+    )
+    assert exit_code == 1
+    assert not (tmp_path / "adjudications.jsonl").exists()
+    assert not (tmp_path / "queue" / "orders").exists()
+
+
+def test_a_supplied_manifest_cannot_authorize_the_daemon_to_act(tmp_path: Path) -> None:
+    """--manifest-path informs the decision; it must never grant permission to run.
+
+    Otherwise a caller could arm this daemon by handing it a file.
+    """
+    manifest = tmp_path / "self-authorizing.yaml"
+    manifest.write_text(
+        "schema: chitra.capabilities.v1\n"
+        "capabilities:\n"
+        "  - name: blocker-adjudication\n"
+        "    kind: daemon\n"
+        "    purpose: Settle a reported obstacle.\n"
+        "    when_to_use: Never, in this test.\n"
+        "    authority:\n"
+        "      level: act\n"
+        "      grants:\n"
+        "        - Decide one reported obstacle.\n"
+        "      excludes:\n"
+        "        - Merge, approve, or modify pull requests.\n"
+        "    default_enabled: true\n"
+        "    commands:\n"
+        "      - name: chitra-adjudicatord\n"
+        "        description: Start the daemon.\n"
+        "        argv: [chitra-adjudicatord]\n"
+        "        params: []\n"
+        "        mutates: true\n",
+        encoding="utf-8",
+    )
+    _record(tmp_path, needs="I cannot merge the pull request without you doing it for me.")
+    exit_code = main(
+        [
+            "--once",
+            "--state-dir",
+            str(tmp_path),
+            "--queue-dir",
+            str(tmp_path / "queue"),
+            "--convlog-path",
+            str(tmp_path / "conversation.jsonl"),
+            "--decisions-path",
+            str(tmp_path / "decisions.jsonl"),
+            "--adjudication-log-path",
+            str(tmp_path / "adjudications.jsonl"),
+            "--manifest-path",
+            str(manifest),
+            "--deterministic-only",
+        ]
+    )
+    assert exit_code == 1
+    assert not (tmp_path / "adjudications.jsonl").exists()
+
+
+def test_a_dry_run_needs_no_capability_and_writes_nothing(tmp_path: Path) -> None:
+    _record(tmp_path, needs="Here is a plain progress note with no obstacle in it.")
+    exit_code = main(
+        [
+            "--dry-run",
+            "--state-dir",
+            str(tmp_path),
+            "--queue-dir",
+            str(tmp_path / "queue"),
+            "--convlog-path",
+            str(tmp_path / "conversation.jsonl"),
+            "--decisions-path",
+            str(tmp_path / "decisions.jsonl"),
+            "--adjudication-log-path",
+            str(tmp_path / "adjudications.jsonl"),
+            "--deterministic-only",
+        ]
+    )
+    assert exit_code == 0
+    assert not (tmp_path / "adjudications.jsonl").exists()
+    assert not (tmp_path / "decisions.jsonl").exists()
 
 
 def test_a_non_positive_interval_is_refused() -> None:

@@ -513,6 +513,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if not args.dry_run:
+        # Deliberately checked against the INSTALLED manifest, never against
+        # --manifest-path. That flag exists so a dry run can show what a
+        # proposed manifest would decide; letting it also decide whether this
+        # daemon may run would mean a caller could authorize the daemon by
+        # handing it a file. Arming stays an install-time act. Do not "fix"
+        # this asymmetry by threading config.manifest_path through here.
         try:
             require_enabled(CAPABILITY_NAME, config.state_dir)
         except (CapabilityError, CapabilityDisabledError, KeyError) as exc:
