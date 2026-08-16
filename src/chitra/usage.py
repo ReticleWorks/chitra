@@ -537,6 +537,11 @@ def _evaluation_output(verdict: AccountedVerdict) -> dict[str, object]:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    # chitra.usage_export builds on this module's snapshot readers, so it is
+    # imported here rather than at module scope to keep the dependency
+    # one-directional at import time.
+    from chitra.usage_export import DEFAULT_STALE_AFTER_SECONDS
+
     parser = argparse.ArgumentParser(
         prog="chitra-usage", description="Read deterministic provider usage snapshots and evaluate thresholds."
     )
@@ -550,11 +555,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     codex = commands.add_parser("codex-snapshot", help="Read the local Codex account usage snapshot.")
     codex.add_argument("--codex-bin", type=Path, default=Path("codex"))
 
+    export_command = commands.add_parser("export", help="Write this host's token-free usage exports to the shared fleet tree.")
+    export_command.add_argument("--fleet-dir", type=Path, required=True, help="Shared usage directory the monitor reads.")
+    export_command.add_argument("--host", default=None, help="Host name to file under (default: this host's short name).")
+    export_command.add_argument("--dir", type=Path, default=None, help="Claude statusline sidecar directory.")
+    export_command.add_argument("--codex-bin", type=Path, default=Path("codex"))
+    export_command.add_argument("--staleness-seconds", type=int, default=1200)
+    export_command.add_argument("--policy-config", type=Path)
+    export_command.add_argument("--no-history", action="store_true", help="Write only the current export, skipping history.")
+
     evaluate_command = commands.add_parser("evaluate", help="Evaluate fresh snapshots against deterministic thresholds.")
-    evaluate_command.add_argument("--dir", type=Path, required=True)
+    evaluate_command.add_argument("--dir", type=Path, default=None)
+    evaluate_command.add_argument("--fleet-dir", type=Path, default=None, help="Read every host's exports instead of local snapshots.")
     evaluate_command.add_argument("--codex", action="store_true")
     evaluate_command.add_argument("--codex-bin", type=Path, default=Path("codex"))
     evaluate_command.add_argument("--staleness-seconds", type=int, default=1200)
+    evaluate_command.add_argument(
+        "--stale-after-seconds",
+        type=int,
+        default=DEFAULT_STALE_AFTER_SECONDS,
+        help="Age at which a fleet export counts as stale (default: two export intervals).",
+    )
     evaluate_command.add_argument("--policy-config", type=Path)
 
     policy_command = commands.add_parser("policy", help="Print the effective usage policy as JSON.")
@@ -562,10 +583,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_export(args: argparse.Namespace) -> None:
+    """Write this host's claude and codex exports into the shared fleet tree."""
+    from chitra.usage_export import build_claude_export, build_codex_export, default_host_name, write_export
+
+    policy = load_policy_config(args.policy_config).usage
+    host = (args.host or default_host_name()).strip().lower()
+    if not host:
+        raise ValueError("export host name resolved empty; pass --host")
+    claude_dir = args.dir if args.dir is not None else Path("/var/lib/chitra/usage")
+    exports = [
+        build_claude_export(claude_dir, host=host, policy=policy, staleness_seconds=args.staleness_seconds),
+        build_codex_export(host=host, policy=policy, codex_bin=args.codex_bin),
+    ]
+    for export in exports:
+        path = write_export(args.fleet_dir, export, keep_history=not args.no_history)
+        print(json.dumps({**export.to_dict(), "path": str(path)}, sort_keys=True))
+
+
+def _run_fleet_evaluate(args: argparse.Namespace) -> None:
+    """Render one verdict line per host and backend from the shared tree."""
+    from chitra.usage_export import read_fleet_exports
+
+    for verdict in read_fleet_exports(args.fleet_dir, stale_after_seconds=args.stale_after_seconds):
+        print(json.dumps(verdict.to_dict(), sort_keys=True))
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     try:
-        if args.command == "read-claude":
+        if args.command == "export":
+            _run_export(args)
+        elif args.command == "evaluate" and args.fleet_dir is not None:
+            if args.dir is not None:
+                raise ValueError("pass either --dir or --fleet-dir, not both")
+            _run_fleet_evaluate(args)
+        elif args.command == "read-claude":
             snapshots = read_snapshots(args.dir, staleness_seconds=args.staleness_seconds)
             payload = [_snapshot_with_fresh(snapshot, fresh) for snapshot, fresh in snapshots]
             if args.json:
@@ -578,6 +631,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "policy":
             print(json.dumps(load_policy_config(args.policy_config).usage.model_dump(), indent=2, sort_keys=True))
         else:
+            if args.dir is None:
+                raise ValueError("evaluate needs --dir for local snapshots or --fleet-dir for exported ones")
             policy = load_policy_config(args.policy_config).usage
             snapshots = read_snapshots(args.dir, staleness_seconds=args.staleness_seconds)
             if args.codex:
