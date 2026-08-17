@@ -311,7 +311,7 @@ def _prove_lane_permissions(
         report = run_self_test(
             backend=backend,
             agent_command=agent_command,
-            state_dir=lane.state_dir,
+            workdir=lane.workdir,
             ssh_target=target,
             as_lane=lambda command: _run_as_lane(lane, command),
             **({"runner": probe_runner} if probe_runner else {}),

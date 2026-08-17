@@ -58,11 +58,20 @@ class LaneSelfTestUnavailable(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class Probe:
-    """One representative command from a class the lane depends on."""
+    """One representative piece of work from a class the lane depends on.
+
+    ``instruction`` is what the agent is told to do, and it is not always a
+    shell command. A lane writes a file with its file-writing tool, not with a
+    shell redirect, and on a managed host a shell redirect is separately fenced,
+    so a probe written as ``printf x > file`` would measure the fence rather
+    than the lane's own file-write path. Measured on tophand 2026-08-17: the
+    first live run of this self-test failed on exactly that, and the probe was
+    wrong, not the lane.
+    """
 
     name: str
     purpose: str
-    command: str
+    instruction: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,16 +102,24 @@ class SelfTestReport:
         }
 
 
-def build_probes(state_dir: Path, *, ssh_target: str | None) -> tuple[tuple[Probe, ...], tuple[str, ...]]:
+def probe_path(workdir: Path) -> Path:
+    """Return the file the write probe creates, inside the lane's own worktree."""
+    return workdir / ".chitra-lane-selftest.probe"
+
+
+def build_probes(workdir: Path, *, ssh_target: str | None) -> tuple[tuple[Probe, ...], tuple[str, ...]]:
     """Return the probes to run and the names of the classes left unprobed.
 
-    The file write lands in the lane's own state directory, which the lane owns
-    and which no other lane reads. The GitHub call is a POST -- the same shape as
-    the pull-request and package writes that were refused -- against the
-    ``/markdown`` endpoint, so it exercises an authenticated write path without
-    changing a repository. It proves the lane may make an authenticated write
-    call; it does not prove the token carries push rights on any given
-    repository, and it is not a substitute for that check.
+    The file write lands in the lane's worktree, which is where a lane does its
+    work, and it is made with the agent's file-writing tool rather than a shell
+    redirect, because that is how a lane writes files.
+
+    The GitHub call is a POST -- the same shape as the pull-request and package
+    writes that were refused -- against the ``/markdown`` endpoint, so it
+    exercises an authenticated write path without changing a repository. It
+    proves the lane may make an authenticated write call. It does not prove the
+    token carries push rights on any given repository, and it is not a
+    substitute for that check.
 
     The SSH target is a site fact, not a property of this package, so it is
     supplied by the caller. With no target there is no honest SSH probe, and the
@@ -111,13 +128,19 @@ def build_probes(state_dir: Path, *, ssh_target: str | None) -> tuple[tuple[Prob
     probes = [
         Probe(
             name="file_write",
-            purpose="write a file in the lane's own state directory",
-            command=f"printf '{PROBE_MARKER}\\n' > {state_dir / 'lane-selftest.probe'}",
+            purpose="write a file in the lane's own worktree",
+            instruction=(
+                f"Using your file-writing tool, write the single line {PROBE_MARKER} "
+                f"to the file {probe_path(workdir)}"
+            ),
         ),
         Probe(
             name="gh_api_write",
             purpose="make an authenticated GitHub API write call",
-            command=f"gh api --method POST /markdown --field text={PROBE_MARKER}",
+            instruction=(
+                "Run this shell command: "
+                f"gh api --method POST /markdown --field text={PROBE_MARKER}"
+            ),
         ),
     ]
     unprobed: list[str] = []
@@ -126,7 +149,10 @@ def build_probes(state_dir: Path, *, ssh_target: str | None) -> tuple[tuple[Prob
             Probe(
                 name="fleet_ssh",
                 purpose="reach another fleet host over SSH",
-                command=f"ssh -o BatchMode=yes -o ConnectTimeout=10 {ssh_target} true",
+                instruction=(
+                    "Run this shell command: "
+                    f"ssh -o BatchMode=yes -o ConnectTimeout=10 {ssh_target} true"
+                ),
             )
         )
     else:
@@ -144,20 +170,20 @@ def build_prompt(probes: Sequence[Probe]) -> str:
     """
     lines = [
         "You are a launch-time self-test for a governed Chitra lane.",
-        "Run each of the following shell commands exactly once, in order.",
-        "Do not modify a command. Do not substitute a different command.",
-        "If a command runs and exits non-zero, that is a normal result: report it and carry on.",
-        "If you are not permitted to attempt a command, do not look for another way to do it.",
+        "Do each of the following exactly once, in order.",
+        "Do not modify an instruction. Do not substitute a different one.",
+        "If something runs and fails, that is a normal result: report it and carry on.",
+        "If you are not permitted to attempt one, do not look for another way to do it.",
         "Report the refusal instead, quoting the refusal text you were given.",
         "",
     ]
     for index, probe in enumerate(probes, start=1):
-        lines.append(f"{index}. {probe.command}")
+        lines.append(f"{index}. [{probe.name}] {probe.instruction}")
     lines.extend(
         [
             "",
-            "Then reply with one line per command, in this exact form:",
-            "<name>: RAN exit=<code>   or   <name>: REFUSED <the refusal text>",
+            "Then reply with one line per item, in this exact form:",
+            "<name>: RAN <one-line outcome>   or   <name>: REFUSED <the refusal text>",
             "",
             "The names, in order, are: " + ", ".join(probe.name for probe in probes) + ".",
         ]
@@ -235,7 +261,7 @@ def run_self_test(
     *,
     backend: str,
     agent_command: Sequence[str],
-    state_dir: Path,
+    workdir: Path,
     ssh_target: str | None,
     as_lane: Callable[[Sequence[str]], list[str]],
     runner: CommandRunner = _run,
@@ -259,7 +285,7 @@ def run_self_test(
             ),
         )
 
-    probes, unprobed = build_probes(state_dir, ssh_target=ssh_target)
+    probes, unprobed = build_probes(workdir, ssh_target=ssh_target)
     prompt = build_prompt(probes)
     command = as_lane(claude_probe_command(agent_command, prompt))
     started = time.monotonic()
@@ -288,7 +314,7 @@ def run_self_test(
         refusals=refusals,
         live=True,
         detail=f"probed {len(probes)} command classes in {elapsed:.0f}s",
-        commands=tuple(probe.command for probe in probes),
+        commands=tuple(probe.instruction for probe in probes),
     )
 
 

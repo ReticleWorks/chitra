@@ -38,6 +38,7 @@ from chitra.lane_selftest import (
     build_probes,
     build_prompt,
     claude_probe_command,
+    probe_path,
     read_refusals,
     run_self_test,
 )
@@ -111,9 +112,23 @@ def test_the_probes_cover_the_classes_the_blocked_lanes_needed(tmp_path: Path) -
     probes, unprobed = build_probes(tmp_path, ssh_target="tiptap@renegade")
     assert [probe.name for probe in probes] == ["file_write", "gh_api_write", "fleet_ssh"]
     assert unprobed == ()
-    assert str(tmp_path) in probes[0].command
-    assert "gh api --method POST" in probes[1].command
-    assert "tiptap@renegade" in probes[2].command
+    assert str(probe_path(tmp_path)) in probes[0].instruction
+    assert "gh api --method POST" in probes[1].instruction
+    assert "tiptap@renegade" in probes[2].instruction
+
+
+def test_the_write_probe_uses_the_file_tool_not_a_shell_redirect(tmp_path: Path) -> None:
+    """Measured on tophand 2026-08-17, on this self-test's first live run.
+
+    The probe was written as ``printf x > file`` and was refused, because a
+    managed host separately fences shell redirects. That refusal was the probe's
+    fault, not the lane's: a lane writes files with its file-writing tool.
+    """
+    probes, _ = build_probes(tmp_path, ssh_target=None)
+    write_probe = probes[0]
+    assert "file-writing tool" in write_probe.instruction
+    assert ">" not in write_probe.instruction
+    assert probe_path(tmp_path).parent == tmp_path
 
 
 def test_an_unset_ssh_target_is_reported_as_unprobed_not_as_a_pass(tmp_path: Path) -> None:
@@ -129,7 +144,7 @@ def test_the_prompt_forbids_routing_around_a_refusal(tmp_path: Path) -> None:
     prompt = build_prompt(probes)
     assert "do not look for another way to do it" in prompt
     for probe in probes:
-        assert probe.command in prompt
+        assert probe.instruction in prompt
 
 
 def test_the_probe_runs_the_lane_s_own_command() -> None:
@@ -198,7 +213,7 @@ def test_a_clean_self_test_reports_what_it_probed(tmp_path: Path) -> None:
     report = run_self_test(
         backend="claude",
         agent_command=_agent_command("claude", "sonnet", "high"),
-        state_dir=tmp_path,
+        workdir=tmp_path,
         ssh_target="temp-twinridge",
         as_lane=_as_lane,
         runner=lambda command: _completed(_headless("file_write: RAN exit=0")),
@@ -212,7 +227,7 @@ def test_a_refused_self_test_does_not_pass(tmp_path: Path) -> None:
     report = run_self_test(
         backend="claude",
         agent_command=_agent_command("claude", "sonnet", "high"),
-        state_dir=tmp_path,
+        workdir=tmp_path,
         ssh_target="temp-twinridge",
         as_lane=_as_lane,
         runner=lambda command: _completed(_headless(f"gh_api_write: REFUSED {CLASSIFIER_REFUSAL}")),
@@ -227,7 +242,7 @@ def test_an_agent_that_cannot_run_leaves_the_lane_unproven(tmp_path: Path) -> No
         run_self_test(
             backend="claude",
             agent_command=_agent_command("claude", "sonnet", "high"),
-            state_dir=tmp_path,
+            workdir=tmp_path,
             ssh_target="temp-twinridge",
             as_lane=_as_lane,
             runner=lambda command: _completed("", returncode=1, stderr="claude: command not found"),
@@ -238,7 +253,7 @@ def test_a_codex_lane_reports_that_its_classes_were_not_exercised(tmp_path: Path
     report = run_self_test(
         backend="codex",
         agent_command=_agent_command("codex", "gpt-5.6-sol", "high"),
-        state_dir=tmp_path,
+        workdir=tmp_path,
         ssh_target="temp-twinridge",
         as_lane=_as_lane,
         runner=lambda command: pytest.fail("a Codex lane must not spend a live probe"),
@@ -323,5 +338,5 @@ def test_the_ssh_target_can_come_from_the_environment(tmp_path: Path, monkeypatc
 
 
 def test_the_receipt_records_what_the_self_test_proved() -> None:
-    probe = Probe(name="file_write", purpose="write a file", command="printf x > /tmp/x")
+    probe = Probe(name="file_write", purpose="write a file", instruction="write /tmp/x")
     assert probe.name in build_prompt([probe])
