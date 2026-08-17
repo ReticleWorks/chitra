@@ -281,6 +281,12 @@ class MergePolicyConfig(BaseModel):
     # and a brake wired to a label the repository never applies is not a brake.
     # Matching more labels can only refuse more, so both known spellings ship on.
     hold_labels: list[str] = Field(default_factory=lambda: list(DEFAULT_HOLD_LABELS))
+    # Set to require an opt-in label before anything merges. Empty keeps the
+    # specified opt-out behaviour. See MergePolicy.require_label for why this
+    # exists: lane_authors cannot tell one lane from another when every lane
+    # shares one GitHub identity, so allowlisting a repository enrols all of
+    # them at once.
+    require_label: str = ""
     # The login a merge must be attributed to. Blank means "any app identity",
     # which is still not "any identity": a personal token is refused either way
     # by chitra.merge.decide.

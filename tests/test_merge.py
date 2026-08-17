@@ -122,6 +122,41 @@ def test_the_reported_hold_reason_names_the_label_that_was_actually_set() -> Non
     assert decision.detail.startswith("hold is set")
 
 
+def test_without_an_opt_in_label_configured_a_green_pull_request_still_merges() -> None:
+    """The specified opt-out behaviour is unchanged when require_label is empty."""
+    assert decide(make_state(), POLICY, APP).allowed
+
+
+def test_an_opt_in_label_is_required_when_configured() -> None:
+    """Forgetting should cost a wait, not a merge.
+
+    lane_authors cannot tell one lane from another when every lane opens pull
+    requests under one shared identity, so allowlisting a repository enrols all
+    of them. Observed 2026-08-16: the daemon merged another lane's pull
+    request, correctly by policy, without that lane asking.
+    """
+    opt_in = MergePolicy(
+        allowed_repos=("ReticleWorks/chitra",),
+        lane_authors=("lane-bot",),
+        app_login=APP.login,
+        require_label="chitra-automerge",
+    )
+    refused = decide(make_state(), opt_in, APP)
+    assert refused.reason == "not_opted_in"
+    assert decide(make_state(labels=("chitra-automerge",)), opt_in, APP).allowed
+
+
+def test_an_opt_in_label_does_not_override_a_hold() -> None:
+    opt_in = MergePolicy(
+        allowed_repos=("ReticleWorks/chitra",),
+        lane_authors=("lane-bot",),
+        app_login=APP.login,
+        require_label="chitra-automerge",
+    )
+    state = make_state(labels=("chitra-automerge", "hold"))
+    assert decide(state, opt_in, APP).reason == "hold_label_present"
+
+
 def test_an_unrelated_label_does_not_hold_a_pull_request() -> None:
     assert decide(make_state(labels=("enhancement", "python")), POLICY, APP).allowed
 

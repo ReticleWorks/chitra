@@ -46,6 +46,7 @@ def policy_from_config(path: Path | None) -> MergePolicy:
         allowed_repos=tuple(configured.allowed_repos),
         lane_authors=tuple(configured.lane_authors),
         hold_labels=tuple(configured.hold_labels),
+        require_label=configured.require_label,
         app_login=configured.app_login,
     )
 
