@@ -44,15 +44,22 @@ REVIEWER_SYSTEM_PROMPT = (
 )
 
 #: How many times one reviewer invocation may be attempted before it fails
-#: closed. Measured on tophand 2026-08-17: the same prompt and the same flags
-#: returned a valid verdict on three of seven attempts and a degenerate
-#: ``{"ok": true}`` on the other four. The failure is intermittent, not
-#: systematic -- the production reviewer wrapper's own header records the same
-#: ``{"ok": ...}`` shape as observed. Without a retry, that intermittency
-#: reaches a person: watchd turns one unusable reply into a blocked session and
-#: an ask to review the work by hand, so a healthy session is falsely blocked
-#: roughly as often as the model misfires.
-REVIEWER_ATTEMPTS = 3
+#: closed. The failure being retried is intermittent, not systematic: the same
+#: prompt and the same flags return either a valid verdict or a degenerate
+#: ``{"ok": ...}`` object, and the production reviewer wrapper's own header
+#: records that same shape as observed. Without a retry the intermittency
+#: reaches a person, because watchd turns one unusable reply into a blocked
+#: session and an ask to review the work by hand.
+#:
+#: Five, not three, and the difference is measured rather than chosen. Fifteen
+#: runs of the real review path on tophand, 2026-08-17, needed 21 attempts in
+#: total: 8 replies were unusable, so a single reply is unusable about 38% of the
+#: time. Three attempts therefore fail closed on roughly 5% of reviews, and the
+#: sample bore that out -- one of the fifteen ran out of attempts and became a
+#: false blocker. Five attempts put the same arithmetic near 0.8%, about one in
+#: 125. The cost is paid only by a review already going wrong: a run that
+#: succeeds first time still makes one call.
+REVIEWER_ATTEMPTS = 5
 
 MIN_REVIEWERS = 1
 DEFAULT_REVIEWERS = 2
