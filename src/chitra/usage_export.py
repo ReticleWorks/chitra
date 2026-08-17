@@ -497,54 +497,96 @@ def read_fleet_exports(
                 )
             )
     for host_dir in sorted(path for path in fleet_dir.iterdir() if path.is_dir()):
-        for backend in EXPORT_BACKENDS:
-            path = host_dir / f"{backend}.json"
-            if not path.is_file():
-                results.append(
-                    _incident(
-                        host=host_dir.name,
-                        backend=backend,
-                        verdict="missing-export",
-                        error=f"no {backend} export has ever been written by this host",
-                        path=path,
-                    )
-                )
-                continue
-            try:
-                export = UsageExport.from_dict(json.loads(path.read_text(encoding="utf-8")))
-            except (OSError, ValueError, json.JSONDecodeError) as exc:
-                results.append(
-                    _incident(
-                        host=host_dir.name,
-                        backend=backend,
-                        verdict="invalid-export",
-                        error=str(exc),
-                        path=path,
-                    )
-                )
-                continue
-            captured = parse_iso8601(export.captured_at, require_timezone=True, normalize_utc=True)
-            age = int((current - captured).total_seconds())
-            verdict: FleetVerdict = "stale-export" if age > stale_after_seconds else export.verdict
-            error = export.error
-            if verdict == "stale-export":
-                error = f"export is {age}s old, past the {stale_after_seconds}s ceiling; check the export timer on {host_dir.name}"
+        results.extend(read_host_exports(host_dir, stale_after_seconds=stale_after_seconds, now=current))
+    return results
+
+
+def holds_exports(directory: Path) -> bool:
+    """Whether this directory holds ``chitra.usage-export.v1`` documents.
+
+    A person who points the local-snapshot flag at an export directory should
+    get a reading, not a schema complaint.  The two document kinds live in
+    different trees and are easy to confuse, and the least useful thing this
+    tool can do is refuse to read a file it wrote itself.
+    """
+    if not directory.is_dir():
+        return False
+    for path in sorted(directory.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("schema") == EXPORT_SCHEMA:
+            return True
+    return False
+
+
+def read_host_exports(
+    host_dir: Path,
+    *,
+    stale_after_seconds: int = DEFAULT_STALE_AFTER_SECONDS,
+    now: datetime | None = None,
+) -> list[FleetExportVerdict]:
+    """Read one host's exports and return one verdict per backend.
+
+    Both backends are always reported.  A file that is absent, old, or
+    unparseable becomes its own verdict, so a dead export timer surfaces as an
+    incident rather than as a quiet gap.
+    """
+    if stale_after_seconds < 0:
+        raise ValueError("stale_after_seconds must be non-negative")
+    if now is not None and now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    current = datetime.now(UTC) if now is None else now.astimezone(UTC)
+    results: list[FleetExportVerdict] = []
+    for backend in EXPORT_BACKENDS:
+        path = host_dir / f"{backend}.json"
+        if not path.is_file():
             results.append(
-                FleetExportVerdict(
-                    host=export.host or host_dir.name,
-                    backend=export.backend,
-                    verdict=verdict,
-                    captured_at=export.captured_at,
-                    age_seconds=age,
-                    account=export.account,
-                    five_hour_pct=export.five_hour.pct if export.five_hour is not None else None,
-                    long_window_key=export.long_window_key,
-                    long_window_pct=export.long_window.pct if export.long_window is not None else None,
-                    binding_window=export.binding_window,
-                    resume_at_epoch=export.resume_at_epoch,
-                    policy_rev=export.policy_rev,
-                    error=error,
-                    path=str(path),
+                _incident(
+                    host=host_dir.name,
+                    backend=backend,
+                    verdict="missing-export",
+                    error=f"no {backend} export has ever been written by this host",
+                    path=path,
                 )
             )
+            continue
+        try:
+            export = UsageExport.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            results.append(
+                _incident(
+                    host=host_dir.name,
+                    backend=backend,
+                    verdict="invalid-export",
+                    error=str(exc),
+                    path=path,
+                )
+            )
+            continue
+        captured = parse_iso8601(export.captured_at, require_timezone=True, normalize_utc=True)
+        age = int((current - captured).total_seconds())
+        verdict: FleetVerdict = "stale-export" if age > stale_after_seconds else export.verdict
+        error = export.error
+        if verdict == "stale-export":
+            error = f"export is {age}s old, past the {stale_after_seconds}s ceiling; check the export timer on {host_dir.name}"
+        results.append(
+            FleetExportVerdict(
+                host=export.host or host_dir.name,
+                backend=export.backend,
+                verdict=verdict,
+                captured_at=export.captured_at,
+                age_seconds=age,
+                account=export.account,
+                five_hour_pct=export.five_hour.pct if export.five_hour is not None else None,
+                long_window_key=export.long_window_key,
+                long_window_pct=export.long_window.pct if export.long_window is not None else None,
+                binding_window=export.binding_window,
+                resume_at_epoch=export.resume_at_epoch,
+                policy_rev=export.policy_rev,
+                error=error,
+                path=str(path),
+            )
+        )
     return results
