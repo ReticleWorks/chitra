@@ -229,3 +229,102 @@ def test_done_is_completion_owned_and_plain_idle_does_not_erase_it(tmp_path: Pat
 
     assert broker.statuses()[0].state == "done"
     assert broker.statuses()[0].authority == "completion"
+
+
+def test_wedge_candidate_reason_demotes_a_working_manifest_verdict(tmp_path: Path) -> None:
+    broker = AgentStatusBroker(tmp_path, ManifestRepository())
+
+    broker.observe(
+        pane_id="%1",
+        target="lane:0.0",
+        session_ref="host:lane:0.0",
+        lane_id="lane",
+        detected_agent="codex",
+        snapshot="Working... esc to interrupt\n",
+        tmux_socket=None,
+        wedge_candidate_reason="no transcript growth or screen-residue change for 1300s",
+    )
+
+    status = broker.statuses()[0]
+    assert status.state == "wedged"
+    assert status.authority == "wedged"
+    assert status.explain.warning == "no transcript growth or screen-residue change for 1300s"
+    assert status.explain.source == "chitra:wedge_detector"
+
+
+def test_wedge_candidate_reason_never_touches_a_non_working_verdict(tmp_path: Path) -> None:
+    broker = AgentStatusBroker(tmp_path, ManifestRepository())
+
+    broker.observe(
+        pane_id="%1",
+        target="lane:0.0",
+        session_ref="host:lane:0.0",
+        lane_id="lane",
+        detected_agent="codex",
+        snapshot="Allow command?\nYes\nNo\n",
+        tmux_socket=None,
+        wedge_candidate_reason="no transcript growth or screen-residue change for 1300s",
+    )
+
+    status = broker.statuses()[0]
+    assert status.state == "blocked"
+    assert status.authority == "manifest"
+
+
+def test_wedge_candidate_reason_never_overrides_lifecycle_authority(tmp_path: Path) -> None:
+    broker = AgentStatusBroker(tmp_path, ManifestRepository())
+    broker.report_agent(
+        pane_id="%1",
+        session_ref="host:lane:0.0",
+        source="integration:codex",
+        agent="codex",
+        state="working",
+    )
+
+    broker.observe(
+        pane_id="%1",
+        target="lane:0.0",
+        session_ref="host:lane:0.0",
+        lane_id="lane",
+        detected_agent="codex",
+        snapshot="Working... esc to interrupt\n",
+        tmux_socket=None,
+        wedge_candidate_reason="no transcript growth or screen-residue change for 1300s",
+    )
+
+    status = broker.statuses()[0]
+    assert status.state == "working"
+    assert status.authority == "integration"
+
+
+def test_a_recovered_pane_reclassifies_normally_once_wedge_candidate_reason_clears(tmp_path: Path) -> None:
+    """The override lasts only as long as watchd keeps handing it a reason;
+    real progress means the next observation drops it and reclassifies off
+    the live screen, exactly like nothing happened."""
+    broker = AgentStatusBroker(tmp_path, ManifestRepository())
+    broker.observe(
+        pane_id="%1",
+        target="lane:0.0",
+        session_ref="host:lane:0.0",
+        lane_id="lane",
+        detected_agent="codex",
+        snapshot="Working... esc to interrupt\n",
+        tmux_socket=None,
+        wedge_candidate_reason="no transcript growth or screen-residue change for 1300s",
+    )
+    assert broker.statuses()[0].state == "wedged"
+
+    broker.observe(
+        pane_id="%1",
+        target="lane:0.0",
+        session_ref="host:lane:0.0",
+        lane_id="lane",
+        detected_agent="codex",
+        snapshot="Working... esc to interrupt\n",
+        tmux_socket=None,
+        wedge_candidate_reason=None,
+    )
+
+    status = broker.statuses()[0]
+    assert status.state == "working"
+    assert status.authority == "manifest"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import threading
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -15,18 +16,24 @@ from chitra.agent_status import ManifestRepository
 from chitra.dispatch import DispatchOrder
 from chitra.goal_enforcement import ReviewerVerdict, ReviewFinding
 from chitra.goals import GoalRecord, get_goal, upsert_goal
+from chitra.heartbeat import heartbeat_path
 from chitra.lane_activity import load_lane_activity
 from chitra.triaged import ReceivingOutputs, parse_event_line, run_once
 from chitra.watchd import (
+    DEFAULT_WEDGE_AFTER_SECONDS,
     Pane,
     Watchd,
     WatchdConfig,
+    _run_command,
     append_event,
     build_arg_parser,
+    chrome_stripped_residue_hash,
     list_panes,
     normalize,
     resolve_config,
+    run_forever,
     status_event_line,
+    transcript_path,
 )
 
 
@@ -595,3 +602,192 @@ def test_reviewer_config_precedence_is_cli_then_env_then_pinned_defaults(monkeyp
 def test_resolve_config_rejects_non_positive_reviewer_count(tmp_path: Path, reviewer_count: int) -> None:
     with pytest.raises(ValueError, match="reviewer_count must be a positive integer"):
         resolve_config(state_dir=tmp_path, reviewer_count=reviewer_count)
+
+
+# --- wedge demotion, ground-truth progress tracking ---------------------------
+
+
+def test_chrome_stripped_residue_hash_ignores_spinner_timer_token_and_statusline_chrome() -> None:
+    frame_one = "esc to interrupt\ntokens 1,234\nWorking (12s • esc to interrupt)\n"
+    frame_two = "esc to interrupt\ntokens 987,654\nWorking (4m 51s • esc to interrupt)\n"
+
+    assert chrome_stripped_residue_hash(frame_one) == chrome_stripped_residue_hash(frame_two)
+
+
+def test_chrome_stripped_residue_hash_changes_on_substantive_content() -> None:
+    before = "esc to interrupt\nrunning step 1 of 4\n"
+    after = "esc to interrupt\nrunning step 2 of 4\n"
+
+    assert chrome_stripped_residue_hash(before) != chrome_stripped_residue_hash(after)
+
+
+def test_wedge_demotes_working_to_wedged_after_threshold_with_only_chrome_churn(tmp_path: Path) -> None:
+    """A spinner/token frame that keeps re-rendering, with nothing substantive
+    moving, must eventually stop counting as "working" on its own."""
+    now = [1_000.0]
+    captures = iter(
+        [
+            "esc to interrupt\ntokens 100\n",
+            "esc to interrupt\ntokens 87,654\n",  # churn only: still no real progress
+        ]
+    )
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\twedge:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures))
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(
+        WatchdConfig(
+            state_dir=tmp_path,
+            events_log=tmp_path / "events.log",
+            wedge_after_seconds=100,
+        ),
+        runner=runner,
+        clock=lambda: now[0],
+    )
+
+    watcher.poll_once()
+    baseline = watcher.status_broker.statuses()[0]
+    assert baseline.state == "working"
+
+    now[0] += 150  # past the 100s wedge threshold, no substantive change occurred
+    watcher.poll_once()
+    status = watcher.status_broker.statuses()[0]
+    assert status.state == "wedged"
+    assert status.authority == "wedged"
+    assert status.explain.warning is not None
+    assert "no transcript growth or screen-residue change" in status.explain.warning
+
+
+def test_wedge_does_not_fire_before_the_threshold(tmp_path: Path) -> None:
+    now = [1_000.0]
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\twedge:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, "esc to interrupt\ntokens 100\n")
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(
+        WatchdConfig(
+            state_dir=tmp_path,
+            events_log=tmp_path / "events.log",
+            wedge_after_seconds=100,
+        ),
+        runner=runner,
+        clock=lambda: now[0],
+    )
+    watcher.poll_once()
+    now[0] += 50  # under the threshold
+    watcher.poll_once()
+
+    assert watcher.status_broker.statuses()[0].state == "working"
+
+
+def test_wedge_does_not_fire_when_the_transcript_keeps_growing(tmp_path: Path) -> None:
+    """Real transcript growth is progress even while the screen only shows
+    chrome churn; classify_snapshot's "working" verdict must survive."""
+    goal = _tracked_goal(tmp_path)
+    now = [1_000.0]
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, "esc to interrupt\ntokens 100\n")
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(
+        WatchdConfig(
+            state_dir=tmp_path,
+            events_log=tmp_path / "events.log",
+            wedge_after_seconds=100,
+            transcript_root=tmp_path / "lanes",
+        ),
+        runner=runner,
+        clock=lambda: now[0],
+    )
+
+    watcher.poll_once()
+    assert watcher.status_broker.statuses()[0].state == "working"
+
+    # The transcript appears with real output for the first time -- progress.
+    transcript = transcript_path(tmp_path / "lanes", goal.session_ref)
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text("turn output so far\n", encoding="utf-8")
+    now[0] += 50  # still under threshold
+    watcher.poll_once()
+    assert watcher.status_broker.statuses()[0].state == "working"
+
+    # Well past the threshold since the last progress point, but the
+    # transcript grows again in this same poll -- still not wedged.
+    now[0] += 120
+    transcript.write_text("turn output so far\nmore output just landed\n", encoding="utf-8")
+    watcher.poll_once()
+    assert watcher.status_broker.statuses()[0].state == "working"
+
+
+def test_wedge_config_rejects_non_positive_seconds(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="wedge_after_seconds must be a positive integer"):
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log", wedge_after_seconds=0)
+
+
+def test_resolve_config_reads_wedge_after_seconds_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("CHITRA_WATCHD_WEDGE_AFTER_SECONDS", "42")
+    config = resolve_config(state_dir=tmp_path)
+    assert config.wedge_after_seconds == 42
+
+
+def test_resolve_config_defaults_wedge_after_seconds(tmp_path: Path) -> None:
+    config = resolve_config(state_dir=tmp_path)
+    assert config.wedge_after_seconds == DEFAULT_WEDGE_AFTER_SECONDS
+
+
+# --- bounded subprocess timeouts -----------------------------------------------
+
+
+def test_run_command_timeout_is_caught_and_reported_as_a_failed_result() -> None:
+    result = _run_command(["sleep", "2"], timeout=0.05)
+
+    assert result.returncode != 0
+    assert "timed out" in result.stderr
+
+
+# --- daemon heartbeats ----------------------------------------------------------
+
+
+def test_run_forever_writes_a_heartbeat_file_each_cycle(tmp_path: Path) -> None:
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "")
+        raise AssertionError(f"unexpected command: {command}")
+
+    config = WatchdConfig(
+        state_dir=tmp_path,
+        events_log=tmp_path / "events.log",
+        interval_seconds=0.02,
+        socket_path=tmp_path / "control.sock",
+    )
+    watcher = Watchd(config, runner=runner)
+    stop_event = threading.Event()
+    thread = threading.Thread(target=run_forever, args=(watcher,), kwargs={"stop_event": stop_event})
+    thread.start()
+    try:
+        path = heartbeat_path(tmp_path, "watchd")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not path.exists():
+            time.sleep(0.01)
+        assert path.exists(), "watchd did not write a heartbeat file within the deadline"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["daemon"] == "watchd"
+        assert payload["cycle"] >= 1
+        assert payload["cadence_seconds"] == 0.02
+        assert payload["ts"]
+    finally:
+        stop_event.set()
+        thread.join(timeout=5)
+        assert not thread.is_alive()

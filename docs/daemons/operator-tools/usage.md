@@ -87,7 +87,11 @@ A backend that cannot be read still gets a file, with `verdict: unknown` and
 the reason in `error`. That is deliberate: a broken read must stay
 distinguishable from a host that runs no lane on that backend.
 
-Run it from a systemd timer every 15 minutes.
+Run it from a systemd timer every 15 minutes: install
+`packaging/systemd/chitra-usage-export.service.example` and
+`chitra-usage-export.timer.example` (fill in the venv, `--fleet-dir`, `--host`,
+and `--policy-config` paths, matching the `chitra-rate-limit-guard`
+service/timer pair), then `systemctl enable --now chitra-usage-export.timer`.
 
 ### evaluate --fleet-dir — Read every host's usage
 

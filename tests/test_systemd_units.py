@@ -29,6 +29,8 @@ def test_shipped_systemd_environment_variables_are_consumed_by_their_entrypoints
         "chitra-rate-limit-guard.service.example": set(),
         "chitra-rate-limit-guard.timer.example": set(),
         "chitra-triaged.service.example": set(),
+        "chitra-usage-export.service.example": set(),
+        "chitra-usage-export.timer.example": set(),
         # The merge daemon takes its GitHub App token from an EnvironmentFile,
         # never an inline Environment= line, so the credential cannot end up
         # in a unit file that anyone can read.
