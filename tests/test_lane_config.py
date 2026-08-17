@@ -95,7 +95,10 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
         return subprocess.CompletedProcess(command, 1 if len(calls) == 1 else 0, "", "")
 
     control_socket = tmp_path / "chitra.sock"
-    assert start_lane(lane, runner=runner, socket_path=control_socket)
+    # The launch self-test spends a live agent call, which this test does not
+    # need: it is checking the command the launcher builds, and the self-test
+    # has its own tests in test_lane_permissions.py.
+    assert start_lane(lane, runner=runner, socket_path=control_socket, self_test=False)
     assert calls[:2] == [
         [
             "runuser",
@@ -148,6 +151,10 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
             "sonnet",
             "--effort",
             "high",
+            # A governed lane runs at full permissions. Without this flag the
+            # lane falls back to the config directory's permissions.defaultMode
+            # and its own work gets refused; see test_lane_permissions.py.
+            "--dangerously-skip-permissions",
         ],
     ]
     assert calls[2:-1] == [calls[0]] * 5
@@ -233,7 +240,10 @@ def test_lane_identity_reaches_a_new_session_on_an_existing_tmux_server(
         text=True,
     )
     try:
-        assert start_lane(lane, socket_path=control_socket)
+        # This test replaces the agent command outright with a Python probe, so
+        # the full-permission check and the live self-test have nothing real to
+        # measure here. Both are covered in test_lane_permissions.py.
+        assert start_lane(lane, socket_path=control_socket, self_test=False)
         deadline = time.monotonic() + 5.0
         while not proof_path.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -404,9 +414,16 @@ def test_governed_claude_model_selection(model, tmp_path):
     def runner(command):
         calls.append(list(command))
         return subprocess.CompletedProcess(command, 1 if len(calls) == 1 else 0, "", "")
-    assert start_lane(lane, backend="claude", model=model, effort="max", runner=runner)
+    assert start_lane(lane, backend="claude", model=model, effort="max", runner=runner, self_test=False)
     new_session = next(command for command in calls if "new-session" in command)
-    assert new_session[-5:] == ["claude", "--model", model, "--effort", "max"]
+    assert new_session[-6:] == [
+        "claude",
+        "--model",
+        model,
+        "--effort",
+        "max",
+        "--dangerously-skip-permissions",
+    ]
 
 
 def test_governed_codex_effort_is_explicit_and_receipted(tmp_path):
@@ -441,14 +458,18 @@ def test_governed_codex_effort_is_explicit_and_receipted(tmp_path):
         model="gpt-5.6-sol",
         effort="xhigh",
         runner=runner,
+        self_test=False,
     )
     new_session = next(command for command in calls if "new-session" in command)
-    assert new_session[-5:] == [
+    assert new_session[-6:] == [
         "codex",
         "--model",
         "gpt-5.6-sol",
         "--config",
         'model_reasoning_effort="xhigh"',
+        # Full access for Codex, the other half of the standing order that a
+        # governed lane never stops on an approval nobody is there to answer.
+        "--dangerously-bypass-approvals-and-sandbox",
     ]
     receipt = json.loads((lane.state_dir / "lane-launch.json").read_text())
     assert receipt["model"] == "gpt-5.6-sol"
