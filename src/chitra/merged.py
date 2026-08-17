@@ -29,6 +29,7 @@ from pathlib import Path
 from chitra.dispatch import enqueue_dispatch_order
 from chitra.goals import GoalRecord, load_goals
 from chitra.merge import (
+    BOT_LOGIN_SUFFIX,
     GhRunner,
     GitHubIdentity,
     MergeError,
@@ -92,7 +93,10 @@ def discover_pull_requests(repo: str, policy: MergePolicy, *, runner: GhRunner =
         if row.get("isDraft"):
             continue
         author = (row.get("author") or {}).get("login", "")
-        if author not in policy.lane_authors:
+        # Cheap pre-screen only. decide() checks both of these again on the
+        # state it actually merges; skipping here just avoids fetching full
+        # state for pull requests that cannot qualify.
+        if author.endswith(BOT_LOGIN_SUFFIX) or author not in policy.lane_authors:
             continue
         number = row.get("number")
         if isinstance(number, int):

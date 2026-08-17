@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,10 @@ def pr_node(**overrides: object) -> dict[str, object]:
         "state": "OPEN",
         "mergeable": "MERGEABLE",
         "mergeStateStatus": "CLEAN",
+        # Relative, not a fixed date: a hard-coded timestamp would silently
+        # become stale and start failing these tests a day after they were
+        # written, which is exactly the trap the freshness gate is guarding.
+        "updatedAt": (datetime.now(UTC) - timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
         "author": {"login": "lane-bot"},
         "labels": {"nodes": []},
         "commits": {"nodes": [{"commit": {"oid": "a" * 40, "statusCheckRollup": {"state": "SUCCESS"}}}]},
