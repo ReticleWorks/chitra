@@ -21,7 +21,7 @@ from typing import Any, BinaryIO, cast
 
 from chitra._fsio import write_json_atomic
 from chitra.agent_runtime import AgentStatusBroker, PaneStatus, StatusRuntimeError
-from chitra.agent_status import AgentState
+from chitra.agent_status import AGENT_STATES, AgentState
 from chitra.api_protocol import API_PROTOCOL_VERSION, ProtocolError, api_schema, parse_subscriptions
 from chitra.api_protocol import MAX_WAIT_MS as MAX_WAIT_MS
 
@@ -149,7 +149,7 @@ class ApiRuntime:
         raw_until = raw.get("until")
         values = [raw_until] if isinstance(raw_until, str) else raw_until
         if not isinstance(values, list) or not values or any(
-            value not in ("idle", "working", "blocked", "done", "unknown") for value in values
+            value not in AGENT_STATES for value in values
         ):
             raise ProtocolError("invalid_params", "until must be a state string or non-empty state array")
         timeout_ms = raw.get("timeout_ms", MAX_WAIT_MS)

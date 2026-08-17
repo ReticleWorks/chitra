@@ -20,6 +20,59 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.11.0] - 2026-08-16
+
+Rate-limit visibility and failover. A Codex lane hit its weekly hard cap around
+2026-08-14 and sat dead for roughly two days: the monitor had no reading for
+that host, and a capped pane classified as idle.
+
+### Added
+
+- `chitra-usage export` writes a token-free `chitra.usage-export.v1` file per
+  host and backend into a shared directory, so a host publishes its own usage
+  rather than being reached into. The file carries percentages, reset times, an
+  account identity and a verdict, never a provider token.
+- `chitra-usage evaluate --fleet-dir` reads every host's exports and returns one
+  verdict per host and backend. A reading that is missing, old, or unreadable
+  becomes its own named verdict — `missing-export`, `stale-export`,
+  `invalid-export` — instead of silence.
+- Two agent states, `rate_limited_hard` and `rate_limited_warn`, with banner
+  signatures for Codex quoted from a real capped lane's transcript. A matched
+  rate-limit rule is never overridden, because a capped pane still draws its
+  input row and would otherwise read as idle. The resume time is parsed onto the
+  event, since the banner scrolls away.
+- Separate Codex thresholds (`codex_pause_5h_pct`, `codex_pause_weekly_pct`,
+  `codex_warn_5h_pct`, `codex_warn_weekly_pct`) and an `auto_transfer` policy
+  knob. The Codex weekly pause sits at 90 against Claude's 95: that window is a
+  hard cap with a multi-day reset, so margin is cheaper than dead time.
+- `chitra-goals transfer` holds a capped lane and scaffolds its successor on the
+  other backend under one lock, copying the strategic fields verbatim. It starts
+  nothing; `chitra-goals check` still gates launch.
+- Transcript-pipe liveness in watchd: a governed lane whose pipe is unarmed,
+  whose transcript is absent, or whose transcript has stopped growing while the
+  pane changes is reported, and `triaged` raises it as CRIT.
+
+### Changed
+
+- Goals documents are written as `chitra.goals.v2`, adding `successor_of` and
+  `transferred_to`. The bump is additive and v1 documents still load, so a host
+  that has not upgraded keeps working.
+- Codex usage windows are identified by their reset horizon rather than by the
+  slot the provider used. Measured 2026-08-16, a capped account reported its
+  weekly cap in the `primary` slot with `secondary` null, so a weekly threshold
+  keyed on the slot name would never have fired.
+
+### Fixed
+
+- `lane_anchor.start_lane` arms `tmux pipe-pane` on both the create and the
+  already-running paths. It previously armed it nowhere, and its early return
+  for an existing session did nothing at all — which is the respawn path that
+  left a lane unrecorded for twenty-five hours.
+- The ownership provider follows the goals schema instead of pinning one
+  version, and carries the new record fields. Pinned to `chitra.goals.v1` it
+  would have refused every v2 document and answered non-authoritative
+  `unknown`, continuing to run while knowing nothing.
+
 ## [0.10.2] - 2026-08-14
 
 ### Fixed

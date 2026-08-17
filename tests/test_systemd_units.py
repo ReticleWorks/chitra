@@ -29,6 +29,10 @@ def test_shipped_systemd_environment_variables_are_consumed_by_their_entrypoints
         "chitra-rate-limit-guard.service.example": set(),
         "chitra-rate-limit-guard.timer.example": set(),
         "chitra-triaged.service.example": set(),
+        # The merge daemon takes its GitHub App token from an EnvironmentFile,
+        # never an inline Environment= line, so the credential cannot end up
+        # in a unit file that anyone can read.
+        "polyphony-chitra-merged.service.example": set(),
     }
     actual = {unit_path.name: _environment_names(unit_path) for unit_path in sorted(SYSTEMD_DIR.glob("*.example"))}
 
@@ -54,3 +58,18 @@ def test_shipped_systemd_environment_variables_are_consumed_by_their_entrypoints
     boardd_source = (REPO_ROOT / "src" / "boardd" / "config.py").read_text(encoding="utf-8")
     for env_name in expected["boardd.service.example"]:
         assert f'"{env_name}"' in boardd_source
+
+
+def test_the_merge_daemon_unit_fails_rather_than_starting_without_its_token() -> None:
+    """A dash prefix would let systemd start the unit with no token at all.
+
+    The daemon would then resolve whatever identity gh happens to hold. It
+    refuses to merge under that identity, so nothing unsafe would land, but
+    the unit would sit there logging refusals and look like a broken daemon
+    rather than a missing credential. Fail at start instead.
+    """
+    unit = (SYSTEMD_DIR / "polyphony-chitra-merged.service.example").read_text(encoding="utf-8")
+    environment_files = [line for line in unit.splitlines() if line.startswith("EnvironmentFile=")]
+    assert environment_files, "the merge daemon unit must name the file holding its GitHub App token"
+    for line in environment_files:
+        assert not line.startswith("EnvironmentFile=-"), line

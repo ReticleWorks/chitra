@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "chitra-monitor"
-version = "0.10.2"
+version = "0.11.0"
 description = "Deterministic tmux relay/dedup daemons for AI-agent fleet monitoring"
 readme = "README.md"
 license = "MIT"
@@ -63,6 +63,9 @@ chitra-lane-anchor = "chitra.lane_anchor:main"
 chitra-lane-session = "chitra.lane_anchor:main"
 chitra-decisions = "chitra.decisions:main"
 chitra-agent = "chitra.agent_cli:main"
+chitra-merge = "chitra.merge_cli:main"
+chitra-failover = "chitra.failover_cli:main"
+polyphony-chitra-merged = "chitra.merged:main"
 
 [project.urls]
 Homepage = "https://github.com/ReticleWorks/chitra"

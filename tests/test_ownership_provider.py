@@ -92,7 +92,10 @@ def test_missing_state_returns_non_authoritative_unknown(tmp_path: Path) -> None
 
     assert response["authoritative"] is False
     assert response["source"] == {
-        "schema": "chitra.goals.v1",
+        # The schema this provider expects, which follows chitra.goals. The
+        # document fixture above stays on v1 on purpose, to prove a host that
+        # has not upgraded yet still reads authoritatively.
+        "schema": "chitra.goals.v2",
         "generation": 0,
         "complete": False,
         "manager_heartbeat_at": "",

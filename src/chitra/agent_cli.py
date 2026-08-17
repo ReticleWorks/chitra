@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 
-from chitra.agent_status import ManifestRepository, classify_snapshot
+from chitra.agent_status import AGENT_STATES, ManifestRepository, classify_snapshot
 from chitra.api_protocol import api_schema
 from chitra.socket_api import MAX_WAIT_MS, default_socket_path, request
 
@@ -52,7 +52,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     wait = commands.add_parser("wait", help="Block until a pane reaches semantic state.")
     wait.add_argument("--pane-id", default=None)
-    wait.add_argument("--until", choices=("idle", "working", "blocked", "done", "unknown"), required=True)
+    wait.add_argument("--until", choices=AGENT_STATES, required=True)
     wait.add_argument("--timeout-ms", type=int, default=MAX_WAIT_MS)
 
     schema = commands.add_parser("schema", help="Print the full local socket JSON Schema document.")

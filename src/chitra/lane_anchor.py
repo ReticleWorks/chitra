@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -21,6 +22,10 @@ from chitra.socket_api import default_socket_path
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 SANCTIONED_HOST = "tophand"
 SANCTIONED_HOSTS = frozenset({"tophand", "trinity"})
+# The name chitra.watchd's transcript-pipe liveness check looks for. The two
+# must agree: the watcher reads this file to decide whether a governed lane is
+# still being recorded.
+TRANSCRIPT_NAME = "tmux-transcript.log"
 CLAUDE_MODELS = ("sonnet", "opus")
 BACKENDS = ("claude", "codex")
 CLAUDE_EFFORTS = ("low", "medium", "high", "max")
@@ -182,6 +187,37 @@ def _pane_pythonpath() -> str:
     return f"{package_root}{os.pathsep}{inherited}" if inherited else package_root
 
 
+def lane_transcript_path(lane: LaneSpec) -> Path:
+    """Return where this lane's tmux transcript is recorded."""
+    return lane.state_dir / TRANSCRIPT_NAME
+
+
+def arm_transcript_pipe(lane: LaneSpec, *, runner: CommandRunner = _run) -> None:
+    """Point pipe-pane at this lane's transcript, safely on every call.
+
+    ``pipe-pane -o`` opens a pipe only when the pane has none, so calling this
+    on an already-piped lane is a no-op rather than a second writer.
+
+    This runs on the respawn path as well as at creation. Measured 2026-08-16,
+    tophand:atlas-v5 was running with a launch receipt, no transcript file, and
+    tmux reporting no pipe for its pane -- so its output went unrecorded from
+    2026-08-15 13:15Z onward and nothing that reads that file noticed for
+    twenty-five hours. Arming only at creation is what let that happen.
+    """
+    transcript = lane_transcript_path(lane)
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    target = f"{lane.tmux_session}:0.0"
+    result = runner(
+        _run_as_lane(
+            lane,
+            _tmux(lane, "pipe-pane", "-o", "-t", target, f"cat >> {shlex.quote(str(transcript))}"),
+        )
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"tmux exited {result.returncode}"
+        raise RuntimeError(f"could not arm the transcript pipe for lane {lane.identifier}: {detail}")
+
+
 def start_lane(
     lane: LaneSpec,
     *,
@@ -198,6 +234,11 @@ def start_lane(
     control_socket = socket_path or default_socket_path()
     existing = runner(_run_as_lane(lane, _tmux(lane, "has-session", "-t", lane.tmux_session)))
     if existing.returncode == 0:
+        # A lane that is already up still gets its pipe re-armed. This early
+        # return is the respawn path: the session survives, and before this it
+        # returned here having done nothing, so a lane that came back without
+        # its pipe stayed unrecorded until somebody looked.
+        arm_transcript_pipe(lane, runner=runner)
         return False
     identity_environment = (
         f"{LANE_ID_ENV_VAR}={lane.identifier}",
@@ -231,6 +272,7 @@ def start_lane(
         detail = result.stderr.strip() or result.stdout.strip() or f"tmux exited {result.returncode}"
         raise RuntimeError(f"could not create lane {lane.identifier} session: {detail}")
     _require_startup_survival(lane, runner=runner)
+    arm_transcript_pipe(lane, runner=runner)
     _write_launch_receipt(
         lane,
         goal,
