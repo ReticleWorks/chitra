@@ -40,7 +40,9 @@ from pathlib import Path
 import structlog
 
 from chitra._fsio import env_csv, env_path, write_json_atomic
+from chitra.heartbeat import notify_ready, notify_watchdog, write_heartbeat
 from chitra.lane_config import enabled_lanes
+from chitra.state_paths import state_dir as default_state_dir
 
 logger = structlog.get_logger(__name__)
 
@@ -61,6 +63,13 @@ _STATIC_CRITICAL_RULES = (
     # cost roughly two days in August 2026. It leads the rule list so that when
     # it fires it takes the queue line's summary slot.
     ("rate_limited_hard", re.compile(r"\bAGENT_STATUS state=rate_limited_hard\b")),
+    # A wedged turn -- classify_snapshot's manifest still reads "working" off a
+    # frozen spinner frame, but watchd's ground-truth check (transcript byte
+    # growth plus a chrome-stripped screen-residue hash) has seen no progress
+    # for wedge_after_seconds. Eleven lanes sat wedged and undetected for 2h on
+    # 2026-08-17 because a frozen "working" screen never demoted itself; this
+    # is the CRIT rule that makes the demotion actually surface.
+    ("wedged", re.compile(r"\bAGENT_STATUS state=wedged\b")),
     # A lane whose transcript stopped growing is invisible to every file-based
     # liveness check that reads it. An atlas-v5 respawn dropped its pipe on
     # 2026-08-15 and nothing noticed for twenty-five hours, because a pane with
@@ -372,8 +381,14 @@ def run_forever(
     receiving_outputs: ReceivingOutputs | None = None,
 ) -> None:
     logger.info("triaged_started", events_log=str(events_log), poll_seconds=poll_seconds)
+    heartbeat_root = state_file.parent
+    notify_ready()
+    cycle = 0
     while True:
         run_once(events_log, state_file=state_file, triage_log=triage_log, receiving_outputs=receiving_outputs)
+        cycle += 1
+        write_heartbeat(heartbeat_root, daemon="triaged", cycle=cycle, cadence_seconds=poll_seconds)
+        notify_watchdog()
         time.sleep(poll_seconds)
 
 
@@ -399,8 +414,17 @@ def run_lanes_once(lanes_file: Path | None) -> dict[str, int]:
 
 def run_lanes_forever(lanes_file: Path | None, *, poll_seconds: float = DEFAULT_POLL_SECONDS) -> None:
     """Run one shared triage process over every enabled lane event log."""
+    # One process, many lane state roots: the heartbeat lives in the
+    # process-level default state directory (CHITRA_STATE_DIR), not any one
+    # lane's own state root.
+    heartbeat_root = default_state_dir()
+    notify_ready()
+    cycle = 0
     while True:
         run_lanes_once(lanes_file)
+        cycle += 1
+        write_heartbeat(heartbeat_root, daemon="triaged", cycle=cycle, cadence_seconds=poll_seconds)
+        notify_watchdog()
         time.sleep(poll_seconds)
 
 

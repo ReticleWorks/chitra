@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the chitra usage-export publish every 15 minutes
+Documentation=https://github.com/ReticleWorks/chitra
+
+[Timer]
+OnCalendar=*:0/15
+Unit=chitra-usage-export.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

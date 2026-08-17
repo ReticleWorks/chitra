@@ -22,6 +22,7 @@ from chitra.agent_status import (
     classify_snapshot,
     completion_explain,
     integration_explain,
+    wedge_explain,
 )
 
 STATUS_SNAPSHOT_SCHEMA = "chitra.agent-status.v1"
@@ -34,7 +35,7 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_HANDOFF_RULES = 128
 MAX_HANDOFF_MATCHERS = 32
 
-StatusAuthority = Literal["integration", "manifest", "fallback", "completion"]
+StatusAuthority = Literal["integration", "manifest", "fallback", "completion", "wedged"]
 
 
 class StatusRuntimeError(RuntimeError):
@@ -153,7 +154,7 @@ class PaneStatus:
         if state not in AGENT_STATES:
             raise ValueError("pane status agent_status is invalid")
         authority = _required_text(raw, "authority", name="pane status")
-        if authority not in ("integration", "manifest", "fallback", "completion"):
+        if authority not in ("integration", "manifest", "fallback", "completion", "wedged"):
             raise ValueError("pane status authority is invalid")
         revision = raw.get("revision")
         if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
@@ -286,7 +287,7 @@ def detection_explain_from_dict(payload: object) -> DetectionExplain:
     if state not in AGENT_STATES:
         raise ValueError("detection explain state is invalid")
     authority = _required_text(raw, "authority", name="detection explain")
-    if authority not in ("integration", "manifest", "fallback", "completion"):
+    if authority not in ("integration", "manifest", "fallback", "completion", "wedged"):
         raise ValueError("detection explain authority is invalid")
     source_kind = raw.get("source_kind")
     if source_kind not in (None, "integration", "local", "bundled", "internal"):
@@ -362,7 +363,7 @@ def detection_explain_from_dict(payload: object) -> DetectionExplain:
     return DetectionExplain(
         agent=_required_text(raw, "agent", name="detection explain"),
         state=cast(AgentState, state),
-        authority=cast(Literal["integration", "manifest", "fallback", "completion"], authority),
+        authority=cast(Literal["integration", "manifest", "fallback", "completion", "wedged"], authority),
         source=_optional_text(raw, "source", name="detection explain"),
         source_kind=cast(Literal["integration", "local", "bundled", "internal"] | None, source_kind),
         manifest_version=_optional_text(raw, "manifest_version", name="detection explain"),
@@ -488,8 +489,17 @@ class AgentStatusBroker:
         detected_agent: str,
         snapshot: str,
         tmux_socket: Path | None,
+        wedge_candidate_reason: str | None = None,
     ) -> StatusEvent | None:
-        """Apply integration authority or classify the captured snapshot."""
+        """Apply integration authority or classify the captured snapshot.
+
+        ``wedge_candidate_reason`` carries watchd's ground-truth staleness
+        evidence (see ``Watchd._track_wedge_progress``). It is only ever used
+        to DEMOTE a screen-derived ``working`` verdict to ``wedged`` -- a
+        lifecycle-authoritative report and every other manifest state are
+        left untouched, since screen text may add confidence to ``working``
+        but must never be what sustains it past the staleness threshold.
+        """
         with self._condition:
             self._ensure_mutable()
             report = self._lifecycle.get(pane_id)
@@ -502,6 +512,8 @@ class AgentStatusBroker:
             else:
                 agent = detected_agent
                 explain = classify_snapshot(snapshot, agent=agent, repository=self.repository)
+                if wedge_candidate_reason and explain.state == "working":
+                    explain = wedge_explain(agent=agent, reason=wedge_candidate_reason)
             existing = self._statuses.get(pane_id)
             if existing is not None and existing.state == "done" and explain.state == "idle":
                 return None

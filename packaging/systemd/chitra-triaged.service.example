@@ -4,7 +4,11 @@ Documentation=https://github.com/ReticleWorks/chitra
 After=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+# Default poll interval is 2s (--poll-seconds, unset here); 3x cadence gives
+# one missed cycle of slack before systemd concludes the loop is hung.
+WatchdogSec=6
 # Replace with the user/group this service should run as. Do not run as root.
 User=chitra
 Group=chitra

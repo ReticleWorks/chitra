@@ -17,14 +17,21 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Literal, cast
 
-AgentState = Literal["idle", "working", "blocked", "done", "unknown", "rate_limited_hard", "rate_limited_warn"]
+AgentState = Literal[
+    "idle", "working", "blocked", "done", "unknown", "rate_limited_hard", "rate_limited_warn", "wedged"
+]
 ManifestState = Literal["idle", "working", "blocked", "rate_limited_hard", "rate_limited_warn"]
 MatcherKind = Literal["contains", "regex", "line_regex"]
 ManifestSourceKind = Literal["local", "bundled"]
 BlockerKind = Literal["approval", "question", "permission"]
 
 MANIFEST_STATES = ("idle", "working", "blocked", "rate_limited_hard", "rate_limited_warn")
-AGENT_STATES = ("idle", "working", "blocked", "done", "unknown", "rate_limited_hard", "rate_limited_warn")
+# "wedged" is never authored by a manifest rule -- it is a ground-truth override
+# watchd applies on top of a screen-derived "working" verdict when neither the
+# transcript nor the chrome-stripped pane residue has moved in wedge_after_seconds
+# (see watchd.chrome_stripped_residue_hash / Watchd._track_wedge_progress). It
+# joins "done" and "unknown" as an AgentState with no manifest-rule counterpart.
+AGENT_STATES = ("idle", "working", "blocked", "done", "unknown", "rate_limited_hard", "rate_limited_warn", "wedged")
 # A pane that has hit a provider cap still draws its input row, so without a
 # state of its own it classifies as idle. That is exactly how a Codex lane sat
 # on a weekly hard cap for roughly two days: the monitor saw idle and had no
@@ -210,7 +217,7 @@ class DetectionExplain:
 
     agent: str
     state: AgentState
-    authority: Literal["integration", "manifest", "fallback", "completion"]
+    authority: Literal["integration", "manifest", "fallback", "completion", "wedged"]
     source: str | None
     source_kind: Literal["integration", "local", "bundled", "internal"] | None
     manifest_version: str | None
@@ -260,6 +267,34 @@ def integration_explain(*, agent: str, state: AgentState, source: str) -> Detect
         screen_detection_skipped=True,
         screen_detection_skip_reason=LIFECYCLE_AUTHORITY_SKIP_REASON,
         evaluated_rules=(),
+    )
+
+
+def wedge_explain(*, agent: str, reason: str) -> DetectionExplain:
+    """Build explain output for a ground-truth wedge override.
+
+    A screen-derived ``working`` verdict is only ever confidence, never proof:
+    the manifest classification can be replayed forever off a frozen spinner
+    frame. This overrides that verdict with the deterministic evidence watchd
+    actually tracked -- transcript byte growth and a chrome-stripped residue
+    hash of the captured pane -- once neither has moved for longer than
+    ``wedge_after_seconds``. The override lasts only as long as the staleness
+    does: the next observation that sees real progress reclassifies normally.
+    """
+    return DetectionExplain(
+        agent=agent,
+        state="wedged",
+        authority="wedged",
+        source="chitra:wedge_detector",
+        source_kind="internal",
+        manifest_version=None,
+        matched_rule=None,
+        blocker_kind=None,
+        fallback_reason=None,
+        screen_detection_skipped=True,
+        screen_detection_skip_reason="ground_truth_progress_stalled",
+        evaluated_rules=(),
+        warning=reason,
     )
 
 

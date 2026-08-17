@@ -56,6 +56,7 @@ from chitra.goals import (
     session_host,
     update_now,
 )
+from chitra.heartbeat import notify_ready, notify_watchdog, write_heartbeat
 from chitra.lane_activity import LaneActivity, LaneBackend, load_lane_activity, upsert_lane_activity
 from chitra.lane_config import enabled_lanes
 from chitra.live_handoff import perform_live_handoff
@@ -101,13 +102,53 @@ DEFAULT_TRANSCRIPT_STALE_SECONDS = 900
 TRANSCRIPT_NAME = "tmux-transcript.log"
 LANE_LAUNCH_NAME = "lane-launch.json"
 CAPTURE_LINES = 60
+WEDGE_AFTER_SECONDS_ENV_VAR = "CHITRA_WATCHD_WEDGE_AFTER_SECONDS"
+# Twenty minutes. A screen-derived "working" verdict is only ever confidence,
+# never proof -- classify_snapshot replays a frozen spinner frame forever.
+# This is the ceiling on how long "working" may be sustained by screen text
+# alone once ground truth (transcript growth, chrome-stripped residue) has
+# stopped moving. Eleven lanes sat wedged and undetected for 2h on 2026-08-17
+# because nothing enforced this ceiling.
+DEFAULT_WEDGE_AFTER_SECONDS = 1200
+SUBPROCESS_TIMEOUT_ENV_VAR = "CHITRA_WATCHD_SUBPROCESS_TIMEOUT_SECONDS"
+# Every tmux invocation goes through _run_command. Without a timeout, a wedged
+# or hung tmux server call blocks the poll thread forever -- the daemon itself
+# becomes the thing that needs a heartbeat to catch.
+DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 10.0
 
 _VOLATILE_LINE_RE = re.compile(
     r"^[\s]*[·✻✽✳✢✶*●○◐◯]|tokens\b|🪟|⏵⏵|esc to interrupt|ctrl\+b|^─+$|^[\s]*$|Press up to edit|globalVersion: [0-9.]+"
 )
 _TIMING_CHROME_RE = re.compile(r"\([0-9]+m? ?[0-9]*s?[^)]*\)")
+# Defensive: tmux capture-pane -p (no -e) does not embed escape sequences, but
+# strip them anyway so a chrome-stripped hash never keys off terminal color
+# codes an operator's TERM setting happens to add.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+_NON_ALNUM_RE = re.compile(r"[^0-9A-Za-z]+")
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 ReviewKey = tuple[str, str]
+
+
+def chrome_stripped_residue_hash(content: str) -> str:
+    """Hash the alphanumeric residue of a captured pane, chrome stripped out.
+
+    A wedged turn keeps re-rendering the same spinner/timer/token/statusline
+    chrome forever -- that alone must never look like progress. This reuses
+    the same volatile-line and timing-chrome patterns ``normalize`` strips for
+    triage-event dedup, then collapses everything left to bare alphanumerics
+    before hashing, so incidental whitespace or column-alignment reflow (not
+    substantive content) never masquerades as movement either.
+    """
+    text = _ANSI_ESCAPE_RE.sub("", content)
+    residue_parts: list[str] = []
+    for line in text.splitlines():
+        if _VOLATILE_LINE_RE.search(line):
+            continue
+        stripped_timing = _TIMING_CHROME_RE.sub("", line)
+        residue = _NON_ALNUM_RE.sub("", stripped_timing)
+        if residue:
+            residue_parts.append(residue)
+    return hashlib.sha256("".join(residue_parts).encode("utf-8", errors="replace")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +192,11 @@ class WatchdConfig:
     # at <host>/<lane>/tmux-transcript.log. Unset means the check is off.
     transcript_root: Path | None = None
     transcript_stale_seconds: int = DEFAULT_TRANSCRIPT_STALE_SECONDS
+    # Ceiling on how long a screen-derived "working" verdict may be sustained
+    # by screen text alone once ground-truth progress (transcript growth, the
+    # chrome-stripped residue hash) has stopped moving. See
+    # DEFAULT_WEDGE_AFTER_SECONDS.
+    wedge_after_seconds: int = DEFAULT_WEDGE_AFTER_SECONDS
 
     def __post_init__(self) -> None:
         if self.reviewer_count < 1:
@@ -159,6 +205,8 @@ class WatchdConfig:
             raise ValueError("idle_threshold_seconds must be a positive number")
         if self.transcript_stale_seconds < 1:
             raise ValueError("transcript_stale_seconds must be a positive integer")
+        if self.wedge_after_seconds < 1:
+            raise ValueError("wedge_after_seconds must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,8 +254,19 @@ def pane_at_input_row(content: str) -> bool:
     return any(line.lstrip().startswith(("❯", "›")) for line in lines[-12:])
 
 
-def _run_command(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, check=False, capture_output=True, text=True)
+def _run_command(
+    command: Sequence[str], *, timeout: float = DEFAULT_SUBPROCESS_TIMEOUT_SECONDS
+) -> subprocess.CompletedProcess[str]:
+    """Run one subprocess with a bounded timeout so a hung tmux call cannot
+    wedge the poll loop itself. A timeout is treated exactly like any other
+    command failure: a non-zero returncode, logged and counted, never raised."""
+    try:
+        return subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        logger.warning("watchd_subprocess_timeout", command=list(command), timeout_seconds=timeout)
+        return subprocess.CompletedProcess(
+            args=list(command), returncode=124, stdout="", stderr=f"timed out after {timeout}s"
+        )
 
 
 def _tmux_command(command: Sequence[str], tmux_socket: Path | None) -> list[str]:
@@ -445,6 +504,12 @@ class Watchd:
     status_revisions: dict[str, int] = field(default_factory=dict)
     status_states: dict[str, AgentState] = field(default_factory=dict)
     transcript_faults: dict[str, str] = field(default_factory=dict)
+    # Per-pane wedge-progress tracking (ground truth, not screen text): the
+    # last observed transcript size, the last observed chrome-stripped
+    # residue hash, and the monotonic time either one last actually changed.
+    wedge_transcript_sizes: dict[str, int] = field(default_factory=dict)
+    wedge_chrome_hashes: dict[str, str] = field(default_factory=dict)
+    wedge_progress_at: dict[str, float] = field(default_factory=dict)
     clock: Callable[[], float] = time.monotonic
     reviewed_turns: set[ReviewKey] = field(default_factory=set)
     pending_reviews: dict[ReviewKey, PendingCompletionReview] = field(default_factory=dict)
@@ -733,6 +798,58 @@ class Watchd:
         )
         return 1
 
+    def _track_wedge_progress(self, pane: Pane, content: str, session_ref: str | None) -> float:
+        """Update ground-truth progress tracking for one pane; return the
+        monotonic time of its most recent real progress signal.
+
+        Two independent sources count as progress, and either is sufficient:
+        the governed-lane transcript growing (reusing the same path
+        resolution ``transcript_pipe_fault`` already uses), and the
+        chrome-stripped alphanumeric residue of the captured pane text
+        changing. A pane observed for the first time is never treated as
+        stale -- there is no prior sample to compare against yet.
+        """
+        now = self.clock()
+        progressed = False
+
+        transcript_size: int | None = None
+        if self.config.transcript_root is not None and session_ref is not None:
+            transcript = transcript_path(self.config.transcript_root, session_ref)
+            try:
+                transcript_size = transcript.stat().st_size
+            except OSError:
+                transcript_size = None
+        if transcript_size is not None:
+            previous_size = self.wedge_transcript_sizes.get(pane.pane_id)
+            if previous_size is None or transcript_size != previous_size:
+                progressed = True
+            self.wedge_transcript_sizes[pane.pane_id] = transcript_size
+
+        chrome_hash = chrome_stripped_residue_hash(content)
+        previous_hash = self.wedge_chrome_hashes.get(pane.pane_id)
+        if previous_hash is None or chrome_hash != previous_hash:
+            progressed = True
+        self.wedge_chrome_hashes[pane.pane_id] = chrome_hash
+
+        if progressed or pane.pane_id not in self.wedge_progress_at:
+            self.wedge_progress_at[pane.pane_id] = now
+        return self.wedge_progress_at[pane.pane_id]
+
+    def _wedge_candidate_reason(self, pane: Pane, content: str, session_ref: str | None) -> str | None:
+        """Return the ground-truth staleness reason once past the wedge
+        threshold, or None. This is only ever a CANDIDATE: it demotes a
+        screen-derived ``working`` verdict inside ``observe``, never any
+        other state, so a legitimately idle/blocked/rate-limited pane is
+        untouched."""
+        progress_at = self._track_wedge_progress(pane, content, session_ref)
+        stale_elapsed = self.clock() - progress_at
+        if stale_elapsed < self.config.wedge_after_seconds:
+            return None
+        return (
+            f"no transcript growth or screen-residue change for {int(stale_elapsed)}s "
+            f"(wedge_after_seconds={self.config.wedge_after_seconds})"
+        )
+
     def poll_once(self) -> int:
         """Capture panes and emit only semantic status transitions."""
         self._drain_completed_reviews()
@@ -757,6 +874,7 @@ class Watchd:
             self._save_raw_capture(pane.pane_id, content)
             observed_at = datetime.now(UTC).isoformat()
             session_ref = self._session_ref(pane)
+            wedge_candidate_reason = self._wedge_candidate_reason(pane, content, session_ref)
             try:
                 self.status_broker.observe(
                     pane_id=pane.pane_id,
@@ -766,6 +884,7 @@ class Watchd:
                     detected_agent=pane.backend,
                     snapshot=content,
                     tmux_socket=self.config.tmux_socket,
+                    wedge_candidate_reason=wedge_candidate_reason,
                 )
             except StatusRuntimeError:
                 break
@@ -881,6 +1000,7 @@ def resolve_config(
     idle_threshold_seconds: float | None = None,
     transcript_root: Path | None = None,
     transcript_stale_seconds: int | None = None,
+    wedge_after_seconds: int | None = None,
 ) -> WatchdConfig:
     """Resolve CLI values, then ``CHITRA_*`` overrides, then generic defaults."""
     configured_state_dir = state_dir or default_state_dir()
@@ -969,6 +1089,14 @@ def resolve_config(
             if raw_transcript_stale
             else DEFAULT_TRANSCRIPT_STALE_SECONDS
         )
+    configured_wedge_after = wedge_after_seconds
+    if configured_wedge_after is None:
+        raw_wedge_after = _env_value(WEDGE_AFTER_SECONDS_ENV_VAR)
+        configured_wedge_after = (
+            _positive_int(raw_wedge_after, name=WEDGE_AFTER_SECONDS_ENV_VAR)
+            if raw_wedge_after
+            else DEFAULT_WEDGE_AFTER_SECONDS
+        )
     return WatchdConfig(
         state_dir=configured_state_dir,
         events_log=configured_events_log,
@@ -989,6 +1117,7 @@ def resolve_config(
         idle_threshold_seconds=configured_idle_threshold,
         transcript_root=configured_transcript_root,
         transcript_stale_seconds=configured_transcript_stale,
+        wedge_after_seconds=configured_wedge_after,
     )
 
 
@@ -1026,9 +1155,19 @@ def run_forever(watchd: Watchd, *, stop_event: threading.Event | None = None) ->
     assert watchd.status_broker is not None
     server = _start_control_server(watchd.status_broker, watchd.config, stop_event)
     logger.info("watchd_started", events_log=str(watchd.config.events_log), interval_seconds=watchd.config.interval_seconds)
+    notify_ready()
+    cycle = 0
     try:
         while not stop_event.is_set():
             watchd.poll_once()
+            cycle += 1
+            write_heartbeat(
+                watchd.config.state_dir,
+                daemon="watchd",
+                cycle=cycle,
+                cadence_seconds=watchd.config.interval_seconds,
+            )
+            notify_watchdog()
             stop_event.wait(watchd.config.interval_seconds)
     finally:
         watchd.shutdown()
@@ -1087,10 +1226,20 @@ def run_lanes_forever(
     watchers = build_lane_watchers(lanes_file, base_config, status_broker=broker)
     server = _start_control_server(broker, base_config, active_stop_event)
     logger.info("watchd_started", lanes_file=str(lanes_file), lane_count=len(watchers))
+    notify_ready()
+    cycle = 0
     try:
         while not active_stop_event.is_set():
             for watcher in watchers:
                 watcher.poll_once()
+            cycle += 1
+            write_heartbeat(
+                base_config.state_dir,
+                daemon="watchd",
+                cycle=cycle,
+                cadence_seconds=base_config.interval_seconds,
+            )
+            notify_watchdog()
             active_stop_event.wait(base_config.interval_seconds)
     finally:
         for watcher in watchers:
@@ -1160,6 +1309,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Age at which a transcript counts as not growing (default: CHITRA_WATCHD_TRANSCRIPT_STALE_SECONDS or 900).",
     )
     parser.add_argument(
+        "--wedge-after-seconds",
+        type=int,
+        default=None,
+        help=(
+            "Demote a screen-derived 'working' verdict to 'wedged' once neither the transcript nor the "
+            "chrome-stripped pane residue has moved for this long (default: CHITRA_WATCHD_WEDGE_AFTER_SECONDS or 1200)."
+        ),
+    )
+    parser.add_argument(
         "--agent-manifest-dir",
         type=Path,
         default=None,
@@ -1226,6 +1384,7 @@ def main(argv: list[str] | None = None) -> int:
         idle_threshold_seconds=args.idle_threshold_seconds,
         transcript_root=args.transcript_root,
         transcript_stale_seconds=args.transcript_stale_seconds,
+        wedge_after_seconds=args.wedge_after_seconds,
     )
     if args.lanes_file is not None:
         if args.once:
