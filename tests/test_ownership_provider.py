@@ -66,6 +66,12 @@ def _write_state(
         complete=complete,
     )
     marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    # The reader refuses a group- or world-writable state file, so these have to
+    # carry a mode rather than inherit one. A host with umask 002 writes 0664
+    # and every test here reads back state_unsafe -- which is the reader working
+    # correctly and the fixture testing the umask it happened to run under.
+    for path in (goals_path, marker_path):
+        path.chmod(0o600)
     return goals_path, marker_path
 
 
