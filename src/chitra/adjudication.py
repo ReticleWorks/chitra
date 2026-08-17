@@ -40,7 +40,7 @@ from chitra.decisions import DecisionEntry, read_decisions
 # kind of process, so they share one unwrapping rule rather than two that can
 # drift apart. It lives with the reviewer because that is where it landed first;
 # a neutral home would be better if a third caller ever appears.
-from chitra.goal_enforcement import unwrap_json_object
+from chitra.goal_enforcement import REVIEWER_ATTEMPTS, REVIEWER_SYSTEM_PROMPT, unwrap_json_object
 from chitra.goals import GoalRecord, lane_id_from_session_ref, session_host
 from chitra.lane_read import extract_open_asks
 from chitra.lexicon import OPERATOR_GATE_PATTERNS
@@ -778,11 +778,15 @@ class ClaudeProcessAdjudicator:
         model: str | None = None,
         timeout_seconds: int = 180,
         runner: ProcessRunner = subprocess.run,
+        attempts: int = REVIEWER_ATTEMPTS,
     ) -> None:
+        if attempts < 1:
+            raise ValueError("attempts must be a positive integer")
         self.command = command
         self.model = model
         self.timeout_seconds = timeout_seconds
         self.runner = runner
+        self.attempts = attempts
 
     @staticmethod
     def _prompt(claim: BlockerClaim, context: AdjudicationContext, evidence: Sequence[Evidence]) -> str:
@@ -808,20 +812,44 @@ class ClaudeProcessAdjudicator:
             # No tools. Every fact it may use is already in the prompt.
             "--allowed-tools",
             "",
+            # Replace the host's system prompt for the same reason the reviewer
+            # does: an operator output style installed on the host otherwise
+            # tells this process to answer in narrated prose, and a reply that
+            # is not one JSON object cannot be read as a decision.
+            "--system-prompt",
+            REVIEWER_SYSTEM_PROMPT,
         ]
         if self.model is not None:
             command.extend(["--model", self.model])
-        try:
-            completed = self.runner(command, check=False, capture_output=True, text=True, timeout=self.timeout_seconds)
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise AdjudicatorProcessError(f"the adjudicator process could not run: {exc}") from exc
-        if completed.returncode != 0:
-            detail = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
-            raise AdjudicatorProcessError(f"the adjudicator process failed: {detail}")
-        try:
-            return AdjudicatorReply.model_validate_json(unwrap_json_object(completed.stdout))
-        except ValueError as exc:
-            raise AdjudicatorProcessError(f"the adjudicator process returned an unusable answer: {exc}") from exc
+        invalid = ""
+        for attempt in range(1, self.attempts + 1):
+            try:
+                completed = self.runner(command, check=False, capture_output=True, text=True, timeout=self.timeout_seconds)
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise AdjudicatorProcessError(f"the adjudicator process could not run: {exc}") from exc
+            if completed.returncode != 0:
+                detail = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
+                raise AdjudicatorProcessError(f"the adjudicator process failed: {detail}")
+            try:
+                return AdjudicatorReply.model_validate_json(unwrap_json_object(completed.stdout))
+            except ValueError as exc:
+                # Retry only an unusable reply. Measured on tophand 2026-08-17
+                # against the reviewer's prompt: identical input returned a
+                # valid object three times in seven and a degenerate one the
+                # rest. Losing a good decision to that coin flip would send the
+                # claim back as undecided about half the time.
+                invalid = str(exc)
+                logger.warning(
+                    "adjudication_reply_invalid",
+                    claim_id=claim.claim_id,
+                    attempt=attempt,
+                    attempts=self.attempts,
+                    reply=completed.stdout.strip()[:200],
+                )
+        raise AdjudicatorProcessError(
+            f"the adjudicator process returned an unusable answer on all {self.attempts} attempts: {invalid}"
+        )
+
 
 
 def _reply_text_issues(reply: AdjudicatorReply) -> tuple[str, ...]:

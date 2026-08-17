@@ -35,6 +35,7 @@ from chitra.adjudication import (
 from chitra.capabilities import CapabilityManifest
 from chitra.convlog import ConversationEntry
 from chitra.decisions import DecisionEntry
+from chitra.goal_enforcement import REVIEWER_SYSTEM_PROMPT
 from chitra.goals import GoalRecord
 from chitra.usage_export import FleetExportVerdict, FleetVerdict
 
@@ -535,6 +536,77 @@ def test_the_reasoning_process_is_granted_no_tools_and_no_memory() -> None:
     command = captured[0]
     assert "--no-session-persistence" in command
     assert command[command.index("--allowed-tools") + 1] == ""
+
+
+def test_the_reasoning_process_replaces_the_host_system_prompt() -> None:
+    """Same exposure the reviewer had: a host output style forces narrated prose."""
+    captured: list[list[str]] = []
+    claim = _claim("A plain progress note.")
+
+    def _runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(command)
+        reply = AdjudicatorReply(
+            claim_id=claim.claim_id,
+            verdict="operator-required",
+            escalation="Do you want to spend money on a second storage volume?",
+            escalation_class="spend",
+        )
+        return subprocess.CompletedProcess(command, 0, reply.model_dump_json(), "")
+
+    ClaudeProcessAdjudicator(runner=_runner).adjudicate(claim, _context(), ())
+    command = captured[0]
+    assert command[command.index("--system-prompt") + 1] == REVIEWER_SYSTEM_PROMPT
+
+
+def test_an_unusable_reply_is_retried_because_the_failure_is_intermittent() -> None:
+    """Measured three valid replies in seven attempts on identical input."""
+    claim = _claim("A plain progress note.")
+    calls: list[int] = []
+
+    def _runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(1)
+        if len(calls) < 3:
+            return subprocess.CompletedProcess(command, 0, '{"ok":true}', "")
+        reply = AdjudicatorReply(
+            claim_id=claim.claim_id,
+            verdict="operator-required",
+            escalation="Do you want to spend money on a second storage volume?",
+            escalation_class="spend",
+        )
+        return subprocess.CompletedProcess(command, 0, reply.model_dump_json(), "")
+
+    assert ClaudeProcessAdjudicator(runner=_runner).adjudicate(claim, _context(), ()).verdict == "operator-required"
+    assert len(calls) == 3
+
+
+def test_an_unusable_reply_still_fails_closed_once_the_attempts_run_out() -> None:
+    calls: list[int] = []
+
+    def _runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(1)
+        return subprocess.CompletedProcess(command, 0, '{"ok":true}', "")
+
+    with pytest.raises(AdjudicatorProcessError, match="all 3 attempts"):
+        ClaudeProcessAdjudicator(runner=_runner).adjudicate(_claim("A note."), _context(), ())
+    assert len(calls) == 3
+
+
+def test_a_reasoning_process_that_exits_non_zero_is_not_retried() -> None:
+    """Only the intermittent failure is retried; a broken process fails at once."""
+    calls: list[int] = []
+
+    def _runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(1)
+        return subprocess.CompletedProcess(command, 1, "", "the model was unavailable")
+
+    with pytest.raises(AdjudicatorProcessError, match="the model was unavailable"):
+        ClaudeProcessAdjudicator(runner=_runner).adjudicate(_claim("A note."), _context(), ())
+    assert len(calls) == 1
+
+
+def test_a_non_positive_attempt_count_is_refused() -> None:
+    with pytest.raises(ValueError, match="attempts must be a positive integer"):
+        ClaudeProcessAdjudicator(attempts=0)
 
 
 def test_a_reasoning_process_that_exits_non_zero_is_an_error() -> None:
