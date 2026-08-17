@@ -97,9 +97,11 @@ _GOAL_FIELDS = frozenset(
         "resume_at",
         "successor_of",
         "transferred_to",
+        "interview",
+        "interview_waiver",
     )
 )
-_GOAL_STRING_FIELDS = _GOAL_FIELDS - {"goal_version", "goal_history", "open_asks", "retired_asks"}
+_GOAL_STRING_FIELDS = _GOAL_FIELDS - {"goal_version", "goal_history", "open_asks", "retired_asks", "interview"}
 
 
 class ProtocolError(ValueError):
@@ -301,6 +303,20 @@ def _validate_goals_document(raw: bytes, *, host_id: str) -> dict[str, Ownership
             for item in history
         ):
             raise ValueError("managed goal goal_history must contain string objects")
+        interview = raw_goal["interview"]
+        if not isinstance(interview, list) or len(interview) > MAX_GOAL_HISTORY or not all(
+            isinstance(item, dict)
+            and len(item) == 3
+            and all(
+                isinstance(key, str)
+                and isinstance(value, str)
+                and len(key.encode("utf-8")) <= MAX_IDENTIFIER_BYTES
+                and len(value.encode("utf-8")) <= MAX_GOAL_STRING_BYTES
+                for key, value in item.items()
+            )
+            for item in interview
+        ):
+            raise ValueError("managed goal interview must contain string objects")
         session_ref = _nonempty_string(raw_goal, "session_ref", maximum=MAX_SESSION_REF_BYTES)
         record_host, record_lane, _ = canonical_session_parts(session_ref)
         lane_id = _nonempty_string(raw_goal, "lane_id", maximum=MAX_IDENTIFIER_BYTES)

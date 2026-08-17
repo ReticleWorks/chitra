@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _interview_fixtures import VALID_INTERVIEW
 
 from chitra.goal_enforcement import (
     REVIEWER_SYSTEM_PROMPT,
@@ -49,6 +50,7 @@ def _goal(root: Path) -> GoalRecord:
             scope="WS1 source tests and documentation only.",
             source="task-file:/tmp/ws1.md",
             status="working",
+            interview=VALID_INTERVIEW,
         ),
     )
 

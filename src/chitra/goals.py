@@ -7,7 +7,7 @@ stated goal, completion condition, and current state.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -52,6 +52,19 @@ SCHEMA = "chitra.goals.v2"
 # the same instant, and a monitor that refused the older document would go
 # blind exactly while a transfer was in flight.
 SUPPORTED_SCHEMAS = ("chitra.goals.v2", "chitra.goals.v1")
+
+# The four fixed SHORT INTERVIEW questions the ingestion gate requires before
+# a lane is well-specified (see check_specification). Order is fixed so the
+# CLI's --print-questions output and any doc referencing "the four questions"
+# stay in lockstep with the stored ids.
+INTERVIEW_QUESTION_IDS: tuple[str, ...] = ("intent", "done_when", "out_of_scope", "constraints")
+INTERVIEW_QUESTIONS: dict[str, str] = {
+    "intent": "Original intent, in the operator's words: what outcome, for whom?",
+    "done_when": "Done-when: what concrete artifact or check closes it (the four-rung standard)?",
+    "out_of_scope": "What is explicitly OUT of scope?",
+    "constraints": "What material constraints does the brief impose (spend, tools, order, approvals)?",
+}
+INTERVIEW_WAIVER_REASON = "migrated-from-legacy"
 
 # Shared hold_reason convention: a hold_reason starting with this prefix
 # (e.g. "rate-limit:5h") marks a timed pause driven by provider usage
@@ -112,6 +125,16 @@ class GoalRecord:
     # successor on the held one. Both empty on a lane that has never moved.
     successor_of: str = ""
     transferred_to: str = ""
+    # Ingestion-interview provenance (chitra.goals.v2, additive). ``interview``
+    # holds the four SHORT INTERVIEW answers (see INTERVIEW_QUESTION_IDS); a
+    # record with none is a record whose interview has never run. A record
+    # created before this field existed loads with an empty tuple, same
+    # backward-compatible treatment as successor_of/transferred_to above.
+    # ``interview_waiver`` is empty except for a record explicitly waived
+    # through ``chitra-goals interview --waive-legacy``; the only accepted
+    # value is INTERVIEW_WAIVER_REASON.
+    interview: tuple[dict[str, str], ...] = ()
+    interview_waiver: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return cast(dict[str, object], _GOAL_RECORD_ADAPTER.dump_python(self, mode="json"))
@@ -160,11 +183,14 @@ class GoalRecord:
             "resume_at",
             "successor_of",
             "transferred_to",
+            "interview_waiver",
         ):
             value = payload.get(field, "")
             if not isinstance(value, str):
                 raise ValueError(f"goal record {field} must be a string")
             normalized[field] = value
+        if normalized["interview_waiver"] and normalized["interview_waiver"] != INTERVIEW_WAIVER_REASON:
+            raise ValueError(f"goal record interview_waiver must be {INTERVIEW_WAIVER_REASON!r} or empty")
         session_ref = cast(str, normalized["session_ref"])
         done_when = cast(str, normalized["done_when"])
         created_at = cast(str, normalized["created_at"])
@@ -190,6 +216,18 @@ class GoalRecord:
             if entry["state"] not in ("resolved-by-operator", "retired-by-monitor-with-cited-basis"):
                 raise ValueError("goal record retired ask state is invalid")
         normalized["retired_asks"] = raw_retired_asks
+        raw_interview = payload.get("interview", [])
+        interview_fields = {"question", "answer", "provenance"}
+        if not isinstance(raw_interview, list):
+            raise ValueError("goal record interview must be a list of objects")
+        for entry in raw_interview:
+            if not isinstance(entry, dict) or set(entry) != interview_fields:
+                raise ValueError("goal record interview entries must contain question, answer, and provenance")
+            if not all(isinstance(value, str) for value in entry.values()):
+                raise ValueError("goal record interview entries must contain strings")
+            if entry["question"] not in INTERVIEW_QUESTION_IDS:
+                raise ValueError(f"goal record interview question must be one of {', '.join(INTERVIEW_QUESTION_IDS)}")
+        normalized["interview"] = raw_interview
         goal_version = payload.get("goal_version", 1)
         if not isinstance(goal_version, int) or isinstance(goal_version, bool):
             raise ValueError("goal record goal_version must be an integer")
@@ -251,7 +289,17 @@ def validate_goal(rec: GoalRecord) -> list[str]:
 
 
 def check_specification(rec: GoalRecord) -> list[str]:
-    """Return stricter deterministic interview-bypass criteria for a goal."""
+    """Return stricter deterministic interview-bypass criteria for a goal.
+
+    Alongside the pre-existing field-shape checks, this now enforces the
+    doctrine SHORT INTERVIEW as a hard machine gate: a lane is not
+    well-specified unless it carries all four interview entries (see
+    INTERVIEW_QUESTION_IDS), each with a non-empty answer and a provenance
+    citing either the operator's own words or a primary source -- OR the
+    record carries the explicit ``interview_waiver`` set only via
+    ``chitra-goals interview --waive-legacy``. A waived record is still
+    flagged so it stays visibly distinguishable from an interviewed one.
+    """
     issues: list[str] = []
     if not rec.intent.strip() or len(rec.intent.split()) < 8:
         issues.append("intent must be non-empty and contain at least eight words")
@@ -263,7 +311,89 @@ def check_specification(rec: GoalRecord) -> list[str]:
         issues.append("scope must be non-empty and contain at least four words")
     if not rec.source.startswith(("task-file", "branch", "transcript-first-msg")):
         issues.append("source must start with task-file, branch, or transcript-first-msg")
+    if not rec.interview_waiver:
+        answered = {entry["question"]: entry for entry in rec.interview}
+        for question_id in INTERVIEW_QUESTION_IDS:
+            entry = answered.get(question_id)
+            if entry is None:
+                issues.append(f"interview: missing answer for {question_id!r} ({INTERVIEW_QUESTIONS[question_id]})")
+                continue
+            answer_issues = validate_interview_answer(question_id, entry["answer"], entry["provenance"])
+            issues.extend(answer_issues)
     return issues
+
+
+_INTERVIEW_PROVENANCE_PREFIXES = ("operator:", "source:")
+
+
+def validate_interview_answer(question: str, answer: str, provenance: str) -> list[str]:
+    """Return deterministic doctrine violations for one interview entry.
+
+    ``provenance`` must be "operator:<verbatim operator words>" or
+    "source:<citation - doc path, branch, task file, or transcript ref>",
+    each with real content after the prefix; a bare prefix is not a citation.
+    """
+    issues: list[str] = []
+    if question not in INTERVIEW_QUESTION_IDS:
+        issues.append(f"interview question id must be one of {', '.join(INTERVIEW_QUESTION_IDS)}, got {question!r}")
+    if not answer.strip():
+        issues.append(f"interview answer for {question!r} must be non-empty")
+    stripped_provenance = provenance.strip()
+    prefix = next((candidate for candidate in _INTERVIEW_PROVENANCE_PREFIXES if stripped_provenance.startswith(candidate)), None)
+    if prefix is None or not stripped_provenance[len(prefix) :].strip():
+        issues.append(
+            f'interview provenance for {question!r} must be "operator:<verbatim operator words>" '
+            'or "source:<citation - doc path, branch, task file, or transcript ref>"'
+        )
+    return issues
+
+
+def record_interview(root: Path | None, session_ref: str, *, answers: Mapping[str, tuple[str, str]]) -> GoalRecord:
+    """Validate and persist all four SHORT INTERVIEW answers for a lane.
+
+    ``answers`` maps each id in ``INTERVIEW_QUESTION_IDS`` to
+    ``(answer, provenance)``. A partial interview -- fewer than all four
+    answers in one call -- is not a valid interview and is refused: doctrine
+    requires the full four-question interview to run before a lane's
+    ingestion gate can pass.
+    """
+    missing = [question_id for question_id in INTERVIEW_QUESTION_IDS if question_id not in answers]
+    if missing:
+        raise GoalValidationError(f"interview is missing answers for: {', '.join(missing)}")
+    issues: list[str] = []
+    for question_id in INTERVIEW_QUESTION_IDS:
+        answer, provenance = answers[question_id]
+        issues.extend(validate_interview_answer(question_id, answer, provenance))
+    if issues:
+        raise GoalValidationError("; ".join(issues))
+    entries = tuple(
+        {"question": question_id, "answer": answers[question_id][0], "provenance": answers[question_id][1]}
+        for question_id in INTERVIEW_QUESTION_IDS
+    )
+    with locked_json_store(goals_path(root)):
+        existing = get_goal(root, session_ref)
+        if existing is None:
+            raise GoalNotFoundError(session_ref)
+        stored = _upsert_goal_locked(root, replace(existing, interview=entries))
+    logger.info("goal_mutated", session_ref=session_ref, action="interview")
+    return stored
+
+
+def waive_interview(root: Path | None, session_ref: str) -> GoalRecord:
+    """Mark a record's ingestion interview waived as migrated-from-legacy.
+
+    This is an explicit, loudly-logged CLI-only escape hatch (``chitra-goals
+    interview --waive-legacy``) for a record that predates the interview
+    gate, not a routine path -- ``check_specification`` still flags a waived
+    record so it stays visibly distinguishable from an interviewed one.
+    """
+    with locked_json_store(goals_path(root)):
+        existing = get_goal(root, session_ref)
+        if existing is None:
+            raise GoalNotFoundError(session_ref)
+        stored = _upsert_goal_locked(root, replace(existing, interview_waiver=INTERVIEW_WAIVER_REASON))
+    logger.warning("goal_interview_waived", session_ref=session_ref, reason=INTERVIEW_WAIVER_REASON)
+    return stored
 
 
 def goals_path(root: Path | None = None) -> Path:
@@ -416,6 +546,12 @@ def _upsert_goal_locked(
         # and two lanes on one branch is the collision the doctrine forbids.
         successor_of=rec.successor_of or (existing.successor_of if existing is not None else ""),
         transferred_to=rec.transferred_to or (existing.transferred_to if existing is not None else ""),
+        # Interview provenance is monitor-recorded evidence, not a routine
+        # tactical field: a plain `set`/`now` write that says nothing about it
+        # must not silently blank an already-recorded interview, the same
+        # non-clobber treatment as transfer linkage above.
+        interview=rec.interview or (existing.interview if existing is not None else ()),
+        interview_waiver=rec.interview_waiver or (existing.interview_waiver if existing is not None else ""),
     )
     records = [record for record in records if record.session_ref != rec.session_ref]
     records.append(stored)
@@ -832,14 +968,20 @@ def close_goal(
     close_notes: Sequence[str] = (),
     operator_acknowledged_items: Sequence[str] = (),
     administrative: bool = False,
+    administrative_reason: str = "",
 ) -> GoalRecord:
     """Remove a record.
 
     A completion close (the default) must first satisfy the operator-stated
     inventory diff. An ``administrative`` close is a discard of a dead lane
     (e.g. a superseded hold being reconciled by the sweep janitor), NOT a
-    completion claim, so the delivery-inventory gate does not apply to it.
+    completion claim, so the delivery-inventory gate does not apply to it --
+    it requires a non-empty ``administrative_reason``, recorded in the close
+    log line, so a bypassed inventory gate always leaves a stated reason
+    behind rather than a silent discard.
     """
+    if administrative and not administrative_reason.strip():
+        raise GoalValidationError("administrative close requires a non-empty reason")
     with locked_json_store(goals_path(root)):
         records = load_goals(root)
         closed = next((record for record in records if record.session_ref == session_ref), None)
@@ -857,7 +999,10 @@ def close_goal(
                 goal_history=closed.goal_history,
             )
         _write_goals(root, [record for record in records if record.session_ref != session_ref])
-    logger.info("goal_mutated", session_ref=session_ref, action="close")
+    if administrative:
+        logger.info("goal_mutated", session_ref=session_ref, action="close", administrative=True, reason=administrative_reason)
+    else:
+        logger.info("goal_mutated", session_ref=session_ref, action="close")
     return closed
 
 

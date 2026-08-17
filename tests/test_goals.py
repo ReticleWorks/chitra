@@ -15,6 +15,8 @@ from chitra import board
 from chitra.artifacts import ARTIFACT_URL_PREFIX, ArtifactRecord, upsert_artifact
 from chitra.close_gate import DONE_WHEN_OPERATOR_FLAG, CloseGateError
 from chitra.goals import (
+    INTERVIEW_QUESTION_IDS,
+    INTERVIEW_WAIVER_REASON,
     EnrolledScopeImmutableError,
     GoalNotFoundError,
     GoalRecord,
@@ -32,6 +34,7 @@ from chitra.goals import (
     load_goals,
     main,
     mark_completion_gate_passed,
+    record_interview,
     redirect_goal,
     resolve_ask,
     resume_goal,
@@ -40,6 +43,8 @@ from chitra.goals import (
     update_now,
     upsert_goal,
     validate_goal,
+    validate_interview_answer,
+    waive_interview,
 )
 
 
@@ -61,7 +66,34 @@ def _mp_add_ask(root_str: str, session_ref: str, ask: str) -> None:
     add_ask(Path(root_str), session_ref, ask)
 
 
-def _record(**changes: str) -> GoalRecord:
+# A fully-answered SHORT INTERVIEW, valid for check_specification's interview
+# gate: one entry per chitra.goals.INTERVIEW_QUESTION_IDS, each with a
+# provenance citing either the operator's own words or a primary source.
+_VALID_INTERVIEW: tuple[dict[str, str], ...] = (
+    {
+        "question": "intent",
+        "answer": "Ship a safe deterministic goals store the fleet monitor can rely on.",
+        "provenance": "operator:ship a safe deterministic goals store the monitor can rely on",
+    },
+    {
+        "question": "done_when",
+        "answer": "The full suite and static checks pass.",
+        "provenance": "source:tests/test_goals.py",
+    },
+    {
+        "question": "out_of_scope",
+        "answer": "UI rendering and dashboard styling are out of scope.",
+        "provenance": "operator:UI rendering and dashboard styling are out of scope",
+    },
+    {
+        "question": "constraints",
+        "answer": "Stdlib only, no new third-party dependencies.",
+        "provenance": "source:CLAUDE.md",
+    },
+)
+
+
+def _record(*, interview: tuple[dict[str, str], ...] | None = None, **changes: str) -> GoalRecord:
     values: dict[str, str] = {
         "session_ref": "host-b:f2-77:0.0",
         "goal": "Ship the tested deterministic goals store safely.",
@@ -86,6 +118,7 @@ def _record(**changes: str) -> GoalRecord:
         now=values["now"],
         last_verified=values["last_verified"],
         needs=values["needs"],
+        interview=_VALID_INTERVIEW if interview is None else interview,
     )
 
 
@@ -654,6 +687,37 @@ def test_goal_cli_set_redirect_now_and_check_paths(tmp_path: Path, capsys: pytes
     assert '"goal_version": 2' in capsys.readouterr().out
     assert main(["now", "--root", str(tmp_path), "--session-ref", record.session_ref, "--now", "running tests"]) == 0
     assert '"now": "running tests"' in capsys.readouterr().out
+    assert main(["check", "--root", str(tmp_path), "--session-ref", record.session_ref]) == 1
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "interview",
+                "--root",
+                str(tmp_path),
+                "--session-ref",
+                record.session_ref,
+                "--answer",
+                "intent=Ship a safe deterministic goals store the fleet monitor can rely on.",
+                "--provenance",
+                "intent=operator:ship a safe deterministic goals store the monitor can rely on",
+                "--answer",
+                "done_when=The full suite and static checks pass.",
+                "--provenance",
+                "done_when=source:tests/test_goals.py",
+                "--answer",
+                "out_of_scope=UI rendering and dashboard styling are out of scope.",
+                "--provenance",
+                "out_of_scope=operator:UI rendering and dashboard styling are out of scope",
+                "--answer",
+                "constraints=Stdlib only, no new third-party dependencies.",
+                "--provenance",
+                "constraints=source:CLAUDE.md",
+            ]
+        )
+        == 0
+    )
+    assert "well-specified" in capsys.readouterr().out
     assert main(["check", "--root", str(tmp_path), "--session-ref", record.session_ref]) == 0
     assert capsys.readouterr().out.strip() == "well-specified"
 
@@ -942,3 +1006,235 @@ def test_concurrent_writers_adding_asks_to_the_same_lane_do_not_lose_each_other(
     stored = get_goal(tmp_path, "host-b:f2-77:0.0")
     assert stored is not None
     assert set(stored.open_asks) == set(asks)
+
+
+# --- ingestion interview gate --------------------------------------------
+
+
+def _interview_answers(**overrides: tuple[str, str]) -> dict[str, tuple[str, str]]:
+    answers: dict[str, tuple[str, str]] = {
+        "intent": ("Ship a safe deterministic goals store the fleet monitor can rely on.", "operator:ship a safe goals store"),
+        "done_when": ("The full suite and static checks pass.", "source:tests/test_goals.py"),
+        "out_of_scope": ("UI rendering and dashboard styling are out of scope.", "operator:UI is out of scope"),
+        "constraints": ("Stdlib only, no new third-party dependencies.", "source:CLAUDE.md"),
+    }
+    answers.update(overrides)
+    return answers
+
+
+def test_check_specification_fails_without_any_interview(tmp_path: Path) -> None:
+    issues = check_specification(_record(interview=()))
+
+    assert len(issues) == len(INTERVIEW_QUESTION_IDS)
+    for question_id in INTERVIEW_QUESTION_IDS:
+        assert any(f"missing answer for {question_id!r}" in issue for issue in issues)
+
+
+def test_check_specification_passes_with_all_four_valid_interview_entries(tmp_path: Path) -> None:
+    stored = upsert_goal(tmp_path, _record(interview=()))
+    interviewed = record_interview(tmp_path, stored.session_ref, answers=_interview_answers())
+
+    assert check_specification(interviewed) == []
+    assert {entry["question"] for entry in interviewed.interview} == set(INTERVIEW_QUESTION_IDS)
+    # Round-trips through storage unchanged.
+    assert load_goals(tmp_path)[0].interview == interviewed.interview
+
+
+def test_record_interview_requires_all_four_questions_in_one_call(tmp_path: Path) -> None:
+    stored = upsert_goal(tmp_path, _record(interview=()))
+    partial = _interview_answers()
+    del partial["constraints"]
+
+    with pytest.raises(GoalValidationError, match="missing answers for: constraints"):
+        record_interview(tmp_path, stored.session_ref, answers=partial)
+    with pytest.raises(GoalNotFoundError):
+        record_interview(tmp_path, "missing:lane", answers=_interview_answers())
+
+
+@pytest.mark.parametrize(
+    ("provenance", "expected_message"),
+    [
+        ("just some words", "must be"),
+        ("operator:", "must be"),
+        ("operator:   ", "must be"),
+        ("source:", "must be"),
+        ("wrong-prefix:citation", "must be"),
+    ],
+)
+def test_validate_interview_answer_enforces_provenance_format(provenance: str, expected_message: str) -> None:
+    issues = validate_interview_answer("intent", "A real answer.", provenance)
+    assert issues
+    assert any(expected_message in issue for issue in issues)
+
+
+def test_validate_interview_answer_accepts_operator_and_source_prefixes() -> None:
+    assert validate_interview_answer("intent", "A real answer.", "operator:the operator's own words") == []
+    assert validate_interview_answer("done_when", "A real answer.", "source:docs/spec.md#done-when") == []
+
+
+def test_validate_interview_answer_rejects_empty_answer_and_unknown_question() -> None:
+    assert any("must be non-empty" in issue for issue in validate_interview_answer("intent", "  ", "operator:x"))
+    assert any("must be one of" in issue for issue in validate_interview_answer("bogus", "answer", "operator:x"))
+
+
+def test_record_interview_rejects_bad_provenance_and_leaves_record_unchanged(tmp_path: Path) -> None:
+    stored = upsert_goal(tmp_path, _record(interview=()))
+    bad_answers = _interview_answers(intent=("An answer without a citation.", "no prefix here"))
+
+    with pytest.raises(GoalValidationError):
+        record_interview(tmp_path, stored.session_ref, answers=bad_answers)
+    assert get_goal(tmp_path, stored.session_ref).interview == ()
+
+
+def test_interview_is_preserved_across_routine_now_and_set_writes(tmp_path: Path) -> None:
+    stored = upsert_goal(tmp_path, _record(interview=()))
+    interviewed = record_interview(tmp_path, stored.session_ref, answers=_interview_answers())
+
+    revised = update_now(tmp_path, interviewed.session_ref, now="running the suite")
+    assert revised.interview == interviewed.interview
+
+    replayed = upsert_goal(tmp_path, replace(interviewed, now="still running", interview=()))
+    assert replayed.interview == interviewed.interview
+
+
+def test_interview_waiver_lets_check_pass_and_stays_visibly_marked(tmp_path: Path) -> None:
+    stored = upsert_goal(tmp_path, _record(interview=()))
+    assert check_specification(stored) != []
+
+    waived = waive_interview(tmp_path, stored.session_ref)
+
+    assert waived.interview_waiver == INTERVIEW_WAIVER_REASON
+    assert check_specification(waived) == []
+    assert waived.interview == ()
+    rendered = board.render_roster([waived], fmt="markdown")
+    assert INTERVIEW_WAIVER_REASON in rendered
+    with pytest.raises(GoalNotFoundError):
+        waive_interview(tmp_path, "missing:lane")
+
+
+def test_goal_record_rejects_an_unknown_interview_waiver_value(tmp_path: Path) -> None:
+    payload = {
+        "schema": "chitra.goals.v2",
+        "updated_at": "2026-08-17T00:00:00+00:00",
+        "goals": [{**_record().to_dict(), "interview_waiver": "just-because"}],
+    }
+    (tmp_path / "goals.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="interview_waiver"):
+        load_goals(tmp_path)
+
+
+def test_goal_record_rejects_malformed_interview_entries(tmp_path: Path) -> None:
+    payload = {
+        "schema": "chitra.goals.v2",
+        "updated_at": "2026-08-17T00:00:00+00:00",
+        "goals": [{**_record().to_dict(), "interview": [{"question": "not-a-real-id", "answer": "x", "provenance": "operator:x"}]}],
+    }
+    (tmp_path / "goals.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="interview question must be one of"):
+        load_goals(tmp_path)
+
+
+def test_interview_cli_print_questions_and_round_trip(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["interview", "--root", str(tmp_path), "--session-ref", "host-b:f2-77:0.0", "--print-questions"]) == 0
+    printed = capsys.readouterr().out
+    for question_id in INTERVIEW_QUESTION_IDS:
+        assert question_id in printed
+
+    stored = upsert_goal(tmp_path, _record(interview=()))
+    assert main(["check", "--root", str(tmp_path), "--session-ref", stored.session_ref]) == 1
+    capsys.readouterr()
+
+    interview_args = ["interview", "--root", str(tmp_path), "--session-ref", stored.session_ref]
+    for question_id, (answer, provenance) in _interview_answers().items():
+        interview_args += ["--answer", f"{question_id}={answer}", "--provenance", f"{question_id}={provenance}"]
+    assert main(interview_args) == 0
+    output = capsys.readouterr().out
+    assert "well-specified" in output
+
+    assert main(["check", "--root", str(tmp_path), "--session-ref", stored.session_ref]) == 0
+    assert capsys.readouterr().out.strip() == "well-specified"
+
+
+def test_interview_cli_rejects_missing_provenance_pairing(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    stored = upsert_goal(tmp_path, _record(interview=()))
+
+    assert (
+        main(
+            [
+                "interview",
+                "--root",
+                str(tmp_path),
+                "--session-ref",
+                stored.session_ref,
+                "--answer",
+                "intent=An answer with no matching provenance.",
+            ]
+        )
+        == 1
+    )
+    assert "--provenance missing for: intent" in capsys.readouterr().err
+
+
+def test_interview_cli_waive_legacy_marks_record_and_check_passes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    stored = upsert_goal(tmp_path, _record(interview=()))
+
+    assert main(["interview", "--root", str(tmp_path), "--session-ref", stored.session_ref, "--waive-legacy"]) == 0
+    captured = capsys.readouterr()
+    assert "interview waived" in captured.err
+    assert "well-specified" in captured.out
+    assert "interview waived" in captured.out
+
+    assert main(["check", "--root", str(tmp_path), "--session-ref", stored.session_ref]) == 0
+
+
+# --- administrative close --------------------------------------------------
+
+
+def test_close_administrative_bypasses_inventory_and_requires_a_reason(tmp_path: Path) -> None:
+    stored = upsert_goal(
+        tmp_path,
+        _record(done_when="both the X client and the Y client pass live validation"),
+    )
+
+    with pytest.raises(GoalValidationError, match="administrative close requires a non-empty reason"):
+        close_goal(tmp_path, stored.session_ref, administrative=True)
+    assert get_goal(tmp_path, stored.session_ref) == stored
+
+    with pytest.raises(CloseGateError):
+        close_goal(tmp_path, stored.session_ref)
+
+    closed = close_goal(
+        tmp_path, stored.session_ref, administrative=True, administrative_reason="superseded hold reconciled by sweep janitor"
+    )
+    assert closed == stored
+    assert get_goal(tmp_path, stored.session_ref) is None
+
+
+def test_close_cli_administrative_requires_reason_flag(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    stored = upsert_goal(
+        tmp_path,
+        _record(done_when="both the X client and the Y client pass live validation"),
+    )
+
+    assert main(["close", "--root", str(tmp_path), "--session-ref", stored.session_ref, "--administrative"]) == 1
+    assert "--administrative requires a non-empty --reason" in capsys.readouterr().err
+    assert get_goal(tmp_path, stored.session_ref) is not None
+
+    assert (
+        main(
+            [
+                "close",
+                "--root",
+                str(tmp_path),
+                "--session-ref",
+                stored.session_ref,
+                "--administrative",
+                "--reason",
+                "dead lane reconciled by the sweep janitor",
+            ]
+        )
+        == 0
+    )
+    assert get_goal(tmp_path, stored.session_ref) is None

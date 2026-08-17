@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import pytest
+from _interview_fixtures import VALID_INTERVIEW
 
 from chitra.goals import GoalRecord, hold_goal, redirect_goal, upsert_goal
 from chitra.lane_anchor import LaneLaunchRefused, LaneStartupFailed, _pane_pythonpath, ingestion_gate, start_lane
@@ -86,6 +87,7 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
             scope="Chitra lane launcher and lifecycle integration",
             source="task-file:lane-architecture",
             status="working",
+            interview=VALID_INTERVIEW,
         ),
     )
     calls: list[list[str]] = []
@@ -207,6 +209,7 @@ def test_lane_identity_reaches_a_new_session_on_an_existing_tmux_server(
             scope="One disposable local tmux server",
             source="task-file:tmux-environment",
             status="working",
+            interview=VALID_INTERVIEW,
         ),
     )
     proof_path = tmp_path / "pane-environment.json"
@@ -286,6 +289,7 @@ def test_lane_startup_death_returns_temporary_failure_without_receipt(tmp_path, 
             scope="One disposable governed test lane",
             source="task-file:startup-death-test",
             status="working",
+            interview=VALID_INTERVIEW,
         ),
     )
     results = iter(
@@ -321,6 +325,7 @@ def test_trinity_uses_the_same_host_qualified_goal_convention(tmp_path):
             scope="Trinity lane launch configuration only",
             source="task-file:trinity-parity",
             status="working",
+            interview=VALID_INTERVIEW,
         ),
     )
 
@@ -343,6 +348,7 @@ def test_done_when_redirect_refreshes_snapshot_for_relaunch(tmp_path):
             scope="Chitra lane launcher and lifecycle integration",
             source="task-file:lane-architecture",
             status="working",
+            interview=VALID_INTERVIEW,
         ),
     )
 
@@ -373,6 +379,7 @@ def test_lane_launch_refuses_active_usage_pause(tmp_path):
             scope="Chitra lane launcher and lifecycle integration",
             source="task-file:lane-architecture",
             status="working",
+            interview=VALID_INTERVIEW,
         ),
     )
     hold_goal(lane.state_dir, "tophand:alpha:0.0", reason="rate-limit:provider-window")
@@ -398,6 +405,7 @@ def test_governed_claude_model_selection(model, tmp_path):
             scope="Chitra lane launcher and lifecycle integration",
             source="task-file:lane-architecture",
             status="working",
+            interview=VALID_INTERVIEW,
         ),
     )
     calls = []
@@ -427,6 +435,7 @@ def test_governed_codex_effort_is_explicit_and_receipted(tmp_path):
             scope="One disposable governed test lane",
             source="task-file:codex-effort-test",
             status="working",
+            interview=VALID_INTERVIEW,
         ),
     )
     calls = []

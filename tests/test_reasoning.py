@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+from _interview_fixtures import VALID_INTERVIEW
 
 from chitra.dispatch import DispatchOrder
 from chitra.goal_enforcement import SessionReviewSignal, WatchedSessionBehavior, freeze_goal
@@ -29,6 +30,7 @@ def _goal() -> GoalRecord:
         source="task-file:/tmp/goal.md",
         status="working",
         goal_version=3,
+        interview=VALID_INTERVIEW,
     )
 
 

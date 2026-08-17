@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _interview_fixtures import VALID_INTERVIEW
 
 import chitra.dispatchd as dispatchd_mod
 from chitra.account_registry import RegistryEntry, get_entry
@@ -68,6 +69,7 @@ def _goal(session_ref: str = "host-b:lane1:0.0") -> GoalRecord:
         done_when="Tests pass and the full suite is green.",
         source="task",
         status="working",
+        interview=VALID_INTERVIEW,
     )
 
 
