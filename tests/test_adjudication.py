@@ -31,7 +31,6 @@ from chitra.adjudication import (
     resolve_merge_rights,
     resolve_usage,
     split_claim_text,
-    unwrap_json_object,
 )
 from chitra.capabilities import CapabilityManifest
 from chitra.convlog import ConversationEntry
@@ -555,18 +554,9 @@ REAL_FENCED_REPLY = (
 )
 
 
-@pytest.mark.parametrize(
-    ("packaged", "expected"),
-    [
-        ('{"a": 1}', '{"a": 1}'),
-        ('```json\n{"a": 1}\n```', '{"a": 1}'),
-        ('```\n{"a": 1}\n```', '{"a": 1}'),
-        ('Here is the answer:\n{"a": 1}\n', '{"a": 1}'),
-        ("not json at all", "not json at all"),
-    ],
-)
-def test_the_usual_packaging_is_removed_before_the_reply_is_read(packaged: str, expected: str) -> None:
-    assert unwrap_json_object(packaged) == expected
+# The unwrapping rule itself is tested at its home, in test_goal_enforcement.py.
+# What belongs here is that this adjudicator actually applies it, and that
+# applying it does not soften the reply contract — the two tests below.
 
 
 def test_a_fenced_reply_from_a_real_model_is_accepted() -> None:
