@@ -14,17 +14,20 @@ import select
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Literal, Self, cast
+from typing import TYPE_CHECKING, Annotated, Literal, Self, cast
 
 from pydantic import ConfigDict, Field, TypeAdapter, ValidationInfo, model_validator
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 from chitra._fsio import parse_iso8601
 from chitra.policy_config import UsagePolicy, load_policy_config
+
+if TYPE_CHECKING:
+    from chitra.usage_export import FleetExportVerdict
 
 SCHEMA = "chitra.usage.v1"
 UsageKind = Literal["claude", "codex"]
@@ -150,9 +153,7 @@ class UsageSnapshot:
         normalized["account"] = account
         for field_name in ("five_hour", "seven_day"):
             raw_window = payload.get(field_name)
-            normalized[field_name] = (
-                None if raw_window is None else UsageWindow.from_dict(raw_window, field_name=field_name)
-            )
+            normalized[field_name] = None if raw_window is None else UsageWindow.from_dict(raw_window, field_name=field_name)
         return normalized
 
     @model_validator(mode="after")
@@ -203,9 +204,7 @@ def _parse_utc_timestamp(value: str) -> datetime:
     )
 
 
-def read_snapshots(
-    directory: Path, *, staleness_seconds: int = 1200, now: datetime | None = None
-) -> list[tuple[UsageSnapshot, bool]]:
+def read_snapshots(directory: Path, *, staleness_seconds: int = 1200, now: datetime | None = None) -> list[tuple[UsageSnapshot, bool]]:
     """Read snapshot files and flag whether each one is within the staleness window."""
     if staleness_seconds < 0:
         raise ValueError("staleness_seconds must be non-negative")
@@ -344,9 +343,7 @@ def _account_group_key(snapshot: UsageSnapshot) -> str:
     return snapshot.account if snapshot.account else f"\0unknown:{snapshot.session_id}"
 
 
-def evaluate_grouped(
-    items: list[tuple[UsageSnapshot, bool]], *, policy: UsagePolicy
-) -> list[AccountedVerdict]:
+def evaluate_grouped(items: list[tuple[UsageSnapshot, bool]], *, policy: UsagePolicy) -> list[AccountedVerdict]:
     """Evaluate fresh readings by account, sorted by account then input order.
 
     Every input session receives its account's verdict, including stale siblings
@@ -577,9 +574,7 @@ def _evaluation_output(verdict: AccountedVerdict) -> dict[str, object]:
         "level": verdict.level,
         "binding_window": verdict.binding_window,
         "resume_at_epoch": verdict.resume_at_epoch,
-        "resume_at_iso": datetime.fromtimestamp(verdict.resume_at_epoch, UTC).isoformat()
-        if verdict.resume_at_epoch
-        else "",
+        "resume_at_iso": datetime.fromtimestamp(verdict.resume_at_epoch, UTC).isoformat() if verdict.resume_at_epoch else "",
         "self_fresh": verdict.self_fresh,
         "account_attributed": verdict.account_attributed,
     }
@@ -614,7 +609,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     export_command.add_argument("--no-history", action="store_true", help="Write only the current export, skipping history.")
 
     evaluate_command = commands.add_parser("evaluate", help="Evaluate fresh snapshots against deterministic thresholds.")
-    evaluate_command.add_argument("--dir", type=Path, default=None)
+    evaluate_command.add_argument(
+        "--dir",
+        type=Path,
+        default=None,
+        help="Local snapshot directory, or one host's export directory. Exports are recognised and read as exports.",
+    )
     evaluate_command.add_argument("--fleet-dir", type=Path, default=None, help="Read every host's exports instead of local snapshots.")
     evaluate_command.add_argument("--codex", action="store_true")
     evaluate_command.add_argument("--codex-bin", type=Path, default=Path("codex"))
@@ -662,6 +662,40 @@ def _run_export(args: argparse.Namespace) -> None:
         print(json.dumps({**export.to_dict(), "path": str(path)}, sort_keys=True))
 
 
+def _print_export_verdicts(verdicts: Iterable[FleetExportVerdict], *, fail_on_incident: bool) -> int:
+    from chitra.usage_export import INCIDENT_VERDICTS
+
+    incidents = 0
+    for verdict in verdicts:
+        print(json.dumps(verdict.to_dict(), sort_keys=True))
+        if verdict.verdict in INCIDENT_VERDICTS:
+            incidents += 1
+    if incidents and fail_on_incident:
+        print(
+            f"chitra-usage: {incidents} host/backend reading(s) could not be trusted; the monitor is blind to them",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def _run_host_evaluate(args: argparse.Namespace) -> int:
+    """Evaluate one host's exports when ``--dir`` names an export directory.
+
+    The exporter and the evaluator write and read different document kinds, and
+    pointing the local-snapshot flag at an export directory used to fail with a
+    schema error -- the reader refusing a file the tool wrote itself.  A
+    directory holding ``chitra.usage-export.v1`` documents is read as what it
+    is, and prints the same verdict lines ``--fleet-dir`` prints.
+    """
+    from chitra.usage_export import read_host_exports
+
+    return _print_export_verdicts(
+        read_host_exports(args.dir, stale_after_seconds=args.stale_after_seconds),
+        fail_on_incident=args.fail_on_incident,
+    )
+
+
 def _run_fleet_evaluate(args: argparse.Namespace) -> int:
     """Render one verdict line per host and backend from the shared tree.
 
@@ -670,24 +704,16 @@ def _run_fleet_evaluate(args: argparse.Namespace) -> int:
     command fail, so a systemd oneshot can carry the alarm rather than needing
     something else to parse the output and notice.
     """
-    from chitra.usage_export import INCIDENT_VERDICTS, read_fleet_exports
+    from chitra.usage_export import read_fleet_exports
 
-    incidents = 0
-    for verdict in read_fleet_exports(
-        args.fleet_dir,
-        stale_after_seconds=args.stale_after_seconds,
-        expect_hosts=args.expect_host,
-    ):
-        print(json.dumps(verdict.to_dict(), sort_keys=True))
-        if verdict.verdict in INCIDENT_VERDICTS:
-            incidents += 1
-    if incidents and args.fail_on_incident:
-        print(
-            f"chitra-usage: {incidents} host/backend reading(s) could not be trusted; the monitor is blind to them",
-            file=sys.stderr,
-        )
-        return 1
-    return 0
+    return _print_export_verdicts(
+        read_fleet_exports(
+            args.fleet_dir,
+            stale_after_seconds=args.stale_after_seconds,
+            expect_hosts=args.expect_host,
+        ),
+        fail_on_incident=args.fail_on_incident,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -714,6 +740,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             if args.dir is None:
                 raise ValueError("evaluate needs --dir for local snapshots or --fleet-dir for exported ones")
+            from chitra.usage_export import holds_exports
+
+            if holds_exports(args.dir):
+                return _run_host_evaluate(args)
             policy = load_policy_config(args.policy_config).usage
             snapshots = read_snapshots(args.dir, staleness_seconds=args.staleness_seconds)
             if args.codex:
