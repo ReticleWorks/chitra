@@ -35,6 +35,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from chitra.capabilities import Capability, CapabilityManifest, load_manifest
 from chitra.convlog import ConversationEntry, OperatorBrief, read_entries
 from chitra.decisions import DecisionEntry, read_decisions
+
+# The reviewer and this adjudicator meet the same reply packaging from the same
+# kind of process, so they share one unwrapping rule rather than two that can
+# drift apart. It lives with the reviewer because that is where it landed first;
+# a neutral home would be better if a third caller ever appears.
+from chitra.goal_enforcement import unwrap_json_object
 from chitra.goals import GoalRecord, lane_id_from_session_ref, session_host
 from chitra.lane_read import extract_open_asks
 from chitra.lexicon import OPERATOR_GATE_PATTERNS
@@ -816,29 +822,6 @@ class ClaudeProcessAdjudicator:
             return AdjudicatorReply.model_validate_json(unwrap_json_object(completed.stdout))
         except ValueError as exc:
             raise AdjudicatorProcessError(f"the adjudicator process returned an unusable answer: {exc}") from exc
-
-
-_FENCED_BLOCK = re.compile(r"```(?:json)?\s*(?P<body>.*?)```", re.DOTALL)
-
-
-def unwrap_json_object(text: str) -> str:
-    """Return the JSON object in a reply, with its usual packaging removed.
-
-    A live run found the reason this is needed: the answer comes back correct
-    but wrapped in a fenced code block, which a strict parser rejects. Two
-    deviations are tolerated and no more — a code fence, and prose either side
-    of the object. Anything else still fails, because the reply contract is what
-    keeps a malformed answer from reaching a person as if it were a decision.
-    """
-    stripped = text.strip()
-    fenced = _FENCED_BLOCK.search(stripped)
-    if fenced is not None:
-        stripped = fenced.group("body").strip()
-    if stripped.startswith("{"):
-        return stripped
-    opening = stripped.find("{")
-    closing = stripped.rfind("}")
-    return stripped[opening : closing + 1] if 0 <= opening < closing else stripped
 
 
 def _reply_text_issues(reply: AdjudicatorReply) -> tuple[str, ...]:
