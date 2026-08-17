@@ -22,6 +22,19 @@ from chitra.reasoning import DecisionAttestation
 from chitra.routing_config import ROUTING_CONFIG_ENV_VAR, RoutingConfig
 
 
+def user_turn_jsonl(text: str, *, with_followup: bool = True) -> str:
+    """Build a structural JSONL transcript fixture (mirrors
+    ``tests/test_dispatch.py``'s helper of the same name).
+    ``transcript_confirms_nudge`` requires the marker to land in a user-role
+    record with a later assistant/tool/progress record proving the turn
+    actually started -- a plain ``{"text": ...}`` line is no longer enough.
+    """
+    lines = [json.dumps({"type": "user", "message": {"role": "user", "content": text}})]
+    if with_followup:
+        lines.append(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": "Working on it."}}))
+    return "\n".join(lines) + "\n"
+
+
 def _write_order(orders_dir: Path, order: DispatchOrder) -> Path:
     orders_dir.mkdir(parents=True, exist_ok=True)
     path = orders_dir / f"{order.order_id}.json"
@@ -135,7 +148,7 @@ def test_remote_delivery_writes_a_ledger_entry_same_as_local(tmp_path: Path, mon
         if "find " in remote_cmd:
             return fake_completed(0, "1720000000 /remote/projects/foo/abc.jsonl\n")
         if "tail -c" in remote_cmd:
-            return fake_completed(0, "Stop editing main and open a PR.")
+            return fake_completed(0, user_turn_jsonl("Stop editing main and open a PR."))
         return fake_completed(0, "")
 
     # dispatch_to_tmux resolves its default runner (run_cmd) as a module
@@ -271,6 +284,72 @@ def test_lane_lock_timeout_is_retried_then_succeeds(tmp_path: Path, monkeypatch:
     assert (queue_dir / "processed" / "retry-then-send.json").exists()
     assert (queue_dir / "results" / "retry-then-send.json").exists()
     assert not retry_state.exists()
+
+
+def test_delivery_unconfirmed_is_deferred_not_terminal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """DispatchStatus.DELIVERY_UNCONFIRMED (pane-capture-only confirmation)
+    must never become a persisted terminal result on its own: dispatchd
+    defers it, using the same durable retry-attempts sidecar the lane-lock
+    timeout path uses, so a later pass gives transcript-grep another
+    chance."""
+
+    def always_unconfirmed(order: DispatchOrder, **kwargs: Any) -> DispatchResult:
+        return DispatchResult(
+            order_id=order.order_id,
+            session_ref=order.session_ref,
+            status=DispatchStatus.DELIVERY_UNCONFIRMED,
+            reason="delivery-unconfirmed: confirmed only via pane-capture fallback (transcript-grep found no marker)",
+        )
+
+    monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", always_unconfirmed)
+    queue_dir = tmp_path / "queue"
+    order = DispatchOrder(order_id="unconfirmed-1", session_ref="localhost:s:0.0", nudge="hi")
+    _write_order(queue_dir / "orders", order)
+
+    results = run_once(queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl", lane_lock_retry_attempts=5)
+
+    assert [result.status for result in results] == [DispatchStatus.DELIVERY_UNCONFIRMED]
+    assert not (queue_dir / "results" / "unconfirmed-1.json").exists()
+    assert not (queue_dir / "processed" / "unconfirmed-1.json").exists()
+    assert (queue_dir / "deferred" / "unconfirmed-1.json").exists()
+    assert dispatchd_mod._lane_lock_retry_state_path(queue_dir / "deferred", order.order_id).exists()
+
+
+def test_delivery_unconfirmed_retries_then_exhausts_with_a_crit_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """After the retry budget on repeated DELIVERY_UNCONFIRMED results runs
+    out, dispatchd reports a terminal FAILED "retry-exhausted" (the same
+    exhaustion path the lane-lock timeout retry uses) and emits a CRIT-level
+    log line -- a silently-dropped delivery must never happen."""
+
+    def always_unconfirmed(order: DispatchOrder, **kwargs: Any) -> DispatchResult:
+        return DispatchResult(
+            order_id=order.order_id,
+            session_ref=order.session_ref,
+            status=DispatchStatus.DELIVERY_UNCONFIRMED,
+            reason="delivery-unconfirmed: confirmed only via pane-capture fallback (transcript-grep found no marker)",
+        )
+
+    monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", always_unconfirmed)
+    queue_dir = tmp_path / "queue"
+    order = DispatchOrder(order_id="unconfirmed-2", session_ref="localhost:s:0.0", nudge="hi")
+    _write_order(queue_dir / "orders", order)
+
+    first = run_once(queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl", lane_lock_retry_attempts=2)
+    assert [result.status for result in first] == [DispatchStatus.DELIVERY_UNCONFIRMED]
+
+    second = run_once(queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl", lane_lock_retry_attempts=2)
+
+    assert [result.status for result in second] == [DispatchStatus.FAILED]
+    assert second[0].reason == "retry-exhausted"
+    assert (queue_dir / "processed" / "unconfirmed-2.json").exists()
+    assert not (queue_dir / "deferred" / "unconfirmed-2.json").exists()
+
+    captured = capsys.readouterr()
+    crit_lines = [line for line in captured.out.splitlines() if "dispatchd_retry_exhausted" in line]
+    assert crit_lines
+    assert any("critical" in line.lower() for line in crit_lines)
 
 
 def test_lane_lock_retry_exhaustion_writes_only_a_terminal_failed_result(
@@ -831,7 +910,7 @@ def test_kill_point_crash_after_pane_touch_reconciles_instead_of_double_pasting(
         # produced, exactly like a genuine paste would before the process died.
         session_dir = projects_root / "some-project"
         session_dir.mkdir(parents=True, exist_ok=True)
-        (session_dir / "abc123.jsonl").write_text(json.dumps({"text": order.nudge}) + "\n", encoding="utf-8")
+        (session_dir / "abc123.jsonl").write_text(user_turn_jsonl(order.nudge), encoding="utf-8")
         return DispatchResult(order_id=order.order_id, session_ref=order.session_ref, status=DispatchStatus.SENT)
 
     def crashing_write_result_once(*args: Any, **kwargs: Any) -> Path:
