@@ -212,3 +212,44 @@ def test_an_empty_allowlist_looks_at_nothing(tmp_path: Path) -> None:
         raise AssertionError("the daemon must not call gh with an empty allowlist")
 
     assert merged.run_once(MergePolicy(), root=tmp_path, queue_dir=tmp_path / "q", runner=runner) == []
+
+
+def test_a_credential_it_cannot_use_fails_the_daemon(tmp_path: Path) -> None:
+    """An unusable credential must stop the unit, not become a quiet log line.
+
+    Treated like any other bad pass, the daemon would loop for days merging
+    nothing while every reading systemd can take says it is running -- a
+    missing credential wearing the costume of a working one. Exiting non-zero
+    is what lets the unit's OnFailure handler say so.
+    """
+    config = tmp_path / "policy.yaml"
+    config.write_text(
+        "merge:\n"
+        "  enabled: true\n"
+        "  allowed_repos: [ReticleWorks/chitra]\n"
+        "  lane_authors: [lane-bot]\n"
+        "  token_command: ['/bin/false']\n",
+        encoding="utf-8",
+    )
+
+    exit_code = merged.main(
+        [
+            "--once",
+            "--policy-config",
+            str(config),
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--queue-dir",
+            str(tmp_path / "queue"),
+        ]
+    )
+
+    assert exit_code == 1
+
+
+def test_merges_disabled_is_a_clean_exit_not_a_failure(tmp_path: Path) -> None:
+    """Every host that is not the merge host reads this path on every boot."""
+    config = tmp_path / "policy.yaml"
+    config.write_text("merge:\n  enabled: false\n", encoding="utf-8")
+
+    assert merged.main(["--once", "--policy-config", str(config), "--state-dir", str(tmp_path / "state")]) == 0
