@@ -126,6 +126,37 @@ def test_an_unrelated_label_does_not_hold_a_pull_request() -> None:
     assert decide(make_state(labels=("enhancement", "python")), POLICY, APP).allowed
 
 
+def test_a_minted_token_reaches_gh_through_the_environment_not_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A token in argv shows up in any process list on the host."""
+    import chitra.merge as merge_module
+
+    seen: dict[str, object] = {}
+
+    def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
+        if list(command) == ["mint-it"]:
+            return subprocess.CompletedProcess(command, 0, "protocol=https\npassword=ghs_secret\n", "")
+        seen["command"] = list(command)
+        seen["env_token"] = (kwargs.get("env") or {}).get("GH_TOKEN")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(merge_module.subprocess, "run", fake_run)
+    merge_module.minting_gh_runner(["mint-it"])(["gh", "api", "user"])
+
+    assert seen["env_token"] == "ghs_secret"
+    assert "ghs_secret" not in " ".join(seen["command"])  # type: ignore[arg-type]
+
+
+def test_a_failed_mint_raises_rather_than_merging_as_whoever_gh_is(monkeypatch: pytest.MonkeyPatch) -> None:
+    import chitra.merge as merge_module
+
+    def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
+        return subprocess.CompletedProcess(command, 1, "", "1Password is locked")
+
+    monkeypatch.setattr(merge_module.subprocess, "run", fake_run)
+    with pytest.raises(MergeError, match="could not mint"):
+        merge_module.minting_gh_runner(["mint-it"])(["gh", "api", "user"])
+
+
 def test_an_empty_lane_allowlist_qualifies_nobody() -> None:
     empty = MergePolicy(allowed_repos=("ReticleWorks/chitra",), app_login=APP.login)
     assert decide(make_state(), empty, APP).reason == "author_not_a_lane"
