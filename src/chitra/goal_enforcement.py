@@ -299,7 +299,16 @@ class ClaudeProcessReviewer:
             "before or after it. The object's only keys are reviewer_id, goal_contract_id, behavior_sha256, verdict "
             '("accept" or "reject"), and findings (a list; each item has exactly code, detail, and citation).\n'
             "</output_format>\n"
-            "<input>\n" + _canonical_json(request) + "\n</input>"
+            # The payload MUST be introduced by a newline and "INPUT=", and MUST
+            # run to the end of the prompt with nothing after it. That is not a
+            # style choice: the deployed reviewer wrapper
+            # (chitra_adapter/bin/chitra-watchd-reviewer) recovers the reviewer
+            # id and the two content bindings by splitting the prompt on
+            # "\nINPUT=" and parsing everything after it as JSON. Wrapping the
+            # payload in tags instead broke that, and the wrapper then refused
+            # every review before any model was called. See
+            # test_prompt_payload_matches_the_deployed_wrapper_contract.
+            "INPUT=" + _canonical_json(request)
         )
 
     def review(self, goal: FrozenGoal, behavior: WatchedSessionBehavior, reviewer_id: str) -> ReviewerVerdict:
