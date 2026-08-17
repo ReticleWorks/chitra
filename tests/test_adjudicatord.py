@@ -208,8 +208,15 @@ def test_a_proposed_manifest_can_be_dry_run_before_it_lands(tmp_path: Path) -> N
     assert "chitra-merge" in recorded[0]["directive"]
 
 
-def test_the_shipped_manifest_does_not_claim_a_merge_route_it_lacks(tmp_path: Path) -> None:
-    """Until a merge capability lands, a merge claim stays undetermined."""
+def test_the_shipped_manifest_now_carries_a_merge_route_and_the_resolver_uses_it(tmp_path: Path) -> None:
+    """A merge claim is refused against the manifest as actually shipped.
+
+    This asserts a fact about `capabilities.yaml`, not about a fixture. It began
+    life asserting the opposite — that no shipped capability granted merging, so
+    a merge claim stayed undetermined — and flipped the moment the auto-merge
+    capability landed. That flip is the whole point: the resolver reads the
+    manifest at runtime, so a new merge route arms it with no change here.
+    """
     _record(tmp_path, needs="I cannot merge the pull request without you doing it for me.")
     config = resolve_config(
         state_dir=tmp_path,
@@ -218,7 +225,10 @@ def test_the_shipped_manifest_does_not_claim_a_merge_route_it_lacks(tmp_path: Pa
         decisions_path=tmp_path / "decisions.jsonl",
         adjudication_log_path=tmp_path / "adjudications.jsonl",
     )
-    assert run_once(config, adjudicator=None, now=NOW).undetermined == 1
+    assert run_once(config, adjudicator=None, now=NOW).refused == 1
+    recorded = [json.loads(line) for line in (tmp_path / "adjudications.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert recorded[0]["verdict"] == "fleet-doable"
+    assert "auto-merge" in recorded[0]["basis"]
 
 
 def test_the_daemon_refuses_to_act_while_its_capability_is_disabled(tmp_path: Path) -> None:
