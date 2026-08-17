@@ -1,0 +1,20 @@
+# chitra-keeperd — the acting supervisor loop.
+# Install: copy to /etc/systemd/system/chitra-keeperd.service, adjust paths,
+# then: systemctl daemon-reload && systemctl enable --now chitra-keeperd.service
+[Unit]
+Description=Chitra keeper supervisor (acts on idle/wedged/held lanes every cycle)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m chitra.keeperd \
+    --goals-tree /mnt/renegade-datasets/OpsHome/scratch/temp-twinridge/fleet-monitor/governed-lanes/tophand \
+    --state-dir /opt/opshome/scratch/temp-twinridge/fleet-monitor/keeper \
+    --cycle-seconds 120
+Restart=on-failure
+RestartSec=30s
+# The keeper writes its own heartbeat each cycle; peers alarm on its silence.
+WatchdogSec=360
+
+[Install]
+WantedBy=multi-user.target
