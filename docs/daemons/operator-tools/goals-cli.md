@@ -15,7 +15,7 @@ chitra-goals set \
   --open-ask "Retrieve current auth library version"
 ```
 
-Creates or updates a goal. On first write, the goal is immutable (lane_id, enrolled_done_when, enrolled_at are write-once). On later writes, only status and reasoning can change.
+Creates or updates a goal. On first write, the goal is immutable (lane_id, enrolled_done_when, enrolled_at are write-once). On later writes, only status and reasoning can change. `set` never moves the enrolled anchors. Only `redirect` can, and only under the condition described in its section below.
 
 Validates:
 - Goal text is ≥6 words.
@@ -78,7 +78,15 @@ chitra-goals redirect \
   --reason "Operator request: add MFA requirement"
 ```
 
-Updates the goal with a reason. The old goal is kept in history; the redirect reason is recorded.
+Updates the goal with a reason. The old goal is kept in history, and the redirect reason is recorded.
+
+A redirect that changes `done_when` also re-freezes the enrollment anchors. It sets
+`enrolled_done_when` to the new `done_when` and stamps `enrolled_at` with the redirect
+time. This is what keeps the lane launchable. Without it, every later
+`chitra-lane-launch` refuses with `lane launch refused: lane identity or frozen done_when
+snapshot does not match`, and the only way out is editing the governed store by hand.
+
+A redirect that leaves `done_when` unchanged keeps the original enrollment anchors.
 
 ### now — Current status
 
@@ -190,7 +198,7 @@ chitra-goals check --goal "Implement comprehensive user authentication system"  
 - **Done_when:** Non-empty, plain language, clear observable condition.
 - **Status:** One of 8 values (open, working, paused, held, complete, abandoned, redirected, deferred).
 - **Lane ID:** Immutable once set; prevents re-enrollment under a fresh session ref.
-- **Enrolled anchors:** First write creates enrolled_done_when and enrolled_at; later writes checked against these.
+- **Enrolled anchors:** First write creates enrolled_done_when and enrolled_at. Later writes are checked against these. The single exception is a `redirect` that changes done_when, which re-freezes both.
 
 ## Output formats
 
