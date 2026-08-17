@@ -201,10 +201,18 @@ def _wrap_cell(text: str, width: int) -> list[str]:
 
 
 def _roster_needs(record: RosterRecord, marker: str) -> str:
-    """The Needs cell: for a red lane, the named unblock; otherwise a dash."""
+    """The Needs cell: for a red lane, the named unblock; otherwise a dash.
+
+    A record whose ingestion interview was waived stays visibly marked here
+    regardless of marker color -- the waiver is a standing exception to the
+    interview gate, not a private implementation detail.
+    """
+    waiver = getattr(record, "interview_waiver", "")
+    waiver_note = f"interview waived: {waiver}" if waiver else ""
     if marker == "🔴":
-        return record.needs or "; ".join(record.open_asks) or "(name the block)"
-    return "—"
+        base = record.needs or "; ".join(record.open_asks) or "(name the block)"
+        return f"{base}; {waiver_note}" if waiver_note else base
+    return waiver_note or "—"
 
 
 def _roster_goal(record: RosterRecord) -> str:

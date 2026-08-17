@@ -21,6 +21,19 @@ def _print_record(record: goal_store.GoalRecord) -> None:
     print(json.dumps(record.to_dict(), indent=2, sort_keys=True))
 
 
+def _parse_id_value_pairs(items: list[str], flag: str) -> dict[str, str]:
+    """Parse repeated ``id=value`` CLI arguments keyed by interview question id."""
+    parsed: dict[str, str] = {}
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"{flag} must be id=<text>, got {item!r}")
+        question_id, _, text = item.partition("=")
+        if question_id not in goal_store.INTERVIEW_QUESTION_IDS:
+            raise ValueError(f"{flag} id must be one of {', '.join(goal_store.INTERVIEW_QUESTION_IDS)}, got {question_id!r}")
+        parsed[question_id] = text
+    return parsed
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="chitra-goals", description="Store deterministic monitor goal state and render its roster.")
     parser.add_argument("--root", type=Path, default=state_dir())
@@ -74,6 +87,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=[],
         help="Required item the operator explicitly acknowledged may close without delivery; repeat as needed.",
     )
+    close_command.add_argument(
+        "--administrative",
+        action="store_true",
+        help="Discard a dead lane's record without a completion claim, bypassing the delivery-inventory gate.",
+    )
+    close_command.add_argument(
+        "--reason",
+        default=None,
+        help="Required with --administrative: why this record is being closed without a completion claim.",
+    )
 
     hold_command = commands.add_parser("hold", help="Hold an existing lane without discarding its goal.")
     add_root(hold_command)
@@ -116,6 +139,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     check_command = commands.add_parser("check", help="Check whether a lane meets the specification threshold.")
     add_root(check_command)
     check_command.add_argument("--session-ref", required=True)
+
+    interview_command = commands.add_parser(
+        "interview",
+        help="Run or record the SHORT INTERVIEW ingestion gate for a lane (see CLAUDE.md Ingestion gate).",
+    )
+    add_root(interview_command)
+    interview_command.add_argument("--session-ref", required=True)
+    interview_command.add_argument(
+        "--print-questions",
+        action="store_true",
+        help="Print the four fixed interview questions with their ids and exit; no write.",
+    )
+    interview_command.add_argument(
+        "--answer",
+        action="append",
+        default=[],
+        metavar="id=<answer text>",
+        help=f"One interview answer, id in {{{', '.join(goal_store.INTERVIEW_QUESTION_IDS)}}}; repeat for all four.",
+    )
+    interview_command.add_argument(
+        "--provenance",
+        action="append",
+        default=[],
+        metavar="id=<provenance>",
+        help='Provenance for the paired --answer id, "operator:<verbatim words>" or "source:<citation>"; repeat for all four.',
+    )
+    interview_command.add_argument(
+        "--waive-legacy",
+        action="store_true",
+        help="Mark this record's interview waived as migrated-from-legacy. Always allowed; logged loudly.",
+    )
 
     guidance_command = commands.add_parser("guidance", help="Locate canonical operator guidance for a working directory.")
     guidance_command.add_argument("--cwd", type=Path, required=True)
@@ -191,6 +245,8 @@ def main(argv: list[str] | None = None) -> int:
                 for record in records:
                     print(f"{record.session_ref}\t{record.status}\t{record.goal}\t{json.dumps(list(record.open_asks))}")
         elif args.command == "close":
+            if args.administrative and not (args.reason or "").strip():
+                raise ValueError("--administrative requires a non-empty --reason")
             _print_record(
                 goal_store.close_goal(
                     args.root,
@@ -198,6 +254,8 @@ def main(argv: list[str] | None = None) -> int:
                     delivered_items=tuple(args.delivered_item),
                     close_notes=tuple(args.close_note),
                     operator_acknowledged_items=tuple(args.operator_acknowledged_item),
+                    administrative=args.administrative,
+                    administrative_reason=args.reason or "",
                 )
             )
         elif args.command == "hold":
@@ -247,6 +305,38 @@ def main(argv: list[str] | None = None) -> int:
                 print("\n".join(specification_issues))
                 return 1
             print("well-specified")
+        elif args.command == "interview":
+            if args.print_questions:
+                for question_id in goal_store.INTERVIEW_QUESTION_IDS:
+                    print(f"{question_id}: {goal_store.INTERVIEW_QUESTIONS[question_id]}")
+            else:
+                stored = None
+                if args.waive_legacy:
+                    stored = goal_store.waive_interview(args.root, args.session_ref)
+                    print(f"interview waived: {stored.interview_waiver}", file=sys.stderr)
+                if args.answer or args.provenance:
+                    answers_raw = _parse_id_value_pairs(args.answer, "--answer")
+                    provenance_raw = _parse_id_value_pairs(args.provenance, "--provenance")
+                    missing_provenance = [question_id for question_id in answers_raw if question_id not in provenance_raw]
+                    if missing_provenance:
+                        raise ValueError(f"--provenance missing for: {', '.join(missing_provenance)}")
+                    extra_provenance = [question_id for question_id in provenance_raw if question_id not in answers_raw]
+                    if extra_provenance:
+                        raise ValueError(f"--provenance given without a matching --answer for: {', '.join(extra_provenance)}")
+                    answers = {question_id: (answers_raw[question_id], provenance_raw[question_id]) for question_id in answers_raw}
+                    stored = goal_store.record_interview(args.root, args.session_ref, answers=answers)
+                if stored is None:
+                    found_record = goal_store.get_goal(args.root, args.session_ref)
+                    if found_record is None:
+                        raise goal_store.GoalNotFoundError(args.session_ref)
+                    stored = found_record
+                _print_record(stored)
+                specification_issues = goal_store.check_specification(stored)
+                if specification_issues:
+                    print("\n".join(specification_issues))
+                    return 1
+                waiver_suffix = f" (interview waived: {stored.interview_waiver})" if stored.interview_waiver else ""
+                print(f"well-specified{waiver_suffix}")
         elif args.command == "guidance":
             guidance_path = resolve_guidance(load_policy_config(), args.cwd)
             if guidance_path is None:

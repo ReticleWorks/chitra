@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
+from _interview_fixtures import VALID_INTERVIEW
 
 from chitra.agent_runtime import AgentStatusBroker
 from chitra.agent_status import ManifestRepository
@@ -248,6 +249,7 @@ def _tracked_goal(root: Path) -> GoalRecord:
             scope="WS1 source tests and documentation only.",
             source="task-file:/tmp/ws1.md",
             status="working",
+            interview=VALID_INTERVIEW,
         ),
     )
 
