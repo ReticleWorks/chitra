@@ -37,6 +37,7 @@ from chitra.merge import (
     append_merge_record,
     fetch_state,
     merge,
+    minting_gh_runner,
     repo_merge_lock,
     resolve_identity,
     run_gh,
@@ -256,6 +257,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     policy = policy_from_config(args.policy_config)
     interval = args.poll_seconds if args.poll_seconds is not None else configured.poll_seconds
+    # A stored installation token expires within the hour and the daemon would
+    # keep running, failing every merge while looking alive. Minting per call
+    # costs one subprocess and removes that failure entirely.
+    runner = minting_gh_runner(configured.token_command) if configured.token_command else run_gh
+    if not configured.token_command:
+        LOGGER.warning(
+            "no merge.token_command configured; using whatever identity gh already holds. "
+            "A daemon should mint its own token: a stored installation token expires within the hour."
+        )
     while True:
         try:
             for record in run_once(
@@ -264,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
                 queue_dir=queue_dir,
                 goals_root=args.goals_root,
                 dry_run=args.dry_run,
+                runner=runner,
             ):
                 LOGGER.info("%s#%d: %s", record.repo, record.number, record.decision.reason)
         except MergeError as exc:
