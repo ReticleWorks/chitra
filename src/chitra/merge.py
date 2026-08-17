@@ -49,6 +49,7 @@ RefusalReason = Literal[
     "ok",
     "repo_not_allowlisted",
     "author_not_a_lane",
+    "not_opted_in",
     "hold_label_present",
     "draft",
     "not_mergeable",
@@ -128,6 +129,20 @@ class MergePolicy:
     lane_authors: tuple[str, ...] = ()
     hold_labels: tuple[str, ...] = DEFAULT_HOLD_LABELS
     app_login: str = ""
+    # When set, a pull request must carry this label to be merged at all.
+    #
+    # This exists because `lane_authors` does not do what its name suggests on
+    # this fleet. Every lane opens pull requests under one shared identity, so
+    # "authored by a lane" cannot distinguish WHICH lane, and allowlisting a
+    # repository silently enrols every lane's work in it. Observed on
+    # 2026-08-16: the daemon merged another lane's pull request, correctly by
+    # policy and without that lane asking.
+    #
+    # Empty keeps the opt-out behaviour the design specifies -- anything green
+    # merges unless someone remembers to add a hold label. Setting it inverts
+    # that to opt-in, where forgetting means your work simply is not merged.
+    # Forgetting should cost a wait, not a merge.
+    require_label: str = ""
 
     def allows_repo(self, repo: str) -> bool:
         return repo in self.allowed_repos
@@ -172,6 +187,12 @@ def decide(state: PullRequestState, policy: MergePolicy, identity: GitHubIdentit
         )
     if not policy.allows_author(state.author):
         return MergeDecision(False, "author_not_a_lane", f"{state.author} is not a declared lane author")
+    if policy.require_label and policy.require_label not in state.labels:
+        return MergeDecision(
+            False,
+            "not_opted_in",
+            f"{policy.require_label} is required on this repository and is not set",
+        )
     if held := policy.holds_on(state.labels):
         return MergeDecision(False, "hold_label_present", f"{held} is set, so a person has taken this one")
     if state.state.upper() != "OPEN":
