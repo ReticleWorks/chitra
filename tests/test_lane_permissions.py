@@ -109,12 +109,45 @@ def test_the_flag_check_passes_the_command_the_launcher_builds() -> None:
 
 
 def test_the_probes_cover_the_classes_the_blocked_lanes_needed(tmp_path: Path) -> None:
-    probes, unprobed = build_probes(tmp_path, ssh_target="tiptap@renegade")
-    assert [probe.name for probe in probes] == ["file_write", "gh_api_write", "fleet_ssh"]
+    probes, unprobed = build_probes(
+        tmp_path,
+        ssh_target="tiptap@renegade",
+        publish_prefix="s3://polyphony-fleet-packages/selftest",
+    )
+    assert [probe.name for probe in probes] == [
+        "file_write",
+        "gh_api_write",
+        "fleet_ssh",
+        "package_publish",
+    ]
     assert unprobed == ()
     assert str(probe_path(tmp_path)) in probes[0].instruction
     assert "gh api --method POST" in probes[1].instruction
     assert "tiptap@renegade" in probes[2].instruction
+    assert "s3://polyphony-fleet-packages/selftest" in probes[3].instruction
+
+
+def test_the_publish_probe_is_shaped_like_a_write_not_a_read(tmp_path: Path) -> None:
+    """The publish class is the one that cost infra-followup its warden-guard publish.
+
+    The classifier judges what a command does, so a read-only ``aws`` call can
+    pass while a write is turned down. A read-only probe would therefore miss
+    exactly the refusal this class exists to catch.
+    """
+    probes, _ = build_probes(
+        tmp_path, ssh_target=None, publish_prefix="s3://bucket/prefix/"
+    )
+    publish = probes[-1]
+    assert publish.name == "package_publish"
+    assert "aws s3 cp" in publish.instruction
+    # A trailing slash on the prefix must not produce a doubled separator.
+    assert "s3://bucket/prefix/chitra-lane-selftest.txt" in publish.instruction
+
+
+def test_an_unset_publish_prefix_is_reported_as_unprobed_not_as_a_pass(tmp_path: Path) -> None:
+    probes, unprobed = build_probes(tmp_path, ssh_target="tiptap@renegade")
+    assert [probe.name for probe in probes] == ["file_write", "gh_api_write", "fleet_ssh"]
+    assert unprobed == ("package_publish",)
 
 
 def test_the_write_probe_uses_the_file_tool_not_a_shell_redirect(tmp_path: Path) -> None:
@@ -135,7 +168,7 @@ def test_an_unset_ssh_target_is_reported_as_unprobed_not_as_a_pass(tmp_path: Pat
     """Silence about a class is the failure mode this whole file exists to end."""
     probes, unprobed = build_probes(tmp_path, ssh_target=None)
     assert [probe.name for probe in probes] == ["file_write", "gh_api_write"]
-    assert unprobed == ("fleet_ssh",)
+    assert unprobed == ("fleet_ssh", "package_publish")
 
 
 def test_the_prompt_forbids_routing_around_a_refusal(tmp_path: Path) -> None:

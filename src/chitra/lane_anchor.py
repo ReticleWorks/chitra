@@ -17,6 +17,7 @@ from chitra._fsio import write_json_atomic
 from chitra.goals import RATE_LIMIT_HOLD_REASON_PREFIX, GoalRecord, check_specification, get_goal
 from chitra.lane_config import LaneSpec, load_lanes
 from chitra.lane_selftest import (
+    SELFTEST_ENV_PUBLISH_PREFIX,
     SELFTEST_ENV_SSH_TARGET,
     LanePermissionRefused,
     LaneSelfTestUnavailable,
@@ -286,6 +287,7 @@ def _prove_lane_permissions(
     agent_command: Sequence[str],
     enabled: bool,
     ssh_target: str | None,
+    publish_prefix: str | None,
     runner: CommandRunner,
     probe_runner: CommandRunner | None,
 ) -> SelfTestReport:
@@ -304,15 +306,17 @@ def _prove_lane_permissions(
             backend=backend,
             live=False,
             detail="self-test disabled for this launch",
-            unprobed=("file_write", "gh_api_write", "fleet_ssh"),
+            unprobed=("file_write", "gh_api_write", "fleet_ssh", "package_publish"),
         )
     target = ssh_target or os.environ.get(SELFTEST_ENV_SSH_TARGET) or None
+    prefix = publish_prefix or os.environ.get(SELFTEST_ENV_PUBLISH_PREFIX) or None
     try:
         report = run_self_test(
             backend=backend,
             agent_command=agent_command,
             workdir=lane.workdir,
             ssh_target=target,
+            publish_prefix=prefix,
             as_lane=lambda command: _run_as_lane(lane, command),
             **({"runner": probe_runner} if probe_runner else {}),
         )
@@ -343,6 +347,7 @@ def start_lane(
     runner: CommandRunner = _run,
     self_test: bool = True,
     self_test_ssh_target: str | None = None,
+    self_test_publish_prefix: str | None = None,
     self_test_runner: CommandRunner | None = None,
 ) -> bool:
     """Ensure the lane session exists; return whether this call created it."""
@@ -399,6 +404,7 @@ def start_lane(
         agent_command=agent_command,
         enabled=self_test,
         ssh_target=self_test_ssh_target,
+        publish_prefix=self_test_publish_prefix,
         runner=runner,
         probe_runner=self_test_runner,
     )
@@ -441,15 +447,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default="sonnet")
     parser.add_argument("--effort", default="high")
     parser.add_argument("--socket-path", type=Path, default=None)
-    # Which host the SSH probe reaches is a site fact, not a property of this
-    # package, so there is no default target here. Without one the SSH class is
-    # reported as unprobed rather than counted as a pass it never measured.
+    # Which host the SSH probe reaches, and where the publish probe writes, are
+    # site facts rather than properties of this package, so there is no default
+    # for either. Without one the class is reported as unprobed rather than
+    # counted as a pass it never measured.
     parser.add_argument(
         "--selftest-ssh-target",
         default=None,
         help=(
             "host the launch self-test reaches over SSH, for example user@host; "
             f"falls back to ${SELFTEST_ENV_SSH_TARGET}"
+        ),
+    )
+    parser.add_argument(
+        "--selftest-publish-prefix",
+        default=None,
+        help=(
+            "object-store prefix the launch self-test publishes a probe object to, "
+            f"for example s3://bucket/path; falls back to ${SELFTEST_ENV_PUBLISH_PREFIX}"
         ),
     )
     parser.add_argument(
@@ -478,6 +493,7 @@ def main(argv: list[str] | None = None) -> int:
                 socket_path=args.socket_path,
                 self_test=args.self_test,
                 self_test_ssh_target=args.selftest_ssh_target,
+                self_test_publish_prefix=args.selftest_publish_prefix,
             )
         except LaneStartupFailed as exc:
             print(f"LaneStartupFailed: {exc}", file=sys.stderr)
