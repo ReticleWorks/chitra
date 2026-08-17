@@ -249,9 +249,7 @@ def test_a_host_that_never_exported_is_invisible_unless_it_is_expected(tmp_path:
 def test_an_expected_host_that_never_exported_reads_as_missing(tmp_path: Path) -> None:
     write_export(tmp_path, _export(host="twinridge", captured_at=NOW.isoformat()), keep_history=False, now=NOW)
 
-    verdicts = {
-        (item.host, item.backend): item for item in read_fleet_exports(tmp_path, now=NOW, expect_hosts=["tophand", "trinity"])
-    }
+    verdicts = {(item.host, item.backend): item for item in read_fleet_exports(tmp_path, now=NOW, expect_hosts=["tophand", "trinity"])}
 
     for host in ("tophand", "trinity"):
         for backend in ("claude", "codex"):
@@ -314,9 +312,7 @@ def test_export_cli_writes_both_backends(tmp_path: Path, monkeypatch: pytest.Mon
     assert [line["backend"] for line in lines] == ["claude", "codex"]
 
 
-def test_evaluate_fleet_dir_cli_renders_one_line_per_host_and_backend(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_evaluate_fleet_dir_cli_renders_one_line_per_host_and_backend(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     write_export(tmp_path, _export(host="tophand", captured_at=datetime.now(UTC).isoformat()), keep_history=False)
 
     assert main(["evaluate", "--fleet-dir", str(tmp_path)]) == 0
@@ -347,9 +343,7 @@ def test_an_incident_is_still_only_reported_without_the_fail_flag(tmp_path: Path
     assert "missing-export" in capsys.readouterr().out
 
 
-def test_fail_on_incident_exits_non_zero_so_a_oneshot_can_carry_the_alarm(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_fail_on_incident_exits_non_zero_so_a_oneshot_can_carry_the_alarm(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     write_export(tmp_path, _export(host="tophand", captured_at=datetime.now(UTC).isoformat()), keep_history=False)
 
     assert main(["evaluate", "--fleet-dir", str(tmp_path), "--fail-on-incident"]) == 1
@@ -362,6 +356,69 @@ def test_fail_on_incident_exits_zero_when_every_host_reads_cleanly(tmp_path: Pat
         write_export(tmp_path, _export(host="tophand", backend=backend, captured_at=now), keep_history=False)
 
     assert main(["evaluate", "--fleet-dir", str(tmp_path), "--fail-on-incident"]) == 0
+
+
+def test_evaluate_dir_reads_one_host_export_directory(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """The defect this closes: the reader refused a file the exporter wrote.
+
+    ``evaluate --dir`` demanded ``chitra.usage.v1`` and failed on the export
+    schema, so a correct pause verdict published by the exporter was thrown
+    away and the host read as fine.
+    """
+    now = datetime.now(UTC).isoformat()
+    for backend in ("claude", "codex"):
+        write_export(tmp_path, _export(host="tophand", backend=backend, captured_at=now), keep_history=False)
+
+    assert main(["evaluate", "--dir", str(tmp_path / "tophand")]) == 0
+
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [(line["host"], line["backend"], line["verdict"]) for line in lines] == [
+        ("tophand", "claude", "ok"),
+        ("tophand", "codex", "ok"),
+    ]
+
+
+def test_evaluate_dir_gives_the_verdict_the_export_file_states(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    write_export(
+        tmp_path,
+        _export(host="tophand", verdict="pause", captured_at=datetime.now(UTC).isoformat()),
+        keep_history=False,
+    )
+
+    assert main(["evaluate", "--dir", str(tmp_path / "tophand")]) == 0
+
+    codex = next(line for line in (json.loads(item) for item in capsys.readouterr().out.splitlines()) if line["backend"] == "codex")
+    assert codex["verdict"] == "pause"
+    assert codex["binding_window"] == "weekly"
+    assert codex["resume_at_iso"] == datetime.fromtimestamp(LONG_RESET, UTC).isoformat()
+
+
+def test_evaluate_dir_on_exports_still_carries_the_incident_alarm(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    write_export(
+        tmp_path,
+        _export(host="tophand", captured_at=(datetime.now(UTC) - timedelta(hours=6)).isoformat()),
+        keep_history=False,
+    )
+
+    assert main(["evaluate", "--dir", str(tmp_path / "tophand"), "--fail-on-incident"]) == 1
+    assert "stale-export" in capsys.readouterr().out
+
+
+def test_evaluate_dir_still_reads_local_snapshots(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Recognising exports must not take the local-snapshot reading away."""
+    _write_snapshot(tmp_path, _claude_snapshot(five_hour_pct=10, seven_day_pct=10, ts=datetime.now(UTC).isoformat()))
+
+    assert main(["evaluate", "--dir", str(tmp_path)]) == 0
+
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [(line["kind"], line["level"]) for line in lines] == [("claude", "ok")]
+
+
+def test_a_snapshot_directory_is_not_mistaken_for_an_export_one(tmp_path: Path) -> None:
+    _write_snapshot(tmp_path, _claude_snapshot(five_hour_pct=10, seven_day_pct=10))
+
+    assert usage_export.holds_exports(tmp_path) is False
+    assert usage_export.holds_exports(tmp_path / "absent") is False
 
 
 def test_an_expected_host_with_no_directory_fails_the_check(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
