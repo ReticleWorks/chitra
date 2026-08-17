@@ -20,6 +20,59 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.12.0] - 2026-08-17
+
+Every automatic behaviour gets a manual verb, and a daemon that merges a lane's
+green work without waiting for a person. Five lanes stalled at once on
+2026-08-16, each waiting on someone to merge its own passing pull request.
+
+### Added
+
+- `chitra-failover evaluate`, `chitra-failover run --lane`, and
+  `chitra-failover resume` — the pause and resume decisions as commands anyone
+  can run. Auto mode is the daemon calling the same verbs, so what you watch it
+  do you can do yourself, and what it refuses stays refused when you type it.
+- `chitra-merge <owner/repo> <number> [--dry-run]` merges one pull request
+  through the same decision the daemon uses. `--dry-run` prints the decision and
+  writes a ledger line without merging.
+- `polyphony-chitra-merged`, a daemon that merges verifiably green
+  lane-authored pull requests under a GitHub App identity, one at a time per
+  repository. It never reads or writes branch protection: a pull request
+  protection would refuse is one this refuses.
+- `chitra-usage evaluate --dir` now reads a host's export directory as well as a
+  local snapshot directory.
+
+### Changed
+
+- The merge decision refuses on more than gate state. A bot author is refused,
+  and so is a pull request nobody has touched in 24 hours. Both come from real
+  merges an interim auto-merger made overnight: five dependency-bot pull
+  requests including a 1.28.1 to 2.0.0 major bump, and one that had been open
+  about five days. Green says a change is mechanically safe to land. It cannot
+  say whose work it is or whether anyone still wants it.
+- The hold brake honours `hold` as well as `chitra-hold`. It was wired only to a
+  label ReticleWorks repositories do not apply, so it stopped nothing.
+
+### Fixed
+
+- `chitra-usage evaluate` could not read the exports `chitra-usage export`
+  writes. It demanded `chitra.usage.v1` and the exporter publishes
+  `chitra.usage-export.v1`, so a correct pause verdict was thrown away
+  overnight while the monitor reported nothing wrong.
+- The merge identity check called `/user`, which an installation token cannot
+  call. The daemon could never have merged anything. Every test passed, because
+  every fixture agreed with the wrong assumption.
+- The ledger recorded the verified head as the merge commit, naming a sha that
+  is not on the base branch. A squash merge creates a new commit, and both are
+  now read back after the merge.
+- The merge token is minted per call and passed by environment rather than
+  stored, so it cannot expire mid-run or land in a process listing.
+- Ten tests measured the host they ran on rather than the code. Three named a
+  real fleet host as the *remote* host, so on that machine they took the local
+  path and stopped testing what they were named for. One of those reached a
+  live tmux pane belonging to another lane. Six wrote state files without a
+  mode and failed wherever the umask is 002.
+
 ## [0.11.0] - 2026-08-16
 
 Rate-limit visibility and failover. A Codex lane hit its weekly hard cap around
