@@ -46,10 +46,27 @@ MERGEABLE_STATE = "MERGEABLE"
 REQUIRED_MERGE_STATE_STATUS = "CLEAN"
 REQUIRED_ROLLUP_STATE = "SUCCESS"
 
+# A merge is scoped by three independent things, not one. Gate state says the
+# change is mechanically safe to land. It says nothing about WHOSE work it is,
+# or whether anyone still wants it. Both of the following were learned from
+# real merges an interim auto-merger made overnight on 2026-08-16.
+#
+# Any login ending in [bot] is refused outright, regardless of the lane
+# allowlist. A dependency bot opened five pull requests that merged on green,
+# one of them a major version bump from 1.28.1 to 2.0.0. Green CI is evidence
+# the tests passed, never evidence a major bump is runtime-safe.
+BOT_LOGIN_SUFFIX = "[bot]"
+# A pull request nobody has touched in a day is not obviously still wanted.
+# One that had been open about five days merged on green, because "green and
+# mergeable" is a statement about the branch, not about anyone's intent.
+DEFAULT_MAX_AGE_HOURS = 24.0
+
 RefusalReason = Literal[
     "ok",
     "repo_not_allowlisted",
     "author_not_a_lane",
+    "author_is_a_bot",
+    "stale_pull_request",
     "hold_label_present",
     "draft",
     "not_mergeable",
@@ -103,6 +120,7 @@ class PullRequestState:
     checks_rollup: str
     head_oid: str
     labels: tuple[str, ...] = ()
+    updated_at: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -118,7 +136,24 @@ class PullRequestState:
             "checks_rollup": self.checks_rollup,
             "head_oid": self.head_oid,
             "labels": list(self.labels),
+            "updated_at": self.updated_at,
         }
+
+    def age_hours(self, now: datetime) -> float | None:
+        """Hours since this pull request was last touched, or None if unknown.
+
+        Unknown is not zero. A state whose timestamp could not be read must not
+        pass a freshness gate by defaulting to fresh.
+        """
+        if not self.updated_at:
+            return None
+        try:
+            touched = datetime.fromisoformat(self.updated_at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if touched.tzinfo is None:
+            return None
+        return (now - touched).total_seconds() / 3600.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +164,7 @@ class MergePolicy:
     lane_authors: tuple[str, ...] = ()
     hold_labels: tuple[str, ...] = DEFAULT_HOLD_LABELS
     app_login: str = ""
+    max_age_hours: float = DEFAULT_MAX_AGE_HOURS
 
     def allows_repo(self, repo: str) -> bool:
         return repo in self.allowed_repos
@@ -156,12 +192,22 @@ class MergeDecision:
         return {"allowed": self.allowed, "reason": self.reason, "detail": self.detail}
 
 
-def decide(state: PullRequestState, policy: MergePolicy, identity: GitHubIdentity) -> MergeDecision:
+def decide(
+    state: PullRequestState,
+    policy: MergePolicy,
+    identity: GitHubIdentity,
+    *,
+    now: datetime | None = None,
+) -> MergeDecision:
     """Return whether this pull request may be merged, refusing on first doubt.
 
     The order matters: configuration and identity are checked before anything
     about the pull request itself, so a misconfigured daemon reports that
     rather than reporting on a pull request it was never allowed to read.
+
+    Scope is three independent questions, and gate state is only one of them.
+    Is this mechanically safe to land, whose work is it, and does anyone still
+    want it. A pull request can be perfectly green and fail the other two.
     """
     if not policy.allows_repo(state.repo):
         return MergeDecision(False, "repo_not_allowlisted", f"{state.repo} is not in the merge allowlist")
@@ -171,8 +217,26 @@ def decide(state: PullRequestState, policy: MergePolicy, identity: GitHubIdentit
             "identity_not_app",
             f"merges must be attributed to {policy.app_login or 'the automation app'}, not {identity.login} ({identity.kind})",
         )
+    # Before the allowlist, not after. A bot login is refused even if someone
+    # puts it in lane_authors, because "a lane asked for this" is the whole
+    # premise of merging without review and a dependency bot never asked.
+    if state.author.endswith(BOT_LOGIN_SUFFIX):
+        return MergeDecision(
+            False,
+            "author_is_a_bot",
+            f"{state.author} is a bot; a dependency bump is not lane work and green is not review",
+        )
     if not policy.allows_author(state.author):
         return MergeDecision(False, "author_not_a_lane", f"{state.author} is not a declared lane author")
+    age = state.age_hours(now or datetime.now(UTC))
+    if age is None:
+        return MergeDecision(False, "stale_pull_request", "last-updated time could not be read, so freshness is unknown")
+    if age > policy.max_age_hours:
+        return MergeDecision(
+            False,
+            "stale_pull_request",
+            f"last touched {age:.1f}h ago, past the {policy.max_age_hours:.0f}h bound; green does not mean still wanted",
+        )
     if held := policy.holds_on(state.labels):
         return MergeDecision(False, "hold_label_present", f"{held} is set, so a person has taken this one")
     if state.state.upper() != "OPEN":
@@ -203,6 +267,7 @@ query($owner: String!, $name: String!, $number: Int!) {
       state
       mergeable
       mergeStateStatus
+      updatedAt
       author { login }
       labels(first: 50) { nodes { name } }
       commits(last: 1) {
@@ -331,6 +396,7 @@ def fetch_state(repo: str, number: int, *, runner: GhRunner = run_gh) -> PullReq
         checks_rollup=str(rollup.get("state") or "MISSING"),
         head_oid=str(commit.get("oid") or ""),
         labels=labels,
+        updated_at=str(node.get("updatedAt") or ""),
     )
 
 
