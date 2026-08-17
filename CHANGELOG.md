@@ -20,6 +20,28 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.12.1] - 2026-08-17
+
+Turn-end review has never completed a single review anywhere in the fleet. The
+last reason is fixed here, and it does not reach the monitor until this ships.
+
+### Fixed
+
+- The reviewer prompt could not be read by the wrapper that runs it. In the
+  fleet the reviewer is not run directly: `chitra-watchd-reviewer` runs it, and
+  that wrapper recovers the reviewer identifier and the two content bindings by
+  splitting the prompt on a newline followed by `INPUT=`. The prompt wrapped its
+  payload in tags instead, so the wrapper refused before a model was ever
+  called, and watchd turned the refusal into a blocked session. The only
+  turn-end review record the fleet has ever written says exactly that, and it
+  marked a clean completion as blocked. Every reviewer test read the payload
+  back with its own marker rather than the wrapper's, which is why the suite
+  stayed green while the gate could not run once.
+- Three instructions in that same prompt still told the reviewer to read its
+  fields "in `<input>`" after the payload moved out of that section, so they
+  pointed at nothing. A test now holds every section the prompt names to one it
+  opens and closes.
+
 ## [0.12.0] - 2026-08-17
 
 Every automatic behaviour gets a manual verb, and a daemon that merges a lane's
