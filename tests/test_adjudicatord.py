@@ -8,9 +8,10 @@ from pathlib import Path
 
 import pytest
 
-from chitra.adjudication import Adjudication, BlockerClaim, Evidence
+from chitra.adjudication import Adjudication, AdjudicatorReply, BlockerClaim, Evidence
 from chitra.adjudicatord import (
     AdjudicationRunError,
+    AdjudicatordConfig,
     RunReport,
     append_adjudication,
     build_directive_order,
@@ -327,6 +328,95 @@ def test_a_dry_run_needs_no_capability_and_writes_nothing(tmp_path: Path) -> Non
     assert exit_code == 0
     assert not (tmp_path / "adjudications.jsonl").exists()
     assert not (tmp_path / "decisions.jsonl").exists()
+
+
+def _write_config(tmp_path: Path) -> AdjudicatordConfig:
+    return resolve_config(
+        state_dir=tmp_path,
+        queue_dir=tmp_path / "queue",
+        convlog_path=tmp_path / "conversation.jsonl",
+        decisions_path=tmp_path / "decisions.jsonl",
+        adjudication_log_path=tmp_path / "adjudications.jsonl",
+        repair_specifications=False,
+    )
+
+
+def test_a_refusal_writes_an_order_retires_the_ask_and_records_the_decision(tmp_path: Path) -> None:
+    """The write path end to end, which cannot be exercised live while held.
+
+    Every other run of this daemon so far has been a dry run, so this is the
+    only place the three writes a refusal performs are actually observed.
+    """
+    _record(tmp_path)
+    ask = "I cannot merge the pull request without you doing it for me."
+    add_ask(tmp_path, SESSION_REF, ask)
+
+    report = run_once(_write_config(tmp_path), adjudicator=None, now=NOW)
+    assert report.refused == 1
+
+    orders = sorted((tmp_path / "queue" / "orders").glob("*.json"))
+    assert len(orders) == 1
+    order = json.loads(orders[0].read_text(encoding="utf-8"))
+    assert order["session_ref"] == SESSION_REF
+    assert order["task_type"] == "blocker-adjudication"
+    assert order["nudge"].strip()
+    assert "operator" not in order["nudge"].lower()
+
+    stored = get_goal(tmp_path, SESSION_REF)
+    assert stored is not None
+    assert ask not in stored.open_asks
+    retirement = next(item for item in stored.retired_asks if item["ask"] == ask)
+    assert retirement["state"] == "retired-by-monitor-with-cited-basis"
+    assert retirement["basis"].strip()
+    assert retirement["citation"].strip()
+
+    decisions = [json.loads(line) for line in (tmp_path / "decisions.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert decisions[0]["kind"] == "adjudication"
+    assert decisions[0]["citation"].strip()
+
+
+def test_an_escalation_opens_one_operator_thread_and_sends_nothing_down(tmp_path: Path) -> None:
+    """Only the escalation path may reach a person, and it must not also direct."""
+    _record(tmp_path)
+    ask = "Should we buy a second storage volume for this?"
+    add_ask(tmp_path, SESSION_REF, ask)
+
+    class _Escalating:
+        def adjudicate(self, claim: object, context: object, evidence: object) -> AdjudicatorReply:
+            assert isinstance(claim, BlockerClaim)
+            return AdjudicatorReply(
+                claim_id=claim.claim_id,
+                verdict="operator-required",
+                escalation="Do you want to spend money on a second storage volume?",
+                escalation_class="spend",
+            )
+
+    report = run_once(_write_config(tmp_path), adjudicator=_Escalating(), now=NOW)
+    assert report.escalated == 1
+
+    entries = [json.loads(line) for line in (tmp_path / "conversation.jsonl").read_text(encoding="utf-8").splitlines()]
+    briefs = [entry for entry in entries if entry["kind"] == "operator_brief"]
+    assert len(briefs) == 1
+    assert briefs[0]["payload"]["brief"]["decision"] == "Do you want to spend money on a second storage volume?"
+    assert briefs[0]["session_ref"] == SESSION_REF
+
+    assert not (tmp_path / "queue" / "orders").exists()
+    stored = get_goal(tmp_path, SESSION_REF)
+    assert stored is not None
+    assert ask in stored.open_asks
+
+
+def test_an_undecided_claim_writes_no_order_and_retires_nothing(tmp_path: Path) -> None:
+    _record(tmp_path)
+    ask = "Here is a plain progress note with no obstacle in it."
+    add_ask(tmp_path, SESSION_REF, ask)
+
+    assert run_once(_write_config(tmp_path), adjudicator=None, now=NOW).undetermined == 1
+    assert not (tmp_path / "queue" / "orders").exists()
+    assert not (tmp_path / "conversation.jsonl").exists()
+    stored = get_goal(tmp_path, SESSION_REF)
+    assert stored is not None
+    assert ask in stored.open_asks
 
 
 def test_a_non_positive_interval_is_refused() -> None:
