@@ -11,6 +11,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import re
 import subprocess
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
@@ -43,6 +44,33 @@ class ReviewerProcessError(GoalReviewError):
 
 class _FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+_FENCED_BLOCK = re.compile(r"```(?:json)?\s*(?P<body>.*?)```", re.DOTALL)
+
+
+def unwrap_json_object(text: str) -> str:
+    """Return the JSON object in a reviewer reply, with its packaging removed.
+
+    A reviewer that answers correctly but wraps the object in a fenced code
+    block used to fail the strict parse, and a failed parse is not harmless
+    here: ``watchd`` turns an unavailable review into a ``blocked`` status and
+    an ask for someone to review the session by hand. A correct review of
+    healthy work became a false blocker.
+
+    Two deviations are tolerated and no more — a code fence, and prose either
+    side of the object. Anything else still fails, because the verdict contract
+    is what keeps a malformed answer from being treated as a review.
+    """
+    stripped = text.strip()
+    fenced = _FENCED_BLOCK.search(stripped)
+    if fenced is not None:
+        stripped = fenced.group("body").strip()
+    if stripped.startswith("{"):
+        return stripped
+    opening = stripped.find("{")
+    closing = stripped.rfind("}")
+    return stripped[opening : closing + 1] if 0 <= opening < closing else stripped
 
 
 def _canonical_json(payload: object) -> str:
@@ -246,7 +274,21 @@ class ClaudeProcessReviewer:
         )
 
     def review(self, goal: FrozenGoal, behavior: WatchedSessionBehavior, reviewer_id: str) -> ReviewerVerdict:
-        command = [self.command, "-p", self._prompt(goal, behavior, reviewer_id), "--output-format", "text"]
+        command = [
+            self.command,
+            "-p",
+            self._prompt(goal, behavior, reviewer_id),
+            "--output-format",
+            "text",
+            # No tools, and no memory between reviewers. The turn under review
+            # is already in the prompt, so a reviewer has nothing legitimate to
+            # read, run, or fetch, and one reviewer's process must not carry
+            # state into the next one's -- these rounds are meant to be
+            # independent.
+            "--no-session-persistence",
+            "--allowed-tools",
+            "",
+        ]
         if self.model is not None:
             command.extend(["--model", self.model])
         try:
@@ -263,7 +305,7 @@ class ClaudeProcessReviewer:
             detail = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
             raise ReviewerProcessError(f"isolated reviewer {reviewer_id} failed: {detail}")
         try:
-            return ReviewerVerdict.model_validate_json(completed.stdout.strip())
+            return ReviewerVerdict.model_validate_json(unwrap_json_object(completed.stdout))
         except ValueError as exc:
             raise ReviewerProcessError(f"isolated reviewer {reviewer_id} returned invalid JSON: {exc}") from exc
 
