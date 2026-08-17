@@ -35,6 +35,7 @@ from chitra.merge import (
     MergeError,
     MergePolicy,
     MergeRecord,
+    TokenError,
     append_merge_record,
     fetch_state,
     merge,
@@ -281,6 +282,15 @@ def main(argv: list[str] | None = None) -> int:
                 runner=runner,
             ):
                 LOGGER.info("%s#%d: %s", record.repo, record.number, record.decision.reason)
+        # A credential this daemon cannot use is a configuration fault, not a
+        # bad minute. Caught and logged like anything else it would loop for
+        # days merging nothing while every reading systemd can take says the
+        # daemon is running -- a missing credential wearing the costume of a
+        # working one. Exiting non-zero puts the unit into failed and lets its
+        # OnFailure handler say so.
+        except TokenError as exc:
+            LOGGER.error("cannot authenticate, so nothing can be merged: %s", exc)
+            return 1
         except MergeError as exc:
             LOGGER.error("pass failed: %s", exc)
         if args.once:
