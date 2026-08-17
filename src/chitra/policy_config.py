@@ -12,7 +12,7 @@ import yaml
 from pydantic import BaseModel, Field, model_validator
 
 from chitra.lexicon import COMPLETION_DEFERRAL_PHRASES
-from chitra.merge import DEFAULT_HOLD_LABELS
+from chitra.merge import DEFAULT_HOLD_LABELS, DEFAULT_MAX_AGE_HOURS
 
 logger = structlog.get_logger(__name__)
 
@@ -287,6 +287,10 @@ class MergePolicyConfig(BaseModel):
     # lives about an hour, so a daemon given a stored one starts failing every
     # merge while still looking alive.
     token_command: list[str] = Field(default_factory=list)
+    # Hours since a pull request was last touched, past which it is refused.
+    # Green and mergeable describe the branch; they say nothing about whether
+    # anyone still wants it. One five-day-old pull request merged on green.
+    max_age_hours: float = DEFAULT_MAX_AGE_HOURS
     # The login a merge must be attributed to. Blank means "any app identity",
     # which is still not "any identity": a personal token is refused either way
     # by chitra.merge.decide.

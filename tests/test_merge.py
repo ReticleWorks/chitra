@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,8 @@ from chitra.merge import (
     repo_merge_lock,
     resolve_identity,
 )
+
+NOW = datetime(2026, 8, 16, 22, 30, tzinfo=UTC)
 
 APP = GitHubIdentity(login="polyphony-automation[bot]", kind="app", source="test")
 PAT = GitHubIdentity(login="lean-wintermute", kind="user", source="test")
@@ -49,6 +52,8 @@ def make_state(**overrides: object):
         "checks_rollup": "SUCCESS",
         "head_oid": "a" * 40,
         "labels": (),
+        # Fresh by default so every other test exercises what it means to.
+        "updated_at": "2026-08-16T22:00:00Z",
     }
     base.update(overrides)
     return PullRequestState(**base)  # type: ignore[arg-type]
@@ -157,6 +162,63 @@ def test_a_failed_mint_raises_rather_than_merging_as_whoever_gh_is(monkeypatch: 
         merge_module.minting_gh_runner(["mint-it"])(["gh", "api", "user"])
 
 
+def test_a_dependency_bot_is_refused_even_when_fully_green() -> None:
+    """From a real overnight merge: five bot pull requests landed on green,
+    one a major version bump from 1.28.1 to 2.0.0. Green CI is evidence the
+    tests passed, never evidence a major bump is runtime-safe.
+    """
+    decision = decide(make_state(author="dependabot[bot]"), POLICY, APP)
+    assert decision.reason == "author_is_a_bot"
+
+
+def test_a_bot_is_refused_even_if_someone_allowlists_it() -> None:
+    """The bot check sits before the allowlist on purpose.
+
+    Merging without review rests on a lane having asked for it. A dependency
+    bot never asked, so putting its login in lane_authors must not buy it a
+    merge.
+    """
+    permissive = MergePolicy(
+        allowed_repos=("ReticleWorks/chitra",),
+        lane_authors=("dependabot[bot]",),
+        app_login=APP.login,
+    )
+    assert decide(make_state(author="dependabot[bot]"), permissive, APP).reason == "author_is_a_bot"
+
+
+def test_a_pull_request_nobody_has_touched_for_days_is_refused() -> None:
+    """From a real overnight merge: one open about five days landed on green.
+    Green and mergeable describe the branch, not whether anyone still wants it.
+    """
+    stale = make_state(updated_at="2026-08-11T00:00:00Z")
+    decision = decide(stale, POLICY, APP, now=NOW)
+    assert decision.reason == "stale_pull_request"
+    assert "still wanted" in decision.detail
+
+
+def test_a_pull_request_touched_today_passes_the_freshness_bound() -> None:
+    assert decide(make_state(updated_at="2026-08-16T20:00:00Z"), POLICY, APP, now=NOW).allowed
+
+
+def test_an_unreadable_last_updated_time_is_refused_rather_than_assumed_fresh() -> None:
+    """Unknown is not zero. A freshness gate must not pass on missing data."""
+    for value in ("", "not a timestamp", "2026-08-16T20:00:00"):
+        assert decide(make_state(updated_at=value), POLICY, APP, now=NOW).reason == "stale_pull_request"
+
+
+def test_the_freshness_bound_is_configurable_and_defaults_to_a_day() -> None:
+    from chitra.merge import DEFAULT_MAX_AGE_HOURS
+
+    assert DEFAULT_MAX_AGE_HOURS == 24.0
+    wide = MergePolicy(
+        allowed_repos=("ReticleWorks/chitra",),
+        lane_authors=("lane-bot",),
+        app_login=APP.login,
+        max_age_hours=24 * 7,
+    )
+    assert decide(make_state(updated_at="2026-08-11T00:00:00Z"), wide, APP, now=NOW).allowed
+
+
 def test_an_empty_lane_allowlist_qualifies_nobody() -> None:
     empty = MergePolicy(allowed_repos=("ReticleWorks/chitra",), app_login=APP.login)
     assert decide(make_state(), empty, APP).reason == "author_not_a_lane"
@@ -177,6 +239,7 @@ def graphql_payload(**pr: object) -> str:
         "state": "OPEN",
         "mergeable": "MERGEABLE",
         "mergeStateStatus": "CLEAN",
+        "updatedAt": "2026-08-16T22:00:00Z",
         "author": {"login": "lane-bot"},
         "labels": {"nodes": [{"name": "enhancement"}]},
         "commits": {"nodes": [{"commit": {"oid": "b" * 40, "statusCheckRollup": {"state": "SUCCESS"}}}]},
@@ -199,7 +262,7 @@ def test_a_pull_request_with_no_checks_at_all_reads_as_missing_not_success() -> 
     payload = graphql_payload(commits={"nodes": [{"commit": {"oid": "c" * 40, "statusCheckRollup": None}}]})
     state = fetch_state("ReticleWorks/chitra", 7, runner=fake_runner(stdout=payload))
     assert state.checks_rollup == "MISSING"
-    assert decide(state, POLICY, APP).reason == "checks_not_successful"
+    assert decide(state, POLICY, APP, now=NOW).reason == "checks_not_successful"
 
 
 def test_a_failed_graphql_query_raises_rather_than_returning_a_default_state() -> None:
