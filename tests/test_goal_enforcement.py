@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -312,6 +313,29 @@ def test_prompt_payload_matches_the_deployed_wrapper_contract(tmp_path: Path) ->
     assert request["reviewer_id"] == "reviewer-a"
     assert request["frozen_goal"]["contract_id"] == goal.contract_id
     assert request["watched_session_behavior"]["behavior_sha256"] == behavior.behavior_sha256
+
+
+def test_the_prompt_never_points_at_a_section_it_does_not_contain(tmp_path: Path) -> None:
+    """Directing the reviewer to a section that is not there invites a bad reply.
+
+    Moving the payload out of an <input> section left three instructions still
+    telling the reviewer to read fields "in <input>", a section the prompt no
+    longer had. This holds every section the prompt names to one it opens and
+    closes.
+    """
+    goal = freeze_goal(_goal(tmp_path))
+    captured: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(command)
+        return subprocess.CompletedProcess(command, 0, _verdict_json(command), "")
+
+    ClaudeProcessReviewer(runner=runner).review(goal, _behavior(goal), "reviewer-a")
+    prompt = captured[0][2]
+
+    named = set(re.findall(r"<([a-z_]+)>", prompt))
+    closed = set(re.findall(r"</([a-z_]+)>", prompt))
+    assert named == closed, f"the prompt names sections it never opens or closes: {named ^ closed}"
 
 
 def test_an_unusable_reply_is_retried_because_the_failure_is_intermittent(tmp_path: Path) -> None:
