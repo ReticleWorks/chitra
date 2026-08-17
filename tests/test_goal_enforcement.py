@@ -22,6 +22,21 @@ from chitra.goal_enforcement import (
 from chitra.goals import GoalRecord, get_goal, redirect_goal, upsert_goal
 
 
+def _request_from_prompt(prompt: str) -> dict[str, object]:
+    """Read the payload back exactly the way the deployed wrapper reads it.
+
+    `chitra_adapter/bin/chitra-watchd-reviewer` recovers the payload with
+    `prompt.rsplit("\\nINPUT=", 1)[1]` and parses that as JSON. Every test here
+    parses it the same way on purpose. When the tests used their own marker
+    instead, the prompt drifted away from the wrapper and no test noticed.
+    """
+    marker = "\nINPUT="
+    assert marker in prompt
+    request = json.loads(prompt.rsplit(marker, 1)[1])
+    assert isinstance(request, dict)
+    return request
+
+
 def _goal(root: Path) -> GoalRecord:
     return upsert_goal(
         root,
@@ -186,7 +201,7 @@ def test_a_fenced_reviewer_verdict_is_accepted(tmp_path: Path) -> None:
     behavior = WatchedSessionBehavior.from_turn(goal.session_ref, "Continuing against the recorded goal.")
 
     def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        request = json.loads(command[2].split("<input>\n", 1)[1].rsplit("\n</input>", 1)[0])
+        request = _request_from_prompt(command[2])
         verdict = ReviewerVerdict(
             reviewer_id=request["reviewer_id"],
             goal_contract_id=request["frozen_goal"]["contract_id"],
@@ -217,7 +232,7 @@ def test_the_reviewer_process_is_granted_no_tools_and_no_memory(tmp_path: Path) 
 
     def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         commands.append(command)
-        request = json.loads(command[2].split("<input>\n", 1)[1].rsplit("\n</input>", 1)[0])
+        request = _request_from_prompt(command[2])
         output = ReviewerVerdict(
             reviewer_id=request["reviewer_id"],
             goal_contract_id=request["frozen_goal"]["contract_id"],
@@ -233,7 +248,7 @@ def test_the_reviewer_process_is_granted_no_tools_and_no_memory(tmp_path: Path) 
 
 
 def _verdict_json(command: list[str]) -> str:
-    request = json.loads(command[2].split("<input>\n", 1)[1].rsplit("\n</input>", 1)[0])
+    request = _request_from_prompt(command[2])
     return ReviewerVerdict(
         reviewer_id=request["reviewer_id"],
         goal_contract_id=request["frozen_goal"]["contract_id"],
@@ -263,6 +278,40 @@ def test_the_reviewer_replaces_the_host_system_prompt(tmp_path: Path) -> None:
     ClaudeProcessReviewer(runner=runner).review(goal, _behavior(goal), "reviewer-a")
     command = captured[0]
     assert command[command.index("--system-prompt") + 1] == REVIEWER_SYSTEM_PROMPT
+
+
+def test_prompt_payload_matches_the_deployed_wrapper_contract(tmp_path: Path) -> None:
+    """The prompt must stay readable by the wrapper that runs the reviewer.
+
+    In the fleet the reviewer is not run directly. `chitra-watchd-reviewer`
+    runs it, and that wrapper recovers the reviewer id and the two content
+    bindings by splitting the prompt on "\\nINPUT=" and parsing the rest as
+    JSON. The prompt once wrapped the payload in tags instead, so the wrapper
+    refused every review with "reviewer prompt does not contain INPUT" before
+    any model was called. The only production review record the fleet has ever
+    written carries exactly that error, and it marked a clean completion as
+    blocked. No test held the prompt to the reader's shape, so nothing caught
+    it. This test is that hold.
+    """
+    goal = freeze_goal(_goal(tmp_path))
+    behavior = _behavior(goal)
+    captured: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(command)
+        return subprocess.CompletedProcess(command, 0, _verdict_json(command), "")
+
+    ClaudeProcessReviewer(runner=runner).review(goal, behavior, "reviewer-a")
+    prompt = captured[0][2]
+
+    marker = "\nINPUT="
+    assert marker in prompt, "the wrapper fails outright when the marker is absent"
+    payload = prompt.rsplit(marker, 1)[1]
+    request = json.loads(payload)
+    assert payload == payload.strip(), "nothing may follow the payload"
+    assert request["reviewer_id"] == "reviewer-a"
+    assert request["frozen_goal"]["contract_id"] == goal.contract_id
+    assert request["watched_session_behavior"]["behavior_sha256"] == behavior.behavior_sha256
 
 
 def test_an_unusable_reply_is_retried_because_the_failure_is_intermittent(tmp_path: Path) -> None:
@@ -320,7 +369,7 @@ def test_claude_reviewer_uses_a_fresh_process_and_only_watched_behavior_context(
     def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         commands.append(command)
         prompt = command[2]
-        request = json.loads(prompt.split("<input>\n", 1)[1].rsplit("\n</input>", 1)[0])
+        request = _request_from_prompt(prompt)
         output = ReviewerVerdict(
             reviewer_id=request["reviewer_id"],
             goal_contract_id=request["frozen_goal"]["contract_id"],
