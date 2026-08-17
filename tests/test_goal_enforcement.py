@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from chitra.goal_enforcement import (
+    REVIEWER_ATTEMPTS,
     REVIEWER_SYSTEM_PROMPT,
     ClaudeProcessReviewer,
     FrozenGoal,
@@ -361,9 +362,20 @@ def test_an_unusable_reply_still_fails_closed_once_the_attempts_run_out(tmp_path
         calls.append(1)
         return subprocess.CompletedProcess(command, 0, '{"ok":true}', "")
 
-    with pytest.raises(ReviewerProcessError, match="all 3 attempts"):
+    with pytest.raises(ReviewerProcessError, match=f"all {REVIEWER_ATTEMPTS} attempts"):
         ClaudeProcessReviewer(runner=runner).review(goal, _behavior(goal), "reviewer-a")
-    assert len(calls) == 3
+    assert len(calls) == REVIEWER_ATTEMPTS
+
+
+def test_the_attempt_budget_is_the_one_the_measurement_supports() -> None:
+    """Measured on tophand 2026-08-17 over 15 runs of the real review path.
+
+    Those runs needed 21 attempts, of which 8 replies were unusable, so a single
+    reply is unusable about 38% of the time. At three attempts that leaves about
+    5% of reviews failing closed, and one of the 15 did exactly that and became a
+    false blocker. Five attempts put the same arithmetic near one in 125.
+    """
+    assert REVIEWER_ATTEMPTS == 5
 
 
 def test_a_process_that_exits_non_zero_is_not_retried(tmp_path: Path) -> None:
