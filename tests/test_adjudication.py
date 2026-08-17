@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import subprocess
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -726,3 +728,28 @@ def test_the_reasoning_prompt_carries_every_layer_and_the_claim() -> None:
     assert claim.claim_id in prompt
     assert "presence" in prompt
     assert "Ask upward only about presence, spend, or scope." in prompt
+
+
+def test_the_reasoning_prompt_frames_its_payload_the_way_the_fleet_reads_it() -> None:
+    """Hold this prompt to the framing that cost the fleet its turn-end review.
+
+    The turn-end reviewer prompt wrapped its payload in an <input> section. The
+    wrapper that runs a reviewer in the fleet reads the payload by splitting on a
+    newline followed by INPUT=, so every review was refused before a model was
+    called, and no test noticed because each side read the prompt its own way.
+    This prompt is built by the same package and is held to the same two rules:
+    no section named that is not opened and closed, and a payload that runs to
+    the end of the prompt after the marker.
+    """
+    prompt = ClaudeProcessAdjudicator._prompt(_claim("A note."), _context(), ())
+
+    opened = set(re.findall(r"<([a-z_]+)>", prompt))
+    closed = set(re.findall(r"</([a-z_]+)>", prompt))
+    assert opened == closed, f"the prompt names sections it never opens or closes: {opened ^ closed}"
+
+    marker = "\nINPUT="
+    assert marker in prompt
+    payload = prompt.rsplit(marker, 1)[1]
+    request = json.loads(payload)
+    assert payload == payload.strip(), "nothing may follow the payload"
+    assert request["claim_id"] == _claim("A note.").claim_id
