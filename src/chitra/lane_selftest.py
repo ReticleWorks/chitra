@@ -32,6 +32,7 @@ from pathlib import Path
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 
 SELFTEST_ENV_SSH_TARGET = "CHITRA_LANE_SELFTEST_SSH_TARGET"
+SELFTEST_ENV_PUBLISH_PREFIX = "CHITRA_LANE_SELFTEST_PUBLISH_PREFIX"
 PROBE_TIMEOUT_SECONDS = 300
 PROBE_MARKER = "chitra-lane-selftest"
 
@@ -107,7 +108,12 @@ def probe_path(workdir: Path) -> Path:
     return workdir / ".chitra-lane-selftest.probe"
 
 
-def build_probes(workdir: Path, *, ssh_target: str | None) -> tuple[tuple[Probe, ...], tuple[str, ...]]:
+def build_probes(
+    workdir: Path,
+    *,
+    ssh_target: str | None,
+    publish_prefix: str | None = None,
+) -> tuple[tuple[Probe, ...], tuple[str, ...]]:
     """Return the probes to run and the names of the classes left unprobed.
 
     The file write lands in the lane's worktree, which is where a lane does its
@@ -121,9 +127,18 @@ def build_probes(workdir: Path, *, ssh_target: str | None) -> tuple[tuple[Probe,
     token carries push rights on any given repository, and it is not a
     substitute for that check.
 
-    The SSH target is a site fact, not a property of this package, so it is
-    supplied by the caller. With no target there is no honest SSH probe, and the
-    class is reported as unprobed rather than quietly counted as passing.
+    The publish probe uploads an empty object under the caller's own prefix. It
+    is the class that cost the most: on 2026-08-16 the infra-followup lane was
+    refused the warden-guard package publish by the auto-mode classifier, and it
+    reported to the operator that the publish needed a person. That publish is
+    still not done. The probe is shaped like a publish because that is what the
+    classifier judges -- a read-only ``aws`` call can pass while a write is
+    turned down, so a read-only probe would miss exactly this failure.
+
+    Neither the SSH target nor the publish prefix is a property of this package.
+    Both are site facts, so both are supplied by the caller. With no value there
+    is no honest probe, and the class is reported as unprobed rather than quietly
+    counted as passing.
     """
     probes = [
         Probe(
@@ -157,6 +172,19 @@ def build_probes(workdir: Path, *, ssh_target: str | None) -> tuple[tuple[Probe,
         )
     else:
         unprobed.append("fleet_ssh")
+    if publish_prefix:
+        probes.append(
+            Probe(
+                name="package_publish",
+                purpose="publish an artifact to the fleet package store",
+                instruction=(
+                    "Run this shell command: "
+                    f"aws s3 cp /dev/null {publish_prefix.rstrip('/')}/{PROBE_MARKER}.txt"
+                ),
+            )
+        )
+    else:
+        unprobed.append("package_publish")
     return tuple(probes), tuple(unprobed)
 
 
@@ -263,6 +291,7 @@ def run_self_test(
     agent_command: Sequence[str],
     workdir: Path,
     ssh_target: str | None,
+    publish_prefix: str | None = None,
     as_lane: Callable[[Sequence[str]], list[str]],
     runner: CommandRunner = _run,
 ) -> SelfTestReport:
@@ -277,7 +306,7 @@ def run_self_test(
     if backend != "claude":
         return SelfTestReport(
             backend=backend,
-            unprobed=("file_write", "gh_api_write", "fleet_ssh"),
+            unprobed=("file_write", "gh_api_write", "fleet_ssh", "package_publish"),
             live=False,
             detail=(
                 "live probes run for the Claude backend only; a Codex lane is checked "
@@ -285,7 +314,9 @@ def run_self_test(
             ),
         )
 
-    probes, unprobed = build_probes(workdir, ssh_target=ssh_target)
+    probes, unprobed = build_probes(
+        workdir, ssh_target=ssh_target, publish_prefix=publish_prefix
+    )
     prompt = build_prompt(probes)
     command = as_lane(claude_probe_command(agent_command, prompt))
     started = time.monotonic()
