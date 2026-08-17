@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 
 from chitra.goal_enforcement import (
+    REVIEWER_SYSTEM_PROMPT,
     ClaudeProcessReviewer,
+    FrozenGoal,
     GoalReviewError,
     ReviewerProcessError,
     ReviewerVerdict,
@@ -228,6 +230,86 @@ def test_the_reviewer_process_is_granted_no_tools_and_no_memory(tmp_path: Path) 
     command = commands[0]
     assert "--no-session-persistence" in command
     assert command[command.index("--allowed-tools") + 1] == ""
+
+
+def _verdict_json(command: list[str]) -> str:
+    request = json.loads(command[2].split("<input>\n", 1)[1].rsplit("\n</input>", 1)[0])
+    return ReviewerVerdict(
+        reviewer_id=request["reviewer_id"],
+        goal_contract_id=request["frozen_goal"]["contract_id"],
+        behavior_sha256=request["watched_session_behavior"]["behavior_sha256"],
+        verdict="accept",
+    ).model_dump_json()
+
+
+def _behavior(goal: FrozenGoal) -> WatchedSessionBehavior:
+    return WatchedSessionBehavior.from_turn(goal.session_ref, "Continuing against the recorded goal.")
+
+
+def test_the_reviewer_replaces_the_host_system_prompt(tmp_path: Path) -> None:
+    """An operator-installed output style must not change the shape of a verdict.
+
+    Measured on tophand: with the ambient system prompt in place the reviewer
+    answered in narrated prose, which fails validation and becomes a false
+    blocker. Replacing the system prompt is what stops that.
+    """
+    goal = freeze_goal(_goal(tmp_path))
+    captured: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(command)
+        return subprocess.CompletedProcess(command, 0, _verdict_json(command), "")
+
+    ClaudeProcessReviewer(runner=runner).review(goal, _behavior(goal), "reviewer-a")
+    command = captured[0]
+    assert command[command.index("--system-prompt") + 1] == REVIEWER_SYSTEM_PROMPT
+
+
+def test_an_unusable_reply_is_retried_because_the_failure_is_intermittent(tmp_path: Path) -> None:
+    """Measured three valid replies in seven attempts on identical input."""
+    goal = freeze_goal(_goal(tmp_path))
+    calls: list[int] = []
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(1)
+        if len(calls) < 3:
+            return subprocess.CompletedProcess(command, 0, '{"ok":true}', "")
+        return subprocess.CompletedProcess(command, 0, _verdict_json(command), "")
+
+    assert ClaudeProcessReviewer(runner=runner).review(goal, _behavior(goal), "reviewer-a").verdict == "accept"
+    assert len(calls) == 3
+
+
+def test_an_unusable_reply_still_fails_closed_once_the_attempts_run_out(tmp_path: Path) -> None:
+    goal = freeze_goal(_goal(tmp_path))
+    calls: list[int] = []
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(1)
+        return subprocess.CompletedProcess(command, 0, '{"ok":true}', "")
+
+    with pytest.raises(ReviewerProcessError, match="all 3 attempts"):
+        ClaudeProcessReviewer(runner=runner).review(goal, _behavior(goal), "reviewer-a")
+    assert len(calls) == 3
+
+
+def test_a_process_that_exits_non_zero_is_not_retried(tmp_path: Path) -> None:
+    """Only the intermittent failure is retried; a broken process fails at once."""
+    goal = freeze_goal(_goal(tmp_path))
+    calls: list[int] = []
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(1)
+        return subprocess.CompletedProcess(command, 1, "", "the model was unavailable")
+
+    with pytest.raises(ReviewerProcessError, match="the model was unavailable"):
+        ClaudeProcessReviewer(runner=runner).review(goal, _behavior(goal), "reviewer-a")
+    assert len(calls) == 1
+
+
+def test_a_non_positive_attempt_count_is_refused() -> None:
+    with pytest.raises(ValueError, match="attempts must be a positive integer"):
+        ClaudeProcessReviewer(attempts=0)
 
 
 def test_claude_reviewer_uses_a_fresh_process_and_only_watched_behavior_context(tmp_path: Path) -> None:
