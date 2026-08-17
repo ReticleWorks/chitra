@@ -9,11 +9,13 @@ import pytest
 from chitra.goal_enforcement import (
     ClaudeProcessReviewer,
     GoalReviewError,
+    ReviewerProcessError,
     ReviewerVerdict,
     ReviewFinding,
     WatchedSessionBehavior,
     freeze_goal,
     review_watched_session,
+    unwrap_json_object,
 )
 from chitra.goals import GoalRecord, get_goal, redirect_goal, upsert_goal
 
@@ -155,6 +157,77 @@ def test_tampered_reviewer_binding_fails_closed(tmp_path: Path) -> None:
 
     with pytest.raises(GoalReviewError, match="tampered goal binding"):
         review_watched_session(tmp_path, goal.session_ref, behavior, reviewer=TamperedReviewer())
+
+
+@pytest.mark.parametrize(
+    ("packaged", "expected"),
+    [
+        ('{"a": 1}', '{"a": 1}'),
+        ('```json\n{"a": 1}\n```', '{"a": 1}'),
+        ('```\n{"a": 1}\n```', '{"a": 1}'),
+        ('Here is the verdict:\n{"a": 1}\n', '{"a": 1}'),
+        ("not json at all", "not json at all"),
+    ],
+)
+def test_reviewer_reply_packaging_is_removed_before_the_verdict_is_read(packaged: str, expected: str) -> None:
+    assert unwrap_json_object(packaged) == expected
+
+
+def test_a_fenced_reviewer_verdict_is_accepted(tmp_path: Path) -> None:
+    """A correct verdict must not be lost to a code fence.
+
+    A lost verdict is not harmless: watchd turns an unavailable review into a
+    blocked status and an ask to review the session by hand, so a correct review
+    of healthy work became a false blocker.
+    """
+    goal = freeze_goal(_goal(tmp_path))
+    behavior = WatchedSessionBehavior.from_turn(goal.session_ref, "Continuing against the recorded goal.")
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        request = json.loads(command[2].split("<input>\n", 1)[1].rsplit("\n</input>", 1)[0])
+        verdict = ReviewerVerdict(
+            reviewer_id=request["reviewer_id"],
+            goal_contract_id=request["frozen_goal"]["contract_id"],
+            behavior_sha256=request["watched_session_behavior"]["behavior_sha256"],
+            verdict="accept",
+        ).model_dump_json()
+        return subprocess.CompletedProcess(command, 0, f"```json\n{verdict}\n```", "")
+
+    assert ClaudeProcessReviewer(runner=runner).review(goal, behavior, "reviewer-a").verdict == "accept"
+
+
+def test_unwrapping_never_rescues_a_verdict_that_breaks_its_contract(tmp_path: Path) -> None:
+    """Tolerating packaging must not tolerate a wrong verdict."""
+    goal = freeze_goal(_goal(tmp_path))
+    behavior = WatchedSessionBehavior.from_turn(goal.session_ref, "Continuing against the recorded goal.")
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, '```json\n{"reviewer_id": "reviewer-a", "verdict": "accept"}\n```', "")
+
+    with pytest.raises(ReviewerProcessError, match="invalid JSON"):
+        ClaudeProcessReviewer(runner=runner).review(goal, behavior, "reviewer-a")
+
+
+def test_the_reviewer_process_is_granted_no_tools_and_no_memory(tmp_path: Path) -> None:
+    goal = freeze_goal(_goal(tmp_path))
+    behavior = WatchedSessionBehavior.from_turn(goal.session_ref, "Continuing against the recorded goal.")
+    commands: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        request = json.loads(command[2].split("<input>\n", 1)[1].rsplit("\n</input>", 1)[0])
+        output = ReviewerVerdict(
+            reviewer_id=request["reviewer_id"],
+            goal_contract_id=request["frozen_goal"]["contract_id"],
+            behavior_sha256=request["watched_session_behavior"]["behavior_sha256"],
+            verdict="accept",
+        ).model_dump_json()
+        return subprocess.CompletedProcess(command, 0, output, "")
+
+    ClaudeProcessReviewer(runner=runner).review(goal, behavior, "reviewer-a")
+    command = commands[0]
+    assert "--no-session-persistence" in command
+    assert command[command.index("--allowed-tools") + 1] == ""
 
 
 def test_claude_reviewer_uses_a_fresh_process_and_only_watched_behavior_context(tmp_path: Path) -> None:
