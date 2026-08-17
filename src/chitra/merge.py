@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import subprocess
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -220,6 +221,51 @@ query($owner: String!, $name: String!, $number: Int!) {
 
 def run_gh(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, check=False, capture_output=True, text=True)
+
+
+class TokenError(MergeError):
+    """A fresh GitHub App installation token could not be minted."""
+
+
+def minting_gh_runner(token_command: Sequence[str], *, runner: GhRunner = run_gh) -> GhRunner:
+    """Return a gh runner that mints a fresh installation token per call.
+
+    A GitHub App installation token lives about an hour. A daemon handed one
+    static token in an environment file therefore works until roughly the first
+    hour of its life and then fails every merge, which is a worse failure than
+    not starting: it looks alive. That is what the unit this daemon ships with
+    originally specified, and it would have failed on its first night.
+
+    So the token is minted, not stored. ``token_command`` is whatever the host
+    already uses to produce one -- on this fleet a git credential helper that
+    prints ``password=<token>``. Its output is parsed for that line, or taken
+    whole if it prints a bare token.
+
+    The token never reaches argv. It is passed to gh through ``GH_TOKEN`` in
+    the child environment, so it cannot show up in a process list.
+    """
+
+    def mint() -> str:
+        result = subprocess.run(list(token_command), check=False, capture_output=True, text=True, input="")
+        if result.returncode != 0:
+            raise TokenError(f"could not mint a GitHub App token: {result.stderr.strip() or 'no output'}")
+        for line in result.stdout.splitlines():
+            if line.startswith("password="):
+                return line.split("=", 1)[1].strip()
+        token = result.stdout.strip()
+        if not token or "\n" in token:
+            raise TokenError("the token command printed no password= line and no bare token")
+        return token
+
+    def run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        environment = dict(os.environ)
+        environment["GH_TOKEN"] = mint()
+        # GH_TOKEN wins over a cached gh login, so an operator's stale personal
+        # token in gh's config cannot quietly become the merging identity.
+        environment.pop("GITHUB_TOKEN", None)
+        return subprocess.run(list(command), check=False, capture_output=True, text=True, env=environment)
+
+    return run
 
 
 def _split_repo(repo: str) -> tuple[str, str]:

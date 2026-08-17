@@ -281,6 +281,12 @@ class MergePolicyConfig(BaseModel):
     # and a brake wired to a label the repository never applies is not a brake.
     # Matching more labels can only refuse more, so both known spellings ship on.
     hold_labels: list[str] = Field(default_factory=lambda: list(DEFAULT_HOLD_LABELS))
+    # Command that prints a fresh GitHub App installation token. Empty means
+    # use whatever identity gh already holds, which is fine for a person
+    # running the manual verb and wrong for a daemon: an installation token
+    # lives about an hour, so a daemon given a stored one starts failing every
+    # merge while still looking alive.
+    token_command: list[str] = Field(default_factory=list)
     # The login a merge must be attributed to. Blank means "any app identity",
     # which is still not "any identity": a personal token is refused either way
     # by chitra.merge.decide.
