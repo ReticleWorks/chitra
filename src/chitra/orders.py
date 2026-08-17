@@ -33,6 +33,19 @@ class DispatchStatus(enum.StrEnum):
     # real delivery's own idempotency check. See
     # docs/SOL-ADVERSARIAL-REVIEW finding #1.
     DEFERRED = "deferred"
+    # dispatch_to_tmux pasted the nudge and transcript-grep could not confirm
+    # it structurally (see chitra.dispatch.transcript_confirms_nudge), but
+    # the weaker pane-capture fallback saw the marker in the pane's recent
+    # scrollback. Pane capture cannot distinguish a genuinely-started turn
+    # from a scrollback echo or an unsubmitted composer row, so it is never
+    # treated as a terminal SENT result on its own. dispatchd retries the
+    # order using the same durable retry-attempts sidecar the lane-lock
+    # timeout path uses (chitra.dispatchd._process_claimed_order), giving
+    # transcript-grep another chance on a later pass; after the retry budget
+    # is exhausted it becomes a terminal FAILED "retry-exhausted" result.
+    # Like DEFERRED, this status is for in-process visibility only -- it is
+    # never written to results/.
+    DELIVERY_UNCONFIRMED = "delivery_unconfirmed"
 
 
 class DispatchOrder(BaseModel):

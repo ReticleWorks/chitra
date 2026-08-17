@@ -740,6 +740,15 @@ def _process_claimed_order(
             session_ref=order.session_ref,
             retry_limit=lane_lock_retry_attempts,
         )
+        # Non-silent terminal failure: a lane that never got its retries
+        # cleared before hitting the queue's exhaustion check is otherwise
+        # only visible in the daemon's own log stream.
+        logger.critical(
+            "dispatchd_retry_exhausted",
+            order_id=order.order_id,
+            session_ref=order.session_ref,
+            retry_limit=lane_lock_retry_attempts,
+        )
         result = DispatchResult(
             order_id=order.order_id,
             session_ref=order.session_ref,
@@ -885,6 +894,12 @@ def _process_claimed_order(
         if attempts >= lane_lock_retry_attempts:
             logger.error(
                 "dispatchd_lane_lock_retry_exhausted",
+                order_id=order.order_id,
+                session_ref=order.session_ref,
+                retry_limit=lane_lock_retry_attempts,
+            )
+            logger.critical(
+                "dispatchd_retry_exhausted",
                 order_id=order.order_id,
                 session_ref=order.session_ref,
                 retry_limit=lane_lock_retry_attempts,
@@ -1043,6 +1058,61 @@ def _process_claimed_order(
         session_ref=order.session_ref,
         status=result.status.value,
     )
+    if result.status == DispatchStatus.DELIVERY_UNCONFIRMED:
+        # Pane-capture-only confirmation is never terminal (see
+        # DispatchStatus.DELIVERY_UNCONFIRMED). Defer using the same durable
+        # retry-attempts sidecar the lane-lock timeout path uses, so
+        # ``_requeue_lane_lock_deferred`` returns it to ``orders/`` on a
+        # later pass and the exhaustion check at the top of this function
+        # (which already emits the terminal FAILED "retry-exhausted" result,
+        # CRIT-logged) applies uniformly. Deliberately do NOT clear the
+        # send-nonce written before this delivery attempt: the retried pass's
+        # existing crash-reconciliation check (nonce present, no result) will
+        # re-grep the transcript before ever pasting again, so a delivery
+        # that only needed a later transcript flush is confirmed without a
+        # second paste.
+        attempts = _record_lane_lock_retry_attempt(deferred_dir, order.order_id, retry_limit=lane_lock_retry_attempts)
+        logger.warning(
+            "dispatchd_delivery_unconfirmed",
+            order_id=order.order_id,
+            session_ref=order.session_ref,
+            reason=result.reason,
+            attempts=attempts,
+            retry_limit=lane_lock_retry_attempts,
+        )
+        if attempts >= lane_lock_retry_attempts:
+            # Same inline exhaustion check the lane-lock timeout path applies
+            # right after incrementing its own attempt counter -- catch it in
+            # this same pass rather than deferring one more time only to have
+            # the top-of-function pre-check reject it on the next.
+            logger.error(
+                "dispatchd_lane_lock_retry_exhausted",
+                order_id=order.order_id,
+                session_ref=order.session_ref,
+                retry_limit=lane_lock_retry_attempts,
+            )
+            logger.critical(
+                "dispatchd_retry_exhausted",
+                order_id=order.order_id,
+                session_ref=order.session_ref,
+                retry_limit=lane_lock_retry_attempts,
+            )
+            result.status = DispatchStatus.FAILED
+            result.reason = "retry-exhausted"
+            with contextlib.suppress(OSError):
+                (in_flight_dir / f".{order.order_id}.nonce").unlink()
+            return _finalize_claimed_order(
+                claimed_path,
+                results_dir=results_dir,
+                destination_dir=processed_dir,
+                result=result,
+                retry_state_dir=deferred_dir,
+                retry_order_id=order.order_id,
+            )
+        deferred_dir.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            claimed_path.replace(deferred_dir / claimed_path.name)
+        return result
     if result.status == DispatchStatus.SENT:
         # Persist the successful transport result before attempting the ledger
         # write. If the ledger is temporarily unavailable, the next pass can
