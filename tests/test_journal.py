@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ from chitra.journal import (
     CanonicalType,
     Client,
     JournalIngestor,
+    JsonlTailReader,
     LifecycleReceipt,
     NormalizationContext,
     ProgressClass,
@@ -286,3 +288,75 @@ def test_progress_classification_stays_evidence_bound(tmp_path: Path) -> None:
     assert non_progress.classification is ProgressClass.NON_PROGRESS
 
     assert os.stat(tmp_path / "journal" / "claude.jsonl").st_size > 0
+
+
+_REWRITE_PAD = 48
+_REWRITE_SUFFIX = b'"}\n'
+
+
+def _mutated_line(line: bytes, rng: random.Random) -> bytes:
+    value_start = len(line) - len(_REWRITE_SUFFIX) - _REWRITE_PAD
+    mutated = bytearray(line)
+    for position in rng.sample(range(value_start, value_start + _REWRITE_PAD), k=min(8, _REWRITE_PAD)):
+        mutated[position] = rng.choice(b"abcdefghijklmnop")
+    return bytes(mutated)
+
+
+def test_same_inode_same_size_rewrite_before_anchor_is_detected(tmp_path: Path) -> None:
+    transcript = tmp_path / "rewritten.jsonl"
+    first = json.dumps({"value": "a" * 160}, separators=(",", ":")).encode() + b"\n"
+    second = json.dumps({"value": "stable-suffix" * 10}, separators=(",", ":")).encode() + b"\n"
+    transcript.write_bytes(first + second)
+
+    with JsonlTailReader(transcript) as reader:
+        initial = reader.poll()
+        inode = transcript.stat().st_ino
+        replacement = json.dumps({"value": "b" * 160}, separators=(",", ":")).encode() + b"\n"
+        assert len(replacement) == len(first)
+        with transcript.open("r+b") as handle:
+            handle.write(replacement)
+            handle.flush()
+            os.fsync(handle.fileno())
+        assert transcript.stat().st_ino == inode
+        rewritten = reader.poll()
+
+    assert len(rewritten.rotations) == 1
+    assert len(rewritten.records) == 2
+    assert rewritten.records[0].raw_sha256 != initial.records[0].raw_sha256
+    assert rewritten.records[0].record == {"value": "b" * 160}
+
+
+@pytest.mark.parametrize("seed", range(16))
+def test_property_same_inode_rewrites_are_detected_at_any_position(tmp_path: Path, seed: int) -> None:
+    rng = random.Random(seed)
+    record_count = 12
+    lines = [
+        json.dumps({"index": f"{index:02d}", "value": "x" * _REWRITE_PAD}, separators=(",", ":")).encode() + b"\n"
+        for index in range(record_count)
+    ]
+    line_length = len(lines[0])
+    assert all(len(line) == line_length for line in lines)
+    transcript = tmp_path / "rewritten-property.jsonl"
+    transcript.write_bytes(b"".join(lines))
+
+    with JsonlTailReader(transcript) as reader:
+        initial = reader.poll()
+        assert len(initial.records) == record_count
+        inode = transcript.stat().st_ino
+        target = rng.randrange(record_count)
+        replacement = _mutated_line(lines[target], rng)
+        assert len(replacement) == line_length
+        assert replacement != lines[target]
+        with transcript.open("r+b") as handle:
+            handle.seek(target * line_length)
+            handle.write(replacement)
+            handle.flush()
+            os.fsync(handle.fileno())
+        detected = reader.poll()
+
+    assert transcript.stat().st_ino == inode
+    assert transcript.stat().st_size == record_count * line_length
+    assert len(detected.rotations) == 1
+    assert detected.rotations[0].previous.inode == detected.rotations[0].current.inode
+    assert len(detected.records) == record_count
+    assert detected.records[target].record["value"] != json.loads(lines[target])["value"]

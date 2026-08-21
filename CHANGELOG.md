@@ -20,6 +20,16 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.14.1] - 2026-08-21
+
+### Fixed
+
+- Same-inode rewrites are no longer missed when file size and the final
+  64 bytes are unchanged: each poll re-verifies stored record hashes at
+  their byte ranges (first and last records always, a deterministic
+  sample of earlier records, plus buffered partial bytes) and replays
+  the transcript on any mismatch.
+
 ## [0.14.0] - 2026-08-21
 
 ### Added

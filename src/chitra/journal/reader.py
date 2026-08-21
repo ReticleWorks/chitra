@@ -13,6 +13,8 @@ from typing import Any, BinaryIO
 
 from .models import ByteRange, RawRecord, TranscriptIdentity
 
+_VERIFICATION_SAMPLE = 16
+
 
 @dataclass(frozen=True)
 class Rotation:
@@ -42,6 +44,7 @@ class JsonlTailReader:
         self._buffer_start = 0
         self._generation = 0
         self._anchor = b""
+        self._consumed: list[tuple[int, int, str]] = []
 
     @property
     def identity(self) -> TranscriptIdentity | None:
@@ -77,7 +80,9 @@ class JsonlTailReader:
         current_key = (self._identity.device, self._identity.inode)
         path_key = (path_stat.st_dev, path_stat.st_ino)
         replaced = path_key != current_key
-        rewritten = path_key == current_key and (path_stat.st_size < self._offset or not self._anchor_matches())
+        rewritten = path_key == current_key and (
+            path_stat.st_size < self._offset or not self._anchor_matches() or not self._consumed_intact()
+        )
         records = self._drain() if replaced else []
         if replaced or rewritten:
             previous = self._identity
@@ -88,6 +93,7 @@ class JsonlTailReader:
             self._buffer = bytearray()
             self._buffer_start = 0
             self._anchor = b""
+            self._consumed = []
             self._open_current()
             assert self._identity is not None
             rotations.append(Rotation(previous, self._identity, abandoned))
@@ -111,6 +117,7 @@ class JsonlTailReader:
             self._buffer = bytearray()
             self._buffer_start = 0
             self._anchor = b""
+            self._consumed = []
             self._open_current()
             assert self._identity is not None
             rotations.append(Rotation(previous, self._identity, abandoned))
@@ -161,6 +168,29 @@ class JsonlTailReader:
         start = self._offset - len(self._anchor)
         return os.pread(self._handle.fileno(), len(self._anchor), start) == self._anchor
 
+    def _consumed_intact(self) -> bool:
+        """Verify earlier record hashes and buffered bytes still match disk."""
+        assert self._handle is not None
+        if self._buffer:
+            prefix = os.pread(self._handle.fileno(), len(self._buffer), self._buffer_start)
+            if prefix != bytes(self._buffer):
+                return False
+        for index in self._verification_indices():
+            start, end, digest = self._consumed[index]
+            found = os.pread(self._handle.fileno(), end - start, start)
+            if hashlib.sha256(found).hexdigest() != digest:
+                return False
+        return True
+
+    def _verification_indices(self) -> list[int]:
+        count = len(self._consumed)
+        if count <= _VERIFICATION_SAMPLE:
+            return list(range(count))
+        stride = (count - 1) / (_VERIFICATION_SAMPLE - 1)
+        sampled = {round(index * stride) for index in range(_VERIFICATION_SAMPLE)}
+        sampled.update((0, count - 1))
+        return sorted(sampled)
+
     def _drain(self) -> list[RawRecord]:
         assert self._handle is not None
         assert self._identity is not None
@@ -201,6 +231,7 @@ class JsonlTailReader:
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             error = str(exc)
         assert self._identity is not None
+        self._consumed.append((start, end, digest))
         return RawRecord(
             transcript=self._identity,
             byte_range=ByteRange(start=start, end=end),
