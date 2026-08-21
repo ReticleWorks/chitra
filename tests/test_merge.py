@@ -52,8 +52,9 @@ def make_state(**overrides: object):
         "checks_rollup": "SUCCESS",
         "head_oid": "a" * 40,
         "labels": (),
-        # Fresh by default so every other test exercises what it means to.
-        "updated_at": "2026-08-16T22:00:00Z",
+        # Keep the default fixture fresh for tests that intentionally omit an
+        # explicit `now`; the production freshness bound must stay narrow.
+        "updated_at": datetime.now(UTC).isoformat(),
     }
     base.update(overrides)
     return PullRequestState(**base)  # type: ignore[arg-type]
