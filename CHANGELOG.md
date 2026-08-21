@@ -30,6 +30,18 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   same-inode resumes, and switches cleanly across rotation.
 - Add append-only per-lane event and progress-derivation journals under each
   instance state root. Native records remain intact for replay.
+- `chitra-receipts ingest`, `list`, and `verify` manage immutable per-lane
+  validation receipts under the instance state root. Ingest verifies the W12
+  nine-field envelope, its canonical digest, and every copied evidence hash.
+- Receipt verification checks current artifact or commit identity and validates
+  PVR report-to-audit bindings when the receipt names the Polyvalidation Rig.
+
+### Changed
+
+- Done transition and completion close now reload the exact frozen receipt from
+  the lane store. Only a verified `PASS` with validator acceptance and no
+  unexercised surface counts; caller flags and claimed result text cannot
+  replace it.
 
 ## [0.13.0] - 2026-08-21
 

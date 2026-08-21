@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
+from pathlib import Path
+
 from chitra.completion_gate import CompletionEvidence
 from chitra.goals import EnrolledDoneWhenItem, InterviewReceipt
+from chitra.validation_receipts import ingest_receipt
 
 VALID_INTERVIEW_RECEIPT = InterviewReceipt(
     name="interview:test-goal",
@@ -52,3 +57,41 @@ def passing_completion_evidence(
         validator_result="pass",
         citation=citation,
     )
+
+
+def ingest_passing_receipt(
+    root: Path,
+    session_ref: str,
+    *,
+    validator: str = "pytest",
+    receipt_name: str = "tests-green",
+) -> Path:
+    """Install a minimal hash-bound PASS receipt for goal-store tests."""
+    source_dir = root / "test-receipt-sources" / hashlib.sha256(session_ref.encode()).hexdigest()
+    evidence_path = source_dir / "evidence" / "test-report.txt"
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_path.write_text("all tests passed\n", encoding="utf-8")
+    digest = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    payload: dict[str, object] = {
+        "receipt_name": receipt_name,
+        "validator": {"name": validator, "version": "test"},
+        "target": {"artifact": {"path": str(evidence_path), "sha256": digest}},
+        "exercise": {"command": ["pytest", "-q"]},
+        "result": {"status": "PASS", "validator_acceptance": True},
+        "not_exercised": [],
+        "artifacts": [{"path": "evidence/test-report.txt", "kind": "report", "sha256": digest}],
+        "produced_at": "2026-08-21T12:00:00Z",
+        "integrity": {
+            "algorithm": "sha256",
+            "canonicalization": "UTF-8 JSON; keys sorted; separators comma and colon; ensure_ascii false",
+            "scope": "entire receipt with /integrity/digest omitted",
+            "hand_authored_fields": [],
+        },
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    integrity = payload["integrity"]
+    assert isinstance(integrity, dict)
+    integrity["digest"] = hashlib.sha256(canonical).hexdigest()
+    source = source_dir / "receipt.json"
+    source.write_text(json.dumps(payload), encoding="utf-8")
+    return ingest_receipt(root, session_ref, source)
