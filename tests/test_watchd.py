@@ -19,6 +19,7 @@ from chitra.watchd import (
     Pane,
     Watchd,
     WatchdConfig,
+    _pane_backend,
     append_event,
     build_arg_parser,
     event_line,
@@ -345,6 +346,21 @@ def test_list_panes_uses_live_tmux_enumeration_and_deduplicates_pane_id() -> Non
     ]
 
 
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("opencode", "opencode"),
+        ("/usr/local/bin/opencode", "opencode"),
+        ("opencode-helper", "unknown"),
+        ("not-opencode", "unknown"),
+        ("claude", "claude"),
+        ("codex", "codex"),
+    ],
+)
+def test_pane_backend_recognizes_only_allowlisted_executables(command: str, expected: str) -> None:
+    assert _pane_backend(command) == expected
+
+
 def test_watchd_persists_backend_neutral_change_recency_and_attachment(tmp_path: Path) -> None:
     _tracked_goal(tmp_path)
 
@@ -364,6 +380,24 @@ def test_watchd_persists_backend_neutral_change_recency_and_attachment(tmp_path:
     assert activity[0].attached is False
     assert activity[0].backend == "codex"
     assert activity[0].last_change_at
+
+
+def test_watchd_persists_opencode_backend_activity(tmp_path: Path) -> None:
+    _tracked_goal(tmp_path)
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t0\topencode\n")
+        if command[1] == "capture-pane":
+            return _completed(command, "working on the requested change\n")
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"), runner=runner)
+    watcher.poll_once()
+
+    activity = load_lane_activity(tmp_path)
+    assert len(activity) == 1
+    assert activity[0].backend == "opencode"
 
 
 def test_list_panes_can_isolate_a_session_namespace() -> None:

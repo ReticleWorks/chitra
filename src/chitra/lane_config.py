@@ -11,13 +11,15 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 import yaml
 
 LANES_FILE_ENV_VAR = "CHITRA_LANES_FILE"
 DEFAULT_LANES_FILE = Path("/etc/chitra/lanes.yaml")
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+LaneBackend = Literal["shell", "claude", "codex", "opencode"]
+LANE_BACKENDS: tuple[LaneBackend, ...] = ("shell", "claude", "codex", "opencode")
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,7 +32,12 @@ class LaneCredentials:
 
 @dataclass(frozen=True, slots=True)
 class LaneSpec:
-    """One independently-owned Chitra runtime namespace."""
+    """One independently-owned Chitra runtime namespace.
+
+    ``backend`` is an allowlisted executable family for the explicit lane
+    launcher.  It is not a model selector and does not give the manifest a
+    free-form command or prompt field.
+    """
 
     identifier: str
     account: str
@@ -43,6 +50,7 @@ class LaneSpec:
     tmux_session: str
     credentials: LaneCredentials
     enabled: bool = True
+    backend: LaneBackend = "shell"
 
     @property
     def queue_dir(self) -> Path:
@@ -120,6 +128,7 @@ def _lane(value: Any, *, index: int) -> LaneSpec:
         "tmux_session",
         "credentials",
         "enabled",
+        "backend",
     }
     unknown = sorted(set(raw) - expected)
     if unknown:
@@ -150,6 +159,10 @@ def _lane(value: Any, *, index: int) -> LaneSpec:
     enabled = raw.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ValueError(f"{path}.enabled must be boolean")
+    backend = raw.get("backend", "shell")
+    if backend not in LANE_BACKENDS:
+        choices = ", ".join(LANE_BACKENDS)
+        raise ValueError(f"{path}.backend must be one of: {choices}")
     return LaneSpec(
         identifier=identifier,
         account=account,
@@ -162,6 +175,7 @@ def _lane(value: Any, *, index: int) -> LaneSpec:
         tmux_session=tmux_session,
         credentials=credentials,
         enabled=enabled,
+        backend=cast(LaneBackend, backend),
     )
 
 

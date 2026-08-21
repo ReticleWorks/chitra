@@ -88,8 +88,11 @@ the `chitra@.service` session-anchor template. Build it with
 
 The package daemons read `/etc/chitra/lanes.yaml`. Each declaration supplies
 the lane identity, account, roots, tmux socket and credential bindings. The
-declaration has no model field. The operator selects the model when starting
-the shell in `chitra@<lane>.service`.
+declaration has no model or free-form command field. It may name one
+allowlisted backend (`shell`, `claude`, `codex`, or `opencode`) for the
+explicit `chitra-lane-anchor ... launch` action. The backend starts with its
+own default model selection; Chitra does not choose a model. The systemd
+`chitra@<lane>.service` unit still uses the shell-only `start` action.
 
 The host role enables the shared units once. Adding a lane uses one command:
 

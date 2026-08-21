@@ -157,19 +157,20 @@ capabilities:
 
   - name: lane-anchor
     kind: tool
-    purpose: Ensure one declared lane has its own tmux session anchor.
-    when_to_use: Run only for a declared lane after the operator has chosen how to start the session's model.
+    purpose: Ensure one declared lane has its own tmux session anchor or explicitly launch its allowlisted backend.
+    when_to_use: Run only for a declared lane after the operator has chosen the model and approved backend launch.
     authority:
       level: act
       grants:
         - Create or inspect the tmux session named by one rendered lane declaration.
+        - Explicitly launch only the backend executable allowlisted by that lane declaration.
       excludes:
-        - Choose a model or start an agent process.
+        - Choose a model or start an unallowlisted agent process.
         - Create accounts, alter credentials, or touch an undeclared session.
     default_enabled: true
     commands:
       - name: chitra-lane-anchor
-        description: Create, stop, or inspect one declared lane's tmux session anchor.
+        description: Create, launch, stop, or inspect one declared lane's tmux session anchor.
         argv: [chitra-lane-anchor]
         params: []
         mutates: true

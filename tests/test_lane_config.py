@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from chitra.lane_anchor import start_lane
+from chitra.lane_anchor import backend_command, launch_lane, start_lane
 from chitra.lane_config import load_lanes
 
 
@@ -43,6 +43,7 @@ def test_lane_manifest_is_one_explicit_contract(tmp_path):
     assert lane.account == "alpha"
     assert lane.queue_dir == tmp_path / "alpha-state/queue"
     assert lane.tmux_socket == tmp_path / "alpha.sock"
+    assert lane.backend == "shell"
     assert not hasattr(lane, "model")
 
 
@@ -55,6 +56,37 @@ def test_lane_manifest_rejects_model_at_any_depth(tmp_path):
     path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
 
     with pytest.raises(ValueError, match="model"):
+        load_lanes(path)
+
+
+def test_lane_manifest_accepts_only_allowlisted_backends(tmp_path):
+    import yaml
+
+    manifest = _manifest(tmp_path)
+    manifest["lanes"][0]["backend"] = "opencode"
+    path = tmp_path / "lanes.yaml"
+    path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+
+    lane = load_lanes(path)[0]
+
+    assert lane.backend == "opencode"
+    assert backend_command(lane) == ("opencode",)
+
+    manifest["lanes"][0]["backend"] = "sh -c 'rm -rf /'"
+    path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="backend must be one of"):
+        load_lanes(path)
+
+
+def test_lane_manifest_rejects_arbitrary_launcher_field(tmp_path):
+    import yaml
+
+    manifest = _manifest(tmp_path)
+    manifest["lanes"][0]["command"] = ["opencode", "--model", "untrusted"]
+    path = tmp_path / "lanes.yaml"
+    path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsupported fields: command"):
         load_lanes(path)
 
 
@@ -104,6 +136,65 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
             "alpha",
             "-c",
             "/srv/chitra/lanes/alpha",
+        ],
+    ]
+
+
+def test_lane_launcher_uses_fixed_opencode_argv_and_lane_xdg_roots(tmp_path):
+    import yaml
+
+    manifest = _manifest(tmp_path)
+    manifest["lanes"][0]["backend"] = "opencode"
+    path = tmp_path / "lanes.yaml"
+    path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    lane = load_lanes(path)[0]
+    calls: list[list[str]] = []
+
+    def runner(command):
+        calls.append(list(command))
+        return subprocess.CompletedProcess(command, 1 if len(calls) == 1 else 0, "", "")
+
+    assert launch_lane(lane, runner=runner)
+    assert calls == [
+        [
+            "runuser",
+            "--user",
+            "alpha",
+            "--",
+            "env",
+            "HOME=/home/alpha",
+            "CLAUDE_CONFIG_DIR=/home/alpha/.claude-alpha",
+            "XDG_CONFIG_HOME=/home/alpha/.claude-alpha/xdg",
+            f"XDG_DATA_HOME={tmp_path / 'alpha-state/xdg-data'}",
+            f"XDG_STATE_HOME={tmp_path / 'alpha-state/xdg-state'}",
+            "tmux",
+            "-S",
+            str(tmp_path / "alpha.sock"),
+            "has-session",
+            "-t",
+            "alpha",
+        ],
+        [
+            "runuser",
+            "--user",
+            "alpha",
+            "--",
+            "env",
+            "HOME=/home/alpha",
+            "CLAUDE_CONFIG_DIR=/home/alpha/.claude-alpha",
+            "XDG_CONFIG_HOME=/home/alpha/.claude-alpha/xdg",
+            f"XDG_DATA_HOME={tmp_path / 'alpha-state/xdg-data'}",
+            f"XDG_STATE_HOME={tmp_path / 'alpha-state/xdg-state'}",
+            "tmux",
+            "-S",
+            str(tmp_path / "alpha.sock"),
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            "-c",
+            "/srv/chitra/lanes/alpha",
+            "opencode",
         ],
     ]
 
