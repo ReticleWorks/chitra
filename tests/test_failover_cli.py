@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _goal_fixtures import enrollment_fields
 
 from chitra import failover_cli
 from chitra.goals import GoalRecord, get_goal, upsert_goal
@@ -46,6 +47,7 @@ def make_goal(**overrides: object) -> GoalRecord:
         "status": "working",
     }
     base.update(overrides)
+    base.update(enrollment_fields(str(base["done_when"])))
     return GoalRecord(**base)  # type: ignore[arg-type]
 
 

@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _goal_fixtures import enrollment_fields
 
 from chitra.goal_enforcement import (
     REVIEWER_ATTEMPTS,
@@ -21,7 +22,7 @@ from chitra.goal_enforcement import (
     review_watched_session,
     unwrap_json_object,
 )
-from chitra.goals import GoalRecord, get_goal, redirect_goal, upsert_goal
+from chitra.goals import EnrolledScopeImmutableError, GoalRecord, get_goal, redirect_goal, upsert_goal
 
 
 def _request_from_prompt(prompt: str) -> dict[str, object]:
@@ -50,6 +51,7 @@ def _goal(root: Path) -> GoalRecord:
             scope="WS1 source tests and documentation only.",
             source="task-file:/tmp/ws1.md",
             status="working",
+            **enrollment_fields("Every required local validation passes with cited output."),
         ),
     )
 
@@ -91,19 +93,19 @@ def test_initial_round_requires_unanimous_isolated_acceptance(tmp_path: Path) ->
     assert (tmp_path / "goal_reviews.jsonl").exists()
 
 
-def test_frozen_goal_uses_redirect_refreshed_enrollment_condition(tmp_path: Path) -> None:
+def test_frozen_goal_uses_immutable_structured_enrollment_condition(tmp_path: Path) -> None:
     enrolled = _goal(tmp_path)
-    redirected = redirect_goal(
-        tmp_path,
-        enrolled.session_ref,
-        reason="operator proposed a smaller validation target",
-        done_when="The focused local validation passes with cited output.",
-    )
+    with pytest.raises(EnrolledScopeImmutableError, match="done_when is frozen"):
+        redirect_goal(
+            tmp_path,
+            enrolled.session_ref,
+            reason="operator proposed a smaller validation target",
+            done_when="The focused local validation passes with cited output.",
+        )
 
-    frozen = freeze_goal(redirected)
+    frozen = freeze_goal(enrolled)
 
-    assert frozen.done_when == redirected.done_when
-    assert frozen.done_when != enrolled.done_when
+    assert frozen.done_when == enrolled.done_when
 
 
 def test_initial_round_can_be_configured_to_one_reviewer(tmp_path: Path) -> None:

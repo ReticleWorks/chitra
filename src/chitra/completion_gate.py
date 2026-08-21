@@ -10,7 +10,7 @@ import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -36,6 +36,9 @@ class CompletionClaimEvent(enum.StrEnum):
 class TodoItem(BaseModel):
     text: str
     status: str
+    id: str | None = None
+    validator: str | None = None
+    required_receipt: str | None = None
 
 
 EvidenceKind = Literal["artifact", "deploy", "live_verify", "merged_pr", "failure"]
@@ -46,9 +49,13 @@ class CompletionEvidence(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    kind: EvidenceKind
+    kind: EvidenceKind = "artifact"
     citation: str = Field(min_length=1)
     todo_item: str | None = None
+    done_when_item_id: str | None = None
+    receipt_name: str | None = None
+    validator: str | None = None
+    validator_result: Literal["pass", "fail"] | None = None
 
     @field_validator("citation")
     @classmethod
@@ -56,6 +63,66 @@ class CompletionEvidence(BaseModel):
         if not value.strip():
             raise ValueError("evidence citation must be non-empty")
         return value.strip()
+
+    @field_validator("todo_item", "done_when_item_id", "receipt_name", "validator")
+    @classmethod
+    def optional_strings_are_not_whitespace(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.strip():
+            raise ValueError("optional evidence bindings must be non-empty when present")
+        return value.strip()
+
+
+class EnrolledDoneWhenItemLike(Protocol):
+    @property
+    def id(self) -> str: ...
+
+    @property
+    def text(self) -> str: ...
+
+    @property
+    def validator(self) -> str: ...
+
+    @property
+    def required_receipt(self) -> str: ...
+
+
+def completion_receipt_issues(
+    enrolled_items: Sequence[EnrolledDoneWhenItemLike],
+    evidence: Sequence[CompletionEvidence],
+) -> list[str]:
+    """Return exact item, receipt, validator, result, and citation gaps."""
+    issues: list[str] = []
+    for item in enrolled_items:
+        item_proofs = [proof for proof in evidence if proof.done_when_item_id == item.id]
+        if not item_proofs:
+            issues.append(f"done item {item.id!r} has no completion receipt")
+            continue
+        named = [proof for proof in item_proofs if proof.receipt_name == item.required_receipt]
+        if not named:
+            issues.append(f"done item {item.id!r} requires receipt {item.required_receipt!r}")
+            continue
+        validated = [proof for proof in named if proof.validator == item.validator]
+        if not validated:
+            issues.append(f"done item {item.id!r} requires validator {item.validator!r}")
+            continue
+        passing = [proof for proof in validated if proof.validator_result == "pass" and evidence_is_concrete(proof)]
+        if not passing:
+            issues.append(f"done item {item.id!r} has no passing validator result with a concrete citation")
+    return issues
+
+
+def require_completion_receipts(
+    enrolled_items: Sequence[EnrolledDoneWhenItemLike],
+    evidence: Sequence[CompletionEvidence],
+) -> None:
+    """Raise before a done transition when any frozen item lacks its receipt."""
+    if not enrolled_items:
+        raise ValueError("completion requires at least one frozen done item")
+    issues = completion_receipt_issues(enrolled_items, evidence)
+    if issues:
+        raise ValueError("; ".join(issues))
 
 
 class CompletionAudit(BaseModel):
@@ -129,10 +196,17 @@ def evidence_is_concrete(evidence: CompletionEvidence) -> bool:
 def extract_completion_evidence(text: str) -> list[CompletionEvidence]:
     """Extract exact cited lines from a pane turn without converting claims to booleans."""
     evidence: list[CompletionEvidence] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str | None, str | None]] = set()
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
+            continue
+        structured = _parse_structured_completion_evidence(line)
+        if structured is not None:
+            key = (structured.kind, structured.citation, structured.done_when_item_id, structured.receipt_name)
+            if key not in seen:
+                evidence.append(structured)
+                seen.add(key)
             continue
         kinds: list[EvidenceKind] = []
         if COMPLETION_EVIDENCE_PR_RE.search(line):
@@ -150,11 +224,39 @@ def extract_completion_evidence(text: str) -> list[CompletionEvidence]:
         if COMPLETION_EVIDENCE_FAILURE_RE.search(line):
             kinds.append("failure")
         for kind in kinds:
-            key = (kind, line)
+            key = (kind, line, None, None)
             if key not in seen:
                 evidence.append(CompletionEvidence(kind=kind, citation=line))
                 seen.add(key)
     return evidence
+
+
+def _parse_structured_completion_evidence(line: str) -> CompletionEvidence | None:
+    """Read one JSON completion proof, optionally after a stable text prefix."""
+    payload_text = line
+    for prefix in ("CHITRA-COMPLETION:", "CHITRA_COMPLETION:"):
+        if line.startswith(prefix):
+            payload_text = line[len(prefix) :].strip()
+            break
+    if not payload_text.startswith("{"):
+        return None
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or not {
+        "done_when_item_id",
+        "receipt_name",
+        "validator",
+        "validator_result",
+        "citation",
+    }.issubset(payload):
+        return None
+    payload.setdefault("kind", "artifact")
+    try:
+        return CompletionEvidence.model_validate(payload)
+    except ValueError:
+        return None
 
 
 def evaluate_completion_claim(
@@ -180,11 +282,19 @@ def evaluate_completion_claim(
     if "live_verify" in policy.required_evidence and "live_verify" not in valid_kinds:
         missing_evidence.append("live-verify evidence citation")
     evidence_gap = bool(missing_evidence or invalid_evidence)
-    per_item_evidence_gap = [
-        item.text
-        for item in todo_items
-        if item.status in policy.complete_todo_statuses and not any(proof.todo_item == item.text for proof in valid)
-    ]
+    per_item_evidence_gap: list[str] = []
+    for item in todo_items:
+        if item.status not in policy.complete_todo_statuses:
+            continue
+        if item.id is None:
+            if not any(proof.todo_item == item.text for proof in valid):
+                per_item_evidence_gap.append(item.text)
+            continue
+        if not item.validator or not item.required_receipt:
+            per_item_evidence_gap.append(item.text)
+            continue
+        if completion_receipt_issues((cast(EnrolledDoneWhenItemLike, item),), valid):
+            per_item_evidence_gap.append(item.text)
     blocked_todos = [item.text for item in todo_items if item.status.lower() in {"blocked", "stalled"}]
     posture_mismatch = bool(blocked_todos and not open_asks and not blockers)
 

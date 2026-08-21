@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _goal_fixtures import enrollment_fields
 
 import chitra.dispatchd as dispatchd_mod
 from chitra.account_registry import RegistryEntry, get_entry
@@ -44,6 +45,20 @@ FAST_POLICY = PolicyConfig(
 CLEAR_PRESSURE = PressureSample(80, 0, 0, 0)
 
 
+@pytest.fixture(autouse=True)
+def _clear_host_pressure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep unit sweeps independent of Linux procfs on developer hosts."""
+    monkeypatch.setattr("chitra.rate_limit_guard.sample_pressure", lambda: CLEAR_PRESSURE)
+
+    def local_transcript_mtime(transcript_path: str, **_: object) -> float | None:
+        try:
+            return Path(transcript_path).stat().st_mtime
+        except OSError:
+            return None
+
+    monkeypatch.setattr("chitra.rate_limit_guard.transcript_mtime", local_transcript_mtime)
+
+
 def _snapshot(*, session_id: str, tmux_session: str, account: str = "acct@example.com", five_hour_pct: float, ts: str) -> UsageSnapshot:
     return UsageSnapshot(
         kind="claude",
@@ -68,6 +83,7 @@ def _goal(session_ref: str = "host-b:lane1:0.0") -> GoalRecord:
         done_when="Tests pass and the full suite is green.",
         source="task",
         status="working",
+        **enrollment_fields("Tests pass and the full suite is green."),
     )
 
 

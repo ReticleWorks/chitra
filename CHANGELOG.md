@@ -20,6 +20,27 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.13.0] - 2026-08-21
+
+### Added
+
+- Goal enrollment now requires one atomic four-question interview result with
+  a typed receipt and at least one frozen structured done item. Each item names
+  its validator and the exact completion receipt it requires.
+- Completion proofs bind exact done-item IDs to receipt names, validators,
+  passing results, and concrete citations. Watchd persists the validated proofs
+  before a done transition, and completion close repeats the same check.
+
+### Changed
+
+- A first `chitra-goals set` prints `INTERVIEW_REQUIRED` JSON with a persisted
+  nonce and writes no goal. The paired `--interview-result` call performs the
+  enrollment. Goals schema v3 keeps v1/v2 records readable but limits them to
+  display and reasoned administrative disposal.
+- Free-form delivered items and operator acknowledgements no longer satisfy a
+  completion close. Administrative discard remains separate and requires a
+  reason that is logged as not done.
+
 ## [0.12.4] - 2026-08-21
 
 ### Fixed

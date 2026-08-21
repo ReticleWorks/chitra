@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from _goal_fixtures import enrollment_fields
+
 from chitra.goal_enforcement import ReviewFinding, SessionReviewSignal, freeze_goal
 from chitra.goals import GoalRecord
 from chitra.reasoned_dispatch import build_reasoned_dispatch
@@ -17,6 +19,7 @@ def _goal(*, scope: str = "Source tests and documentation only") -> GoalRecord:
         scope=scope,
         source="task-file:/tmp/reasoned-dispatch.md",
         status="working",
+        **enrollment_fields("The focused lint and test gates pass locally."),
     )
 
 

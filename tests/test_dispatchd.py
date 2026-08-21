@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 import yaml
+from _goal_fixtures import enrollment_fields
 
 import chitra.dispatchd as dispatchd_mod
 import chitra.ledger as ledger_mod
@@ -573,6 +574,7 @@ def _tracked_goal(session_ref: str = "host-b:feeds-111:0.0") -> GoalRecord:
         done_when="Tests pass.",
         source="task",
         status="working",
+        **enrollment_fields("Tests pass."),
     )
 
 
