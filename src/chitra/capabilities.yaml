@@ -157,21 +157,45 @@ capabilities:
 
   - name: lane-anchor
     kind: tool
-    purpose: Ensure one declared lane has its own tmux session anchor or explicitly launch its allowlisted backend.
-    when_to_use: Run only for a declared lane after the operator has chosen the model and approved backend launch.
+    purpose: Launch one ingestion-gated interactive tmux lane on Tophand with an approved backend and model.
+    when_to_use: Run for a declared lane after its complete goal record exists and a backend/model is selected. Supported backends are Claude, Codex, and OpenCode.
     authority:
       level: act
       grants:
-        - Create or inspect the tmux session named by one rendered lane declaration.
-        - Explicitly launch only the backend executable allowlisted by that lane declaration.
+        - Create, start an agent in, or inspect the tmux session named by one rendered lane declaration.
       excludes:
-        - Choose a model or start an unallowlisted agent process.
+        - Launch on a host other than Tophand or bypass a goal or usage-pause refusal.
         - Create accounts, alter credentials, or touch an undeclared session.
     default_enabled: true
     commands:
       - name: chitra-lane-anchor
-        description: Create, launch, stop, or inspect one declared lane's tmux session anchor.
+        description: Create, stop, or inspect one governed Tophand tmux lane.
         argv: [chitra-lane-anchor]
+        params: []
+        mutates: true
+      - name: chitra-lane-session
+        description: Launch, stop, or inspect one governed Tophand tmux lane.
+        argv: [chitra-lane-session]
+        params: []
+        mutates: true
+
+  - name: agent-status
+    kind: tool
+    purpose: Report and inspect deterministic semantic state for a supervised pane.
+    when_to_use: Use from a supervised agent lifecycle hook or an operator diagnostic against the local Watchd socket.
+    authority:
+      level: record
+      grants:
+        - Report lifecycle state for an exact pane and inspect, wait for, or explain semantic state.
+        - Print the local socket protocol schema.
+      excludes:
+        - Send input, grant approval, or decide whether an agent should be blocked.
+        - Bypass completion review or claim permission from status alone.
+    default_enabled: true
+    commands:
+      - name: chitra-agent
+        description: Report, explain, wait for, or inspect deterministic pane status.
+        argv: [chitra-agent]
         params: []
         mutates: true
 
@@ -191,6 +215,26 @@ capabilities:
       - name: chitra-capabilities
         description: Inspect or record one reversible capability toggle.
         argv: [chitra-capabilities]
+        params: []
+        mutates: true
+
+  - name: decisions-log
+    kind: tool
+    purpose: Keep an append-only record of consequential monitor decisions and their authority.
+    when_to_use: Use immediately after a monitor adjudication, override, redirect, pause, resume, ask retirement, or work-session architecture change.
+    authority:
+      level: record
+      grants:
+        - Append a complete decision, basis, citation, and authority record to the local decisions log.
+        - Read the decisions log in append order.
+      excludes:
+        - Make a decision merely because this recording tool is available.
+        - Rewrite or delete an earlier decision record.
+    default_enabled: true
+    commands:
+      - name: chitra-decisions
+        description: Append or list consequential monitor decisions.
+        argv: [chitra-decisions]
         params: []
         mutates: true
 
@@ -249,5 +293,60 @@ capabilities:
       - name: chitra-pr-review
         description: Fetch one pull request, run the PR security review gate, and report findings as a non-blocking comment.
         argv: [chitra-pr-review]
+        params: []
+        mutates: true
+
+  - name: failover
+    kind: tool
+    purpose: >-
+      Expose the rate-limit guard's own pause and resume steps as verbs a person can run:
+      show the plan, start the pause for one lane, start the resume for one lane.
+    when_to_use: Run by hand when an operator needs to see or take a failover step now, rather than waiting for the guard's next timed sweep.
+    authority:
+      level: act
+      grants:
+        - Report what the guard would pause and resume right now, changing nothing.
+        - Start a pause transaction for one named lane that the guard's own planner already qualified.
+        - Start a resume transaction for one held lane whose window has reset and whose fresh usage reads ok.
+      excludes:
+        - Pause or resume a lane the guard's planner refused -- there is one decision path, and this command does not overrule it.
+        - Clear a hold directly; a hold clears only on a confirmed resume delivery.
+        - Override an operator- or throttle-held lane.
+    default_enabled: true
+    commands:
+      - name: chitra-failover
+        description: Evaluate, start, or reverse a rate-limit lane pause using the guard's own planner.
+        argv: [chitra-failover]
+        params: []
+        mutates: true
+
+  - name: auto-merge
+    kind: tool
+    purpose: >-
+      Merge lane-authored pull requests that are verifiably green, on repositories an operator
+      allowlisted, under the automation app's identity, recording every attempt and refusal.
+    when_to_use: Run the daemon under systemd to merge continuously, or the single-pull-request verb by hand to see the same decision for one pull request.
+    authority:
+      level: act
+      grants:
+        - Read one pull request's merge state through the GitHub GraphQL API.
+        - Merge one allowlisted, lane-authored, non-draft pull request whose merge state is clean and whose check rollup succeeded.
+        - Append an identity-stamped ledger line for every merge and every refusal.
+        - Tell the one lane whose goal names that pull request that it merged.
+      excludes:
+        - Merge under any identity other than the configured GitHub App.
+        - Read, write, or work around branch protection.
+        - Merge a pull request carrying the hold label, or one whose checks are merely non-required failures.
+        - Merge more than one pull request at a time in a single repository.
+    default_enabled: false
+    commands:
+      - name: chitra-merge
+        description: Verify one pull request against the merge policy and merge it when it qualifies.
+        argv: [chitra-merge]
+        params: []
+        mutates: true
+      - name: polyphony-chitra-merged
+        description: Poll allowlisted repositories and merge lane-authored pull requests that qualify.
+        argv: [polyphony-chitra-merged]
         params: []
         mutates: true

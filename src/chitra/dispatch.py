@@ -120,6 +120,7 @@ _CODEX_TUI_PLACEHOLDER_HINTS: frozenset[str] = frozenset(
         "Check recently modified functions for compatibility",
         "How many files have been modified?",
         "Will this algorithm scale well?",
+        "Ask Codex to do anything",
     }
 )
 # SGR (Select Graphic Rendition) escape — the subset of ANSI escapes that
@@ -303,6 +304,19 @@ def tmux_pane_target(session: str, pane: str) -> str:
     if not pane or ":" in pane or pane.startswith("%"):
         return pane
     return f"{session}:{pane}"
+
+
+def governed_capture_target(pane: str) -> str:
+    """Translate tmux's ``session:window.pane`` into the grant contract.
+
+    The forced-command visibility surface deliberately accepts only colon
+    delimited numeric target components.  Keep native tmux spelling everywhere
+    else and normalize only at the governed SSH boundary.
+    """
+    match = re.fullmatch(r"(?P<session>[A-Za-z0-9_.-]+):(?P<window>[0-9]{1,3})\.(?P<pane>[0-9]{1,3})", pane)
+    if match is None:
+        return pane
+    return f"{match.group('session')}:{match.group('window')}:{match.group('pane')}"
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +527,21 @@ def capture(
     tmux_socket: Path | None = None,
 ) -> list[str]:
     """Capture a local or remote tmux pane through ``run_on_host``."""
+    if host and not is_local_host(host, local_extra) and _env("CHITRA_REMOTE_LANE_GRANT") == "codexman":
+        grant_target = governed_capture_target(pane_id)
+        proc = (runner or run_cmd)(
+            ssh_command(host, f"chitra-tmux-capture {shlex.quote(grant_target)}"), timeout=8
+        )
+        if proc.returncode != 0:
+            return []
+        try:
+            document = json.loads(proc.stdout)
+        except (TypeError, json.JSONDecodeError):
+            return []
+        if document.get("ok") is not True or not isinstance(document.get("content"), str):
+            return []
+        captured = [line.rstrip() for line in document["content"].splitlines() if line.strip()]
+        return captured if lines < 0 else captured[-lines:]
     start = "-" if lines < 0 else f"-{lines}"
     proc = run_on_host(
         host,
@@ -557,6 +586,11 @@ def ssh_command(target: str, remote_command: str) -> list[str]:
     if known_hosts:
         cmd.extend(["-o", f"UserKnownHostsFile={known_hosts}"])
     cmd.extend([target, remote_command])
+    run_as = _env("CHITRA_SSH_RUN_AS")
+    if run_as:
+        if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", run_as):
+            raise ValueError("CHITRA_SSH_RUN_AS must be a valid local account name")
+        cmd = ["sudo", "-n", "-u", run_as, "--", *cmd]
     return cmd
 
 
@@ -1078,6 +1112,14 @@ def pane_capture_confirms_nudge(
     )
     if not captured:
         return False
+    # A marker visible in the active composer is an unsubmitted draft, not
+    # delivery evidence.  Fail closed before considering older scrollback.
+    for row_parser in (_codex_tui_input_row, _claude_code_input_row):
+        input_row = row_parser(captured)
+        if input_row is not None:
+            _input_line, draft, _raw_line = input_row
+            if marker in normalized_dispatch_text(draft):
+                return False
     text = normalized_dispatch_text(strip_terminal_controls("\n".join(captured)))
     return marker in text
 
@@ -1301,7 +1343,12 @@ def dispatch_to_tmux(
     # target host (local or ssh-wrapped) — checking the local tmux server
     # for a remote target's copy-mode state would report on the wrong tmux
     # server entirely.
-    if not ensure_pane_not_in_mode(pane, host=host, runner=run, local_extra=local_extra, tmux_socket=tmux_socket):
+    governed_remote = bool(
+        host and not is_local_host(host, local_extra) and _env("CHITRA_REMOTE_LANE_GRANT") == "codexman"
+    )
+    if not governed_remote and not ensure_pane_not_in_mode(
+        pane, host=host, runner=run, local_extra=local_extra, tmux_socket=tmux_socket
+    ):
         return _result(DispatchStatus.BLOCKED, "blocked: pane in copy-mode and cancel failed")
 
     # Bug fix (a): paste-buffer -p.
@@ -1315,8 +1362,11 @@ def dispatch_to_tmux(
                 proc.stderr.strip() or proc.stdout.strip() or f"tmux paste-buffer failed rc={proc.returncode}",
             )
     else:
-        remote_cmd = remote_tmux_paste_command(pane, order.nudge, tmux_socket=tmux_socket)
-        proc = run(ssh_command(host, remote_cmd), timeout=10)
+        if governed_remote:
+            proc = run_in(ssh_command(host, f"chitra-lane-steer {shlex.quote(session)}"), order.nudge, timeout=10)
+        else:
+            remote_cmd = remote_tmux_paste_command(pane, order.nudge, tmux_socket=tmux_socket)
+            proc = run(ssh_command(host, remote_cmd), timeout=10)
         if proc.returncode != 0:
             return _result(
                 DispatchStatus.FAILED,

@@ -3,7 +3,7 @@
 The monitor consumes ``sweep-digest.json`` once per sweep instead of rebuilding
 fleet state in its foreground context.  This daemon reads only already-digested
 state: goals, rate-limit transactions, account registry entries, and a bounded
-tail of triaged CRIT flags.  It never reads conversation transcripts or invokes
+tail of triaged flags.  It never reads conversation transcripts or invokes
 an LLM.
 """
 
@@ -46,10 +46,11 @@ DEFAULT_FLAG_TAIL_LINES = 100
 DIGEST_FILENAME = "sweep-digest.json"
 SNAPSHOT_FILENAME = "sweep-digest-state.json"
 FLAGS_FILENAME = "flags.log"
+FLAG_SEVERITIES: frozenset[str] = frozenset({"CRIT", "IDLE"})
 
 
 class FlagRecord(BaseModel):
-    """One latest CRIT signal emitted by ``triaged``."""
+    """One latest documented flag signal emitted by ``triaged``."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -255,11 +256,12 @@ def _read_tail(path: Path, *, max_bytes: int) -> str:
 
 
 def parse_flag_line(line: str) -> FlagRecord:
-    """Parse one strict ``triaged`` CRIT line."""
+    """Parse one strict ``triaged`` flag line with a documented severity."""
     stripped = line.strip()
-    prefix, separator, remainder = stripped.partition(" ")
-    if prefix != "CRIT" or not separator:
-        raise ValueError(f"flags.log line must begin with CRIT: {line!r}")
+    severity, separator, remainder = stripped.partition(" ")
+    if severity not in FLAG_SEVERITIES or not separator:
+        allowed = ", ".join(sorted(FLAG_SEVERITIES))
+        raise ValueError(f"flags.log line must begin with a documented severity ({allowed}): {line!r}")
     timestamp, separator, remainder = remainder.partition(" ")
     if not timestamp or not separator:
         raise ValueError(f"flags.log line has no timestamp/lane: {line!r}")
@@ -278,7 +280,7 @@ def load_latest_flags(
     max_bytes: int = DEFAULT_FLAG_TAIL_BYTES,
     max_lines: int = DEFAULT_FLAG_TAIL_LINES,
 ) -> dict[str, FlagRecord]:
-    """Return one newest CRIT signal per ``lane_id``/rule from a bounded tail."""
+    """Return one newest flag signal per ``lane_id``/rule from a bounded tail."""
     if max_lines <= 0:
         raise ValueError("max_lines must be positive")
     payload = _read_tail(path, max_bytes=max_bytes)

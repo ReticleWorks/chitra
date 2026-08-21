@@ -1,0 +1,39 @@
+name: CodeQL Nightly
+run-name: CodeQL Nightly
+
+# New filename, deliberately: codeql.yml is state=disabled_manually today
+# (confirmed live 2026-08-11, gh api .../actions/workflows) and a file edit
+# cannot clear that state -- only a new workflow path does. codeql.yml stays
+# on disk, on its own schedule, untouched by this file (do not delete or
+# rename it; see WS4 follow-up brief).
+#
+# Same job as codeql.yml, on the same hosted runner class, just a new path
+# so scheduling actually fires. GitHub-hosted runners scale per job, so this
+# does not need to be staggered against the org's shared self-hosted
+# codeql-twister runner the way the other seven CodeQL-Nightly workflows are.
+#
+# The fleet-repo nightly coordinator that CodeQL scheduling was meant to
+# migrate to never merged (fleet-repo PR #230, closed 2026-08-10 as deviant
+# to the executor/manual-workflow control plane). schedule: below restores
+# real scheduling directly, matching the other repos' fix.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch: {}
+
+jobs:
+  analyze:
+    # GitHub's CodeQL CLI does not support the estate's Linux ARM64 runners.
+    # Keep this weekly scan on hosted x64 rather than dropping the security gate.
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: python
+      - uses: github/codeql-action/analyze@v4

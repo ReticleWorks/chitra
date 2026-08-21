@@ -81,6 +81,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     hold_command.add_argument("--reason", required=True)
     hold_command.add_argument("--resume-at", default="")
 
+    transfer_command = commands.add_parser(
+        "transfer",
+        help="Hold a lane and scaffold its successor on the other backend. Writes records only; check still gates launch.",
+    )
+    add_root(transfer_command)
+    transfer_command.add_argument("--session-ref", required=True)
+    transfer_command.add_argument("--to-backend", required=True, choices=("claude", "codex"))
+    transfer_command.add_argument("--digest", required=True, help="Handoff digest id the successor reads for its context.")
+    transfer_command.add_argument("--reason", required=True, help="Hold reason, e.g. rate-limit:codex-weekly-hard-cap.")
+    transfer_command.add_argument("--resume-at", default="", help="When the held original becomes due again.")
+
     resume_command = commands.add_parser("resume", help="Return an explicitly held lane to working state.")
     add_root(resume_command)
     resume_command.add_argument("--session-ref", required=True)
@@ -126,6 +137,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     selectors.add_argument("--ask")
     selectors.add_argument("--index", type=int)
     selectors.add_argument("--all", action="store_true")
+    resolve_ask_command.add_argument("--retired-by", choices=("operator", "monitor"), default="operator")
+    resolve_ask_command.add_argument("--basis", default="Operator answered the ask.")
+    resolve_ask_command.add_argument("--citation", default="operator-ruling")
+    resolve_ask_command.add_argument("--authority", default="operator")
 
     scan_asks_command = commands.add_parser("scan-asks", help="Extract verbatim open asks from a lane transcript.")
     add_root(scan_asks_command)
@@ -187,6 +202,17 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "hold":
             _print_record(goal_store.hold_goal(args.root, args.session_ref, reason=args.reason, resume_at=args.resume_at))
+        elif args.command == "transfer":
+            held, successor = goal_store.transfer_goal(
+                args.root,
+                args.session_ref,
+                to_backend=args.to_backend,
+                digest=args.digest,
+                reason=args.reason,
+                resume_at=args.resume_at,
+            )
+            _print_record(held)
+            _print_record(successor)
         elif args.command == "resume":
             _print_record(goal_store.resume_goal(args.root, args.session_ref))
         elif args.command == "redirect":
@@ -246,7 +272,19 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "add-ask":
             _print_record(goal_store.add_ask(args.root, args.session_ref, args.ask))
         elif args.command == "resolve-ask":
-            _print_record(goal_store.resolve_ask(args.root, args.session_ref, ask=args.ask, index=args.index, all=args.all))
+            _print_record(
+                goal_store.resolve_ask(
+                    args.root,
+                    args.session_ref,
+                    ask=args.ask,
+                    index=args.index,
+                    all=args.all,
+                    retired_by=args.retired_by,
+                    basis=args.basis,
+                    citation=args.citation,
+                    authority=args.authority,
+                )
+            )
         elif args.command == "scan-asks":
             if args.record and args.session_ref is None:
                 raise ValueError("--record requires --session-ref")

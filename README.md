@@ -30,16 +30,19 @@ BrowserStack's `chitragupta-node` and `chitragupta-rails` are open-source SDKs t
 
 ## What's in this repo
 
-chitra installs twelve command-line entrypoints backed by a set of small, single-purpose modules. `dispatchd` and `triaged` are the always-on daemons; the rest are periodic or ad-hoc tools.
+chitra installs command-line entrypoints backed by a set of small,
+single-purpose modules. `dispatchd`, `triaged`, and `watchd` are the always-on
+daemons; the rest are periodic or ad-hoc tools.
 
 **Delivery**
 - `chitra.dispatch` / `chitra.dispatchd` — drain a JSON order queue and deliver each message into a tmux session via bracketed paste, confirming delivery by grepping the session's own transcript. One writer per session (`LaneLock`); idempotent and crash-safe (see [Delivery guarantees](#delivery-guarantees)).
 - `chitra.ledger` — an append-only, HMAC-signed log of every delivered message.
 
 **Monitoring**
-- `chitra.watchd` — emits tmux pane-change and turn-end events and runs a completion audit on each finished turn.
+- `chitra.watchd` — derives semantic pane status from authoritative lifecycle reports or declarative screen manifests, serves the local coordination socket, and runs a completion audit on each finished turn.
 - `chitra.triaged` / `chitra.sweepd` — deduplicated state-change events and a compact fleet-state feed for downstream monitors.
 - `chitra.draft_scanner` — flags unsubmitted drafts left sitting in a tmux input box.
+- `chitra.agent_cli` (`chitra-agent`) — reports lifecycle state, explains status evidence, waits for semantic state, and prints the socket API schema.
 
 **PR review**
 - `chitra.pr_review` / `chitra.pr_reviewd` (`chitra-pr-review`) — deterministic blast-radius/diff-size pre-checks plus an isolated multi-reviewer security pass over one pull request's diff, logged to a signed ledger and reported as a plain PR comment. Never merges, approves, requests changes, or fails a required check by default; see the `pr_reviewd` module docstring and `PRReviewPolicy.block_on_findings`. Stock trigger: `.github/workflows/pr-security-review.yml`.
@@ -84,15 +87,23 @@ Trailhead installs one `chitra` Debian package built with `fpm`. The package
 contains one released application virtual environment at `/opt/chitra/venv`,
 the service account, and five core systemd unit files: four shared daemons and
 the `chitra@.service` session-anchor template. Build it with
-`CHITRA_VENV_SOURCE=/path/to/released-venv packaging/build-deb.sh 0.9.0 /path/to/chitra.deb`.
+`CHITRA_VENV_SOURCE=/path/to/released-venv packaging/build-deb.sh 0.9.4 /path/to/chitra.deb`.
 
 The package daemons read `/etc/chitra/lanes.yaml`. Each declaration supplies
 the lane identity, account, roots, tmux socket and credential bindings. The
-declaration has no model or free-form command field. It may name one
-allowlisted backend (`shell`, `claude`, `codex`, or `opencode`) for the
-explicit `chitra-lane-anchor ... launch` action. The backend starts with its
-own default model selection; Chitra does not choose a model. The systemd
-`chitra@<lane>.service` unit still uses the shell-only `start` action.
+declaration has no model field. `chitra-lane-anchor` selects the backend and
+model at launch. It supports Claude, Codex, and OpenCode models such as
+`opencode/x-preview-f-free`. It refuses unless the Tophand lane has a passing
+goal-ingestion record and no active usage pause. See
+[`docs/governed-tmux-lanes.md`](docs/governed-tmux-lanes.md).
+
+Watchd also owns a mode-`0600`, newline-delimited JSON socket at
+`/run/chitra/chitra.sock`. Supervised agents receive their lane, session,
+tmux-pane, target, and socket identity as `CHITRA_*` variables. A replacement
+Watchd process can use `--handoff-from /run/chitra/chitra.sock` to transfer
+verified semantic state and socket ownership without restarting the tmux pane
+processes. See the [agent-status design](docs/agent-status-design.md) and the
+[status migration guide](docs/watchd-status-migration.md).
 
 The host role enables the shared units once. Adding a lane uses one command:
 
@@ -118,6 +129,8 @@ Each entrypoint is configured with CLI flags (`--help` on any command lists them
 |---|---|---|
 | `CHITRA_LANES_FILE` | `/etc/chitra/lanes.yaml` | One rendered lane declaration read by the shared daemons. |
 | `CHITRA_STATE_DIR` | `/var/lib/chitra` | Base directory for the queue, ledger, and ledger key |
+| `CHITRA_SOCKET_PATH` | `/run/chitra/chitra.sock` | Local semantic-status, subscription, wait, and handoff socket. |
+| `CHITRA_AGENT_MANIFEST_DIR` | `${XDG_CONFIG_HOME:-~/.config}/chitra/agent-detection` | Local agent-detection manifests; a local file replaces the bundled file for that agent. |
 | `REMOTE_DISPATCH_HOSTS` | *(empty)* | Comma-separated allowlist of hosts dispatch may target over ssh |
 | `CHITRA_CLAUDE_PROJECTS` | `~/.claude/projects` | Root, or `os.pathsep`-separated list of roots, searched locally for transcript-grep delivery verification. List more than one root when a local session runs under a non-default `CLAUDE_CONFIG_DIR` (e.g. a dedicated persona/harness identity) — its transcripts live under that root's `projects/`, not the default |
 | `CHITRA_ROUTING_CONFIG` | *(unset)* | Optional `task_type` → routing-hint config; see [`docs/routing.yaml.example`](docs/routing.yaml.example) |
@@ -148,7 +161,7 @@ pytest
 
 ## Documentation
 
-For comprehensive guides, API reference, and daemon documentation, see [the docs/](docs/README.md). Start with [Getting Started](docs/quickstart/README.md) for install and first dispatch, or [Concepts](docs/concepts/README.md) to understand chitra's architecture.
+For comprehensive guides, API reference, and daemon documentation, see [the docs/](docs/README.md). Start with [Getting Started](docs/quickstart/README.md) for install and first dispatch, [Concepts](docs/concepts/README.md) for the architecture, or [Semantic agent status](docs/agent-status-design.md) for lifecycle reports, manifests, waits, and live handoff.
 
 ## Getting help
 

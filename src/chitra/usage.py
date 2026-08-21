@@ -14,17 +14,20 @@ import select
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Literal, Self, cast
+from typing import TYPE_CHECKING, Annotated, Literal, Self, cast
 
 from pydantic import ConfigDict, Field, TypeAdapter, ValidationInfo, model_validator
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 from chitra._fsio import parse_iso8601
 from chitra.policy_config import UsagePolicy, load_policy_config
+
+if TYPE_CHECKING:
+    from chitra.usage_export import FleetExportVerdict
 
 SCHEMA = "chitra.usage.v1"
 UsageKind = Literal["claude", "codex"]
@@ -34,6 +37,9 @@ CodexProcessFactory = Callable[..., subprocess.Popen[str]]
 CodexClock = Callable[[], float]
 DEFAULT_USAGE_POLICY = UsagePolicy()
 DEFAULT_CODEX_AUTH_PATH = Path.home() / ".codex" / "auth.json"
+# Above this reset horizon a Codex window is the weekly one, whatever slot the
+# provider reported it in. See ``effective_windows``.
+CODEX_LONG_WINDOW_HORIZON_SECONDS = 6 * 3600
 
 
 def _codex_snapshot_timeout_secs() -> float:
@@ -147,9 +153,7 @@ class UsageSnapshot:
         normalized["account"] = account
         for field_name in ("five_hour", "seven_day"):
             raw_window = payload.get(field_name)
-            normalized[field_name] = (
-                None if raw_window is None else UsageWindow.from_dict(raw_window, field_name=field_name)
-            )
+            normalized[field_name] = None if raw_window is None else UsageWindow.from_dict(raw_window, field_name=field_name)
         return normalized
 
     @model_validator(mode="after")
@@ -200,9 +204,7 @@ def _parse_utc_timestamp(value: str) -> datetime:
     )
 
 
-def read_snapshots(
-    directory: Path, *, staleness_seconds: int = 1200, now: datetime | None = None
-) -> list[tuple[UsageSnapshot, bool]]:
+def read_snapshots(directory: Path, *, staleness_seconds: int = 1200, now: datetime | None = None) -> list[tuple[UsageSnapshot, bool]]:
     """Read snapshot files and flag whether each one is within the staleness window."""
     if staleness_seconds < 0:
         raise ValueError("staleness_seconds must be non-negative")
@@ -223,18 +225,54 @@ def read_snapshots(
     return snapshots
 
 
+def effective_windows(snapshot: UsageSnapshot) -> tuple[UsageWindow | None, UsageWindow | None]:
+    """Return this snapshot's (short, long) windows by what they actually are.
+
+    For Claude the slots mean what they say. Codex does not keep that promise.
+    Read live on tophand 2026-08-16: a capped Codex account reported its
+    *weekly* cap in the ``primary`` slot -- 100% used, resetting 2026-08-20 --
+    while ``secondary`` was null. chitra maps ``primary`` to ``five_hour``, so
+    a weekly threshold applied by slot name would have watched an empty slot
+    and never fired, which is the failure this whole change exists to prevent.
+
+    A window is therefore classified by its own reset horizon. Nothing that
+    resets more than six hours out is a five-hour window, whichever slot the
+    provider chose to put it in.
+    """
+    if snapshot.kind != "codex":
+        return snapshot.five_hour, snapshot.seven_day
+    reading = int(_parse_utc_timestamp(snapshot.ts).timestamp())
+    short: UsageWindow | None = None
+    long_window: UsageWindow | None = None
+    for window in (snapshot.five_hour, snapshot.seven_day):
+        if window is None:
+            continue
+        if window.resets_at - reading > CODEX_LONG_WINDOW_HORIZON_SECONDS:
+            if long_window is None or window.pct > long_window.pct:
+                long_window = window
+        elif short is None or window.pct > short.pct:
+            short = window
+    return short, long_window
+
+
 def _binding_window(
-    five_hour: UsageWindow | None,
-    seven_day: UsageWindow | None,
+    short: UsageWindow | None,
+    long_window: UsageWindow | None,
     *,
-    five_hour_threshold: float,
-    seven_day_threshold: float,
+    short_threshold: float,
+    long_threshold: float,
 ) -> Literal["", "5h", "7d"]:
+    """Return which window binds, as the internal short/long token pair.
+
+    ``5h`` and ``7d`` name the short and long window respectively. For Codex
+    the long window is the weekly one; ``chitra.usage_export`` renders it under
+    each provider's own vocabulary.
+    """
     candidates: list[tuple[float, Literal["5h", "7d"]]] = []
-    if five_hour is not None and five_hour.pct >= five_hour_threshold:
-        candidates.append((five_hour.pct - five_hour_threshold, "5h"))
-    if seven_day is not None and seven_day.pct >= seven_day_threshold:
-        candidates.append((seven_day.pct - seven_day_threshold, "7d"))
+    if short is not None and short.pct >= short_threshold:
+        candidates.append((short.pct - short_threshold, "5h"))
+    if long_window is not None and long_window.pct >= long_threshold:
+        candidates.append((long_window.pct - long_threshold, "7d"))
     if not candidates:
         return ""
     return max(candidates, key=lambda item: (item[0], item[1] == "7d"))[1]
@@ -245,23 +283,32 @@ def evaluate(
     *,
     policy: UsagePolicy | None = None,
 ) -> Verdict:
-    """Return the pure deterministic policy verdict for one snapshot."""
+    """Return the pure deterministic policy verdict for one snapshot.
+
+    Thresholds are selected per provider. A Codex weekly cap is a hard wall
+    with a multi-day reset, so it pauses lower than Claude's seven-day window
+    degrading; the windows themselves are identified by
+    ``effective_windows`` rather than by the slot the provider used.
+    """
     configured = DEFAULT_USAGE_POLICY if policy is None else policy
+    short, long_window = effective_windows(snapshot)
+    pause_short, pause_long = configured.pause_thresholds(snapshot.kind)
+    warn_short, warn_long = configured.warn_thresholds(snapshot.kind)
     pause_binding = _binding_window(
-        snapshot.five_hour,
-        snapshot.seven_day,
-        five_hour_threshold=configured.pause_5h_pct,
-        seven_day_threshold=configured.pause_7d_pct,
+        short,
+        long_window,
+        short_threshold=pause_short,
+        long_threshold=pause_long,
     )
     if pause_binding:
-        window = snapshot.five_hour if pause_binding == "5h" else snapshot.seven_day
+        window = short if pause_binding == "5h" else long_window
         assert window is not None
         return Verdict(level="pause", binding_window=pause_binding, resume_at_epoch=window.resets_at)
     warn_binding = _binding_window(
-        snapshot.five_hour,
-        snapshot.seven_day,
-        five_hour_threshold=configured.warn_5h_pct,
-        seven_day_threshold=configured.warn_7d_pct,
+        short,
+        long_window,
+        short_threshold=warn_short,
+        long_threshold=warn_long,
     )
     if warn_binding:
         return Verdict(level="approaching", binding_window=warn_binding, resume_at_epoch=0)
@@ -269,12 +316,13 @@ def evaluate(
 
 
 def _verdict_binding_pct(snapshot: UsageSnapshot, verdict: Verdict) -> float:
+    short, long_window = effective_windows(snapshot)
     if verdict.binding_window == "5h":
-        assert snapshot.five_hour is not None
-        return snapshot.five_hour.pct
+        assert short is not None
+        return short.pct
     if verdict.binding_window == "7d":
-        assert snapshot.seven_day is not None
-        return snapshot.seven_day.pct
+        assert long_window is not None
+        return long_window.pct
     return 0
 
 
@@ -295,9 +343,7 @@ def _account_group_key(snapshot: UsageSnapshot) -> str:
     return snapshot.account if snapshot.account else f"\0unknown:{snapshot.session_id}"
 
 
-def evaluate_grouped(
-    items: list[tuple[UsageSnapshot, bool]], *, policy: UsagePolicy
-) -> list[AccountedVerdict]:
+def evaluate_grouped(items: list[tuple[UsageSnapshot, bool]], *, policy: UsagePolicy) -> list[AccountedVerdict]:
     """Evaluate fresh readings by account, sorted by account then input order.
 
     Every input session receives its account's verdict, including stale siblings
@@ -528,15 +574,18 @@ def _evaluation_output(verdict: AccountedVerdict) -> dict[str, object]:
         "level": verdict.level,
         "binding_window": verdict.binding_window,
         "resume_at_epoch": verdict.resume_at_epoch,
-        "resume_at_iso": datetime.fromtimestamp(verdict.resume_at_epoch, UTC).isoformat()
-        if verdict.resume_at_epoch
-        else "",
+        "resume_at_iso": datetime.fromtimestamp(verdict.resume_at_epoch, UTC).isoformat() if verdict.resume_at_epoch else "",
         "self_fresh": verdict.self_fresh,
         "account_attributed": verdict.account_attributed,
     }
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    # chitra.usage_export builds on this module's snapshot readers, so it is
+    # imported here rather than at module scope to keep the dependency
+    # one-directional at import time.
+    from chitra.usage_export import DEFAULT_STALE_AFTER_SECONDS
+
     parser = argparse.ArgumentParser(
         prog="chitra-usage", description="Read deterministic provider usage snapshots and evaluate thresholds."
     )
@@ -550,11 +599,44 @@ def build_arg_parser() -> argparse.ArgumentParser:
     codex = commands.add_parser("codex-snapshot", help="Read the local Codex account usage snapshot.")
     codex.add_argument("--codex-bin", type=Path, default=Path("codex"))
 
+    export_command = commands.add_parser("export", help="Write this host's token-free usage exports to the shared fleet tree.")
+    export_command.add_argument("--fleet-dir", type=Path, required=True, help="Shared usage directory the monitor reads.")
+    export_command.add_argument("--host", default=None, help="Host name to file under (default: this host's short name).")
+    export_command.add_argument("--dir", type=Path, default=None, help="Claude statusline sidecar directory.")
+    export_command.add_argument("--codex-bin", type=Path, default=Path("codex"))
+    export_command.add_argument("--staleness-seconds", type=int, default=1200)
+    export_command.add_argument("--policy-config", type=Path)
+    export_command.add_argument("--no-history", action="store_true", help="Write only the current export, skipping history.")
+
     evaluate_command = commands.add_parser("evaluate", help="Evaluate fresh snapshots against deterministic thresholds.")
-    evaluate_command.add_argument("--dir", type=Path, required=True)
+    evaluate_command.add_argument(
+        "--dir",
+        type=Path,
+        default=None,
+        help="Local snapshot directory, or one host's export directory. Exports are recognised and read as exports.",
+    )
+    evaluate_command.add_argument("--fleet-dir", type=Path, default=None, help="Read every host's exports instead of local snapshots.")
     evaluate_command.add_argument("--codex", action="store_true")
     evaluate_command.add_argument("--codex-bin", type=Path, default=Path("codex"))
     evaluate_command.add_argument("--staleness-seconds", type=int, default=1200)
+    evaluate_command.add_argument(
+        "--stale-after-seconds",
+        type=int,
+        default=DEFAULT_STALE_AFTER_SECONDS,
+        help="Age at which a fleet export counts as stale (default: two export intervals).",
+    )
+    evaluate_command.add_argument(
+        "--expect-host",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help="Name a host that must be publishing. One with no export directory reads as missing-export, not as nothing. Repeatable.",
+    )
+    evaluate_command.add_argument(
+        "--fail-on-incident",
+        action="store_true",
+        help="Exit non-zero when any host reads stale-export, missing-export, or invalid-export.",
+    )
     evaluate_command.add_argument("--policy-config", type=Path)
 
     policy_command = commands.add_parser("policy", help="Print the effective usage policy as JSON.")
@@ -562,10 +644,88 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_export(args: argparse.Namespace) -> None:
+    """Write this host's claude and codex exports into the shared fleet tree."""
+    from chitra.usage_export import build_claude_export, build_codex_export, default_host_name, write_export
+
+    policy = load_policy_config(args.policy_config).usage
+    host = (args.host or default_host_name()).strip().lower()
+    if not host:
+        raise ValueError("export host name resolved empty; pass --host")
+    claude_dir = args.dir if args.dir is not None else Path("/var/lib/chitra/usage")
+    exports = [
+        build_claude_export(claude_dir, host=host, policy=policy, staleness_seconds=args.staleness_seconds),
+        build_codex_export(host=host, policy=policy, codex_bin=args.codex_bin),
+    ]
+    for export in exports:
+        path = write_export(args.fleet_dir, export, keep_history=not args.no_history)
+        print(json.dumps({**export.to_dict(), "path": str(path)}, sort_keys=True))
+
+
+def _print_export_verdicts(verdicts: Iterable[FleetExportVerdict], *, fail_on_incident: bool) -> int:
+    from chitra.usage_export import INCIDENT_VERDICTS
+
+    incidents = 0
+    for verdict in verdicts:
+        print(json.dumps(verdict.to_dict(), sort_keys=True))
+        if verdict.verdict in INCIDENT_VERDICTS:
+            incidents += 1
+    if incidents and fail_on_incident:
+        print(
+            f"chitra-usage: {incidents} host/backend reading(s) could not be trusted; the monitor is blind to them",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def _run_host_evaluate(args: argparse.Namespace) -> int:
+    """Evaluate one host's exports when ``--dir`` names an export directory.
+
+    The exporter and the evaluator write and read different document kinds, and
+    pointing the local-snapshot flag at an export directory used to fail with a
+    schema error -- the reader refusing a file the tool wrote itself.  A
+    directory holding ``chitra.usage-export.v1`` documents is read as what it
+    is, and prints the same verdict lines ``--fleet-dir`` prints.
+    """
+    from chitra.usage_export import read_host_exports
+
+    return _print_export_verdicts(
+        read_host_exports(args.dir, stale_after_seconds=args.stale_after_seconds),
+        fail_on_incident=args.fail_on_incident,
+    )
+
+
+def _run_fleet_evaluate(args: argparse.Namespace) -> int:
+    """Render one verdict line per host and backend from the shared tree.
+
+    Returns the exit status. Without ``--fail-on-incident`` this is always 0
+    and the caller reads the lines; with it, an unreadable host makes the
+    command fail, so a systemd oneshot can carry the alarm rather than needing
+    something else to parse the output and notice.
+    """
+    from chitra.usage_export import read_fleet_exports
+
+    return _print_export_verdicts(
+        read_fleet_exports(
+            args.fleet_dir,
+            stale_after_seconds=args.stale_after_seconds,
+            expect_hosts=args.expect_host,
+        ),
+        fail_on_incident=args.fail_on_incident,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     try:
-        if args.command == "read-claude":
+        if args.command == "export":
+            _run_export(args)
+        elif args.command == "evaluate" and args.fleet_dir is not None:
+            if args.dir is not None:
+                raise ValueError("pass either --dir or --fleet-dir, not both")
+            return _run_fleet_evaluate(args)
+        elif args.command == "read-claude":
             snapshots = read_snapshots(args.dir, staleness_seconds=args.staleness_seconds)
             payload = [_snapshot_with_fresh(snapshot, fresh) for snapshot, fresh in snapshots]
             if args.json:
@@ -578,6 +738,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "policy":
             print(json.dumps(load_policy_config(args.policy_config).usage.model_dump(), indent=2, sort_keys=True))
         else:
+            if args.dir is None:
+                raise ValueError("evaluate needs --dir for local snapshots or --fleet-dir for exported ones")
+            from chitra.usage_export import holds_exports
+
+            if holds_exports(args.dir):
+                return _run_host_evaluate(args)
             policy = load_policy_config(args.policy_config).usage
             snapshots = read_snapshots(args.dir, staleness_seconds=args.staleness_seconds)
             if args.codex:
