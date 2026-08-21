@@ -64,6 +64,7 @@ from chitra.reasoned_dispatch import abstaining_oracle, build_reasoned_dispatch
 from chitra.reasoning import Oracle, PrinciplesIndex
 from chitra.socket_api import ApiRuntime, ControlServer, default_socket_path
 from chitra.state_paths import state_dir as default_state_dir
+from chitra.systemd_notify import notify_ready, notify_watchdog
 
 logger = structlog.get_logger(__name__)
 
@@ -101,6 +102,7 @@ DEFAULT_TRANSCRIPT_STALE_SECONDS = 900
 TRANSCRIPT_NAME = "tmux-transcript.log"
 LANE_LAUNCH_NAME = "lane-launch.json"
 CAPTURE_LINES = 60
+DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 10.0
 
 _VOLATILE_LINE_RE = re.compile(
     r"^[\s]*[·✻✽✳✢✶*●○◐◯]|tokens\b|🪟|⏵⏵|esc to interrupt|ctrl\+b|^─+$|^[\s]*$|Press up to edit|globalVersion: [0-9.]+"
@@ -206,8 +208,13 @@ def pane_at_input_row(content: str) -> bool:
     return any(line.lstrip().startswith(("❯", "›")) for line in lines[-12:])
 
 
-def _run_command(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, check=False, capture_output=True, text=True)
+def _run_command(command: Sequence[str], *, timeout: float = DEFAULT_SUBPROCESS_TIMEOUT_SECONDS) -> subprocess.CompletedProcess[str]:
+    """Run one tmux subprocess without allowing it to wedge the poll loop."""
+    try:
+        return subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        logger.warning("watchd_subprocess_timeout", command=list(command), timeout_seconds=timeout)
+        return subprocess.CompletedProcess(args=list(command), returncode=124, stdout="", stderr=f"timed out after {timeout}s")
 
 
 def _tmux_command(command: Sequence[str], tmux_socket: Path | None) -> list[str]:
@@ -1029,9 +1036,11 @@ def run_forever(watchd: Watchd, *, stop_event: threading.Event | None = None) ->
     assert watchd.status_broker is not None
     server = _start_control_server(watchd.status_broker, watchd.config, stop_event)
     logger.info("watchd_started", events_log=str(watchd.config.events_log), interval_seconds=watchd.config.interval_seconds)
+    notify_ready()
     try:
         while not stop_event.is_set():
             watchd.poll_once()
+            notify_watchdog()
             stop_event.wait(watchd.config.interval_seconds)
     finally:
         watchd.shutdown()
@@ -1090,10 +1099,12 @@ def run_lanes_forever(
     watchers = build_lane_watchers(lanes_file, base_config, status_broker=broker)
     server = _start_control_server(broker, base_config, active_stop_event)
     logger.info("watchd_started", lanes_file=str(lanes_file), lane_count=len(watchers))
+    notify_ready()
     try:
         while not active_stop_event.is_set():
             for watcher in watchers:
                 watcher.poll_once()
+            notify_watchdog()
             active_stop_event.wait(base_config.interval_seconds)
     finally:
         for watcher in watchers:
