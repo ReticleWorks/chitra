@@ -11,13 +11,32 @@ from chitra.close_gate import (
     _recorded_descopes,
     delivered_items_from_evidence,
     evaluate_close_inventory,
+    evaluate_structured_close_inventory,
     lint_done_when,
     parse_required_items,
     require_close_inventory,
 )
 from chitra.completion_gate import CompletionEvidence
+from chitra.goals import EnrolledDoneWhenItem
 
 F8_DONE_WHEN = "both the X client and the Y client pass live validation"
+
+
+def test_structured_close_requires_exact_item_receipt_validator_result_and_citation() -> None:
+    item = EnrolledDoneWhenItem(id="tests", text="The tests pass", validator="pytest", required_receipt="tests-green")
+    wrong = CompletionEvidence(
+        done_when_item_id="tests",
+        receipt_name="wrong",
+        validator="pytest",
+        validator_result="pass",
+        citation="proof /tmp/tests.json",
+    )
+    passing = wrong.model_copy(update={"receipt_name": "tests-green"})
+
+    failed = evaluate_structured_close_inventory((item,), (wrong,))
+    assert failed.verdict == "FAIL"
+    assert "requires receipt 'tests-green'" in failed.summary
+    assert evaluate_structured_close_inventory((item,), (passing,)).verdict == "PASS"
 
 
 def test_parser_reads_atomic_conjunction_bullets_and_explicit_counts() -> None:

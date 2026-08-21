@@ -10,8 +10,9 @@ import time
 from pathlib import Path
 
 import pytest
+from _goal_fixtures import enrollment_fields
 
-from chitra.goals import GoalRecord, hold_goal, redirect_goal, upsert_goal
+from chitra.goals import EnrolledScopeImmutableError, GoalRecord, hold_goal, redirect_goal, upsert_goal
 from chitra.lane_anchor import LaneLaunchRefused, LaneStartupFailed, _pane_pythonpath, ingestion_gate, start_lane
 from chitra.lane_config import load_lanes
 
@@ -86,6 +87,7 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
             scope="Chitra lane launcher and lifecycle integration",
             source="task-file:lane-architecture",
             status="working",
+            **enrollment_fields("All guarded lane launch probes pass locally"),
         ),
     )
     calls: list[list[str]] = []
@@ -214,6 +216,7 @@ def test_lane_identity_reaches_a_new_session_on_an_existing_tmux_server(
             scope="One disposable local tmux server",
             source="task-file:tmux-environment",
             status="working",
+            **enrollment_fields("The pane writes every injected identity variable and its runtime pane ID"),
         ),
     )
     proof_path = tmp_path / "pane-environment.json"
@@ -278,6 +281,34 @@ def test_lane_launch_refuses_without_passing_ingestion_record(tmp_path):
         ingestion_gate(lane)
 
 
+def test_lane_launch_refuses_legacy_record_without_interview_receipt(tmp_path):
+    import yaml
+
+    path = tmp_path / "lanes.yaml"
+    path.write_text(yaml.safe_dump(_manifest(tmp_path)), encoding="utf-8")
+    lane = load_lanes(path)[0]
+    legacy = GoalRecord(
+        session_ref="tophand:alpha:0.0",
+        goal="Implement the governed lane launch contract safely",
+        done_when="All guarded lane launch probes pass locally",
+        intent="Ensure every work lane remains observable and governed throughout execution",
+        scope="Chitra lane launcher and lifecycle integration",
+        source="task-file:lane-architecture",
+        status="working",
+        now="waiting for enrollment",
+        created_at="2026-08-21T12:00:00+00:00",
+        updated_at="2026-08-21T12:00:00+00:00",
+    )
+    lane.state_dir.mkdir(parents=True)
+    (lane.state_dir / "goals.json").write_text(
+        json.dumps({"schema": "chitra.goals.v2", "updated_at": legacy.updated_at, "goals": [legacy.to_dict()]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LaneLaunchRefused, match="interview_receipt is required"):
+        ingestion_gate(lane)
+
+
 def test_lane_startup_death_returns_temporary_failure_without_receipt(tmp_path, monkeypatch, capsys):
     import yaml
 
@@ -296,6 +327,7 @@ def test_lane_startup_death_returns_temporary_failure_without_receipt(tmp_path, 
             scope="One disposable governed test lane",
             source="task-file:startup-death-test",
             status="working",
+            **enrollment_fields("No false receipt is written and the caller receives temporary failure"),
         ),
     )
     results = iter(
@@ -331,13 +363,14 @@ def test_trinity_uses_the_same_host_qualified_goal_convention(tmp_path):
             scope="Trinity lane launch configuration only",
             source="task-file:trinity-parity",
             status="working",
+            **enrollment_fields("The host-qualified goal passes the ingestion gate"),
         ),
     )
 
     assert ingestion_gate(lane, host="trinity").session_ref == "trinity:alpha:0.0"
 
 
-def test_done_when_redirect_refreshes_snapshot_for_relaunch(tmp_path):
+def test_done_when_redirect_is_refused_and_original_contract_still_launches(tmp_path):
     import yaml
 
     path = tmp_path / "lanes.yaml"
@@ -353,18 +386,19 @@ def test_done_when_redirect_refreshes_snapshot_for_relaunch(tmp_path):
             scope="Chitra lane launcher and lifecycle integration",
             source="task-file:lane-architecture",
             status="working",
+            **enrollment_fields("All guarded lane launch probes pass locally"),
         ),
     )
 
-    redirected = redirect_goal(
-        lane.state_dir,
-        enrolled.session_ref,
-        reason="operator revised the live acceptance condition",
-        done_when="The redirected live launch and completion probes pass",
-    )
+    with pytest.raises(EnrolledScopeImmutableError, match="done_when is frozen"):
+        redirect_goal(
+            lane.state_dir,
+            enrolled.session_ref,
+            reason="operator revised the live acceptance condition",
+            done_when="The redirected live launch and completion probes pass",
+        )
 
-    assert redirected.enrolled_done_when == redirected.done_when
-    assert ingestion_gate(lane) == redirected
+    assert ingestion_gate(lane) == enrolled
 
 
 def test_lane_launch_refuses_active_usage_pause(tmp_path):
@@ -383,6 +417,7 @@ def test_lane_launch_refuses_active_usage_pause(tmp_path):
             scope="Chitra lane launcher and lifecycle integration",
             source="task-file:lane-architecture",
             status="working",
+            **enrollment_fields("All guarded lane launch probes pass locally"),
         ),
     )
     hold_goal(lane.state_dir, "tophand:alpha:0.0", reason="rate-limit:provider-window")
@@ -408,6 +443,7 @@ def test_governed_claude_model_selection(model, tmp_path):
             scope="Chitra lane launcher and lifecycle integration",
             source="task-file:lane-architecture",
             status="working",
+            **enrollment_fields("All guarded lane launch probes pass locally"),
         ),
     )
     calls = []
@@ -444,6 +480,7 @@ def test_governed_codex_effort_is_explicit_and_receipted(tmp_path):
             scope="One disposable governed test lane",
             source="task-file:codex-effort-test",
             status="working",
+            **enrollment_fields("The command and receipt name model and effort"),
         ),
     )
     calls = []
@@ -494,6 +531,7 @@ def test_governed_opencode_model_is_explicit_and_state_is_lane_local(tmp_path):
             scope="One disposable governed OpenCode lane",
             source="task-file:opencode-route-test",
             status="working",
+            **enrollment_fields("The OpenCode command, model, and lane state roots are explicit"),
         ),
     )
     calls = []

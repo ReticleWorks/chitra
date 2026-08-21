@@ -31,7 +31,9 @@ from chitra._fsio import parse_iso8601
 from chitra.agent_runtime import AgentStatusBroker, PaneStatus, StatusRuntimeError
 from chitra.agent_status import AgentState, ManifestRepository
 from chitra.completion_gate import (
+    CompletionEvidence,
     CompletionReviewRecord,
+    TodoItem,
     TurnEndAudit,
     append_completion_review,
     evaluate_turn_end,
@@ -171,6 +173,7 @@ class PendingCompletionReview:
     session_ref: str
     behavior_sha256: str
     turn_audit: TurnEndAudit
+    completion_evidence: tuple[CompletionEvidence, ...]
     last_verified: str
     future: Future[SessionReviewSignal]
 
@@ -537,6 +540,7 @@ class Watchd:
                 pending.session_ref,
                 now=summary,
                 last_verified=datetime.now(UTC).isoformat(),
+                completion_evidence=pending.completion_evidence,
             )
             assert self.status_broker is not None
             current = next(
@@ -644,11 +648,40 @@ class Watchd:
             return
 
         goal = next(record for record in list_goals(root) if record.session_ref == session_ref)
+        if goal.interview_receipt is None or not goal.enrolled_done_when_items:
+            self.reviewed_turns.add(key)
+            append_completion_review(
+                review_log,
+                CompletionReviewRecord(
+                    session_ref=session_ref,
+                    pane_id=pane.pane_id,
+                    behavior_sha256=behavior_sha256,
+                    condition="completion_claim" if is_completion_claim(text) else "turn_end_without_completion_claim",
+                    completion_verdict="COMPLETION_DISPUTE" if is_completion_claim(text) else None,
+                    review_verdict="unavailable",
+                    status="unenrolled",
+                    summary="turn-end review failed closed: the goal has no interview receipt or frozen done items",
+                ),
+            )
+            return
         policy = load_policy_config().completion_gate
+        completion_evidence = tuple(extract_completion_evidence(text))
+        enrolled_todos = [
+            TodoItem(
+                id=item.id,
+                text=item.text,
+                status="done",
+                validator=item.validator,
+                required_receipt=item.required_receipt,
+            )
+            for item in goal.enrolled_done_when_items
+        ]
+        if not enrolled_todos:
+            enrolled_todos = [TodoItem(text="interview enrollment receipt and frozen done items", status="missing")]
         turn_audit = evaluate_turn_end(
             text,
-            todo_items=[],
-            evidence=extract_completion_evidence(text),
+            todo_items=enrolled_todos,
+            evidence=completion_evidence,
             policy=policy,
             open_asks=goal.open_asks,
             blockers=(goal.needs,) if goal.needs else (),
@@ -658,6 +691,7 @@ class Watchd:
             session_ref=session_ref,
             behavior_sha256=behavior_sha256,
             turn_audit=turn_audit,
+            completion_evidence=completion_evidence,
             last_verified=goal.last_verified,
             future=Future(),
         )
@@ -693,6 +727,7 @@ class Watchd:
             session_ref=session_ref,
             behavior_sha256=behavior_sha256,
             turn_audit=turn_audit,
+            completion_evidence=completion_evidence,
             last_verified=goal.last_verified,
             future=future,
         )

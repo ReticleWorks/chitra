@@ -97,9 +97,20 @@ _GOAL_FIELDS = frozenset(
         "resume_at",
         "successor_of",
         "transferred_to",
+        "interview_receipt",
+        "enrolled_done_when_items",
+        "completion_proofs",
     )
 )
-_GOAL_STRING_FIELDS = _GOAL_FIELDS - {"goal_version", "goal_history", "open_asks", "retired_asks"}
+_GOAL_STRING_FIELDS = _GOAL_FIELDS - {
+    "goal_version",
+    "goal_history",
+    "open_asks",
+    "retired_asks",
+    "interview_receipt",
+    "enrolled_done_when_items",
+    "completion_proofs",
+}
 
 
 class ProtocolError(ValueError):
@@ -264,6 +275,10 @@ def _validate_goals_document(raw: bytes, *, host_id: str) -> dict[str, Ownership
             raise ValueError("managed goal status is invalid")
         if any(not str(raw_goal[field]).strip() for field in ("goal", "done_when", "source")):
             raise ValueError("managed goal strategic fields must be non-empty")
+        if raw_goal["interview_receipt"] is not None and not isinstance(raw_goal["interview_receipt"], dict):
+            raise ValueError("managed goal interview_receipt must be an object or null")
+        if not isinstance(raw_goal["enrolled_done_when_items"], list) or not isinstance(raw_goal["completion_proofs"], list):
+            raise ValueError("managed goal enrolled done items and completion proofs must be lists")
         goal_version = raw_goal["goal_version"]
         if isinstance(goal_version, bool) or not isinstance(goal_version, int) or not 1 <= goal_version <= MAX_GENERATION:
             raise ValueError("managed goal goal_version must be positive")

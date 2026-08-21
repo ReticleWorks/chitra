@@ -7,6 +7,8 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+from _goal_fixtures import enrollment_fields
+
 from chitra.account_registry import update_registry
 from chitra.goals import GoalRecord, GoalStatus, close_goal, upsert_goal
 from chitra.rate_limit_state import LoadHostState, Transaction, upsert_load_state, upsert_transaction
@@ -57,6 +59,7 @@ def _goal(
         needs=needs,
         hold_reason=hold_reason,
         resume_at=resume_at,
+        **enrollment_fields("The daemon writes a compact verified delta digest."),
     )
 
 
@@ -140,7 +143,12 @@ def test_compute_delta_surfaces_changed_new_spec_pending_and_disappeared_lanes(t
 
     upsert_goal(tmp_path, replace(stable, status="blocked", now="waiting for quota reset confirmation"))
     new_lane = upsert_goal(tmp_path, _goal("host-a:new:0.0"))
-    close_goal(tmp_path, pending.session_ref, delivered_items=("compact verified delta digest",))
+    close_goal(
+        tmp_path,
+        pending.session_ref,
+        administrative=True,
+        administrative_reason="remove the fixture to test disappeared-lane reporting",
+    )
     after = build_snapshot(tmp_path, flags_path=flags_path, now=NOW)
     delta = compute_delta(baseline, after, now=NOW)
     changed = {change.lane.session_ref: change.change for change in delta.changed_lanes}
