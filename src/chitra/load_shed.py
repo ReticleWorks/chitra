@@ -218,6 +218,13 @@ def build_shed_candidates(
             continue
         activity = activity_by_ref.get(goal.session_ref)
         registry_entry = registry_by_session.get(session_name(goal.session_ref))
+        # OpenCode activity is observable, but its checkpoint/stop contract is
+        # not implemented by the rate-limit transaction machine yet.  Do not
+        # misclassify it as Claude and paste a Claude-specific pause nudge.
+        if activity is not None and activity.backend == "opencode":
+            continue
+        if (activity is None or activity.backend == "unknown") and registry_entry is not None and registry_entry.kind == "opencode":
+            continue
         backend_name = (
             activity.backend
             if activity is not None and activity.backend != "unknown"

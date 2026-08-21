@@ -275,14 +275,22 @@ def run_self_test(
     probe, and this says so rather than implying coverage it does not have.
     """
     if backend != "claude":
+        if backend == "opencode":
+            detail = (
+                "live permission probes run for the Claude backend only; an OpenCode lane is checked "
+                "for its explicit command and isolated state roots, but its provider/tool policy is "
+                "owned by OpenCode"
+            )
+        else:
+            detail = (
+                "live probes run for the Claude backend only; a Codex lane is checked "
+                "for its full-access flag but its command classes are not exercised"
+            )
         return SelfTestReport(
             backend=backend,
             unprobed=("file_write", "gh_api_write", "fleet_ssh"),
             live=False,
-            detail=(
-                "live probes run for the Claude backend only; a Codex lane is checked "
-                "for its full-access flag but its command classes are not exercised"
-            ),
+            detail=detail,
         )
 
     probes, unprobed = build_probes(workdir, ssh_target=ssh_target)

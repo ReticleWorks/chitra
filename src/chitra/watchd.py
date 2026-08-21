@@ -219,12 +219,15 @@ def _tmux_command(command: Sequence[str], tmux_socket: Path | None) -> list[str]
 
 
 def _pane_backend(command: str) -> LaneBackend:
-    """Classify only explicit pane commands; unknown commands remain unknown."""
-    lowered = command.lower()
-    if "codex" in lowered:
+    """Classify only allowlisted executable names; unknown commands stay unknown."""
+    token = command.strip().split(maxsplit=1)[0] if command.strip() else ""
+    executable = Path(token).name.lower()
+    if executable == "codex":
         return "codex"
-    if "claude" in lowered:
+    if executable in ("claude", "claude-code"):
         return "claude"
+    if executable == "opencode":
+        return "opencode"
     return "unknown"
 
 
