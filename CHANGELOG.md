@@ -20,6 +20,17 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.14.0] - 2026-08-21
+
+### Added
+
+- Add fixture-gated Claude Code 2.1.229 and Codex 0.149.0 transcript
+  normalizers with stable canonical event IDs and native call/result joins.
+- Add a byte-accurate JSONL tail reader that retains partial appends, follows
+  same-inode resumes, and switches cleanly across rotation.
+- Add append-only per-lane event and progress-derivation journals under each
+  instance state root. Native records remain intact for replay.
+
 ## [0.13.0] - 2026-08-21
 
 ### Added
