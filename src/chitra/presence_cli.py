@@ -19,8 +19,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         command = sub.add_parser(verb, help=f"Append a {verb} declaration to this instance's file.")
         command.add_argument("instance")
         command.add_argument("resource")
+        command.add_argument("--session", required=True)
         command.add_argument("--lane", action="append", default=[], dest="lanes")
         command.add_argument("--note", default="")
+        command.add_argument("--goal-ref", action="append", default=[], dest="goal_refs")
+        command.add_argument("--purpose", default="")
+        command.add_argument("--journal-ref", default="", dest="journal_ref")
 
     listing = sub.add_parser("list", help="List current declarations merged across all writer files.")
     listing.add_argument("--resource", default=None)
@@ -31,11 +35,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def run(args: argparse.Namespace) -> int:
     if args.verb == "using":
-        peers = announce_using(args.instance, args.resource, lanes=args.lanes, note=args.note, root=args.shared_dir)
+        peers = announce_using(
+            args.instance,
+            args.resource,
+            session=args.session,
+            lanes=args.lanes,
+            note=args.note,
+            goal_refs=args.goal_refs,
+            purpose=args.purpose,
+            journal_ref=args.journal_ref,
+            root=args.shared_dir,
+        )
         print(json.dumps({"peers_using": [record.to_dict() for record in peers]}, indent=2, sort_keys=True))
         return 0
     if args.verb == "released":
-        record = announce_released(args.instance, args.resource, lanes=args.lanes, note=args.note, root=args.shared_dir)
+        record = announce_released(
+            args.instance,
+            args.resource,
+            session=args.session,
+            lanes=args.lanes,
+            note=args.note,
+            goal_refs=args.goal_refs,
+            purpose=args.purpose,
+            journal_ref=args.journal_ref,
+            root=args.shared_dir,
+        )
         print(json.dumps(record.to_dict(), indent=2, sort_keys=True))
         return 0
 

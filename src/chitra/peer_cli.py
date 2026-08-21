@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 
-from chitra.peer import PeerMessageError, inbox, say
+from chitra.peer import PeerMessageError, consume, inbox, say
 from chitra.presence import PresenceError
 
 
@@ -25,6 +25,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     reading = sub.add_parser("inbox", help="Read an inbox in stable order without consuming it.")
     reading.add_argument("instance", nargs="?", default=None, help="Defaults to CHITRA_INSTANCE.")
+
+    consuming = sub.add_parser("consume", help="Consume pending messages and record consumption receipts.")
+    consuming.add_argument("instance", nargs="?", default=None, help="Defaults to CHITRA_INSTANCE.")
     return parser
 
 
@@ -42,7 +45,10 @@ def run(args: argparse.Namespace) -> int:
     instance = args.instance or os.environ.get("CHITRA_INSTANCE")
     if instance is None:
         raise PeerMessageError("inbox instance is required when CHITRA_INSTANCE is unset")
-    print(json.dumps([message.to_dict() for message in inbox(instance, root=args.shared_dir)], indent=2, sort_keys=True))
+    verb_messages = (
+        consume(instance, root=args.shared_dir) if args.verb == "consume" else inbox(instance, root=args.shared_dir)
+    )
+    print(json.dumps([message.to_dict() for message in verb_messages], indent=2, sort_keys=True))
     return 0
 
 

@@ -24,20 +24,28 @@ class PresenceRecord:
     """One append-only declaration in an instance-owned presence file."""
 
     instance: str
+    session: str
     resource: str
     lanes: tuple[str, ...]
     state: str
     since: str
     note: str
+    goal_refs: tuple[str, ...]
+    purpose: str
+    journal_ref: str
 
     def to_dict(self) -> dict[str, object]:
         return {
             "instance": self.instance,
+            "session": self.session,
             "resource": self.resource,
             "lanes": list(self.lanes),
             "state": self.state,
             "since": self.since,
             "note": self.note,
+            "goal_refs": list(self.goal_refs),
+            "purpose": self.purpose,
+            "journal_ref": self.journal_ref,
         }
 
     @classmethod
@@ -45,14 +53,20 @@ class PresenceRecord:
         if not isinstance(payload, dict):
             raise PresenceError("presence record must be a JSON object")
         instance = payload.get("instance")
+        session = payload.get("session")
         resource = payload.get("resource")
         lanes = payload.get("lanes")
         state = payload.get("state")
         since = payload.get("since")
         note = payload.get("note")
+        goal_refs = payload.get("goal_refs")
+        purpose = payload.get("purpose")
+        journal_ref = payload.get("journal_ref")
         if not isinstance(instance, str):
             raise PresenceError("presence instance must be a string")
         _validate_instance(instance)
+        if not isinstance(session, str) or not session.strip():
+            raise PresenceError("presence session must be a non-empty string")
         if not isinstance(resource, str) or not resource.strip():
             raise PresenceError("presence resource must be a non-empty string")
         if not isinstance(lanes, list) or not all(isinstance(lane, str) and lane.strip() for lane in lanes):
@@ -64,7 +78,24 @@ class PresenceRecord:
         _normalize_time(since)
         if not isinstance(note, str):
             raise PresenceError("presence note must be a string")
-        return cls(instance, resource, tuple(lanes), state, since, note)
+        if not isinstance(goal_refs, list) or not all(isinstance(ref, str) and ref.strip() for ref in goal_refs):
+            raise PresenceError("presence goal_refs must be non-empty strings")
+        if not isinstance(purpose, str):
+            raise PresenceError("presence purpose must be a string")
+        if not isinstance(journal_ref, str):
+            raise PresenceError("presence journal_ref must be a string")
+        return cls(
+            instance,
+            session,
+            resource,
+            tuple(lanes),
+            state,
+            since,
+            note,
+            tuple(goal_refs),
+            purpose,
+            journal_ref,
+        )
 
 
 def shared_dir(path: Path | None = None) -> Path:
@@ -103,27 +134,40 @@ def append_presence(
     instance: str,
     resource: str,
     *,
+    session: str,
     lanes: tuple[str, ...] | list[str] = (),
     state: str,
     note: str = "",
     since: datetime | str | None = None,
+    goal_refs: tuple[str, ...] | list[str] = (),
+    purpose: str = "",
+    journal_ref: str = "",
     root: Path | None = None,
 ) -> PresenceRecord:
     """Append to the calling instance's file without locking any peer writer."""
     if not resource.strip():
         raise PresenceError("resource must be non-empty")
+    if not session.strip():
+        raise PresenceError("session must be non-empty")
     if state not in _STATES:
         raise PresenceError("state must be using or released")
     normalized_lanes = tuple(dict.fromkeys(lane.strip() for lane in lanes if lane.strip()))
     if len(normalized_lanes) != len(lanes):
         raise PresenceError("lanes must be unique, non-empty strings")
+    normalized_goal_refs = tuple(dict.fromkeys(ref.strip() for ref in goal_refs if ref.strip()))
+    if len(normalized_goal_refs) != len(goal_refs):
+        raise PresenceError("goal_refs must be unique, non-empty strings")
     record = PresenceRecord(
         instance=instance,
+        session=session,
         resource=resource,
         lanes=normalized_lanes,
         state=state,
         since=_normalize_time(since),
         note=note,
+        goal_refs=normalized_goal_refs,
+        purpose=purpose,
+        journal_ref=journal_ref,
     )
     path = _presence_path(shared_dir(root), instance)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -174,13 +218,29 @@ def announce_using(
     instance: str,
     resource: str,
     *,
+    session: str,
     lanes: tuple[str, ...] | list[str] = (),
     note: str = "",
     since: datetime | str | None = None,
+    goal_refs: tuple[str, ...] | list[str] = (),
+    purpose: str = "",
+    journal_ref: str = "",
     root: Path | None = None,
 ) -> list[PresenceRecord]:
     """Declare use and return visible peers without acquiring authority or blocking."""
-    append_presence(instance, resource, lanes=lanes, state="using", note=note, since=since, root=root)
+    append_presence(
+        instance,
+        resource,
+        session=session,
+        lanes=lanes,
+        state="using",
+        note=note,
+        since=since,
+        goal_refs=goal_refs,
+        purpose=purpose,
+        journal_ref=journal_ref,
+        root=root,
+    )
     return peers_using(instance, resource, root=root)
 
 
@@ -188,10 +248,26 @@ def announce_released(
     instance: str,
     resource: str,
     *,
+    session: str,
     lanes: tuple[str, ...] | list[str] = (),
     note: str = "",
     since: datetime | str | None = None,
+    goal_refs: tuple[str, ...] | list[str] = (),
+    purpose: str = "",
+    journal_ref: str = "",
     root: Path | None = None,
 ) -> PresenceRecord:
     """Append an explicit release; records never expire implicitly."""
-    return append_presence(instance, resource, lanes=lanes, state="released", note=note, since=since, root=root)
+    return append_presence(
+        instance,
+        resource,
+        session=session,
+        lanes=lanes,
+        state="released",
+        note=note,
+        since=since,
+        goal_refs=goal_refs,
+        purpose=purpose,
+        journal_ref=journal_ref,
+        root=root,
+    )
