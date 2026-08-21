@@ -1,0 +1,110 @@
+{
+  "artifacts": [
+    {
+      "kind": "pvr-audit-log",
+      "path": "evidence/live-pvr-audit-budget5.jsonl",
+      "sha256": "5fb7ae57960bee42dbaee4c563dbbdf07029c67560185e3d776f67ab4e3759fc"
+    },
+    {
+      "kind": "pvr-validation-report",
+      "path": "evidence/live-pvr-report-budget5.json",
+      "sha256": "408d5b46f66270845a5cca686bf38429b55a92779d52e2d5857d43411b5c8d4e"
+    },
+    {
+      "kind": "rendered-capture",
+      "path": "evidence/live-screenshots-budget5/capture-0000.png",
+      "sha256": "fa79f39df55bdca8fe040b98abb67683497d10ffffdeb286e198977fb446a1d8"
+    },
+    {
+      "kind": "rendered-capture",
+      "path": "evidence/live-screenshots-budget5/capture-0001.png",
+      "sha256": "9e809918971d8d793ccdd94cd1eb721192ce95933156c0ce5e2e96dfaac18016"
+    },
+    {
+      "kind": "rendered-capture",
+      "path": "evidence/live-screenshots-budget5/capture-0002.png",
+      "sha256": "546d5540a8d9cd4dcd44da28272c5fd1bf787c32b231c900771891101d5cc712"
+    },
+    {
+      "kind": "rendered-capture",
+      "path": "evidence/live-screenshots-budget5/capture-0003.png",
+      "sha256": "18c00b7de766ff6a63a133774fb974ffa3e5503dcc4418f4f91f5b4394a0a295"
+    },
+    {
+      "kind": "rendered-capture",
+      "path": "evidence/live-screenshots-budget5/capture-0004.png",
+      "sha256": "192880d88dace9b2bcf18a93b1c321be0f51b4c8874ecf2034fed34aae0f9f2e"
+    }
+  ],
+  "exercise": {
+    "live_boundary": {
+      "host": "tophand",
+      "service": "crossroads-monitor-dashboard.service",
+      "url": "http://100.122.81.106:8787/"
+    }
+  },
+  "integrity": {
+    "algorithm": "sha256",
+    "canonicalization": "UTF-8 JSON; keys sorted; separators comma and colon; ensure_ascii false",
+    "digest": "2cbf3a45f5206c7432d971fd60413f33adb9ff7bb245ff71d70b8daf02f9f66e",
+    "hand_authored_fields": [
+      {
+        "pointer": "/receipt_name",
+        "reason": "stable item-facing name chosen for the golden example"
+      },
+      {
+        "pointer": "/target/commit/sha",
+        "reason": "copied from the clean checkout; PVR did not prove the running process loaded this commit"
+      },
+      {
+        "pointer": "/exercise/live_boundary/host",
+        "reason": "observed with hostname and selected for the example"
+      },
+      {
+        "pointer": "/exercise/live_boundary/service",
+        "reason": "mapped from systemd inspection; PVR only records the URL"
+      },
+      {
+        "pointer": "/integrity/canonicalization",
+        "reason": "proposed common-envelope rule, not emitted by PVR today"
+      },
+      {
+        "pointer": "/integrity/scope",
+        "reason": "proposed common-envelope rule, not emitted by PVR today"
+      }
+    ],
+    "scope": "entire receipt with /integrity/digest omitted"
+  },
+  "not_exercised": [
+    {
+      "reason": "15 of 15 state-changing paths remain",
+      "surface": "the-monitor/h1:The Monitor > h2:Operations lanes [/]"
+    }
+  ],
+  "produced_at": "2026-08-21T14:51:49Z",
+  "receipt_name": "live-deployment-crossroads-monitor-dashboard.pvr.v1",
+  "result": {
+    "must_gates_passed": 3,
+    "must_gates_total": 8,
+    "should_gates_met": 2,
+    "should_gates_total": 3,
+    "status": "FAIL",
+    "surfaces_exercised": 0,
+    "surfaces_total": 1,
+    "unresolved_findings": 1,
+    "validator_acceptance": false
+  },
+  "target": {
+    "commit": {
+      "repository": "/opt/polyphony/deploy-main",
+      "sha": "3d963a0c8873a502db1dbf4598d7af03ed16e1e7"
+    }
+  },
+  "validator": {
+    "family_id": "F01",
+    "name": "Polyvalidation Rig",
+    "report_path": "evidence/live-pvr-report-budget5.json",
+    "report_schema": "pvr-v2",
+    "version": "0.2.0"
+  }
+}
