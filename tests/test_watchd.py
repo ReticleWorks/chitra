@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
-from _goal_fixtures import enrollment_fields
+from _goal_fixtures import enrollment_fields, ingest_passing_receipt
 
 from chitra.agent_runtime import AgentStatusBroker
 from chitra.agent_status import ManifestRepository
@@ -240,7 +240,7 @@ class _RejectingReviewer:
 
 
 def _tracked_goal(root: Path) -> GoalRecord:
-    return upsert_goal(
+    goal = upsert_goal(
         root,
         GoalRecord(
             session_ref="localhost:fleet:0.0",
@@ -253,6 +253,8 @@ def _tracked_goal(root: Path) -> GoalRecord:
             **enrollment_fields("The live completion probe passes with cited evidence."),
         ),
     )
+    ingest_passing_receipt(root, goal.session_ref)
+    return goal
 
 
 class _BlockingReviewer:
