@@ -20,6 +20,18 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.12.4] - 2026-08-21
+
+### Fixed
+
+- Watchd bounds every tmux subprocess call. A hung tmux server now returns a
+  logged timeout failure instead of stopping the poll loop indefinitely.
+- Watchd, sweepd, and triaged send systemd readiness and watchdog datagrams.
+  The watchdog signal is enabled only when systemd supplies `WATCHDOG_USEC`.
+- The systemd units use `Type=notify` and a watchdog limit set to three times
+  each daemon's normal poll interval. No extra heartbeat state files are
+  written.
+
 ## [0.12.3] - 2026-08-21
 
 ### Fixed

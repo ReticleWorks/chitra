@@ -37,6 +37,7 @@ from chitra.goals import (
 from chitra.lane_config import enabled_lanes
 from chitra.rate_limit_state import Transaction, TransactionPhase, load_load_states, load_transactions
 from chitra.state_paths import state_dir as default_state_dir
+from chitra.systemd_notify import notify_ready, notify_watchdog
 
 logger = structlog.get_logger(__name__)
 
@@ -464,8 +465,10 @@ def run_forever(config: SweepdConfig, *, stop_event: threading.Event | None = No
         digest_path=str(config.digest_path),
         poll_seconds=config.poll_seconds,
     )
+    notify_ready()
     while not active_stop_event.is_set():
         run_once(config)
+        notify_watchdog()
         active_stop_event.wait(config.poll_seconds)
 
 
@@ -488,8 +491,10 @@ def run_lanes_once(lanes_file: Path | None) -> dict[str, SweepDigest]:
 def run_lanes_forever(lanes_file: Path | None, *, poll_seconds: float = DEFAULT_POLL_SECONDS) -> None:
     """Run one shared sweep process over every enabled lane state root."""
     stop_event = threading.Event()
+    notify_ready()
     while not stop_event.is_set():
         run_lanes_once(lanes_file)
+        notify_watchdog()
         stop_event.wait(poll_seconds)
 
 
