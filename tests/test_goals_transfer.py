@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 import pytest
+from _goal_fixtures import enrollment_fields
 
 from chitra.goals import (
     GoalNotFoundError,
@@ -61,6 +62,7 @@ def _enrol(root: Path, session_ref: str = ORIGINAL) -> GoalRecord:
             status="working",
             intent="Replace the hand-held secret path with a governed broker the fleet can audit",
             scope="the gct secret broker rollout only",
+            **enrollment_fields("the governed rollout playbook lands and the trust refresh is verified live"),
         ),
     )
 
@@ -187,7 +189,7 @@ def test_an_unknown_schema_is_still_refused(tmp_path: Path) -> None:
     payload["schema"] = "chitra.goals.v9"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="chitra.goals.v2"):
+    with pytest.raises(ValueError, match="chitra.goals.v3"):
         load_goals(tmp_path)
 
 

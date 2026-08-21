@@ -48,8 +48,8 @@ daemons; the rest are periodic or ad-hoc tools.
 - `chitra.pr_review` / `chitra.pr_reviewd` (`chitra-pr-review`) — deterministic blast-radius/diff-size pre-checks plus an isolated multi-reviewer security pass over one pull request's diff, logged to a signed ledger and reported as a plain PR comment. Never merges, approves, requests changes, or fails a required check by default; see the `pr_reviewd` module docstring and `PRReviewPolicy.block_on_findings`. Stock trigger: `.github/workflows/pr-security-review.yml`.
 
 **Goals and completion**
-- `chitra.goals` — a per-lane goal store with a write-once enrolled done-condition, guarded by `flock`.
-- `chitra.goal_enforcement` / `chitra.completion_gate` / `chitra.close_gate` — review a session's completion claim against its frozen goal and cited evidence; spend, credentials, and irreversible actions stay operator-gated.
+- `chitra.goals` — a per-lane goal store with atomic interview enrollment and frozen structured done items, guarded by `flock`.
+- `chitra.goal_enforcement` / `chitra.completion_gate` / `chitra.close_gate` — require exact named, validator-bearing receipts for every frozen done item; spend, credentials, and irreversible actions stay operator-gated.
 
 **Rate limiting**
 - `chitra.usage` / `chitra.rate_limit_guard` / `chitra.account_registry` — read account usage and pause/resume lanes on provider limits or host load pressure, over a durable, crash-safe transaction. See [`docs/pause-recovery.md`](docs/pause-recovery.md).

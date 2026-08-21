@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _goal_fixtures import enrollment_fields
 
 from chitra import ownership_provider as provider
 from chitra.goals import GoalRecord
@@ -37,6 +38,7 @@ def _goal(session_ref: str, lane_id: str) -> dict[str, object]:
         enrolled_at="2026-07-15T15:00:00Z",
         created_at="2026-07-15T15:00:00Z",
         updated_at="2026-07-15T15:00:00Z",
+        **enrollment_fields("All focused ownership authority tests pass cleanly"),
     ).to_dict()
 
 
@@ -101,7 +103,7 @@ def test_missing_state_returns_non_authoritative_unknown(tmp_path: Path) -> None
         # The schema this provider expects, which follows chitra.goals. The
         # document fixture above stays on v1 on purpose, to prove a host that
         # has not upgraded yet still reads authoritatively.
-        "schema": "chitra.goals.v2",
+        "schema": "chitra.goals.v3",
         "generation": 0,
         "complete": False,
         "manager_heartbeat_at": "",

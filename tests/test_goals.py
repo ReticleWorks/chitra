@@ -10,10 +10,9 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from _goal_fixtures import enrollment_fields, passing_completion_evidence
 
-from chitra import board
 from chitra.artifacts import ARTIFACT_URL_PREFIX, ArtifactRecord, upsert_artifact
-from chitra.close_gate import DONE_WHEN_OPERATOR_FLAG, CloseGateError
 from chitra.goals import (
     EnrolledScopeImmutableError,
     GoalNotFoundError,
@@ -53,6 +52,7 @@ def _mp_upsert_new_lane(root_str: str, session_ref: str) -> None:
             done_when="The full suite and static checks pass.",
             source="task-file:/tmp/goal-store.md",
             status="working",
+            **enrollment_fields("The full suite and static checks pass."),
         ),
     )
 
@@ -86,7 +86,51 @@ def _record(**changes: str) -> GoalRecord:
         now=values["now"],
         last_verified=values["last_verified"],
         needs=values["needs"],
+        **enrollment_fields(values["done_when"]),
     )
+
+
+def _cli_enroll(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    set_args: list[str],
+    *,
+    done_when: str,
+    extra_args: list[str] | None = None,
+) -> GoalRecord:
+    command = [*set_args, *(extra_args or [])]
+    assert main(command) == 2
+    required = json.loads(capsys.readouterr().out)
+    assert required["type"] == "INTERVIEW_REQUIRED"
+    assert [question["id"] for question in required["questions"]] == ["intent", "done_when", "out_of_scope", "constraints"]
+    result_path = tmp_path / "interview-result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "type": "INTERVIEW_RESULT",
+                "nonce": required["nonce"],
+                "receipt_name": required["receipt_name"],
+                "answers": {
+                    "intent": {
+                        "answer": "Deliver the requested deterministic goal behavior safely for operators.",
+                        "provenance": "operator:test",
+                    },
+                    "done_when": {"answer": done_when, "provenance": "operator:test"},
+                    "out_of_scope": {"answer": "Unrelated board changes are excluded.", "provenance": "operator:test"},
+                    "constraints": {"answer": "Keep the change small and tested.", "provenance": "operator:test"},
+                },
+                "enrolled_done_when_items": [
+                    {"id": "done-1", "text": done_when, "validator": "pytest", "required_receipt": "tests-green"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert main([*command, "--interview-result", str(result_path)]) == 0
+    capsys.readouterr()
+    stored = get_goal(tmp_path, _record().session_ref)
+    assert stored is not None
+    return stored
 
 
 def test_store_round_trip_and_atomic_write(tmp_path: Path) -> None:
@@ -99,7 +143,7 @@ def test_store_round_trip_and_atomic_write(tmp_path: Path) -> None:
     assert load_goals(tmp_path) == [stored]
     assert not list(tmp_path.glob("*.tmp"))
     payload = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
-    assert payload["schema"] == "chitra.goals.v2"
+    assert payload["schema"] == "chitra.goals.v3"
     assert payload["goals"][0]["needs"] == "you: run the interview"
     assert payload["goals"][0]["goal_version"] == 1
     assert payload["goals"][0]["goal_history"] == []
@@ -228,12 +272,14 @@ def test_load_old_record_without_optional_fields_is_backward_compatible(tmp_path
     assert record.lane_id == "lane"
     assert record.enrolled_done_when == record.done_when
     assert record.enrolled_at == payload["updated_at"]
-    stored = upsert_goal(tmp_path, record)
-    assert load_goals(tmp_path) == [stored]
-    assert stored.to_dict()["goal_history"] == []
-    persisted = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))["goals"][0]
-    assert persisted["enrolled_done_when"] == record.done_when
-    assert persisted["enrolled_at"] == payload["updated_at"]
+    with pytest.raises(GoalValidationError, match="legacy goals are display-only"):
+        upsert_goal(tmp_path, record)
+    assert close_goal(
+        tmp_path,
+        record.session_ref,
+        administrative=True,
+        administrative_reason="retire the pre-interview record without claiming completion",
+    ) == record
 
 
 @pytest.mark.parametrize(
@@ -297,25 +343,22 @@ def test_enrolled_scope_is_write_once_and_carried_through_later_writes(tmp_path:
     )
 
 
-def test_done_when_redirect_refreshes_enrollment_and_later_writes_preserve_it(tmp_path: Path) -> None:
+def test_done_when_items_are_frozen_and_later_writes_preserve_them(tmp_path: Path) -> None:
     enrolled = upsert_goal(tmp_path, _record(done_when="both the X client and the Y client pass live validation"))
-    redirected = redirect_goal(
-        tmp_path,
-        enrolled.session_ref,
-        reason="operator explicitly descoped Y",
-        done_when="The X client passes live validation",
-    )
-    updated = update_now(tmp_path, redirected.session_ref, now="validating X")
+    with pytest.raises(EnrolledScopeImmutableError, match="done_when is frozen"):
+        redirect_goal(
+            tmp_path,
+            enrolled.session_ref,
+            reason="operator explicitly descoped Y",
+            done_when="The X client passes live validation",
+        )
+    updated = update_now(tmp_path, enrolled.session_ref, now="validating both items")
     held = hold_goal(tmp_path, updated.session_ref, reason="operator")
     resumed = resume_goal(tmp_path, held.session_ref)
-    closed = close_goal(tmp_path, resumed.session_ref, delivered_items=("X client",))
 
-    assert redirected.enrolled_done_when == redirected.done_when
-    assert redirected.enrolled_at == redirected.updated_at
-    assert redirected.enrolled_at != enrolled.enrolled_at
-    for record in (updated, held, resumed, closed):
-        assert record.enrolled_done_when == redirected.done_when
-        assert record.enrolled_at == redirected.enrolled_at
+    for record in (updated, held, resumed):
+        assert record.enrolled_done_when_items == enrolled.enrolled_done_when_items
+        assert record.enrolled_at == enrolled.enrolled_at
 
 
 def test_redirect_without_done_when_change_preserves_enrollment_anchor(tmp_path: Path) -> None:
@@ -434,12 +477,13 @@ def test_redirect_invalidates_prior_done_state(tmp_path: Path) -> None:
         stored.session_ref,
         now="completion gate passed",
         last_verified="2026-07-14T00:00:00+00:00",
+        completion_evidence=(passing_completion_evidence(),),
     )
     redirected = redirect_goal(
         tmp_path,
         completed.session_ref,
         reason="operator revised the completion contract",
-        done_when="The expanded full suite and static checks pass.",
+        goal="Ship the expanded deterministic goals store safely now.",
     )
 
     assert redirected.status == "working"
@@ -449,12 +493,13 @@ def test_redirect_invalidates_prior_done_state(tmp_path: Path) -> None:
 def test_folio_scope_laundering_paths_are_structurally_blocked_and_visible(tmp_path: Path) -> None:
     full = "both the Folio import lane and the Folio export lane pass live validation"
     stored = upsert_goal(tmp_path, _record(session_ref="host-b:folio:0.0", done_when=full))
-    narrowed = redirect_goal(
-        tmp_path,
-        stored.session_ref,
-        reason="operator is considering a reduced delivery",
-        done_when="The Folio import lane passes live validation",
-    )
+    with pytest.raises(EnrolledScopeImmutableError, match="done_when is frozen"):
+        redirect_goal(
+            tmp_path,
+            stored.session_ref,
+            reason="operator is considering a reduced delivery",
+            done_when="The Folio import lane passes live validation",
+        )
 
     with pytest.raises(GoalRedirectRequiredError, match="redirect"):
         upsert_goal(
@@ -465,9 +510,9 @@ def test_folio_scope_laundering_paths_are_structurally_blocked_and_visible(tmp_p
             ),
         )
     with pytest.raises(GoalValidationError, match=r"update_now cannot set a done-\*"):
-        update_now(tmp_path, narrowed.session_ref, status="done-pending-close")
+        update_now(tmp_path, stored.session_ref, status="done-pending-close")
 
-    assert [item.text for item in descope_delta(narrowed)] == ["the Folio export lane pass live validation"]
+    assert descope_delta(stored) == ()
 
 
 @pytest.mark.parametrize(
@@ -562,7 +607,13 @@ def test_goal_cli_seeds_clears_and_scans_open_asks(tmp_path: Path, capsys: pytes
         "--source",
         record.source,
     ]
-    assert main([*set_args, "--open-ask", "1. Seed one?", "--open-ask", "2. Seed two."]) == 0
+    _cli_enroll(
+        tmp_path,
+        capsys,
+        set_args,
+        done_when=record.done_when,
+        extra_args=["--open-ask", "1. Seed one?", "--open-ask", "2. Seed two."],
+    )
     seeded = get_goal(tmp_path, record.session_ref)
     assert seeded is not None
     assert seeded.open_asks == ("1. Seed one?", "2. Seed two.")
@@ -602,8 +653,13 @@ def test_goal_cli_set_preserves_needs_when_omitted(tmp_path: Path, capsys: pytes
         record.source,
     ]
 
-    assert main([*set_args, "--needs", "you: run the interview"]) == 0
-    capsys.readouterr()
+    _cli_enroll(
+        tmp_path,
+        capsys,
+        set_args,
+        done_when=record.done_when,
+        extra_args=["--needs", "you: run the interview"],
+    )
     assert main([*set_args, "--status", "blocked"]) == 0
     stored = get_goal(tmp_path, record.session_ref)
 
@@ -630,8 +686,7 @@ def test_goal_cli_set_redirect_now_and_check_paths(tmp_path: Path, capsys: pytes
         "--scope",
         record.scope,
     ]
-    assert main(set_args) == 0
-    capsys.readouterr()
+    _cli_enroll(tmp_path, capsys, set_args, done_when=record.done_when)
     assert main([*set_args, "--goal", "Ship a revised deterministic goals store safely now."]) == 1
     assert "chitra-goals redirect --reason" in capsys.readouterr().err
 
@@ -724,22 +779,104 @@ def test_upsert_rejects_invalid_records(tmp_path: Path, record: GoalRecord, mess
     assert not (tmp_path / "goals.json").exists()
 
 
+def test_direct_upsert_requires_interview_receipt_and_nonempty_validated_items(tmp_path: Path) -> None:
+    valid = _record()
+    with pytest.raises(GoalValidationError, match="interview_receipt is required"):
+        upsert_goal(tmp_path, replace(valid, interview_receipt=None, enrolled_done_when_items=()))
+    with pytest.raises(GoalValidationError, match="at least one item"):
+        upsert_goal(tmp_path, replace(valid, enrolled_done_when_items=()))
+    invalid_item = replace(valid.enrolled_done_when_items[0], validator="", required_receipt="")
+    with pytest.raises(GoalValidationError, match="validator must be non-empty"):
+        upsert_goal(tmp_path, replace(valid, enrolled_done_when_items=(invalid_item,)))
+    assert not (tmp_path / "goals.json").exists()
+
+
+def test_done_transition_and_close_require_the_exact_named_receipt(tmp_path: Path) -> None:
+    stored = upsert_goal(tmp_path, _record())
+    with pytest.raises(GoalValidationError, match="no completion receipt"):
+        mark_completion_gate_passed(
+            tmp_path,
+            stored.session_ref,
+            now="unsupported completion",
+            last_verified="2026-08-21T12:00:00+00:00",
+            completion_evidence=(),
+        )
+    with pytest.raises(GoalValidationError, match="requires receipt 'tests-green'"):
+        mark_completion_gate_passed(
+            tmp_path,
+            stored.session_ref,
+            now="wrong receipt",
+            last_verified="2026-08-21T12:00:00+00:00",
+            completion_evidence=(passing_completion_evidence(receipt_name="wrong-name"),),
+        )
+    completed = mark_completion_gate_passed(
+        tmp_path,
+        stored.session_ref,
+        now="exact receipt passed",
+        last_verified="2026-08-21T12:00:00+00:00",
+        completion_evidence=(passing_completion_evidence(),),
+    )
+    with pytest.raises(ValueError, match="requires receipt 'tests-green'"):
+        close_goal(
+            tmp_path,
+            completed.session_ref,
+            completion_evidence=(passing_completion_evidence(receipt_name="wrong-name"),),
+        )
+    assert get_goal(tmp_path, completed.session_ref) == completed
+
+
+def test_one_interviewed_item_with_named_receipt_succeeds_end_to_end(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = _record()
+    set_args = [
+        "set",
+        "--root",
+        str(tmp_path),
+        "--session-ref",
+        record.session_ref,
+        "--goal",
+        record.goal,
+        "--source",
+        record.source,
+    ]
+    enrolled = _cli_enroll(tmp_path, capsys, set_args, done_when=record.done_when)
+    completed = mark_completion_gate_passed(
+        tmp_path,
+        enrolled.session_ref,
+        now="the interviewed item has its named receipt",
+        last_verified="2026-08-21T12:00:00+00:00",
+        completion_evidence=(passing_completion_evidence(),),
+    )
+
+    assert completed.completion_proofs == (passing_completion_evidence(),)
+    assert close_goal(tmp_path, completed.session_ref) == completed
+    assert get_goal(tmp_path, completed.session_ref) is None
+
+
 def test_close_removes_record_and_raises_for_absent_goal(tmp_path: Path) -> None:
     stored = upsert_goal(tmp_path, _record())
+    completed = mark_completion_gate_passed(
+        tmp_path,
+        stored.session_ref,
+        now="completion receipts passed",
+        last_verified="2026-08-21T12:00:00+00:00",
+        completion_evidence=(passing_completion_evidence(),),
+    )
 
-    assert close_goal(tmp_path, stored.session_ref, delivered_items=("full suite", "static checks")) == stored
+    assert close_goal(tmp_path, stored.session_ref) == completed
     assert list_goals(tmp_path) == []
     with pytest.raises(GoalNotFoundError):
         close_goal(tmp_path, stored.session_ref)
 
 
-def test_close_blocks_f8_shape_and_preserves_goal_until_operator_ack(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_close_rejects_delivery_and_acknowledgement_strings(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     stored = upsert_goal(
         tmp_path,
         _record(done_when="both the X client and the Y client pass live validation"),
     )
 
-    with pytest.raises(CloseGateError, match="F8 close tell"):
+    with pytest.raises(GoalValidationError, match="not completion receipts"):
         close_goal(
             tmp_path,
             stored.session_ref,
@@ -760,92 +897,91 @@ def test_close_blocks_f8_shape_and_preserves_goal_until_operator_ack(tmp_path: P
         "Y client is follow-on.",
     ]
     assert main(close_args) == 1
-    assert "F8 close tell" in capsys.readouterr().err
-    assert main([*close_args, "--operator-acknowledged-item", "Y client"]) == 0
-    assert get_goal(tmp_path, stored.session_ref) is None
+    assert "not completion receipts" in capsys.readouterr().err
+    assert main([*close_args, "--operator-acknowledged-item", "Y client"]) == 1
+    assert get_goal(tmp_path, stored.session_ref) == stored
 
 
-def test_close_passes_after_operator_redirect_records_descope(tmp_path: Path) -> None:
+def test_administrative_discard_requires_reason_and_is_not_completion(tmp_path: Path) -> None:
     stored = upsert_goal(
         tmp_path,
         _record(done_when="both the X client and the Y client pass live validation"),
     )
-    redirected = redirect_goal(
-        tmp_path,
-        stored.session_ref,
-        reason="operator descoped the Y client",
-        done_when="The X client passes live validation",
-    )
+    with pytest.raises(GoalValidationError, match="requires a non-empty reason"):
+        close_goal(tmp_path, stored.session_ref, administrative=True)
 
     closed = close_goal(
         tmp_path,
-        redirected.session_ref,
-        delivered_items=("X client",),
-        close_notes=("Y client is future work.",),
+        stored.session_ref,
+        administrative=True,
+        administrative_reason="operator retired the lane without claiming it was done",
     )
 
-    assert closed.goal_version == 2
-    assert closed.goal_history[0]["done_when"] == "both the X client and the Y client pass live validation"
-    assert get_goal(tmp_path, redirected.session_ref) is None
+    assert closed.status == "working"
+    assert get_goal(tmp_path, stored.session_ref) is None
 
 
-def test_goal_cli_set_surfaces_vague_done_when_without_rewriting(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    record = _record(done_when="representative consumers pass live validation")
+def test_goal_cli_first_set_requires_typed_interview_without_writing_goal(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = _record()
+    command = [
+        "set",
+        "--root",
+        str(tmp_path),
+        "--session-ref",
+        record.session_ref,
+        "--goal",
+        record.goal,
+        "--source",
+        record.source,
+    ]
 
-    assert (
-        main(
-            [
-                "set",
-                "--root",
-                str(tmp_path),
-                "--session-ref",
-                record.session_ref,
-                "--goal",
-                record.goal,
-                "--done-when",
-                record.done_when,
-                "--source",
-                record.source,
-            ]
-        )
-        == 0
-    )
-    output = capsys.readouterr().out
-    stored = get_goal(tmp_path, record.session_ref)
-
-    assert stored is not None
-    assert stored.done_when == "representative consumers pass live validation"
-    assert stored.open_asks == (DONE_WHEN_OPERATOR_FLAG,)
-    assert "missing or vague" in output
-    assert DONE_WHEN_OPERATOR_FLAG in board.render_roster([stored], fmt="markdown")
+    assert main(command) == 2
+    required = json.loads(capsys.readouterr().out)
+    assert required["type"] == "INTERVIEW_REQUIRED"
+    assert [question["id"] for question in required["questions"]] == ["intent", "done_when", "out_of_scope", "constraints"]
+    assert not (tmp_path / "goals.json").exists()
+    assert len(list((tmp_path / "goal-interviews").glob("*.json"))) == 1
 
 
-def test_goal_cli_set_does_not_surface_vague_flag_for_explicit_both(tmp_path: Path) -> None:
-    record = _record(done_when="both consumer A and consumer B pass live validation")
+def test_goal_cli_rejects_zero_items_and_wrong_nonce(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    record = _record()
+    command = [
+        "set",
+        "--root",
+        str(tmp_path),
+        "--session-ref",
+        record.session_ref,
+        "--goal",
+        record.goal,
+        "--source",
+        record.source,
+    ]
+    assert main(command) == 2
+    required = json.loads(capsys.readouterr().out)
+    result = {
+        "type": "INTERVIEW_RESULT",
+        "nonce": required["nonce"],
+        "answers": {
+            question: {"answer": f"complete answer for {question}", "provenance": "operator:test"}
+            for question in ("intent", "done_when", "out_of_scope", "constraints")
+        },
+        "enrolled_done_when_items": [],
+    }
+    result_path = tmp_path / "result.json"
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    assert main([*command, "--interview-result", str(result_path)]) == 1
+    assert "at least one item" in capsys.readouterr().err
+    assert get_goal(tmp_path, record.session_ref) is None
 
-    assert (
-        main(
-            [
-                "set",
-                "--root",
-                str(tmp_path),
-                "--session-ref",
-                record.session_ref,
-                "--goal",
-                record.goal,
-                "--done-when",
-                record.done_when,
-                "--source",
-                record.source,
-            ]
-        )
-        == 0
-    )
-    stored = get_goal(tmp_path, record.session_ref)
-
-    assert stored is not None
-    assert stored.done_when == "both consumer A and consumer B pass live validation"
-    assert stored.open_asks == ()
+    result["nonce"] = "wrong"
+    result["enrolled_done_when_items"] = [
+        {"id": "done-1", "text": record.done_when, "validator": "pytest", "required_receipt": "tests-green"}
+    ]
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    assert main([*command, "--interview-result", str(result_path)]) == 1
+    assert "nonce does not match" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
