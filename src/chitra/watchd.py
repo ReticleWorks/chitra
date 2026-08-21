@@ -31,7 +31,9 @@ from chitra._fsio import parse_iso8601
 from chitra.agent_runtime import AgentStatusBroker, PaneStatus, StatusRuntimeError
 from chitra.agent_status import AgentState, ManifestRepository
 from chitra.completion_gate import (
+    CompletionEvidence,
     CompletionReviewRecord,
+    TodoItem,
     TurnEndAudit,
     append_completion_review,
     evaluate_turn_end,
@@ -64,6 +66,7 @@ from chitra.reasoned_dispatch import abstaining_oracle, build_reasoned_dispatch
 from chitra.reasoning import Oracle, PrinciplesIndex
 from chitra.socket_api import ApiRuntime, ControlServer, default_socket_path
 from chitra.state_paths import state_dir as default_state_dir
+from chitra.systemd_notify import notify_ready, notify_watchdog
 
 logger = structlog.get_logger(__name__)
 
@@ -101,6 +104,7 @@ DEFAULT_TRANSCRIPT_STALE_SECONDS = 900
 TRANSCRIPT_NAME = "tmux-transcript.log"
 LANE_LAUNCH_NAME = "lane-launch.json"
 CAPTURE_LINES = 60
+DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 10.0
 
 _VOLATILE_LINE_RE = re.compile(
     r"^[\s]*[·✻✽✳✢✶*●○◐◯]|tokens\b|🪟|⏵⏵|esc to interrupt|ctrl\+b|^─+$|^[\s]*$|Press up to edit|globalVersion: [0-9.]+"
@@ -169,6 +173,7 @@ class PendingCompletionReview:
     session_ref: str
     behavior_sha256: str
     turn_audit: TurnEndAudit
+    completion_evidence: tuple[CompletionEvidence, ...]
     last_verified: str
     future: Future[SessionReviewSignal]
 
@@ -206,8 +211,13 @@ def pane_at_input_row(content: str) -> bool:
     return any(line.lstrip().startswith(("❯", "›")) for line in lines[-12:])
 
 
-def _run_command(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, check=False, capture_output=True, text=True)
+def _run_command(command: Sequence[str], *, timeout: float = DEFAULT_SUBPROCESS_TIMEOUT_SECONDS) -> subprocess.CompletedProcess[str]:
+    """Run one tmux subprocess without allowing it to wedge the poll loop."""
+    try:
+        return subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        logger.warning("watchd_subprocess_timeout", command=list(command), timeout_seconds=timeout)
+        return subprocess.CompletedProcess(args=list(command), returncode=124, stdout="", stderr=f"timed out after {timeout}s")
 
 
 def _tmux_command(command: Sequence[str], tmux_socket: Path | None) -> list[str]:
@@ -530,6 +540,7 @@ class Watchd:
                 pending.session_ref,
                 now=summary,
                 last_verified=datetime.now(UTC).isoformat(),
+                completion_evidence=pending.completion_evidence,
             )
             assert self.status_broker is not None
             current = next(
@@ -637,11 +648,40 @@ class Watchd:
             return
 
         goal = next(record for record in list_goals(root) if record.session_ref == session_ref)
+        if goal.interview_receipt is None or not goal.enrolled_done_when_items:
+            self.reviewed_turns.add(key)
+            append_completion_review(
+                review_log,
+                CompletionReviewRecord(
+                    session_ref=session_ref,
+                    pane_id=pane.pane_id,
+                    behavior_sha256=behavior_sha256,
+                    condition="completion_claim" if is_completion_claim(text) else "turn_end_without_completion_claim",
+                    completion_verdict="COMPLETION_DISPUTE" if is_completion_claim(text) else None,
+                    review_verdict="unavailable",
+                    status="unenrolled",
+                    summary="turn-end review failed closed: the goal has no interview receipt or frozen done items",
+                ),
+            )
+            return
         policy = load_policy_config().completion_gate
+        completion_evidence = tuple(extract_completion_evidence(text))
+        enrolled_todos = [
+            TodoItem(
+                id=item.id,
+                text=item.text,
+                status="done",
+                validator=item.validator,
+                required_receipt=item.required_receipt,
+            )
+            for item in goal.enrolled_done_when_items
+        ]
+        if not enrolled_todos:
+            enrolled_todos = [TodoItem(text="interview enrollment receipt and frozen done items", status="missing")]
         turn_audit = evaluate_turn_end(
             text,
-            todo_items=[],
-            evidence=extract_completion_evidence(text),
+            todo_items=enrolled_todos,
+            evidence=completion_evidence,
             policy=policy,
             open_asks=goal.open_asks,
             blockers=(goal.needs,) if goal.needs else (),
@@ -651,6 +691,7 @@ class Watchd:
             session_ref=session_ref,
             behavior_sha256=behavior_sha256,
             turn_audit=turn_audit,
+            completion_evidence=completion_evidence,
             last_verified=goal.last_verified,
             future=Future(),
         )
@@ -686,6 +727,7 @@ class Watchd:
             session_ref=session_ref,
             behavior_sha256=behavior_sha256,
             turn_audit=turn_audit,
+            completion_evidence=completion_evidence,
             last_verified=goal.last_verified,
             future=future,
         )
@@ -1029,9 +1071,11 @@ def run_forever(watchd: Watchd, *, stop_event: threading.Event | None = None) ->
     assert watchd.status_broker is not None
     server = _start_control_server(watchd.status_broker, watchd.config, stop_event)
     logger.info("watchd_started", events_log=str(watchd.config.events_log), interval_seconds=watchd.config.interval_seconds)
+    notify_ready()
     try:
         while not stop_event.is_set():
             watchd.poll_once()
+            notify_watchdog()
             stop_event.wait(watchd.config.interval_seconds)
     finally:
         watchd.shutdown()
@@ -1090,10 +1134,12 @@ def run_lanes_forever(
     watchers = build_lane_watchers(lanes_file, base_config, status_broker=broker)
     server = _start_control_server(broker, base_config, active_stop_event)
     logger.info("watchd_started", lanes_file=str(lanes_file), lane_count=len(watchers))
+    notify_ready()
     try:
         while not active_stop_event.is_set():
             for watcher in watchers:
                 watcher.poll_once()
+            notify_watchdog()
             active_stop_event.wait(base_config.interval_seconds)
     finally:
         for watcher in watchers:

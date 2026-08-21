@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
+from _goal_fixtures import enrollment_fields
 
 from chitra.agent_runtime import AgentStatusBroker
 from chitra.agent_status import ManifestRepository
@@ -249,6 +250,7 @@ def _tracked_goal(root: Path) -> GoalRecord:
             scope="WS1 source tests and documentation only.",
             source="task-file:/tmp/ws1.md",
             status="working",
+            **enrollment_fields("The live completion probe passes with cited evidence."),
         ),
     )
 
@@ -277,9 +279,32 @@ class _BlockingReviewer:
         )
 
 
-_CITED_CLAIM_CAPTURE = """The forced completion review was completed and deployed at SHA abc1234.
+_DEPLOY_PROOF_LINE = "CHITRA-COMPLETION: " + json.dumps(
+    {
+        "kind": "deploy",
+        "done_when_item_id": "done-1",
+        "receipt_name": "tests-green",
+        "validator": "pytest",
+        "validator_result": "pass",
+        "citation": "deployed SHA abc1234",
+    },
+    separators=(",", ":"),
+)
+_LIVE_PROOF_LINE = "CHITRA-COMPLETION: " + json.dumps(
+    {
+        "kind": "live_verify",
+        "done_when_item_id": "done-1",
+        "receipt_name": "tests-green",
+        "validator": "pytest",
+        "validator_result": "pass",
+        "citation": "live health probe status=200 with 24 requests; /tmp/live-review.log",
+    },
+    separators=(",", ":"),
+)
+_CITED_CLAIM_CAPTURE = f"""The forced completion review was completed and deployed at SHA abc1234.
 It reviews every finished lane turn before any done state is trusted.
-Live health probe status=200 with 24 requests; /tmp/live-review.log.
+{_DEPLOY_PROOF_LINE}
+{_LIVE_PROOF_LINE}
 \u276f
 """
 
@@ -343,11 +368,7 @@ def test_turn_end_automatically_runs_review_and_marks_cited_completion_pending_c
     captures = iter(
         [
             "working on the implementation\nesc to interrupt\n❯\n",
-            """The forced completion review was completed and deployed at SHA abc1234.
-It reviews every finished lane turn before any done state is trusted.
-Live health probe status=200 with 24 requests; /tmp/live-review.log.
-❯
-""",
+            _CITED_CLAIM_CAPTURE,
         ]
     )
 
@@ -379,6 +400,40 @@ Live health probe status=200 with 24 requests; /tmp/live-review.log.
     review = json.loads((tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8"))
     assert review["condition"] == "completion_claim"
     assert review["completion_verdict"] == "CLEAN"
+
+
+def test_legacy_goal_cannot_reach_done_through_watchd(tmp_path: Path) -> None:
+    enrolled = _tracked_goal(tmp_path)
+    payload = enrolled.to_dict()
+    payload["interview_receipt"] = None
+    payload["enrolled_done_when_items"] = []
+    payload["completion_proofs"] = []
+    (tmp_path / "goals.json").write_text(
+        json.dumps({"schema": "chitra.goals.v2", "updated_at": enrolled.updated_at, "goals": [payload]}),
+        encoding="utf-8",
+    )
+    captures = iter(["working\nesc to interrupt\n❯\n", _CITED_CLAIM_CAPTURE])
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures, _CITED_CLAIM_CAPTURE))
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"), runner=runner)
+    try:
+        watcher.poll_once()
+        watcher.poll_once()
+    finally:
+        watcher.shutdown()
+
+    stored = get_goal(tmp_path, enrolled.session_ref)
+    assert stored is not None
+    assert stored.status == "working"
+    review = json.loads((tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8"))
+    assert review["status"] == "unenrolled"
+    assert review["completion_verdict"] == "COMPLETION_DISPUTE"
 
 
 def test_rejected_turn_review_enqueues_reasoned_dispatch(tmp_path: Path) -> None:

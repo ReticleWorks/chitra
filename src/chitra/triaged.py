@@ -41,6 +41,7 @@ import structlog
 
 from chitra._fsio import env_csv, env_path, write_json_atomic
 from chitra.lane_config import enabled_lanes
+from chitra.systemd_notify import notify_ready, notify_watchdog
 
 logger = structlog.get_logger(__name__)
 
@@ -372,8 +373,10 @@ def run_forever(
     receiving_outputs: ReceivingOutputs | None = None,
 ) -> None:
     logger.info("triaged_started", events_log=str(events_log), poll_seconds=poll_seconds)
+    notify_ready()
     while True:
         run_once(events_log, state_file=state_file, triage_log=triage_log, receiving_outputs=receiving_outputs)
+        notify_watchdog()
         time.sleep(poll_seconds)
 
 
@@ -399,8 +402,10 @@ def run_lanes_once(lanes_file: Path | None) -> dict[str, int]:
 
 def run_lanes_forever(lanes_file: Path | None, *, poll_seconds: float = DEFAULT_POLL_SECONDS) -> None:
     """Run one shared triage process over every enabled lane event log."""
+    notify_ready()
     while True:
         run_lanes_once(lanes_file)
+        notify_watchdog()
         time.sleep(poll_seconds)
 
 

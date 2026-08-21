@@ -80,20 +80,20 @@ The pane poll never waits for reviewers to finish; it keeps the lane non-green a
 A goal is a statement of what the session should accomplish. Chitra stores each goal with:
 
 - A 6-word minimum to encourage clarity.
-- A `done_when` condition: the gate looks for this language in the session's final output.
+- Frozen structured done items, each with a validator and exact required receipt name.
 - One of 8 statuses: open, working, paused, held, complete, abandoned, redirected, or deferred.
 - An immutable `lane_id` once set (prevents re-enrollment of the same logical lane under a fresh session ref).
 
-Chitra never rewrites the `done_when` statement. The operator authors it once at enrollment. Post-hoc rewriting would let the system fit the condition to whatever already exists. The first write copies the condition into write-once `enrolled_done_when` and `enrolled_at` anchors; every later write is checked against these.
+The four-question interview result supplies the structured done items. Chitra generates the display `done_when` from those items and freezes the receipt, items, and enrollment time in one locked write.
 
 When a session finishes and claims completion, the completion gate:
 
-1. Reads the enrolled done_when condition.
-2. Checks the session's output for the required language (via watchd's LLM reviewers).
-3. Counts delivered items against the goal's inventory.
-4. Blocks goal closure if the inventory count is short.
+1. Reads the frozen structured done items.
+2. Checks each proof's item ID, receipt name, validator result, and citation.
+3. Runs the watched-session review.
+4. Persists the validated proofs before a done transition and repeats the exact check at close.
 
-It also treats follow-on/deferred language over a still-required item as a silent descope tell, unless the operator explicitly acknowledged the descope or redirected the goal via convlog (the conversation log).
+An operator can still redirect strategic work or administratively discard a dead record with a reason. Those paths are labeled as not done and cannot substitute for completion proof.
 
 ## The Ledger and Audit Trail
 
@@ -112,11 +112,11 @@ The model for trust is "trusted host." The host running chitra is assumed to be 
 
 A typical session flow:
 
-1. **Enrollment (deterministic):** An operator enrolls a session with a goal statement via chitra-goals set. Chitra validates the goal, stores it immutably, and sets lane_id.
+1. **Enrollment (deterministic):** The first `chitra-goals set` returns four typed questions and a nonce without writing a goal. `set --interview-result <file>` verifies the complete result and atomically stores the receipt, done items, enrollment time, and lane ID.
 2. **Delivery (deterministic):** The operator (or an orchestration system) queues messages. Dispatchd drains the queue, delivers each message to the session via tmux, and logs the delivery.
 3. **Rate limiting (deterministic):** Rate-limit-guard polls the account's usage and host load, pauses the session if thresholds are hit, and records the pause in a durable ledger.
 4. **Completion (LLM-judgment):** The session ends a turn claiming completion. Watchd detects this, launches isolated reviewers, and collects verdicts.
-5. **Goal closure (deterministic + LLM):** The operator runs chitra-goals close. Chitra reads the enrolled goal, checks the reviewer verdicts from step 4, counts delivered items, and blocks closure if the inventory is short.
+5. **Goal closure (deterministic + LLM):** The operator runs `chitra-goals close`. Chitra repeats the exact receipt check over the proofs Watchd persisted. Delivered strings and operator acknowledgements cannot substitute for those receipts.
 
 The deterministic and LLM layers are separate. An LLM verdict never forces a decision; an operator always has the last word via convlog. And the core dispatch, ledger, and rate-limiting paths never call an LLM.
 

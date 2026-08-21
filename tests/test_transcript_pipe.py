@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _goal_fixtures import enrollment_fields
 
 from chitra.triaged import critical_hits, parse_event_line
 from chitra.watchd import (
@@ -260,6 +261,7 @@ def test_an_already_running_lane_still_gets_its_pipe_re_armed(tmp_path: Path) ->
             scope="Chitra lane launcher and lifecycle integration",
             source="task-file:lane-architecture",
             status="working",
+            **enrollment_fields("All guarded lane launch probes pass locally"),
         ),
     )
     calls: list[list[str]] = []

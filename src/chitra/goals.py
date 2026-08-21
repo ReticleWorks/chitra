@@ -7,6 +7,7 @@ stated goal, completion condition, and current state.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -18,8 +19,8 @@ from pydantic import ConfigDict, SkipValidation, TypeAdapter, ValidationInfo, mo
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 from chitra._fsio import locked_json_store, parse_iso8601, write_json_atomic
-from chitra.close_gate import RequiredItem, _recorded_descopes, require_close_inventory
-from chitra.completion_gate import CompletionEvidence
+from chitra.close_gate import RequiredItem, _recorded_descopes, require_structured_close_inventory
+from chitra.completion_gate import CompletionEvidence, require_completion_receipts
 from chitra.plain_english import require_plain_english
 from chitra.state_paths import state_dir
 
@@ -45,13 +46,21 @@ GOAL_STATUSES: tuple[GoalStatus, ...] = (
     "done-pending-verification",
     "done-pending-close",
 )
-SCHEMA = "chitra.goals.v2"
-# v2 is additive over v1: it adds successor_of and transferred_to and changes
-# nothing else, so a v1 document still loads and simply carries empty linkage.
-# Reading both matters because the monitor and the lane hosts do not upgrade in
-# the same instant, and a monitor that refused the older document would go
-# blind exactly while a transfer was in flight.
-SUPPORTED_SCHEMAS = ("chitra.goals.v2", "chitra.goals.v1")
+SCHEMA = "chitra.goals.v3"
+# v3 adds the machine-enforced interview receipt, frozen structured done items,
+# and completion proofs. v1/v2 remain readable for display and administrative
+# disposal, but their missing v3 enrollment contract can never pass launch,
+# enter a done state, or use completion close.
+SUPPORTED_SCHEMAS = (SCHEMA, "chitra.goals.v2", "chitra.goals.v1")
+
+INTERVIEW_QUESTION_IDS: tuple[str, ...] = ("intent", "done_when", "out_of_scope", "constraints")
+INTERVIEW_QUESTIONS: dict[str, str] = {
+    "intent": "What outcome is intended, and for whom?",
+    "done_when": "What concrete artifacts or checks prove the goal is done?",
+    "out_of_scope": "What work is explicitly out of scope?",
+    "constraints": "What constraints apply, including tools, order, spend, and approvals?",
+}
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # Shared hold_reason convention: a hold_reason starting with this prefix
 # (e.g. "rate-limit:5h") marks a timed pause driven by provider usage
@@ -80,6 +89,26 @@ class EnrolledScopeImmutableError(GoalValidationError):
 
 class GoalNotFoundError(KeyError):
     """Raised when an operation requires a goal record that is absent."""
+
+
+@pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True))
+class InterviewReceipt:
+    """Immutable proof that all four enrollment questions were answered."""
+
+    name: str
+    completed_at: str
+    answers_sha256: str
+    provenance: tuple[str, ...]
+
+
+@pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True))
+class EnrolledDoneWhenItem:
+    """One immutable completion condition and its exact required proof name."""
+
+    id: str
+    text: str
+    validator: str
+    required_receipt: str
 
 
 @pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True))
@@ -112,6 +141,9 @@ class GoalRecord:
     # successor on the held one. Both empty on a lane that has never moved.
     successor_of: str = ""
     transferred_to: str = ""
+    interview_receipt: InterviewReceipt | None = None
+    enrolled_done_when_items: tuple[EnrolledDoneWhenItem, ...] = ()
+    completion_proofs: tuple[CompletionEvidence, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return cast(dict[str, object], _GOAL_RECORD_ADAPTER.dump_python(self, mode="json"))
@@ -212,6 +244,12 @@ class GoalRecord:
             if not all(isinstance(value, str) for value in entry.values()):
                 raise ValueError("goal record goal_history entries must contain strings")
         normalized["goal_history"] = raw_history
+        normalized["interview_receipt"] = payload.get("interview_receipt")
+        for field in ("enrolled_done_when_items", "completion_proofs"):
+            raw_items = payload.get(field, [])
+            if not isinstance(raw_items, list):
+                raise ValueError(f"goal record {field} must be a list")
+            normalized[field] = raw_items
         return normalized
 
 
@@ -234,7 +272,59 @@ def lane_id_from_session_ref(session_ref: str) -> str:
     return session_name(session_ref)
 
 
-def validate_goal(rec: GoalRecord) -> list[str]:
+def render_done_when_items(items: Sequence[EnrolledDoneWhenItem]) -> str:
+    """Render the human display from the frozen item inventory."""
+    return "; ".join(item.text.strip() for item in items)
+
+
+def validate_enrollment_contract(rec: GoalRecord) -> list[str]:
+    """Return violations of the v3 atomic interview enrollment contract."""
+    issues: list[str] = []
+    receipt = rec.interview_receipt
+    if receipt is None:
+        issues.append("interview_receipt is required")
+    else:
+        if not receipt.name.strip():
+            issues.append("interview_receipt name must be non-empty")
+        try:
+            parse_iso8601(
+                receipt.completed_at,
+                invalid_message="interview_receipt completed_at must be an ISO8601 datetime",
+                timezone_message="interview_receipt completed_at must include a timezone",
+                require_timezone=True,
+            )
+        except ValueError as exc:
+            issues.append(str(exc))
+        if _SHA256_RE.fullmatch(receipt.answers_sha256) is None:
+            issues.append("interview_receipt answers_sha256 must be a lowercase SHA-256 digest")
+        if len(receipt.provenance) != len(INTERVIEW_QUESTION_IDS) or any(
+            not item.startswith(("operator:", "source:")) or not item.partition(":")[2].strip() for item in receipt.provenance
+        ):
+            issues.append("interview_receipt provenance must contain four operator: or source: entries")
+    if not rec.enrolled_done_when_items:
+        issues.append("enrolled_done_when_items must contain at least one item")
+    seen_ids: set[str] = set()
+    for item in rec.enrolled_done_when_items:
+        if not item.id.strip():
+            issues.append("enrolled done item id must be non-empty")
+        elif item.id in seen_ids:
+            issues.append(f"enrolled done item id {item.id!r} is duplicated")
+        seen_ids.add(item.id)
+        if not item.text.strip():
+            issues.append(f"enrolled done item {item.id!r} text must be non-empty")
+        if not item.validator.strip():
+            issues.append(f"enrolled done item {item.id!r} validator must be non-empty")
+        if not item.required_receipt.strip():
+            issues.append(f"enrolled done item {item.id!r} required_receipt must be non-empty")
+    rendered = render_done_when_items(rec.enrolled_done_when_items)
+    if rec.enrolled_done_when_items and rec.done_when.strip() != rendered:
+        issues.append("done_when must be generated from enrolled_done_when_items")
+    if rec.enrolled_done_when and rec.enrolled_done_when != rendered:
+        issues.append("enrolled_done_when must be generated from enrolled_done_when_items")
+    return issues
+
+
+def validate_goal(rec: GoalRecord, *, require_enrollment: bool = True) -> list[str]:
     """Return deterministic doctrine violations for a prospective goal record."""
     issues: list[str] = []
     if not rec.goal.strip():
@@ -247,6 +337,8 @@ def validate_goal(rec: GoalRecord) -> list[str]:
         issues.append("source must be non-empty")
     if rec.status not in GOAL_STATUSES:
         issues.append(f"status must be one of {', '.join(GOAL_STATUSES)}")
+    if require_enrollment:
+        issues.extend(validate_enrollment_contract(rec))
     return issues
 
 
@@ -263,6 +355,7 @@ def check_specification(rec: GoalRecord) -> list[str]:
         issues.append("scope must be non-empty and contain at least four words")
     if not rec.source.startswith(("task-file", "branch", "transcript-first-msg")):
         issues.append("source must start with task-file, branch, or transcript-first-msg")
+    issues.extend(validate_enrollment_contract(rec))
     return issues
 
 
@@ -310,7 +403,7 @@ def upsert_goal(root: Path | None, rec: GoalRecord, *, clear_open_asks: bool = F
     status or ``now`` revisions cannot silently retire an operator request.
     Pass ``clear_open_asks=True`` only for an explicit retirement path.
     """
-    issues = validate_goal(rec)
+    issues = validate_goal(rec, require_enrollment=False)
     if issues:
         raise GoalValidationError("; ".join(issues))
     with locked_json_store(goals_path(root)):
@@ -325,9 +418,10 @@ def _upsert_goal_locked(
     *,
     clear_open_asks: bool = False,
     allow_strategic_change: bool = False,
-    allow_enrollment_refresh: bool = False,
     allow_goal_metadata_change: bool = False,
     allow_done_transition: bool = False,
+    allow_completion_proofs: bool = False,
+    allow_legacy_administrative: bool = False,
     mutation_time: str | None = None,
 ) -> GoalRecord:
     """The body of ``upsert_goal``, assuming the caller already holds
@@ -343,8 +437,14 @@ def _upsert_goal_locked(
     """
     records = load_goals(root)
     existing = next((record for record in records if record.session_ref == rec.session_ref), None)
+    if existing is not None and validate_enrollment_contract(existing) and not allow_legacy_administrative:
+        raise GoalValidationError("legacy goals are display-only; use a reasoned administrative redirect or discard")
     if existing is not None and not _strategic_fields_match(existing, rec) and not allow_strategic_change:
         raise GoalRedirectRequiredError("strategic goal fields changed; use chitra-goals redirect --reason ...")
+    if existing is None:
+        enrollment_issues = validate_enrollment_contract(rec)
+        if enrollment_issues:
+            raise GoalValidationError("; ".join(enrollment_issues))
     now = _utc_now() if mutation_time is None else mutation_time
     derived_lane_id = lane_id_from_session_ref(rec.session_ref)
     lane_id = derived_lane_id
@@ -352,22 +452,25 @@ def _upsert_goal_locked(
         if rec.lane_id.strip() and rec.lane_id.strip() != existing.lane_id:
             raise GoalValidationError("lane_id is immutable once a goal is enrolled")
         lane_id = existing.lane_id
-        if allow_enrollment_refresh:
-            enrolled_done_when = rec.done_when
-            enrolled_at = now
-        else:
-            if rec.enrolled_done_when and rec.enrolled_done_when != existing.enrolled_done_when:
-                raise EnrolledScopeImmutableError("enrolled_done_when is immutable once a goal is enrolled")
-            if rec.enrolled_at and rec.enrolled_at != existing.enrolled_at:
-                raise EnrolledScopeImmutableError("enrolled_at is immutable once a goal is enrolled")
-            enrolled_done_when = existing.enrolled_done_when
-            enrolled_at = existing.enrolled_at
+        if rec.enrolled_done_when and rec.enrolled_done_when != existing.enrolled_done_when:
+            raise EnrolledScopeImmutableError("enrolled_done_when is immutable once a goal is enrolled")
+        if rec.enrolled_at and rec.enrolled_at != existing.enrolled_at:
+            raise EnrolledScopeImmutableError("enrolled_at is immutable once a goal is enrolled")
+        if rec.interview_receipt != existing.interview_receipt:
+            raise EnrolledScopeImmutableError("interview_receipt is immutable once a goal is enrolled")
+        if rec.enrolled_done_when_items != existing.enrolled_done_when_items:
+            raise EnrolledScopeImmutableError("enrolled_done_when_items are immutable once a goal is enrolled")
+        if rec.completion_proofs != existing.completion_proofs and not allow_completion_proofs:
+            raise GoalValidationError("completion proofs may only be written by the completion gate")
+        enrolled_done_when = existing.enrolled_done_when
+        enrolled_at = existing.enrolled_at
     else:
         if rec.lane_id.strip() and rec.lane_id.strip() != derived_lane_id:
             raise GoalValidationError("lane_id must be derived from the durable session name")
-        if rec.enrolled_done_when and rec.enrolled_done_when != rec.done_when:
-            raise EnrolledScopeImmutableError("enrolled_done_when must equal done_when at first enrollment")
-        enrolled_done_when = rec.done_when
+        rendered_done_when = render_done_when_items(rec.enrolled_done_when_items)
+        if rec.enrolled_done_when and rec.enrolled_done_when != rendered_done_when:
+            raise EnrolledScopeImmutableError("enrolled_done_when must be generated from enrolled_done_when_items")
+        enrolled_done_when = rendered_done_when
         enrolled_at = now
     conflicting_lane = next(
         (record for record in records if record.session_ref != rec.session_ref and record.lane_id == lane_id),
@@ -416,6 +519,9 @@ def _upsert_goal_locked(
         # and two lanes on one branch is the collision the doctrine forbids.
         successor_of=rec.successor_of or (existing.successor_of if existing is not None else ""),
         transferred_to=rec.transferred_to or (existing.transferred_to if existing is not None else ""),
+        interview_receipt=rec.interview_receipt,
+        enrolled_done_when_items=rec.enrolled_done_when_items,
+        completion_proofs=rec.completion_proofs,
     )
     records = [record for record in records if record.session_ref != rec.session_ref]
     records.append(stored)
@@ -448,6 +554,8 @@ def redirect_goal(
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
+        if done_when is not None and done_when.strip() != existing.done_when.strip():
+            raise EnrolledScopeImmutableError("done_when is frozen from enrolled_done_when_items and cannot be redirected")
         redirected = replace(
             existing,
             goal=existing.goal if goal is None else goal,
@@ -460,7 +568,7 @@ def redirect_goal(
         )
         if _strategic_fields_match(existing, redirected):
             raise ValueError("redirect must change at least one strategic field")
-        issues = validate_goal(redirected)
+        issues = validate_goal(redirected, require_enrollment=existing.interview_receipt is not None)
         if issues:
             raise GoalValidationError("; ".join(issues))
         revised_at = _utc_now()
@@ -483,11 +591,11 @@ def redirect_goal(
             root,
             candidate,
             allow_strategic_change=True,
-            allow_enrollment_refresh=redirected.done_when.strip() != existing.done_when.strip(),
             allow_goal_metadata_change=True,
+            allow_legacy_administrative=True,
             mutation_time=revised_at,
         )
-    logger.info("goal_mutated", session_ref=session_ref, action="redirect")
+    logger.info("goal_mutated", session_ref=session_ref, action="administrative-redirect-not-done", reason=reason)
     return stored
 
 
@@ -562,16 +670,31 @@ def mark_completion_gate_passed(
     *,
     now: str,
     last_verified: str,
+    completion_evidence: Sequence[CompletionEvidence],
 ) -> GoalRecord:
     """Record Watchd's already-passed completion audit and goal review."""
     with locked_json_store(goals_path(root)):
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
+        enrollment_issues = validate_enrollment_contract(existing)
+        if enrollment_issues:
+            raise GoalValidationError("completion requires a valid interview enrollment: " + "; ".join(enrollment_issues))
+        try:
+            require_completion_receipts(existing.enrolled_done_when_items, completion_evidence)
+        except ValueError as exc:
+            raise GoalValidationError(str(exc)) from exc
         stored = _upsert_goal_locked(
             root,
-            replace(existing, now=now, status="done-pending-close", last_verified=last_verified),
+            replace(
+                existing,
+                now=now,
+                status="done-pending-close",
+                last_verified=last_verified,
+                completion_proofs=tuple(completion_evidence),
+            ),
             allow_done_transition=True,
+            allow_completion_proofs=True,
         )
     logger.info("goal_mutated", session_ref=stored.session_ref, action="completion-gate-passed")
     return stored
@@ -669,6 +792,8 @@ def transfer_goal(
             status="idle",
             intent=existing.intent,
             scope=existing.scope,
+            interview_receipt=existing.interview_receipt,
+            enrolled_done_when_items=existing.enrolled_done_when_items,
             successor_of=session_ref,
             now=f"scaffolded by transfer to {to_backend}: {reason}",
         )
@@ -832,6 +957,7 @@ def close_goal(
     close_notes: Sequence[str] = (),
     operator_acknowledged_items: Sequence[str] = (),
     administrative: bool = False,
+    administrative_reason: str = "",
 ) -> GoalRecord:
     """Remove a record.
 
@@ -845,19 +971,28 @@ def close_goal(
         closed = next((record for record in records if record.session_ref == session_ref), None)
         if closed is None:
             raise GoalNotFoundError(session_ref)
-        if not administrative:
-            require_close_inventory(
-                closed.enrolled_done_when,
-                delivered_items,
-                current_done_when=closed.done_when,
-                evidence=completion_evidence,
-                close_notes=close_notes,
-                operator_acknowledged_items=operator_acknowledged_items,
-                goal_version=closed.goal_version,
-                goal_history=closed.goal_history,
-            )
+        if administrative:
+            if not administrative_reason.strip():
+                raise GoalValidationError("administrative discard requires a non-empty reason and is not a completion close")
+        else:
+            if delivered_items or operator_acknowledged_items:
+                raise GoalValidationError(
+                    "--delivered-item and --operator-acknowledged-item are not completion receipts and cannot satisfy close"
+                )
+            if closed.status != "done-pending-close":
+                raise GoalValidationError("completion close requires done-pending-close from the completion gate")
+            enrollment_issues = validate_enrollment_contract(closed)
+            if enrollment_issues:
+                raise GoalValidationError("completion close requires a valid interview enrollment: " + "; ".join(enrollment_issues))
+            proofs = tuple(completion_evidence) or closed.completion_proofs
+            require_structured_close_inventory(closed.enrolled_done_when_items, proofs)
         _write_goals(root, [record for record in records if record.session_ref != session_ref])
-    logger.info("goal_mutated", session_ref=session_ref, action="close")
+    logger.info(
+        "goal_mutated",
+        session_ref=session_ref,
+        action="administrative-discard-not-done" if administrative else "completion-close",
+        reason=administrative_reason if administrative else "",
+    )
     return closed
 
 
