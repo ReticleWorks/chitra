@@ -114,6 +114,14 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   their byte ranges (first and last records always, a deterministic
   sample of earlier records, plus buffered partial bytes) and replays
   the transcript on any mismatch.
+- Receipt verification now fails closed on every validator, not only the
+  Polyvalidation Rig: a `PASS` receipt must bind a hash-bound
+  `chitra-validator-report-v1` report whose command and exit code support the
+  claim, checked at ingest and again at close. A self-asserted `PASS` over a
+  failing report can no longer close an item.
+- Receipts are stored at `<state-root>/validation-receipts/<receipt_name>.json`
+  as DESIGN-v3 section 2 requires, without the undocumented session-hash
+  directory.
 
 ## [0.14.0] - 2026-08-21
 

@@ -168,6 +168,77 @@ def test_receipts_cli_ingest_list_and_verify(tmp_path: Path, capsys: pytest.Capt
     assert receipt_path(tmp_path, goal.session_ref, original.receipt_name).exists()
 
 
+def _self_asserted_pass_receipt(root: Path, *, command: list[str], report_exit_code: int) -> Path:
+    source_dir = root / "fabricated-source"
+    artifact = source_dir / "evidence" / "result.json"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text(
+        json.dumps(
+            {
+                "schema_version": "chitra-validator-report-v1",
+                "command": command,
+                "exit_code": report_exit_code,
+            }
+        ),
+        encoding="utf-8",
+    )
+    artifact_digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    payload: dict[str, object] = {
+        "receipt_name": "self-asserted-pytest-pass",
+        "validator": {"name": "pytest", "version": "test"},
+        "target": {"artifact": {"path": str(artifact), "sha256": artifact_digest}},
+        "exercise": {"command": command},
+        "result": {"status": "PASS", "validator_acceptance": True},
+        "not_exercised": [],
+        "artifacts": [{"path": "evidence/result.json", "kind": "report", "sha256": artifact_digest}],
+        "produced_at": "2026-08-21T12:00:00Z",
+        "integrity": {
+            "algorithm": "sha256",
+            "canonicalization": "UTF-8 JSON; keys sorted; separators comma and colon; ensure_ascii false",
+            "scope": "entire receipt with /integrity/digest omitted",
+            "hand_authored_fields": [],
+        },
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    integrity = payload["integrity"]
+    assert isinstance(integrity, dict)
+    integrity["digest"] = hashlib.sha256(canonical).hexdigest()
+    path = source_dir / "receipt.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_fabricated_pass_with_failing_validator_report_cannot_close(tmp_path: Path) -> None:
+    goal = upsert_goal(tmp_path, _goal(receipt_name="self-asserted-pytest-pass"))
+    source = _self_asserted_pass_receipt(tmp_path, command=["/usr/bin/false"], report_exit_code=1)
+
+    with pytest.raises(ReceiptError, match="cannot support PASS"):
+        ingest_receipt(tmp_path, goal.session_ref, source)
+
+    stored = tmp_path / "validation-receipts" / "self-asserted-pytest-pass.json"
+    stored.parent.mkdir(parents=True)
+    stored.write_text(source.read_text(encoding="utf-8"))
+    verification = verify_receipt(tmp_path, goal.session_ref, "self-asserted-pytest-pass")
+    assert verification.verified is False
+    with pytest.raises(GoalValidationError, match="receipt is not verified"):
+        mark_completion_gate_passed(
+            tmp_path,
+            goal.session_ref,
+            now="caller self-asserted pass",
+            last_verified="2026-08-21T12:00:00Z",
+            completion_evidence=(passing_completion_evidence(receipt_name="self-asserted-pytest-pass"),),
+        )
+
+
+def test_receipt_is_stored_at_the_contract_path(tmp_path: Path) -> None:
+    goal = upsert_goal(tmp_path, _goal())
+    stored = ingest_passing_receipt(tmp_path, goal.session_ref)
+
+    assert stored == receipt_path(tmp_path, goal.session_ref, "tests-green")
+    assert stored == tmp_path / "validation-receipts" / "tests-green.json"
+    assert stored.parent == tmp_path / "validation-receipts"
+
+
 def test_three_w12_golden_envelopes_round_trip_exactly() -> None:
     observed: dict[str, str] = {}
     for path in sorted(GOLDEN_RECEIPTS.glob("*.json")):

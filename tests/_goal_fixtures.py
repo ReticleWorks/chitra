@@ -70,7 +70,10 @@ def ingest_passing_receipt(
     source_dir = root / "test-receipt-sources" / hashlib.sha256(session_ref.encode()).hexdigest()
     evidence_path = source_dir / "evidence" / "test-report.txt"
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
-    evidence_path.write_text("all tests passed\n", encoding="utf-8")
+    evidence_path.write_text(
+        json.dumps({"schema_version": "chitra-validator-report-v1", "command": ["pytest", "-q"], "exit_code": 0}),
+        encoding="utf-8",
+    )
     digest = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
     payload: dict[str, object] = {
         "receipt_name": receipt_name,

@@ -138,16 +138,10 @@ def receipts_root(root: Path | None = None) -> Path:
     return (state_dir() if root is None else root) / "validation-receipts"
 
 
-def lane_receipts_dir(root: Path | None, session_ref: str) -> Path:
-    """Return one collision-resistant per-lane receipt directory."""
-    lane_key = hashlib.sha256(session_ref.encode("utf-8")).hexdigest()
-    return receipts_root(root) / lane_key
-
-
 def receipt_path(root: Path | None, session_ref: str, receipt_name: str) -> Path:
     if _SAFE_RECEIPT_NAME_RE.fullmatch(receipt_name) is None:
         raise ReceiptError("receipt_name must be a path-safe stable name")
-    return lane_receipts_dir(root, session_ref) / f"{receipt_name}.json"
+    return receipts_root(root) / f"{receipt_name}.json"
 
 
 def _canonical_digest(payload: Mapping[str, object]) -> str:
@@ -337,7 +331,7 @@ def _validator_identifiers(receipt: ValidationReceipt) -> set[str]:
 def _validator_issues(receipt: ValidationReceipt, base: Path) -> list[str]:
     name = _text(receipt.validator, "name", parent="validator")
     if not name.startswith("Polyvalidation Rig"):
-        return []
+        return _generic_validator_issues(receipt, base)
     report_path = receipt.validator.get("report_path")
     status = receipt.result["status"]
     if report_path is None:
@@ -449,6 +443,37 @@ def _pvr_report_accepted(verdict: object) -> bool:
     )
 
 
+def _generic_validator_issues(receipt: ValidationReceipt, base: Path) -> list[str]:
+    """Fail closed on PASS claims that lack a machine-readable validator report."""
+    status = cast(str, receipt.result["status"])
+    if status != "PASS":
+        return []
+    report_artifact = next((item for item in receipt.artifacts if item.kind == "report"), None)
+    if report_artifact is None:
+        return ["PASS requires a hash-bound validator report artifact"]
+    try:
+        raw_report = json.loads((base / _safe_relative_path(report_artifact.path)).read_text(encoding="utf-8"))
+    except (ReceiptError, FileNotFoundError, json.JSONDecodeError) as exc:
+        return [f"validator report is unreadable: {exc}"]
+    if not isinstance(raw_report, dict):
+        return ["validator report must be a JSON object"]
+    required = {"schema_version", "exit_code"}
+    command = receipt.exercise.get("command")
+    if isinstance(command, list):
+        required.add("command")
+    if set(raw_report) != required or raw_report.get("schema_version") != "chitra-validator-report-v1":
+        return ["validator report does not have the exact chitra-validator-report-v1 shape"]
+    exit_code = raw_report.get("exit_code")
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+        return ["validator report exit_code must be an integer"]
+    issues: list[str] = []
+    if isinstance(command, list) and raw_report["command"] != command:
+        issues.append("validator report command does not match the receipt exercise")
+    if exit_code != 0:
+        issues.append(f"validator report records failure (exit_code={exit_code}); it cannot support PASS")
+    return issues
+
+
 def verify_receipt_file(path: Path, *, verify_current_target: bool = True) -> ReceiptVerification:
     """Verify one stored or source receipt without trusting caller status text."""
     try:
@@ -542,7 +567,7 @@ def ingest_receipt(root: Path | None, session_ref: str, source: Path) -> Path:
 
 
 def list_receipts(root: Path | None, session_ref: str) -> list[ValidationReceipt]:
-    directory = lane_receipts_dir(root, session_ref)
+    directory = receipts_root(root)
     receipts: list[ValidationReceipt] = []
     for path in sorted(directory.glob("*.json")):
         receipt, _raw = load_receipt_file(path)
