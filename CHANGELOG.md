@@ -20,6 +20,17 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.14.2] - 2026-08-21
+
+### Fixed
+
+- Same-inode, same-size rewrites at any record position are now always
+  detected: every poll re-verifies the stored hash of every consumed
+  record at its byte range (plus buffered partial bytes), removing the
+  16-record sampled verification that could silently skip an unsampled
+  interior record in journals longer than 16 records. Any mismatch
+  rotates the same inode and replays the whole transcript.
+
 ## [0.14.1] - 2026-08-21
 
 ### Fixed

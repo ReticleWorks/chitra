@@ -360,3 +360,32 @@ def test_property_same_inode_rewrites_are_detected_at_any_position(tmp_path: Pat
     assert detected.rotations[0].previous.inode == detected.rotations[0].current.inode
     assert len(detected.records) == record_count
     assert detected.records[target].record["value"] != json.loads(lines[target])["value"]
+
+
+def test_unsampled_interior_rewrite_in_long_journal_is_detected(tmp_path: Path) -> None:
+    record_count = 64
+    line = json.dumps({"index": "00", "value": "x" * _REWRITE_PAD}, separators=(",", ":")).encode() + b"\n"
+    lines = [line.replace(b'"index": "00"', b'"index": "%02d"' % index) for index in range(record_count)]
+    assert all(len(item) == len(line) for item in lines)
+    transcript = tmp_path / "rewritten-long.jsonl"
+    transcript.write_bytes(b"".join(lines))
+
+    with JsonlTailReader(transcript) as reader:
+        initial = reader.poll()
+        assert len(initial.records) == record_count
+        inode = transcript.stat().st_ino
+        replacement = _mutated_line(lines[1], random.Random(0))
+        assert len(replacement) == len(line)
+        with transcript.open("r+b") as handle:
+            handle.seek(len(line))
+            handle.write(replacement)
+            handle.flush()
+            os.fsync(handle.fileno())
+        assert transcript.stat().st_ino == inode
+        rewritten = reader.poll()
+
+    assert transcript.stat().st_size == record_count * len(line)
+    assert len(rewritten.rotations) == 1
+    assert rewritten.rotations[0].previous.inode == inode
+    assert len(rewritten.records) == record_count
+    assert rewritten.records[1].record != json.loads(lines[1])

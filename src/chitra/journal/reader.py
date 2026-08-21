@@ -13,8 +13,6 @@ from typing import Any, BinaryIO
 
 from .models import ByteRange, RawRecord, TranscriptIdentity
 
-_VERIFICATION_SAMPLE = 16
-
 
 @dataclass(frozen=True)
 class Rotation:
@@ -175,21 +173,11 @@ class JsonlTailReader:
             prefix = os.pread(self._handle.fileno(), len(self._buffer), self._buffer_start)
             if prefix != bytes(self._buffer):
                 return False
-        for index in self._verification_indices():
-            start, end, digest = self._consumed[index]
+        for start, end, digest in self._consumed:
             found = os.pread(self._handle.fileno(), end - start, start)
             if hashlib.sha256(found).hexdigest() != digest:
                 return False
         return True
-
-    def _verification_indices(self) -> list[int]:
-        count = len(self._consumed)
-        if count <= _VERIFICATION_SAMPLE:
-            return list(range(count))
-        stride = (count - 1) / (_VERIFICATION_SAMPLE - 1)
-        sampled = {round(index * stride) for index in range(_VERIFICATION_SAMPLE)}
-        sampled.update((0, count - 1))
-        return sorted(sampled)
 
     def _drain(self) -> list[RawRecord]:
         assert self._handle is not None
