@@ -20,6 +20,22 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.14.6] - 2026-08-22
+
+### Added
+
+- Add per-instance, append-only advisory presence for shared resources. Readers
+  merge every writer file and report peers without locks, expiry, stealing, or
+  exclusive claims.
+- Add atomic file-per-message peer inboxes with stable ordering and idempotent
+  retry IDs. The `chitra-presence` and `chitra-peer` commands expose both
+  library surfaces without adding a daemon or socket.
+
+### Fixed
+
+- Preserve nanosecond modification times with an inode tie-breaker when
+  ordering dispatch queues, so same-tick writes retain FIFO order on Linux.
+
 ## [0.14.5] - 2026-08-22
 
 ### Fixed

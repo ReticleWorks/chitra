@@ -320,6 +320,31 @@ capabilities:
         params: []
         mutates: true
 
+  - name: parallel-coordination
+    kind: tool
+    purpose: Publish advisory shared-resource presence and direct notes among monitor instances.
+    when_to_use: Declare a resource before heavy use, inspect peer declarations, or ask a named peer to coordinate.
+    authority:
+      level: record
+      grants:
+        - Append presence to one named instance's file and read the union of all presence files.
+        - Atomically write one message file into a named peer instance's inbox and read one instance's inbox.
+      excludes:
+        - Claim, lock, expire, steal, wait for, or grant authority over a shared resource.
+        - Create a peer socket, daemon, or implicit message consumer.
+    default_enabled: true
+    commands:
+      - name: chitra-presence
+        description: Publish or list advisory shared-resource presence without blocking.
+        argv: [chitra-presence]
+        params: []
+        mutates: true
+      - name: chitra-peer
+        description: Send or read atomic file-per-message notes for a monitor instance.
+        argv: [chitra-peer]
+        params: []
+        mutates: true
+
   - name: auto-merge
     kind: tool
     purpose: >-

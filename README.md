@@ -141,8 +141,16 @@ Each entrypoint is configured with CLI flags (`--help` on any command lists them
 | `CHITRA_CLAUDE_PROJECTS` | `~/.claude/projects` | Root, or `os.pathsep`-separated list of roots, searched locally for transcript-grep delivery verification. List more than one root when a local session runs under a non-default `CLAUDE_CONFIG_DIR` (e.g. a dedicated persona/harness identity) — its transcripts live under that root's `projects/`, not the default |
 | `CHITRA_ROUTING_CONFIG` | *(unset)* | Optional `task_type` → routing-hint config; see [`docs/routing.yaml.example`](docs/routing.yaml.example) |
 | `CHITRA_POLICY_CONFIG` | *(unset)* | Optional completion-gate and dispatch policy; see [`docs/policy.yaml.example`](docs/policy.yaml.example) |
+| `CHITRA_SHARED_DIR` | `/var/lib/polyphony-chitra-coordination` | Shared advisory presence and peer inbox root. |
 
 The full set — ssh options, triage log paths, transcript globs — is documented per-command via `--help`.
+
+`chitra-presence using <instance> <resource>` appends to that instance's own
+presence file and prints peers already using the same resource. It never waits,
+claims, expires, steals, or grants authority. Use `released` to append an
+explicit release and `list` to merge all instance files. `chitra-peer say
+<instance> <text>` atomically writes one file in the named peer's inbox;
+`chitra-peer inbox` reads the inbox named by `CHITRA_INSTANCE` in stable order.
 
 **Routing.** A caller can tag a `DispatchOrder` with an opaque `task_type`. If a routing config is set, `dispatchd` maps that to a `routing_hint` (a model/harness preference the caller's system uses); an explicit `routing_hint` always wins. chitra carries both fields through `DispatchResult` and, for a successful delivery, the signed ledger; it does not make routing decisions beyond the configured lookup.
 
