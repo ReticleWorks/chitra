@@ -22,6 +22,19 @@ from chitra.reasoning import DecisionAttestation
 from chitra.routing_config import ROUTING_CONFIG_ENV_VAR, RoutingConfig
 
 
+def user_turn_jsonl(text: str, *, with_followup: bool = True) -> str:
+    """Build a structural JSONL transcript fixture (mirrors
+    ``tests/test_dispatch.py``'s helper of the same name).
+    ``transcript_confirms_nudge`` requires the marker to land in a user-role
+    record with a later agent/tool record proving the turn
+    actually started -- a plain ``{"text": ...}`` line is no longer enough.
+    """
+    lines = [json.dumps({"type": "user", "message": {"role": "user", "content": text}})]
+    if with_followup:
+        lines.append(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": "Working on it."}}))
+    return "\n".join(lines) + "\n"
+
+
 def _write_order(orders_dir: Path, order: DispatchOrder) -> Path:
     orders_dir.mkdir(parents=True, exist_ok=True)
     path = orders_dir / f"{order.order_id}.json"
@@ -135,7 +148,7 @@ def test_remote_delivery_writes_a_ledger_entry_same_as_local(tmp_path: Path, mon
         if "find " in remote_cmd:
             return fake_completed(0, "1720000000 /remote/projects/foo/abc.jsonl\n")
         if "tail -c" in remote_cmd:
-            return fake_completed(0, "Stop editing main and open a PR.")
+            return fake_completed(0, user_turn_jsonl("Stop editing main and open a PR."))
         return fake_completed(0, "")
 
     # dispatch_to_tmux resolves its default runner (run_cmd) as a module
@@ -164,9 +177,7 @@ def test_remote_delivery_writes_a_ledger_entry_same_as_local(tmp_path: Path, mon
     assert entry.session_ref == "otherhost:f3:0.0"
 
 
-def test_partially_processed_order_retries_ledger_proof_without_redelivery(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_partially_processed_order_retries_ledger_proof_without_redelivery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A SENT result without its ledger proof is recoverable, not complete."""
 
     call_count = {"n": 0}
@@ -273,9 +284,86 @@ def test_lane_lock_timeout_is_retried_then_succeeds(tmp_path: Path, monkeypatch:
     assert not retry_state.exists()
 
 
-def test_lane_lock_retry_exhaustion_writes_only_a_terminal_failed_result(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_delivery_unconfirmed_is_deferred_not_terminal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """DispatchStatus.DELIVERY_UNCONFIRMED (pane-capture-only confirmation)
+    must never become a persisted terminal result on its own: dispatchd
+    defers it, using the same durable retry-attempts sidecar the lane-lock
+    timeout path uses, so a later pass gives transcript-grep another
+    chance."""
+
+    def always_unconfirmed(order: DispatchOrder, **kwargs: Any) -> DispatchResult:
+        return DispatchResult(
+            order_id=order.order_id,
+            session_ref=order.session_ref,
+            status=DispatchStatus.DELIVERY_UNCONFIRMED,
+            reason="delivery-unconfirmed: confirmed only via pane-capture fallback (transcript-grep found no marker)",
+        )
+
+    monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", always_unconfirmed)
+    queue_dir = tmp_path / "queue"
+    order = DispatchOrder(order_id="unconfirmed-1", session_ref="localhost:s:0.0", nudge="hi")
+    _write_order(queue_dir / "orders", order)
+
+    results = run_once(queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl", lane_lock_retry_attempts=5)
+
+    assert [result.status for result in results] == [DispatchStatus.DELIVERY_UNCONFIRMED]
+    assert not (queue_dir / "results" / "unconfirmed-1.json").exists()
+    assert not (queue_dir / "processed" / "unconfirmed-1.json").exists()
+    assert (queue_dir / "deferred" / "unconfirmed-1.json").exists()
+    assert dispatchd_mod._lane_lock_retry_state_path(queue_dir / "deferred", order.order_id).exists()
+
+
+def test_delivery_unconfirmed_retries_then_exhausts_with_a_crit_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """After the retry budget on repeated DELIVERY_UNCONFIRMED results runs
+    out, dispatchd reports a terminal FAILED "retry-exhausted" (the same
+    exhaustion path the lane-lock timeout retry uses) and emits a CRIT-level
+    log line -- a silently-dropped delivery must never happen."""
+
+    def always_unconfirmed(order: DispatchOrder, **kwargs: Any) -> DispatchResult:
+        return DispatchResult(
+            order_id=order.order_id,
+            session_ref=order.session_ref,
+            status=DispatchStatus.DELIVERY_UNCONFIRMED,
+            reason="delivery-unconfirmed: confirmed only via pane-capture fallback (transcript-grep found no marker)",
+        )
+
+    monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", always_unconfirmed)
+    queue_dir = tmp_path / "queue"
+    projects_root = tmp_path / "empty-projects"
+    order = DispatchOrder(order_id="unconfirmed-2", session_ref="localhost:s:0.0", nudge="hi")
+    _write_order(queue_dir / "orders", order)
+
+    first = run_once(
+        queue_dir,
+        lock_dir=tmp_path / "locks",
+        ledger_path=tmp_path / "ledger.jsonl",
+        lane_lock_retry_attempts=2,
+        projects_root=projects_root,
+    )
+    assert [result.status for result in first] == [DispatchStatus.DELIVERY_UNCONFIRMED]
+
+    second = run_once(
+        queue_dir,
+        lock_dir=tmp_path / "locks",
+        ledger_path=tmp_path / "ledger.jsonl",
+        lane_lock_retry_attempts=2,
+        projects_root=projects_root,
+    )
+
+    assert [result.status for result in second] == [DispatchStatus.FAILED]
+    assert second[0].reason == "retry-exhausted"
+    assert (queue_dir / "processed" / "unconfirmed-2.json").exists()
+    assert not (queue_dir / "deferred" / "unconfirmed-2.json").exists()
+
+    captured = capsys.readouterr()
+    crit_lines = [line for line in captured.out.splitlines() if "dispatchd_retry_exhausted" in line]
+    assert crit_lines
+    assert any("critical" in line.lower() for line in crit_lines)
+
+
+def test_lane_lock_retry_exhaustion_writes_only_a_terminal_failed_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     def always_busy(self: LaneLock, **kwargs: Any) -> bool:
         raise LaneLockError("test lane is busy")
 
@@ -310,9 +398,7 @@ def test_lane_lock_retry_exhaustion_writes_only_a_terminal_failed_result(
     assert not retry_state.exists()
 
 
-def test_lane_lock_deferred_requeue_is_atomic_and_runs_after_pending_orders(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_lane_lock_deferred_requeue_is_atomic_and_runs_after_pending_orders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A crash after the deferred rename leaves the retryable order pending.
 
     The first pass simulates a process death after requeueing the retryable
@@ -831,7 +917,7 @@ def test_kill_point_crash_after_pane_touch_reconciles_instead_of_double_pasting(
         # produced, exactly like a genuine paste would before the process died.
         session_dir = projects_root / "some-project"
         session_dir.mkdir(parents=True, exist_ok=True)
-        (session_dir / "abc123.jsonl").write_text(json.dumps({"text": order.nudge}) + "\n", encoding="utf-8")
+        (session_dir / "abc123.jsonl").write_text(user_turn_jsonl(order.nudge), encoding="utf-8")
         return DispatchResult(order_id=order.order_id, session_ref=order.session_ref, status=DispatchStatus.SENT)
 
     def crashing_write_result_once(*args: Any, **kwargs: Any) -> Path:
@@ -888,12 +974,12 @@ def test_kill_point_crash_after_pane_touch_reconciles_instead_of_double_pasting(
     assert not (queue_dir / "in_flight" / ".ord-crash.nonce").exists()
 
 
-def test_kill_point_crash_before_pane_touch_safely_redelivers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The other half of the same kill-point: if the crash happened BEFORE
-    any real pane I/O landed (the nonce exists, but no transcript anywhere
-    confirms delivery), a restart must correctly conclude "not confirmed"
-    and redeliver normally -- never stall waiting for evidence that will
-    never arrive."""
+def test_existing_unconsumed_nonce_is_verified_without_pasting_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Once a nonce exists, later passes only verify consumption. They never
+    inject the same order again, even if the first process died before pane
+    activity became observable."""
     empty_projects_root = tmp_path / "no-transcripts-here"  # isolates from any real ~/.claude/projects content
 
     def crashing_claim_time_failure(order: DispatchOrder, **kwargs: Any) -> DispatchResult:
@@ -917,23 +1003,38 @@ def test_kill_point_crash_before_pane_touch_safely_redelivers(tmp_path: Path, mo
             projects_root=empty_projects_root,
         )
 
-    # A nonce WAS written (the nonce is written immediately before
-    # dispatch_to_tmux is called), so this exercises the same reconciliation
-    # path -- but with no transcript evidence anywhere, reconciliation must
-    # correctly conclude "not confirmed" and safely redeliver.
+    # The nonce is written immediately before dispatch_to_tmux is called.
     assert (queue_dir / "in_flight" / ".ord-early-crash.nonce").exists()
 
-    def fake_dispatch(order: DispatchOrder, **kwargs: Any) -> DispatchResult:
-        return DispatchResult(order_id=order.order_id, session_ref=order.session_ref, status=DispatchStatus.SENT)
+    repeat_paste_calls = {"n": 0}
 
-    monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", fake_dispatch)
+    def forbidden_repeat_dispatch(order: DispatchOrder, **kwargs: Any) -> DispatchResult:
+        repeat_paste_calls["n"] += 1
+        raise AssertionError("an existing nonce must never paste again")
 
-    results = run_once(queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl", projects_root=empty_projects_root)
+    monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", forbidden_repeat_dispatch)
 
-    assert len(results) == 1
-    assert results[0].status == DispatchStatus.SENT
-    assert "reconciled" not in results[0].reason
-    assert (queue_dir / "results" / "ord-early-crash.json").exists()
+    first = run_once(
+        queue_dir,
+        lock_dir=tmp_path / "locks",
+        ledger_path=tmp_path / "ledger.jsonl",
+        projects_root=empty_projects_root,
+        lane_lock_retry_attempts=2,
+    )
+    second = run_once(
+        queue_dir,
+        lock_dir=tmp_path / "locks",
+        ledger_path=tmp_path / "ledger.jsonl",
+        projects_root=empty_projects_root,
+        lane_lock_retry_attempts=2,
+    )
+
+    assert [result.status for result in first] == [DispatchStatus.DELIVERY_UNCONFIRMED]
+    assert [result.status for result in second] == [DispatchStatus.FAILED]
+    assert second[0].reason == "retry-exhausted"
+    assert repeat_paste_calls["n"] == 0
+    assert (queue_dir / "processed" / "ord-early-crash.json").exists()
+    assert "dispatchd_retry_exhausted" in capsys.readouterr().out
 
 
 def test_stale_in_flight_claim_from_a_dead_owner_is_reclaimed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1670,9 +1771,7 @@ def test_run_forever_keeps_last_successful_configs_after_reload_errors(monkeypat
     assert all(kwargs["exc_info"] is True for _, kwargs in errors)
 
 
-def test_run_forever_uses_shipped_defaults_when_no_config_has_loaded(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_run_forever_uses_shipped_defaults_when_no_config_has_loaded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     observed: list[tuple[RoutingConfig | None, PolicyConfig]] = []
 
     class StopDaemonLoop(Exception):
