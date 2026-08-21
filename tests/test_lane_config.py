@@ -476,6 +476,50 @@ def test_governed_codex_effort_is_explicit_and_receipted(tmp_path):
     assert receipt["effort"] == "xhigh"
 
 
+def test_governed_opencode_model_is_explicit_and_state_is_lane_local(tmp_path):
+    import json
+
+    import yaml
+
+    path = tmp_path / "lanes.yaml"
+    path.write_text(yaml.safe_dump(_manifest(tmp_path)), encoding="utf-8")
+    lane = load_lanes(path)[0]
+    upsert_goal(
+        lane.state_dir,
+        GoalRecord(
+            session_ref="tophand:alpha:0.0",
+            goal="Exercise one explicit governed OpenCode model route",
+            done_when="The OpenCode command, model, and lane state roots are explicit",
+            intent="Keep OpenCode sessions isolated, selectable, and auditable across every governed lane",
+            scope="One disposable governed OpenCode lane",
+            source="task-file:opencode-route-test",
+            status="working",
+        ),
+    )
+    calls = []
+
+    def runner(command):
+        calls.append(list(command))
+        return subprocess.CompletedProcess(command, 1 if len(calls) == 1 else 0, "", "")
+
+    assert start_lane(
+        lane,
+        backend="opencode",
+        model="opencode/x-preview-f-free",
+        effort="high",
+        runner=runner,
+        self_test=False,
+    )
+    new_session = next(command for command in calls if "new-session" in command)
+    assert new_session[-3:] == ["opencode", "--model", "opencode/x-preview-f-free"]
+    assert f"XDG_CONFIG_HOME={lane.config_dir / 'xdg'}" in new_session
+    assert f"XDG_DATA_HOME={lane.state_dir / 'xdg-data'}" in new_session
+    assert f"XDG_STATE_HOME={lane.state_dir / 'xdg-state'}" in new_session
+    receipt = json.loads((lane.state_dir / "lane-launch.json").read_text())
+    assert receipt["backend"] == "opencode"
+    assert receipt["model"] == "opencode/x-preview-f-free"
+
+
 def test_same_account_launch_does_not_require_runuser(tmp_path, monkeypatch):
     import yaml
 

@@ -157,8 +157,8 @@ capabilities:
 
   - name: lane-anchor
     kind: tool
-    purpose: Launch one ingestion-gated interactive tmux lane on Tophand.
-    when_to_use: Run for a declared lane after its complete goal record exists and a backend/model is selected.
+    purpose: Launch one ingestion-gated interactive tmux lane on Tophand with an approved backend and model.
+    when_to_use: Run for a declared lane after its complete goal record exists and a backend/model is selected. Supported backends are Claude, Codex, and OpenCode. Provider routing belongs to oss-step task metadata; it may select OpenRouter through Crush, OpenCode free, or authenticated OpenCode Zen.
     authority:
       level: act
       grants:

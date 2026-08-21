@@ -93,6 +93,15 @@ def test_a_codex_lane_at_backend_default_effort_still_gets_full_access() -> None
     assert CODEX_FULL_ACCESS_FLAG in _agent_command("codex", None, "none")
 
 
+def test_an_opencode_lane_accepts_an_explicit_provider_model_without_a_fake_permission_flag() -> None:
+    assert _agent_command("opencode", "opencode/x-preview-f-free", "high") == [
+        "opencode",
+        "--model",
+        "opencode/x-preview-f-free",
+    ]
+    _require_full_permissions("opencode", _agent_command("opencode", "opencode/x-preview-f-free", "high"))
+
+
 @pytest.mark.parametrize("backend", ["claude", "codex"])
 def test_a_command_without_the_flag_is_refused_before_anything_is_created(backend: str) -> None:
     """The cheap half of the self-test, which costs no model call."""
@@ -261,6 +270,20 @@ def test_a_codex_lane_reports_that_its_classes_were_not_exercised(tmp_path: Path
     assert not report.live
     assert report.unprobed
     assert report.passed
+
+
+def test_an_opencode_lane_reports_provider_owned_permission_policy(tmp_path: Path) -> None:
+    report = run_self_test(
+        backend="opencode",
+        agent_command=_agent_command("opencode", "opencode/x-preview-f-free", "high"),
+        workdir=tmp_path,
+        ssh_target="temp-twinridge",
+        as_lane=_as_lane,
+        runner=lambda command: pytest.fail("an OpenCode lane must not spend a live probe"),
+    )
+    assert not report.live
+    assert report.passed
+    assert "OpenCode" in report.detail
 
 
 # --- what the launcher does with the verdict -----------------------------------

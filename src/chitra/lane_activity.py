@@ -20,7 +20,7 @@ from chitra._fsio import write_json_atomic
 from chitra.state_paths import state_dir
 
 SCHEMA = "chitra.lane-activity.v1"
-LaneBackend = Literal["claude", "codex", "unknown"]
+LaneBackend = Literal["claude", "codex", "opencode", "unknown"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,8 +58,8 @@ class LaneActivity:
         if not isinstance(attached, bool):
             raise ValueError("lane activity attached must be a boolean")
         backend = payload.get("backend", "unknown")
-        if backend not in ("claude", "codex", "unknown"):
-            raise ValueError("lane activity backend must be claude, codex, or unknown")
+        if backend not in ("claude", "codex", "opencode", "unknown"):
+            raise ValueError("lane activity backend must be claude, codex, opencode, or unknown")
         return cls(**strings, attached=attached, backend=cast(LaneBackend, backend))
 
 

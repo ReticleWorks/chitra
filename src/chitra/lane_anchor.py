@@ -35,7 +35,7 @@ SANCTIONED_HOSTS = frozenset({"tophand", "trinity"})
 # still being recorded.
 TRANSCRIPT_NAME = "tmux-transcript.log"
 CLAUDE_MODELS = ("sonnet", "opus")
-BACKENDS = ("claude", "codex")
+BACKENDS = ("claude", "codex", "opencode")
 CLAUDE_EFFORTS = ("low", "medium", "high", "max")
 CODEX_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 LANE_ID_ENV_VAR = "CHITRA_LANE_ID"
@@ -139,7 +139,26 @@ def _agent_command(backend: str, model: str | None, effort: str | None) -> list[
             command.extend(["--config", f'model_reasoning_effort="{effort}"'])
         command.append(CODEX_FULL_ACCESS_FLAG)
         return command
+    if backend == "opencode":
+        # OpenCode owns provider and tool-permission behavior in its own
+        # config.  Chitra supplies only the explicit model selector and keeps
+        # the lane's XDG roots isolated below.
+        command = ["opencode"]
+        if model:
+            command.extend(["--model", model])
+        return command
     raise LaneLaunchRefused(f"lane launch refused: unsupported backend {backend!r}")
+
+
+def _backend_environment(lane: LaneSpec, backend: str) -> tuple[str, ...]:
+    """Return per-backend state roots without placing secrets in argv."""
+    if backend != "opencode":
+        return ()
+    return (
+        f"XDG_CONFIG_HOME={lane.config_dir / 'xdg'}",
+        f"XDG_DATA_HOME={lane.state_dir / 'xdg-data'}",
+        f"XDG_STATE_HOME={lane.state_dir / 'xdg-state'}",
+    )
 
 
 def _require_full_permissions(backend: str, agent_command: Sequence[str]) -> None:
@@ -366,7 +385,11 @@ def start_lane(
         f"{PANE_TARGET_ENV_VAR}={lane.tmux_session}:0.0",
         f"{SOCKET_PATH_ENV_VAR}={control_socket}",
     )
-    pane_environment = (*identity_environment, f"{PYTHONPATH_ENV_VAR}={_pane_pythonpath()}")
+    pane_environment = (
+        *identity_environment,
+        *_backend_environment(lane, backend),
+        f"{PYTHONPATH_ENV_VAR}={_pane_pythonpath()}",
+    )
     tmux_environment = tuple(
         argument
         for assignment in pane_environment
@@ -386,6 +409,7 @@ def start_lane(
             str(lane.workdir),
             *supervised_command,
         ),
+        extra_environment=_backend_environment(lane, backend),
     )
     result = runner(command)
     if result.returncode != 0:
@@ -438,7 +462,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lane", required=True, dest="identifier")
     parser.add_argument("--host", default=SANCTIONED_HOST)
     parser.add_argument("--backend", choices=BACKENDS, default="claude")
-    parser.add_argument("--model", default="sonnet")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="model selector; Claude defaults to sonnet when omitted",
+    )
     parser.add_argument("--effort", default="high")
     parser.add_argument("--socket-path", type=Path, default=None)
     # Which host the SSH probe reaches is a site fact, not a property of this
@@ -469,10 +497,11 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"lane is declared disabled: {lane.identifier}")
     if args.action == "start":
         try:
+            model = args.model if args.model is not None else ("sonnet" if args.backend == "claude" else None)
             start_lane(
                 lane,
                 backend=args.backend,
-                model=args.model,
+                model=model,
                 effort=args.effort,
                 host=args.host,
                 socket_path=args.socket_path,

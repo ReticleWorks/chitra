@@ -91,10 +91,17 @@ the `chitra@.service` session-anchor template. Build it with
 
 The package daemons read `/etc/chitra/lanes.yaml`. Each declaration supplies
 the lane identity, account, roots, tmux socket and credential bindings. The
-declaration has no model field. `chitra-lane-session` selects Claude Sonnet,
-Claude Opus, or a Codex model at launch and refuses unless the Tophand lane has
-a passing goal-ingestion record and no active usage pause. See
+declaration has no model field. `chitra-lane-anchor` selects the backend and
+model at launch. It supports Claude, Codex, and OpenCode models such as
+`opencode/x-preview-f-free`. It refuses unless the Tophand lane has a passing
+goal-ingestion record and no active usage pause. See
 [`docs/governed-tmux-lanes.md`](docs/governed-tmux-lanes.md).
+
+Provider routing remains upstream of Chitra. `oss-step` task metadata selects
+OpenRouter through Crush, the anonymous OpenCode free route, or authenticated
+OpenCode Zen. Chitra receives only the allowlisted executable backend and
+passes one provider/model value as one argument. It never accepts a free-form
+shell command or stores a provider secret in the lane manifest.
 
 Watchd also owns a mode-`0600`, newline-delimited JSON socket at
 `/run/chitra/chitra.sock`. Supervised agents receive their lane, session,
