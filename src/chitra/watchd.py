@@ -78,7 +78,7 @@ from chitra.reasoning import Oracle, PrinciplesIndex
 from chitra.socket_api import ApiRuntime, ControlServer, default_socket_path
 from chitra.state_paths import state_dir as default_state_dir
 from chitra.systemd_notify import notify_ready, notify_watchdog
-from chitra.validation_receipts import record_enrolled_validator_runs
+from chitra.validation_receipts import record_enrolled_validator_runs, verified_disk_results
 
 logger = structlog.get_logger(__name__)
 
@@ -809,7 +809,7 @@ class Watchd:
             run_proofs = record_enrolled_validator_runs(root, session_ref, goal.enrolled_done_when_items)
             if run_proofs:
                 completion_evidence = completion_evidence + run_proofs
-                verified_results = {proof.receipt_name or "": proof.validator_result or "" for proof in run_proofs}
+                verified_results = verified_disk_results(root, session_ref, goal.enrolled_done_when_items)
         enrolled_todos = [
             TodoItem(
                 id=item.id,

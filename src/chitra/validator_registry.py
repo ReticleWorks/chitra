@@ -19,7 +19,7 @@ from chitra.state_paths import state_dir
 
 VALIDATORS_ENV_VAR = "CHITRA_VALIDATORS_FILE"
 DEFAULT_VALIDATOR_TIMEOUT_S = 120.0
-_UNRUNNABLE_EXIT_CODE = 125
+UNRUNNABLE_EXIT_CODE = 125
 
 
 class ValidatorRegistryError(ValueError):
@@ -81,8 +81,8 @@ def run_registered_validator(entry: RegisteredValidator) -> tuple[int, str]:
             timeout=entry.timeout_s,
         )
     except subprocess.TimeoutExpired:
-        return _UNRUNNABLE_EXIT_CODE, f"registered validator timed out after {entry.timeout_s}s"
+        return UNRUNNABLE_EXIT_CODE, f"registered validator timed out after {entry.timeout_s}s"
     except OSError as exc:
-        return _UNRUNNABLE_EXIT_CODE, f"registered validator could not execute: {exc}"
+        return UNRUNNABLE_EXIT_CODE, f"registered validator could not execute: {exc}"
     output = "\n".join(part for part in (completed.stdout, completed.stderr) if part.strip())
     return completed.returncode, output

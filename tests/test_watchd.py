@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import threading
@@ -172,12 +173,15 @@ def test_watchd_semantic_idle_periods_land_twice_in_triaged_queue(tmp_path: Path
         stats_file=tmp_path / "stats.json",
         alert_state_file=tmp_path / "alerts.json",
     )
-    assert run_once(
-        tmp_path / "events.log",
-        state_file=tmp_path / "triaged-state.json",
-        triage_log=tmp_path / "triaged.log",
-        receiving_outputs=outputs,
-    ) == 3
+    assert (
+        run_once(
+            tmp_path / "events.log",
+            state_file=tmp_path / "triaged-state.json",
+            triage_log=tmp_path / "triaged.log",
+            receiving_outputs=outputs,
+        )
+        == 3
+    )
     assert [line.split("\t")[1] for line in outputs.queue_file.read_text(encoding="utf-8").splitlines()] == [
         "INFO",
         "INFO",
@@ -1072,9 +1076,7 @@ def test_resolve_config_rejects_non_positive_reviewer_count(tmp_path: Path, revi
         resolve_config(state_dir=tmp_path, reviewer_count=reviewer_count)
 
 
-def test_claimed_pass_with_failing_registered_validator_stays_completion_disputed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_claimed_pass_with_failing_registered_validator_stays_completion_disputed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """P4: the lane's CHITRA-COMPLETION result is ignored; Chitra runs the
     registered validator itself, stores its exit code, and a failing stored
     result keeps the completion claim disputed."""
@@ -1156,6 +1158,108 @@ It reviews every finished lane turn before any done state is trusted.
     assert stored.status == "completion-disputed"
     receipt = json.loads((tmp_path / "validation-receipts" / "failing-check.json").read_text(encoding="utf-8"))
     assert receipt["result"]["status"] == "FAIL"
+    review = json.loads((tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8"))
+    assert review["condition"] == "completion_claim"
+    assert review["completion_verdict"] == "COMPLETION_DISPUTE"
+
+
+@pytest.mark.parametrize("mode", ["forged_pass", "missing"])
+def test_tampered_disk_receipt_cannot_produce_a_clean_completion_audit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    """P4: the turn-end gate reads the hash-bound disk receipt, not the
+    runner's in-memory result; a missing or falsified receipt stays dirty."""
+    import sys
+
+    import chitra.watchd as watchd_module
+    from chitra.validator_registry import VALIDATORS_ENV_VAR
+
+    registry = tmp_path / "validators.json"
+    registry.write_text(json.dumps({"flaky-check": {"argv": [sys.executable, "-c", "pass"]}}), encoding="utf-8")
+    monkeypatch.setenv(VALIDATORS_ENV_VAR, str(registry))
+
+    goal = upsert_goal(
+        tmp_path,
+        GoalRecord(
+            session_ref="localhost:fleet:0.0",
+            intent="Deliver the requested gate while preserving every explicit operator boundary.",
+            goal="Build and verify the requested forced completion review.",
+            done_when="The live completion probe passes with cited evidence.",
+            scope="WS1 source tests and documentation only.",
+            source="task-file:/tmp/ws1.md",
+            status="working",
+            **enrollment_fields(
+                "The live completion probe passes with cited evidence.",
+                validator="flaky-check",
+                required_receipt="tampered-check",
+            ),
+        ),
+    )
+    assert get_goal(tmp_path, goal.session_ref) is not None
+
+    proof_line = "CHITRA-COMPLETION: " + json.dumps(
+        {
+            "kind": "live_verify",
+            "done_when_item_id": "done-1",
+            "receipt_name": "tampered-check",
+            "validator": "flaky-check",
+            "validator_result": "pass",
+            "citation": "live health probe status=200 with 24 requests; /tmp/live-review.log",
+        },
+        separators=(",", ":"),
+    )
+    capture = f"""The forced completion review was completed and deployed at SHA abc1234.
+It reviews every finished lane turn before any done state is trusted.
+{proof_line}
+❯
+"""
+    captures = iter(["working on the implementation\nesc to interrupt\n❯\n", capture])
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures, capture))
+        raise AssertionError(f"unexpected command: {command}")
+
+    original_record = watchd_module.record_enrolled_validator_runs
+    receipt_file = tmp_path / "validation-receipts" / "tampered-check.json"
+
+    def record_then_damage(root, session_ref, items):
+        proofs = original_record(root, session_ref, items)
+        if mode == "forged_pass":
+            forged = json.loads(receipt_file.read_text(encoding="utf-8"))
+            forged["target"]["artifact"]["sha256"] = "0" * 64
+            unsigned = dict(forged)
+            unsigned["integrity"] = {k: v for k, v in forged["integrity"].items() if k != "digest"}
+            canonical = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            forged["integrity"]["digest"] = hashlib.sha256(canonical).hexdigest()
+            receipt_file.write_text(json.dumps(forged), encoding="utf-8")
+        else:
+            receipt_file.unlink()
+        return proofs
+
+    monkeypatch.setattr(watchd_module, "record_enrolled_validator_runs", record_then_damage)
+
+    watcher = Watchd(
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"),
+        runner=runner,
+        reviewer=_AcceptingReviewer(),
+    )
+    try:
+        watcher.poll_once()
+        watcher.poll_once()
+        for _ in range(50):
+            stored = get_goal(tmp_path, goal.session_ref)
+            assert stored is not None
+            if stored.status in {"completion-disputed", "done-pending-close"}:
+                break
+            threading.Event().wait(0.01)
+            watcher.poll_once()
+    finally:
+        watcher.shutdown()
+
+    stored = get_goal(tmp_path, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "completion-disputed"
     review = json.loads((tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8"))
     assert review["condition"] == "completion_claim"
     assert review["completion_verdict"] == "COMPLETION_DISPUTE"

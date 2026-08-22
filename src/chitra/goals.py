@@ -24,6 +24,7 @@ from chitra.completion_gate import CompletionEvidence, require_completion_receip
 from chitra.plain_english import require_plain_english
 from chitra.state_paths import state_dir
 from chitra.validation_receipts import ReceiptError, require_verified_completion_receipts
+from chitra.validation_receipts import receipt_name as safe_receipt_name
 from chitra.validator_registry import load_validators
 
 logger = structlog.get_logger(__name__)
@@ -312,6 +313,7 @@ def validate_enrollment_contract(rec: GoalRecord, *, root: Path | None = None) -
     if not rec.enrolled_done_when_items:
         issues.append("enrolled_done_when_items must contain at least one item")
     seen_ids: set[str] = set()
+    seen_receipts: set[str] = set()
     for item in rec.enrolled_done_when_items:
         if not item.id.strip():
             issues.append("enrolled done item id must be non-empty")
@@ -324,6 +326,17 @@ def validate_enrollment_contract(rec: GoalRecord, *, root: Path | None = None) -
             issues.append(f"enrolled done item {item.id!r} validator must be non-empty")
         if not item.required_receipt.strip():
             issues.append(f"enrolled done item {item.id!r} required_receipt must be non-empty")
+        elif item.required_receipt in seen_receipts:
+            issues.append(
+                f"enrolled done item {item.id!r} required receipt {item.required_receipt!r} is duplicated; "
+                "one receipt name cannot stand in for two independent validator results"
+            )
+        else:
+            try:
+                safe_receipt_name(item.required_receipt)
+            except ReceiptError:
+                issues.append(f"enrolled done item {item.id!r} required receipt {item.required_receipt!r} must be a path-safe stable name")
+        seen_receipts.add(item.required_receipt)
         if registered_validators is not None and item.validator not in registered_validators:
             issues.append(f"enrolled done item {item.id!r} validator not registered: {item.validator!r}")
     rendered = render_done_when_items(rec.enrolled_done_when_items)

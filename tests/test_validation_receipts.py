@@ -313,15 +313,141 @@ def test_record_registered_run_stores_a_fail_receipt_from_exit_one(tmp_path: Pat
     assert "boom" in output_log
 
 
-def test_record_enrolled_validator_runs_skips_unregistered_validators(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_record_enrolled_validator_runs_fails_closed_for_unregistered_validators(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
     from chitra.validation_receipts import record_enrolled_validator_runs
 
-    _write_registry(tmp_path, {}, monkeypatch)
+    _write_registry(
+        tmp_path,
+        {"lane-reports-done": {"argv": [sys.executable, "-c", "pass"]}},
+        monkeypatch,
+    )
     items = [_failing_item("lane-reports-done", "claimed-receipt"), _failing_item("never-registered", "other-receipt")]
 
     proofs = record_enrolled_validator_runs(tmp_path, "host:lane:0.0", items)
 
-    assert proofs == ()
-    assert not (tmp_path / "validation-receipts").exists()
+    assert len(proofs) == 2
+    by_receipt = {proof.receipt_name: proof.validator_result for proof in proofs}
+    assert by_receipt == {"claimed-receipt": "pass", "other-receipt": "fail"}
+    stored = json.loads(receipt_path(tmp_path, "host:lane:0.0", "other-receipt").read_text(encoding="utf-8"))
+    assert stored["result"]["status"] == "FAIL"
+    assert stored["result"]["validator_acceptance"] is False
+    report = json.loads((tmp_path / "validation-receipts" / "other-receipt.report.json").read_text(encoding="utf-8"))
+    assert report["exit_code"] == 125
+
+
+def test_duplicate_required_receipt_names_are_rejected_at_enrollment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    from _goal_fixtures import VALID_INTERVIEW_RECEIPT
+
+    from chitra.goals import GoalRecord, upsert_goal
+    from chitra.validator_registry import VALIDATORS_ENV_VAR
+
+    registry = tmp_path / "validators.json"
+    registry.write_text(json.dumps({"stub": {"argv": [sys.executable, "-c", "pass"]}}), encoding="utf-8")
+    monkeypatch.setenv(VALIDATORS_ENV_VAR, str(registry))
+
+    done_when = "The shared receipt cannot collapse two independent validator results."
+    record = GoalRecord(
+        session_ref="host:duplicate-lane:0.0",
+        goal="Enroll two done items whose receipts stay independent and exact.",
+        done_when=done_when,
+        source="task-file:/tmp/duplicate.md",
+        status="working",
+        intent="Keep every enrolled validator result separately attributable.",
+        scope="Duplicate receipt-name enrollment rejection only.",
+        interview_receipt=VALID_INTERVIEW_RECEIPT,
+        enrolled_done_when_items=(
+            EnrolledDoneWhenItem(id="done-1", text=done_when, validator="stub", required_receipt="same"),
+            EnrolledDoneWhenItem(id="done-2", text=done_when, validator="stub", required_receipt="same"),
+        ),
+    )
+
+    with pytest.raises(GoalValidationError, match=r"required receipt 'same' is duplicated"):
+        upsert_goal(tmp_path, record)
+    assert not (tmp_path / "goals.json").exists()
+
+
+def test_multi_item_runs_with_distinct_receipts_stay_independent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    from chitra.validation_receipts import record_enrolled_validator_runs
+
+    _write_registry(
+        tmp_path,
+        {
+            "pass-check": {"argv": [sys.executable, "-c", "pass"]},
+            "fail-check": {"argv": [sys.executable, "-c", "import sys; sys.exit(1)"]},
+        },
+        monkeypatch,
+    )
+    items = [
+        _failing_item("pass-check", "good-receipt"),
+        EnrolledDoneWhenItem(id="done-2", text="The check fails.", validator="fail-check", required_receipt="bad-receipt"),
+    ]
+
+    proofs = record_enrolled_validator_runs(tmp_path, "host:lane:0.0", items)
+
+    by_item = {proof.done_when_item_id: proof.validator_result for proof in proofs}
+    assert by_item == {"done-1": "pass", "done-2": "fail"}
+    assert verify_receipt(tmp_path, "host:lane:0.0", "good-receipt").completion_eligible is True
+    bad_verification = verify_receipt(tmp_path, "host:lane:0.0", "bad-receipt")
+    assert bad_verification.status == "FAIL"
+    assert bad_verification.completion_eligible is False
+
+
+def test_registered_run_verifies_against_the_instance_state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    from chitra.validation_receipts import record_enrolled_validator_runs
+    from chitra.validator_registry import VALIDATORS_ENV_VAR
+
+    registry = tmp_path / "validators.json"
+    registry.write_text(json.dumps({"stub-check": {"argv": [sys.executable, "-c", "pass"]}}), encoding="utf-8")
+    monkeypatch.delenv(VALIDATORS_ENV_VAR, raising=False)
+
+    proofs = record_enrolled_validator_runs(tmp_path, "host:lane:0.0", [_failing_item("stub-check", "rooted-receipt")])
+
+    assert len(proofs) == 1
+    verification = verify_receipt(tmp_path, "host:lane:0.0", "rooted-receipt")
+    assert verification.verified is True
+    assert verification.completion_eligible is True
+
+
+def test_verify_fails_closed_with_exit_125_for_an_unmapped_validator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    from chitra.validation_receipts import record_enrolled_validator_runs
+    from chitra.validator_registry import VALIDATORS_ENV_VAR
+
+    registry = tmp_path / "validators.json"
+    registry.write_text(json.dumps({"vanishing-check": {"argv": [sys.executable, "-c", "pass"]}}), encoding="utf-8")
+    monkeypatch.setenv(VALIDATORS_ENV_VAR, str(registry))
+    item = _failing_item("vanishing-check", "orphan-receipt")
+    record_enrolled_validator_runs(tmp_path, "host:lane:0.0", [item])
+
+    monkeypatch.setenv(VALIDATORS_ENV_VAR, str(tmp_path / "empty-registry.json"))
+    (tmp_path / "empty-registry.json").write_text("{}", encoding="utf-8")
+
+    verification = verify_receipt(tmp_path, "host:lane:0.0", "orphan-receipt")
+
+    assert verification.verified is False
+    assert any("125" in issue for issue in verification.issues)
+
+
+def test_traversal_receipt_name_never_writes_outside_the_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    from chitra.validation_receipts import record_registered_run
+    from chitra.validator_registry import RegisteredValidator
+
+    _write_registry(tmp_path, {"stub-check": {"argv": [sys.executable, "-c", "pass"]}}, monkeypatch)
+    item = _failing_item("stub-check", "../escaped")
+
+    with pytest.raises(ReceiptError, match="path-safe"):
+        record_registered_run(tmp_path, "host:lane:0.0", item, RegisteredValidator(argv=[sys.executable, "-c", "pass"]))
+    assert not (tmp_path.parent / "escaped.output.log").exists()
+    assert not (tmp_path.parent / "escaped.report.json").exists()
+    assert not (tmp_path.parent / "escaped.json").exists()
