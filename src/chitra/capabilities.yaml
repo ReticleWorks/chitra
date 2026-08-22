@@ -156,6 +156,26 @@ capabilities:
         params: []
         mutates: true
 
+  - name: topology-conversion
+    kind: tool
+    purpose: Build read-only topology conversion, handoff, shadow, and rollback receipts.
+    when_to_use: Use before a governed migration to bind legacy state, dispatch queue replay, lifecycle evidence, and disposable rollback proofs.
+    authority:
+      level: observe
+      grants:
+        - Read legacy state roots or W10 snapshots and write caller-selected receipt artifacts.
+        - Verify disposable rollback snapshots before restoring them in isolated state roots.
+      excludes:
+        - Dispatch messages, manage services, relaunch clients, apply packages, or merge pull requests.
+        - Treat W10 metadata as converted per-record goal evidence.
+    default_enabled: true
+    commands:
+      - name: chitra-convert
+        description: Build topology conversion and migration proof receipts.
+        argv: [chitra-convert]
+        params: []
+        mutates: true
+
   - name: convo
     kind: tool
     purpose: Record structured operator and lane conversation facts.
