@@ -28,6 +28,9 @@ from chitra.reasoning import (
 
 _COMPLETION_FINDINGS: frozenset[FindingCode] = frozenset({"hedged_completion", "unsupported_completion"})
 _DRIFT_FINDINGS: frozenset[FindingCode] = frozenset({"goal_drift", "smuggled_redirect"})
+_PERSISTENCE_FINDINGS: frozenset[FindingCode] = frozenset(
+    {"false_blocker", "deferred_to_operator", "idle_no_action", "unverified_claim"}
+)
 _REVIEW_REJECTION_GATE = "watched-session review rejected the lane behavior"
 
 
@@ -50,6 +53,32 @@ def _question_and_judgment(
 ) -> tuple[DecisionQuestion, GoalJudgment]:
     finding_codes = {finding.code for finding in review_signal.findings}
     evidence_refs = [finding.citation for finding in review_signal.findings]
+    # Persistence findings outrank drift: the stall corrective already restates
+    # goal and scope, so on mixed findings the sharper act-now order wins.
+    if finding_codes & _PERSISTENCE_FINDINGS:
+        answer = (
+            "The completed turn did not pass review because it stalled: "
+            "it declared a false blocker, deferred agent-doable work to the operator, took no action, "
+            "or asserted a state without proof. Take the in-authority next action now. "
+            "An item goes to the operator only for an access right you lack, consent for a step you cannot undo, "
+            "or a decision only the operator can make; otherwise act, and record what you tried with its observed result. "
+            "Cite the artifact check for any state you assert. "
+            f"Continue against the frozen goal: {goal.goal}. Stay within scope: {goal.scope}."
+        )
+        return (
+            DecisionQuestion(
+                text="Should the stalled lane be directed to take its in-authority next action against the frozen goal?",
+                answer_category="nudge",
+                evidence_refs=evidence_refs,
+                session_review=review_signal,
+            ),
+            GoalJudgment(
+                determines_answer=True,
+                answer=answer,
+                goal_fields=["goal", "scope"],
+                inference="The frozen goal and scope directly determine that the lane must act rather than stall.",
+            ),
+        )
     if finding_codes & _DRIFT_FINDINGS:
         answer = (
             "The completed turn did not pass review because it moved away from the frozen goal. "

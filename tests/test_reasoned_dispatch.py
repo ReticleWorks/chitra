@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
 from _goal_fixtures import enrollment_fields
 
 from chitra.goal_enforcement import ReviewFinding, SessionReviewSignal, freeze_goal
@@ -88,6 +89,65 @@ def test_rejected_goal_drift_builds_reasoned_nudge() -> None:
     assert order.message_kind == "reasoned_nudge"
     assert order.decision_attestation is not None
     assert order.decision_attestation.goal_fields == ("goal", "scope")
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["false_blocker", "deferred_to_operator", "idle_no_action", "unverified_claim"],
+)
+def test_rejected_persistence_finding_builds_dispatch(code: str) -> None:
+    goal = _goal()
+    review = _review(
+        goal,
+        verdict="reject",
+        finding=ReviewFinding(
+            code=code,
+            detail="The turn stalled instead of taking its in-authority next action.",
+            citation="I am blocked and handing this back to the operator.",
+        ),
+    )
+
+    order = build_reasoned_dispatch(goal, review, principles=PrinciplesIndex())
+
+    assert order is not None
+    assert order.message_kind == "reasoned_nudge"
+    assert "in-authority" in order.nudge
+    assert order.decision_attestation is not None
+    assert order.decision_attestation.outcome == "answer"
+    assert order.decision_attestation.source == "goal"
+    assert order.decision_attestation.goal_fields == ("goal", "scope")
+
+
+def test_mixed_drift_and_persistence_findings_take_persistence_branch() -> None:
+    goal = _goal()
+    review = SessionReviewSignal.create(
+        session_ref=goal.session_ref,
+        goal_contract_id=freeze_goal(goal).contract_id,
+        behavior_sha256="1" * 64,
+        verdict="reject",
+        reviewer_ids=("reviewer-1", "reviewer-2"),
+        findings=(
+            ReviewFinding(
+                code="false_blocker",
+                detail="The turn declared a false blocker.",
+                citation="I cannot proceed with any of this.",
+            ),
+            ReviewFinding(
+                code="goal_drift",
+                detail="The lane moved to work outside the frozen goal.",
+                citation="I also redesigned an unrelated subsystem.",
+            ),
+        ),
+        recorded_at="2026-07-14T12:00:00+00:00",
+    )
+
+    order = build_reasoned_dispatch(goal, review, principles=PrinciplesIndex())
+
+    assert order is not None
+    assert order.message_kind == "reasoned_nudge"
+    assert order.decision_attestation is not None
+    assert "stalled" in order.decision_attestation.approved_text
+    assert "Stay within scope" in order.decision_attestation.approved_text
 
 
 def test_accepted_review_builds_no_dispatch() -> None:
