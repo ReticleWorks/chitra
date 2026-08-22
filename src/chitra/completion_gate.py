@@ -23,9 +23,11 @@ from chitra.lexicon import (
     COMPLETION_EVIDENCE_PR_RE,
     COMPLETION_EVIDENCE_SHA_RE,
 )
-from chitra.policy_config import GatePolicy
+from chitra.policy_config import INCIDENT_COMPLETION_DEFERRAL_PHRASES, GatePolicy
 
-_DEFERRAL_PHRASES = COMPLETION_DEFERRAL_PHRASES
+# Fallback for callers that scan without a GatePolicy: the shipped default
+# vocabulary, including the incident phrases that live in policy config.
+_DEFERRAL_PHRASES = COMPLETION_DEFERRAL_PHRASES + INCIDENT_COMPLETION_DEFERRAL_PHRASES
 
 
 class CompletionClaimEvent(enum.StrEnum):

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import re
 
+# Incident scar tissue lives in chitra.policy_config (see
+# INCIDENT_COMPLETION_DEFERRAL_PHRASES), not here: these are cue-derived,
+# reviewer-judged phrases, and the lexicon stays free of one-off findings.
 COMPLETION_DEFERRAL_PHRASES: tuple[str, ...] = (
     "you'll need to",
     "you will need to",
@@ -22,11 +25,8 @@ COMPLETION_DEFERRAL_PHRASES: tuple[str, ...] = (
     "in a future pr",
     "future work",
     "conditionally healthy",
-    "correctly blocked",
     "parse-only",
     "not publication-ready",
-    "repaired and covered by tests",
-    "CI evidence",
 )
 
 COMPLETION_CLAIM_RE = re.compile(

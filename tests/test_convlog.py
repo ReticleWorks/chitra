@@ -246,7 +246,7 @@ def test_stored_records_load_leniently_under_tightened_rules(tmp_path: Path) -> 
     assert threads[0].latest_brief.exhaustion.residual_blocker == "Needs key"
 
 
-def test_read_stored_brief_skips_write_path_gates() -> None:
+def test_decisionless_brief_with_operator_directive_passes_validation() -> None:
     payload = _payload(
         category="milestone", decision=None, recommendation="Please run the migration by hand tonight.", options=[], exhaustion=None
     )
@@ -254,8 +254,8 @@ def test_read_stored_brief_skips_write_path_gates() -> None:
     loaded = read_stored_brief(dict(payload))
 
     assert loaded.decision is None
-    with pytest.raises(BriefValidationError, match="operator-directed ask"):
-        validate_brief(dict(payload))
+    validated = validate_brief(dict(payload))
+    assert validated.decision is None
 
 
 @pytest.mark.parametrize(
@@ -264,29 +264,23 @@ def test_read_stored_brief_skips_write_path_gates() -> None:
         ("recommendation", "Please install the patched build on host-b tonight."),
         ("stage", "The vendor amendment is out for signature; you must sign it today."),
         ("progress", "The migration is staged; operator needs to approve the window."),
+        ("progress", 'The lane wrote "can you check the token" and went idle.'),
     ],
 )
-def test_smuggled_ask_in_any_decisionless_field_is_rejected(field: str, text: str) -> None:
+def test_decisionless_brief_quoting_or_directing_the_operator_passes(field: str, text: str) -> None:
+    """Ask detection is the reviewer's prose judgment, not a marker scan: an FYI
+    brief that quotes a lane's ask, or states where an operator action sits,
+    validates without a keyword gate."""
+
     kwargs: dict[str, object] = {"category": "milestone", "decision": None, "recommendation": "", "options": [], "exhaustion": None}
     kwargs[field] = text
-    with pytest.raises(BriefValidationError, match="operator-directed ask") as excinfo:
-        _brief(**kwargs)
-    assert field in str(excinfo.value)
-
-
-def test_clean_decisionless_brief_passes_the_ask_scan() -> None:
-    brief = _brief(
-        category="incident",
-        decision=None,
-        recommendation="The retry queue drained on its own; no action is pending.",
-        options=[],
-        exhaustion=None,
-    )
+    brief = _brief(**kwargs)
 
     assert brief.decision is None
+    assert getattr(brief, field) == text
 
 
-def test_smuggled_ask_scan_never_reads_source_quote() -> None:
+def test_source_quote_containing_an_ask_passes_validation() -> None:
     brief = _brief(
         category="milestone",
         decision=None,
@@ -297,12 +291,6 @@ def test_smuggled_ask_scan_never_reads_source_quote() -> None:
     )
 
     assert brief.source_quote == ["Can you confirm the deploy window?"]
-
-
-def test_smuggled_ask_scan_skips_decision_bearing_briefs() -> None:
-    brief = _brief(progress="Waiting on the vendor contract; you must sign the amendment today.")
-
-    assert brief.decision is not None
 
 
 def test_valid_attempts_exhausted_brief_passes_and_renders_tried() -> None:
@@ -434,35 +422,35 @@ def test_newline_in_residual_blocker_is_rejected() -> None:
         _brief(exhaustion={"reason": "attempts_exhausted", "attempts": _payload()["exhaustion"]["attempts"], "residual_blocker": blocker})  # type: ignore[arg-type]
 
 
-def test_exhaustion_fields_are_evidence_and_skip_the_jargon_filter() -> None:
+def test_exhaustion_evidence_is_not_jargon_filtered() -> None:
+    """Attempts and the residual blocker are evidence records, not operator
+    prose: charter vocabulary ("nudge"), terse result lines, and unpunctuated
+    fragments all validate without a readability gate."""
     attempts = [
         _attempt(
-            "Nudged the lane about the held deploy lock",
-            "the nudge found the lane still blocked by the lock.",
+            "Sent a follow-up nudge to the lane",
+            "no new turn in its transcript.",
             {"kind": "order", "ref": "ord-lock-nudge-1"},
         ),
-        "Ran the reprovision command by hand again -> blocked by the held lock",
+        _attempt(
+            "Ran the reprovision command by hand again",
+            "blocked by the held lock",
+            {"kind": "order", "ref": "ord-lock-reprovision-1"},
+        ),
     ]
-    payload = _payload(
+    blocker = "The held lock still blocks every retry on lane f2."
+    brief = _brief(
         exhaustion={
             "reason": "attempts_exhausted",
             "attempts": attempts,
-            "residual_blocker": "Still stuck on the same held deploy lock",
+            "residual_blocker": blocker,
         }
     )
 
-    brief = OperatorBrief.model_validate(payload)
-
-    assert [attempt.action for attempt in brief.exhaustion.attempts] == [
-        attempts[0]["action"],
-        "Ran the reprovision command by hand again",
-    ]  # type: ignore[index]
-    assert [attempt.result for attempt in brief.exhaustion.attempts] == [
-        attempts[0]["result"],
-        "blocked by the held lock",
-    ]  # type: ignore[index]
-    with pytest.raises(BriefValidationError, match="evidence handle missing"):
-        validate_brief(payload, evidence_resolver=_AcceptingResolver())
+    assert brief.exhaustion is not None
+    assert [attempt.action for attempt in brief.exhaustion.attempts] == [item["action"] for item in attempts]
+    assert [attempt.result for attempt in brief.exhaustion.attempts] == [item["result"] for item in attempts]
+    assert brief.exhaustion.residual_blocker == blocker
 
 
 def test_credential_reason_with_truthful_record_passes_without_keywords() -> None:

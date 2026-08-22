@@ -19,11 +19,22 @@ logger = structlog.get_logger(__name__)
 POLICY_CONFIG_ENV_VAR = "CHITRA_POLICY_CONFIG"
 _ALLOWED_EVIDENCE = frozenset({"deploy", "live_verify"})
 
+# One-off incident phrases kept out of the shared lexicon: they name a single
+# 2026-08 finding verbatim and belong to the configurable completion-gate
+# policy, where an operator can drop them without touching the package.
+INCIDENT_COMPLETION_DEFERRAL_PHRASES: tuple[str, ...] = (
+    "correctly blocked",
+    "repaired and covered by tests",
+    "CI evidence",
+)
+
 
 class GatePolicy(BaseModel):
     """Configurable vocabulary and evidence requirements for the completion gate."""
 
-    deferral_phrases: list[str] = Field(default_factory=lambda: list(COMPLETION_DEFERRAL_PHRASES))
+    deferral_phrases: list[str] = Field(
+        default_factory=lambda: list(COMPLETION_DEFERRAL_PHRASES) + list(INCIDENT_COMPLETION_DEFERRAL_PHRASES)
+    )
     complete_todo_statuses: list[str] = Field(default_factory=lambda: ["done"])
     required_evidence: list[str] = Field(default_factory=lambda: ["deploy", "live_verify"])
 
