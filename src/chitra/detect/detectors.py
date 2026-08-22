@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 from chitra.journal.models import CanonicalEvent, CanonicalType, ProgressClass, ProgressClassification
@@ -21,9 +22,18 @@ from chitra.validation_receipts import load_receipt_file, receipt_path, verify_r
 DETECTOR_VERSION = "chitra-detectors.v1"
 
 _DRIFT_TOOL_RE = re.compile(r"^(Edit|Write|MultiEdit|NotebookEdit)$")
+_WORK_TOOLS = frozenset({"Bash", "Shell", "Edit", "Write", "MultiEdit", "NotebookEdit"})
 _DOC_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 _CODE_SUFFIXES = frozenset({".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".c", ".cc", ".cpp", ".h", ".sh", ".rb"})
 _DOC_SUFFIXES = frozenset({".md", ".rst", ".txt", ".adoc", ".org"})
+_COMPLETION_CLAIM_RE = re.compile(
+    r"\b(done|complete(?:d)?|finished|fixed|implemented|ready|shipped|all tests pass(?:ed)?|tests (?:are )?green)\b",
+    re.IGNORECASE,
+)
+_NEGATED_COMPLETION_RE = re.compile(
+    r"\b(not done|not complete|still working|remain(?:s)? to|left to|todo|to do|pending|need(?:s)? .*run)\b",
+    re.IGNORECASE,
+)
 
 
 def _canonical_digest(value: Any) -> str:
@@ -99,15 +109,16 @@ def _result_signature(call: CanonicalEvent, result: CanonicalEvent | None) -> st
     )
 
 
-def _has_progress_between(progress_rows: Sequence[ProgressClassification], start: int, end: int) -> bool:
+def _has_progress_between(
+    events: Sequence[CanonicalEvent], progress_rows: Sequence[ProgressClassification], start: int, end: int
+) -> bool:
+    positions = {event.event_id: position for position, event in enumerate(events)}
     for row in progress_rows:
         if row.classification is not ProgressClass.PROGRESS:
             continue
         for source in row.source_event_ids:
-            if not source.isdecimal():
-                continue
-            index = int(source)
-            if start < index < end:
+            index = positions.get(source)
+            if index is not None and start < index < end:
                 return True
     return False
 
@@ -137,6 +148,26 @@ def _target_paths(input_value: object) -> tuple[str, ...]:
         elif key in {"files", "paths"} and isinstance(value, list):
             paths.extend(entry for entry in value if isinstance(entry, str))
     return tuple(paths)
+
+
+def _contained_in_worktree(path: str, *, declared_worktree: str, cwd: str | None = None) -> bool:
+    if not declared_worktree:
+        return True
+    root = Path(declared_worktree).expanduser().resolve(strict=False)
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute() and cwd:
+        candidate = Path(cwd).expanduser() / candidate
+    elif not candidate.is_absolute():
+        candidate = root / candidate
+    resolved = candidate.resolve(strict=False)
+    return resolved == root or root in resolved.parents
+
+
+def _semantic_path(path: str, *, declared_worktree: str, cwd: str | None = None) -> str:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute() and cwd:
+        candidate = Path(cwd).expanduser() / candidate
+    return str(candidate.resolve(strict=False))
 
 
 def _violated_scope_clause(text: str, clauses: Sequence[str]) -> str | None:
@@ -186,21 +217,37 @@ def detect_drift(
                 )
             )
             continue
-        if isinstance(tool_name, str) and _DRIFT_TOOL_RE.match(tool_name) and declared_worktree:
+        if isinstance(tool_name, str) and tool_name in _WORK_TOOLS and declared_worktree:
             paths = _target_paths(input_value)
             cwd = event.payload.get("cwd")
             input_cwd = input_value.get("cwd") if isinstance(input_value, dict) else None
-            outside_target = next((path for path in paths if path.startswith("/") and not path.startswith(declared_worktree)), None)
+            work_cwd = input_cwd if isinstance(input_cwd, str) else cwd if isinstance(cwd, str) else None
+            outside_target = next(
+                (
+                    path
+                    for path in paths
+                    if not _contained_in_worktree(path, declared_worktree=declared_worktree, cwd=work_cwd)
+                ),
+                None,
+            )
             outside_cwd = next(
-                (path for path in (cwd, input_cwd) if isinstance(path, str) and not path.startswith(declared_worktree)),
+                (
+                    path
+                    for path in (cwd, input_cwd)
+                    if isinstance(path, str) and not _contained_in_worktree(path, declared_worktree=declared_worktree)
+                ),
                 None,
             )
             if outside_target is not None or outside_cwd is not None:
                 outside = outside_target or outside_cwd or ""
+                outside_semantic = _semantic_path(outside, declared_worktree=declared_worktree, cwd=work_cwd)
                 findings.append(
                     Finding(
                         detector="drift",
-                        fingerprint_seed={"event_id": event.event_id, "outside": outside},
+                        fingerprint_seed={
+                            "wrong_worktree": outside_semantic,
+                            "declared_worktree": str(Path(declared_worktree).resolve(strict=False)),
+                        },
                         event_refs=(event.event_id,),
                         unmet_item=unmet,
                         expected_next_progress="resume work inside the declared worktree",
@@ -237,7 +284,7 @@ def detect_unnecessary_steps(
             continue
         prior = [entry for entry in occurrences[:-1]]
         start_position = prior[-1][0]
-        if _has_progress_between(progress_rows, start_position, position):
+        if _has_progress_between(events, progress_rows, start_position, position):
             occurrences.clear()
             occurrences.append((position, event.event_id))
             continue
@@ -289,7 +336,7 @@ def detect_excessive_testing(
         if len(streak) < threshold:
             continue
         start_position = streak[len(streak) - threshold][0]
-        if _has_progress_between(progress_rows, start_position, run[0]):
+        if _has_progress_between(events, progress_rows, start_position, run[0]):
             streak = [run]
             continue
         refs = tuple(entry[2].event_id for entry in streak[len(streak) - threshold :])
@@ -346,10 +393,19 @@ def detect_document_dithering(
     if implementation_evidence or len(doc_events) < minimum_recurrence:
         return []
     refs = tuple(event.event_id for event in doc_events[:minimum_recurrence])
+    semantic_targets = tuple(
+        sorted(
+            {
+                path.lower()
+                for event in doc_events[:minimum_recurrence]
+                for path in _target_paths(event.payload.get("input"))
+            }
+        )
+    )
     return [
         Finding(
             detector="document_dithering",
-            fingerprint_seed={"doc_event_ids": refs},
+            fingerprint_seed={"doc_targets": semantic_targets, "minimum_recurrence": minimum_recurrence},
             event_refs=refs,
             unmet_item=unmet,
             expected_next_progress=(
@@ -377,6 +433,10 @@ def detect_false_done(
     receipt_names_by_item: dict[str, str],
     receipt_roots: dict[str, object] | None = None,
     session_ref: str = "",
+    target_dirty: bool = False,
+    material_questions: Sequence[str] = (),
+    live_proof_required: bool = False,
+    live_proof_present: bool = True,
 ) -> list[Finding]:
     """Reject a completion claim that conflicts with goal state.
 
@@ -388,15 +448,63 @@ def detect_false_done(
 
     findings: list[Finding] = []
     if final_response is None:
-        return findings
+        item_id = _first_unmet_item(enrolled_items)
+        return [
+            Finding(
+                detector="false_done",
+                fingerprint_seed={"item": item_id, "reason": "exit-before-contract"},
+                event_refs=(),
+                unmet_item=item_id,
+                expected_next_progress="produce a final response that binds the completion contract to current evidence",
+                detail="session exited before a final response could bind the completion contract",
+            )
+        ]
+    final_text = _final_response_text(final_response)
+    if not _makes_completion_claim(final_text):
+        return []
     root: Path | None = None
+    root_available = False
     if receipt_roots is not None and session_ref:
         candidate = receipt_roots.get(session_ref)
         if isinstance(candidate, Path):
             root = candidate
         elif isinstance(candidate, str):
             root = Path(candidate)
+        root_available = root is not None and root.exists()
     refs: tuple[str, ...] = (final_response.event_id,)
+    if target_dirty:
+        findings.append(
+            Finding(
+                detector="false_done",
+                fingerprint_seed={"reason": "dirty-target"},
+                event_refs=refs,
+                unmet_item=_first_unmet_item(enrolled_items),
+                expected_next_progress="cleanly commit or discard target worktree changes before claiming completion",
+                detail="completion claim was made while the target worktree was dirty",
+            )
+        )
+    if material_questions:
+        findings.append(
+            Finding(
+                detector="false_done",
+                fingerprint_seed={"reason": "material-questions", "questions": tuple(material_questions)},
+                event_refs=refs,
+                unmet_item=_first_unmet_item(enrolled_items),
+                expected_next_progress="answer or carry forward material open questions before claiming completion",
+                detail="completion claim was made while material questions remained open",
+            )
+        )
+    if live_proof_required and not live_proof_present:
+        findings.append(
+            Finding(
+                detector="false_done",
+                fingerprint_seed={"reason": "absent-live-proof"},
+                event_refs=refs,
+                unmet_item=_first_unmet_item(enrolled_items),
+                expected_next_progress="produce the required live proof before claiming completion",
+                detail="completion claim was made without the required live proof",
+            )
+        )
     for item in enrolled_items:
         item_id = str(getattr(item, "id", ""))
         validator = str(getattr(item, "validator", ""))
@@ -413,7 +521,17 @@ def detect_false_done(
                 )
             )
             continue
-        if root is None:
+        if not root_available or root is None:
+            findings.append(
+                Finding(
+                    detector="false_done",
+                    fingerprint_seed={"item": item_id, "reason": "receipt-store-unavailable"},
+                    event_refs=refs,
+                    unmet_item=item_id,
+                    expected_next_progress=f"make the validation receipt store available and verify receipt {required_receipt!r}",
+                    detail=f"required receipt store/root is unavailable for session {session_ref!r}",
+                )
+            )
             continue
         try:
             verification = verify_receipt(root, session_ref, required_receipt)
@@ -443,6 +561,15 @@ def detect_false_done(
                 )
             )
     return findings
+
+
+def _final_response_text(event: CanonicalEvent) -> str:
+    value = event.payload.get("text")
+    return value if isinstance(value, str) else ""
+
+
+def _makes_completion_claim(text: str) -> bool:
+    return bool(_COMPLETION_CLAIM_RE.search(text)) and not _NEGATED_COMPLETION_RE.search(text)
 
 
 __all__ = [

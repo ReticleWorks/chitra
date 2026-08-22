@@ -20,6 +20,15 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.14.11] - 2026-08-22
+
+### Fixed
+
+- Tighten W3 detector and ladder semantics: canonical event-ID progress resets,
+  real worktree containment, claim-aware false completion, signed immediate
+  consumption boundaries, sealed RESCUE/checkpoint relaunch gating, and
+  fail-closed rescue evidence capture.
+
 ## [0.14.10] - 2026-08-22
 
 ### Added

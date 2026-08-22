@@ -36,6 +36,8 @@ class RescueBundle(BaseModel):
     session_ref: str
     captured_at: str
     transcript_ref: str
+    transcript_sha256: str
+    process_identity: dict[str, Any]
     pane_capture: str
     git_state: dict[str, Any]
     untracked_files: tuple[str, ...]
@@ -63,9 +65,19 @@ def _git(args: Sequence[str], cwd: Path) -> str:
             timeout=30,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return completed.stdout if completed.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"git {' '.join(args)} failed during RESCUE capture: {exc}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(f"git {' '.join(args)} failed during RESCUE capture: {detail}")
+    return completed.stdout
+
+
+def _sha256_file(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise RuntimeError(f"transcript hash capture failed for {path}: {exc}") from exc
 
 
 def collect_rescue_bundle(
@@ -79,10 +91,15 @@ def collect_rescue_bundle(
     contract_text: str = "",
     incidents: Sequence[IncidentRecord] = (),
     open_asks: Sequence[str] = (),
+    process_identity: dict[str, Any] | None = None,
 ) -> RescueBundle:
     """Gather the RESCUE evidence set. Read-only over the worktree."""
+    if transcript_path is None:
+        raise RuntimeError("RESCUE capture requires a transcript path")
     status = _git(["status", "--porcelain=v1"], worktree)
-    diff = _git(["diff", "HEAD"], worktree)
+    diff_staged = _git(["diff", "--cached"], worktree)
+    diff_unstaged = _git(["diff"], worktree)
+    diff_head = _git(["diff", "HEAD"], worktree)
     commits = _git(["log", "--oneline", "-10"], worktree)
     branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], worktree).strip()
     head = _git(["rev-parse", "HEAD"], worktree).strip()
@@ -104,13 +121,22 @@ def collect_rescue_bundle(
         lane=lane,
         session_ref=session_ref,
         captured_at=datetime.now(UTC).isoformat(),
-        transcript_ref=str(transcript_path) if transcript_path is not None else "",
+        transcript_ref=str(transcript_path),
+        transcript_sha256=_sha256_file(transcript_path),
+        process_identity={
+            "capture_pid": os.getpid(),
+            "capture_ppid": os.getppid(),
+            "session_ref": session_ref,
+            **(process_identity or {}),
+        },
         pane_capture=pane_capture,
         git_state={
             "branch": branch,
             "head": head,
             "status": status,
-            "diff": diff[:20000],
+            "diff_head": diff_head[:20000],
+            "diff_staged": diff_staged[:20000],
+            "diff_unstaged": diff_unstaged[:20000],
             "recent_commits": commits,
         },
         untracked_files=tuple(untracked),
@@ -174,6 +200,16 @@ def generate_relaunch_brief(bundle: RescueBundle, *, tighter_instructions: Seque
             f"- validation receipts referenced: {len(bundle.receipt_paths)}",
             f"- open asks carried forward: {len(bundle.open_asks)}",
             "",
+            "## Open asks",
+            "",
+        ]
+    )
+    if bundle.open_asks:
+        lines.extend(f"- {ask}" for ask in bundle.open_asks)
+    else:
+        lines.append("- none")
+    lines.extend(
+        [
             "## Tighter instructions",
             "",
         ]

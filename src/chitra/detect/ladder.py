@@ -11,6 +11,7 @@ or advances anything.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import os
 import re
 from collections.abc import Sequence
@@ -45,6 +46,7 @@ class ConsumptionProof(BaseModel):
 
     ledger_entry: LedgerEntry
     ledger_key_hex: str = ""
+    session_ref: str = ""
     user_event_id: str
     turn_event_id: str
 
@@ -65,6 +67,8 @@ class IncidentRecord(BaseModel):
     expected_next_progress: str
     detail: str
     consumption: ConsumptionProof | None = None
+    rescue_bundle_sha256: str = ""
+    checkpoint_ref: str = ""
 
 
 class LadderDecision(BaseModel):
@@ -165,6 +169,9 @@ class IncidentStore:
         return self._append(updated)
 
     def advance(self, *, fingerprint: str) -> IncidentRecord:
+        raise TypeError("advance requires next_order_marker")
+
+    def advance_to_next_stage(self, *, fingerprint: str, next_order_marker: str) -> IncidentRecord:
         """Move the newest consumed record for a fingerprint to its next stage."""
         records = self.load()
         target = next((record for record in reversed(records) if record.fingerprint == fingerprint), None)
@@ -175,7 +182,33 @@ class IncidentStore:
         index = LADDER_STAGES.index(target.stage)
         if index >= len(LADDER_STAGES) - 1:
             raise ValueError("incident already reached relaunch")
-        advanced = target.model_copy(update={"stage": LADDER_STAGES[index + 1], "opened_at": _utc_now(), "consumption": None})
+        advanced = target.model_copy(
+            update={
+                "stage": LADDER_STAGES[index + 1],
+                "order_marker": next_order_marker,
+                "opened_at": _utc_now(),
+                "consumption": None,
+                "rescue_bundle_sha256": "",
+                "checkpoint_ref": "",
+            }
+        )
+        return self._append(advanced)
+
+    def seal_rescue_checkpoint(
+        self, *, fingerprint: str, order_marker: str, bundle_sha256: str, checkpoint_ref: str
+    ) -> IncidentRecord:
+        if not bundle_sha256 or not checkpoint_ref:
+            raise ValueError("rescue bundle hash and checkpoint reference are required")
+        records = self.load()
+        target = next(
+            (record for record in reversed(records) if record.fingerprint == fingerprint and record.order_marker == order_marker),
+            None,
+        )
+        if target is None:
+            raise KeyError(f"no incident for fingerprint {fingerprint!r} at marker {order_marker!r}")
+        if target.stage != "rescue":
+            raise ValueError("only the rescue stage can be sealed for relaunch")
+        advanced = target.model_copy(update={"rescue_bundle_sha256": bundle_sha256, "checkpoint_ref": checkpoint_ref})
         return self._append(advanced)
 
 
@@ -220,7 +253,14 @@ class ResponseLadder:
                 record=existing,
                 reason="prior order consumption is not proven; elapsed time never advances the ladder",
             )
-        advanced = self.store.advance(fingerprint=finding.fingerprint)
+        if existing.stage == "rescue" and (not existing.rescue_bundle_sha256 or not existing.checkpoint_ref):
+            return LadderDecision(
+                action="hold",
+                stage=existing.stage,
+                record=existing,
+                reason="relaunch requires a sealed RESCUE bundle and checkpoint receipt",
+            )
+        advanced = self.store.advance_to_next_stage(fingerprint=finding.fingerprint, next_order_marker=order_marker)
         return LadderDecision(
             action="advance", stage=advanced.stage, record=advanced, reason="same fingerprint recurred after proven consumption"
         )
@@ -229,12 +269,29 @@ class ResponseLadder:
         proof = record.consumption
         if proof is None:
             return False
-        if self._ledger_key is not None and not verify_entry(proof.ledger_entry, key=self._ledger_key):
+        if self._ledger_key is None:
+            return False
+        if proof.ledger_key_hex and proof.ledger_key_hex != hashlib.sha256(self._ledger_key).hexdigest():
+            return False
+        if not verify_entry(proof.ledger_entry, key=self._ledger_key):
+            return False
+        if proof.session_ref and proof.ledger_entry.session_ref != proof.session_ref:
+            return False
+        if f":{record.lane}:" not in proof.ledger_entry.session_ref:
             return False
         events_by_id = {event.event_id: event for event in self._events}
         user_event = events_by_id.get(proof.user_event_id)
         turn_event = events_by_id.get(proof.turn_event_id)
         if user_event is None or turn_event is None:
+            return False
+        if user_event.lane != record.lane or turn_event.lane != record.lane:
+            return False
+        if user_event.native_type != "user" or user_event.normalized_type in {
+            CanonicalType.TOOL_CALL,
+            CanonicalType.TOOL_RESULT,
+            CanonicalType.TOOL_ERROR,
+            CanonicalType.FINAL_RESPONSE,
+        }:
             return False
         user_text = _payload_text(user_event)
         if record.order_marker not in user_text:
@@ -243,14 +300,37 @@ class ResponseLadder:
             return False
         if turn_event.normalized_type is not CanonicalType.FINAL_RESPONSE:
             return False
-        return not (
-            self._events and _position_of(self._events, turn_event.event_id) <= _position_of(self._events, user_event.event_id)
-        )
+        if not self._events:
+            return False
+        user_position = _position_of(self._events, user_event.event_id)
+        turn_position = _position_of(self._events, turn_event.event_id)
+        if turn_position <= user_position:
+            return False
+        return _next_final_boundary(self._events, user_position) == turn_event.event_id
 
 
 def _payload_text(event: CanonicalEvent) -> str:
     value = event.payload.get("text")
-    return value if isinstance(value, str) else ""
+    if isinstance(value, str):
+        return value
+    raw = event.raw_record
+    if not isinstance(raw, dict):
+        return ""
+    message = raw.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts: list[str] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                text = block.get("text")
+                if isinstance(text, str):
+                    texts.append(text)
+            return "\n".join(texts)
+    return ""
 
 
 def _position_of(events: tuple[CanonicalEvent, ...], event_id: str) -> int:
@@ -258,6 +338,13 @@ def _position_of(events: tuple[CanonicalEvent, ...], event_id: str) -> int:
         if event.event_id == event_id:
             return position
     return -1
+
+
+def _next_final_boundary(events: tuple[CanonicalEvent, ...], start_position: int) -> str:
+    for event in events[start_position + 1 :]:
+        if event.normalized_type is CanonicalType.FINAL_RESPONSE:
+            return event.event_id
+    return ""
 
 
 __all__ = [
