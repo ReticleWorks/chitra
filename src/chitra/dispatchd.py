@@ -122,6 +122,7 @@ from .dispatch import (
     transcript_confirms_nudge,
 )
 from .goals import LOAD_SHED_HOLD_REASON_PREFIX, RATE_LIMIT_HOLD_REASON_PREFIX, get_goal
+from .journal import native_session_identity
 from .orders import DispatchOrder, DispatchResult, DispatchStatus
 from .policy_config import PolicyConfig, load_policy_config
 from .routing_config import RoutingConfig, load_routing_config, resolve_route, resolve_routing_hint
@@ -250,6 +251,14 @@ def _ensure_delivery_ledger(
     would incorrectly accept an older identical nudge as proof for this
     order. The post-append lookup also catches a short write or a writer that
     returned without making the proof durable.
+
+    When the confirmed result names a lane transcript, its adapter-native
+    session identity is normalized with the journal's own version-gated
+    normalizers and bound into the signed row (signature version 5). The
+    value never comes from ``routing_hint``, which stays opaque audit
+    metadata. A transcript that yields no fixture-gated native identity
+    still gets a valid v4 row; consumption then fails closed instead of
+    trusting an unbound session.
     """
     resolved_ledger_path = ledger_path or default_ledger_path()
     resolved_key_path = ledger_key_path or (ledger_path.with_name("ledger.key") if ledger_path is not None else default_ledger_key_path())
@@ -264,6 +273,8 @@ def _ensure_delivery_ledger(
     if existing is not None:
         return existing
 
+    if not result.native_session_id and result.transcript_path:
+        result.native_session_id = native_session_identity(Path(result.transcript_path))
     ledger_mod.append_entry(
         resolved_ledger_path,
         order_id=order.order_id,
@@ -274,6 +285,7 @@ def _ensure_delivery_ledger(
         resolved_zdr=result.resolved_zdr,
         nudge=order.nudge,
         key=key,
+        native_session_id=result.native_session_id,
     )
     verified = ledger_mod.verify_delivery(
         resolved_ledger_path,

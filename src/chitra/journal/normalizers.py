@@ -6,6 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from .models import (
@@ -16,6 +17,7 @@ from .models import (
     RawRecord,
     TranscriptIdentity,
 )
+from .reader import JsonlTailReader
 
 NORMALIZER_VERSION = "chitra-journal-normalizer.v1"
 SUPPORTED_VERSIONS: dict[Client, frozenset[str]] = {
@@ -454,3 +456,53 @@ def make_normalizer(context: NormalizationContext) -> TranscriptNormalizer:
     if context.client is Client.CLAUDE:
         return ClaudeNormalizer(context)
     return CodexNormalizer(context)
+
+
+def native_session_identity(transcript_path: Path | str) -> str | None:
+    """Derive one transcript's adapter-native session identity.
+
+    The transcript is replayed through the same version-gated normalizers the
+    durable journal uses, so the returned value is exactly the ``session_id``
+    canonical events for that transcript carry. Any transcript that does not
+    identify a fixture-gated Claude/Codex session -- unreadable, foreign
+    schema, unsupported client version, or inconsistent native identity --
+    yields ``None`` so callers can fail closed instead of binding a guess.
+    """
+    path = Path(transcript_path)
+    try:
+        with JsonlTailReader(path) as reader:
+            records = reader.poll().records
+    except OSError:
+        return None
+    client: Client | None = None
+    client_version: str | None = None
+    for raw in records:
+        record = raw.record or {}
+        if client is None:
+            if isinstance(record.get("sessionId"), str):
+                client = Client.CLAUDE
+            elif record.get("type") == "session_meta":
+                client = Client.CODEX
+        payload = record.get("payload")
+        candidate = record.get("version") if client is Client.CLAUDE else (
+            payload.get("cli_version") if isinstance(payload, dict) else None
+        )
+        if isinstance(candidate, str):
+            client_version = candidate
+        if client is not None and client_version is not None:
+            break
+    if client is None or client_version is None or client_version not in SUPPORTED_VERSIONS[client]:
+        return None
+    context = NormalizationContext(
+        instance="native-session-identity",
+        lane="native-session-identity",
+        client=client,
+        client_version=client_version,
+    )
+    normalizer = make_normalizer(context)
+    try:
+        for raw in records:
+            normalizer.normalize(raw)
+    except (UnsupportedClientVersion, ValueError):
+        return None
+    return normalizer.session_id

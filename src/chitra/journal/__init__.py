@@ -18,6 +18,7 @@ from .normalizers import (
     NormalizationContext,
     UnsupportedClientVersion,
     make_normalizer,
+    native_session_identity,
 )
 from .reader import JsonlTailReader, ReadBatch, Rotation
 from .store import CLASSIFIER_VERSION, EventJournal, classify_progress
@@ -45,4 +46,5 @@ __all__ = [
     "UnsupportedClientVersion",
     "classify_progress",
     "make_normalizer",
+    "native_session_identity",
 ]

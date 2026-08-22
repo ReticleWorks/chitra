@@ -20,6 +20,37 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.14.12] - 2026-08-22
+
+### Fixed
+
+- Bind dispatch delivery-ledger rows to the adapter-native session identity
+  normalized from the confirmed lane transcript (signature version 5,
+  never derived from routing_hint), so genuine deliveries advance the W3
+  ladder while cross-session evidence fails closed.
+- Make rescue checkpoint receipts single-create and their consumption
+  atomic: a seal now durably spends the receipt's reference and anti-replay
+  nonce under the incident lock before appending, rejecting duplicate or
+  replayed receipts exactly once ever, including after restart.
+
+## [0.14.11] - 2026-08-22
+
+### Fixed
+
+- Tighten W3 detector and ladder semantics: canonical event-ID progress resets,
+  real worktree containment, claim-aware false completion, signed immediate
+  consumption boundaries, sealed RESCUE/checkpoint relaunch gating, and
+  fail-closed rescue evidence capture.
+
+## [0.14.10] - 2026-08-22
+
+### Added
+
+- Add W3 canonical-journal detectors for drift, unnecessary steps,
+  excessive testing, document dithering, and false completion, plus the
+  consumption-bound response ladder, RESCUE bundle capture, relaunch brief
+  generation, injected failure fixtures, and false-positive controls.
+
 ## [0.14.8] - 2026-08-22
 
 ### Fixed
