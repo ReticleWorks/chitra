@@ -65,16 +65,25 @@ jobs:
       # ReticleWorks/fleet-repo pins this distribution and opens its own pin
       # bump pull request on each release; GitHub has no cross-repo release
       # trigger, so the fleet listens for a repository_dispatch of type
-      # chitra-release instead. The dispatch must come from an identity whose
-      # token can create that repository_dispatch event, which the default
-      # job token cannot do for another repository. FLEET_REPO_DISPATCH_TOKEN
-      # is a token for the polyphony-automation App installation on
-      # ReticleWorks/fleet-repo; until that secret is created this step fails
-      # closed without touching PyPI state, and fleet-repo's weekly poll
-      # enumerates every unreconciled release as the fallback path.
+      # chitra-release instead. The default job token cannot dispatch to
+      # another repository, so this job mints a short-lived installation
+      # token at runtime for the polyphony-automation GitHub App (installed
+      # on all ReticleWorks repos) from the repo secrets
+      # FLEET_DISPATCH_APP_ID and FLEET_DISPATCH_APP_PRIVATE_KEY, scoped to
+      # ReticleWorks/fleet-repo only. If minting or dispatch fails, the step
+      # fails closed without touching PyPI state, and fleet-repo's weekly
+      # poll enumerates every unreconciled release as the fallback path.
+      - uses: actions/create-github-app-token@v1
+        id: fleet-token
+        with:
+          app-id: ${{ secrets.FLEET_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.FLEET_DISPATCH_APP_PRIVATE_KEY }}
+          owner: ReticleWorks
+          repositories: fleet-repo
+
       - name: Send repository_dispatch to ReticleWorks/fleet-repo
         env:
-          GH_TOKEN: ${{ secrets.FLEET_REPO_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ steps.fleet-token.outputs.token }}
         run: |
           gh api repos/ReticleWorks/fleet-repo/dispatches \
             -f event_type=chitra-release \
