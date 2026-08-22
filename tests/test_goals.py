@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from _goal_fixtures import enrollment_fields, passing_completion_evidence
+from _goal_fixtures import enrollment_fields, ingest_passing_receipt, passing_completion_evidence
 
 from chitra.artifacts import ARTIFACT_URL_PREFIX, ArtifactRecord, upsert_artifact
 from chitra.goals import (
@@ -472,6 +472,7 @@ def test_fresh_session_ref_for_open_lane_requires_redirect(tmp_path: Path) -> No
 
 def test_redirect_invalidates_prior_done_state(tmp_path: Path) -> None:
     stored = upsert_goal(tmp_path, _record())
+    ingest_passing_receipt(tmp_path, stored.session_ref)
     completed = mark_completion_gate_passed(
         tmp_path,
         stored.session_ref,
@@ -809,6 +810,7 @@ def test_done_transition_and_close_require_the_exact_named_receipt(tmp_path: Pat
             last_verified="2026-08-21T12:00:00+00:00",
             completion_evidence=(passing_completion_evidence(receipt_name="wrong-name"),),
         )
+    ingest_passing_receipt(tmp_path, stored.session_ref)
     completed = mark_completion_gate_passed(
         tmp_path,
         stored.session_ref,
@@ -841,6 +843,7 @@ def test_one_interviewed_item_with_named_receipt_succeeds_end_to_end(
         record.source,
     ]
     enrolled = _cli_enroll(tmp_path, capsys, set_args, done_when=record.done_when)
+    stored_receipt = ingest_passing_receipt(tmp_path, enrolled.session_ref)
     completed = mark_completion_gate_passed(
         tmp_path,
         enrolled.session_ref,
@@ -849,13 +852,14 @@ def test_one_interviewed_item_with_named_receipt_succeeds_end_to_end(
         completion_evidence=(passing_completion_evidence(),),
     )
 
-    assert completed.completion_proofs == (passing_completion_evidence(),)
+    assert completed.completion_proofs[0].citation == str(stored_receipt)
     assert close_goal(tmp_path, completed.session_ref) == completed
     assert get_goal(tmp_path, completed.session_ref) is None
 
 
 def test_close_removes_record_and_raises_for_absent_goal(tmp_path: Path) -> None:
     stored = upsert_goal(tmp_path, _record())
+    ingest_passing_receipt(tmp_path, stored.session_ref)
     completed = mark_completion_gate_passed(
         tmp_path,
         stored.session_ref,

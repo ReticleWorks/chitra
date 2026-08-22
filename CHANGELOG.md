@@ -114,6 +114,19 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   their byte ranges (first and last records always, a deterministic
   sample of earlier records, plus buffered partial bytes) and replays
   the transcript on any mismatch.
+- Receipt verification now fails closed on every validator, not only the
+  Polyvalidation Rig: a `PASS` receipt must bind a hash-bound
+  `chitra-validator-report-v1` report whose command and exit code support the
+  claim, checked at ingest and again at close. A self-asserted `PASS` over a
+  failing report can no longer close an item.
+- The generic verifier no longer takes a PASS result from caller-authored
+  report text alone. A claimed exit code must be re-established by an
+  independent trusted execution of the declared exercise command in a
+  verifier-controlled environment, so a hash-consistent report that lies about
+  a failing command can no longer close an item.
+- Receipts are stored at `<state-root>/validation-receipts/<receipt_name>.json`
+  as DESIGN-v3 section 2 requires, without the undocumented session-hash
+  directory.
 
 ## [0.14.0] - 2026-08-21
 
@@ -125,6 +138,18 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   same-inode resumes, and switches cleanly across rotation.
 - Add append-only per-lane event and progress-derivation journals under each
   instance state root. Native records remain intact for replay.
+- `chitra-receipts ingest`, `list`, and `verify` manage immutable per-lane
+  validation receipts under the instance state root. Ingest verifies the W12
+  nine-field envelope, its canonical digest, and every copied evidence hash.
+- Receipt verification checks current artifact or commit identity and validates
+  PVR report-to-audit bindings when the receipt names the Polyvalidation Rig.
+
+### Changed
+
+- Done transition and completion close now reload the exact frozen receipt from
+  the lane store. Only a verified `PASS` with validator acceptance and no
+  unexercised surface counts; caller flags and claimed result text cannot
+  replace it.
 
 ## [0.13.0] - 2026-08-21
 

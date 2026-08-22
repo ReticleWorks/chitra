@@ -117,6 +117,26 @@ capabilities:
         params: []
         mutates: true
 
+  - name: validation-receipts
+    kind: tool
+    purpose: Store and verify hash-bound validation receipts for exact frozen goal items.
+    when_to_use: Use after a validator emits a W12 receipt and before a lane can enter or complete its close path.
+    authority:
+      level: record
+      grants:
+        - Ingest an exact enrolled receipt and copy its hash-bound evidence into the lane store.
+        - List receipts and verify their integrity, validator result, and current target identity.
+      excludes:
+        - Generate validator results or change a frozen done item.
+        - Treat a failed, unexercised, stale, or caller-asserted result as completion evidence.
+    default_enabled: true
+    commands:
+      - name: chitra-receipts
+        description: Ingest, list, or verify per-lane validation receipts.
+        argv: [chitra-receipts]
+        params: []
+        mutates: true
+
   - name: artifacts
     kind: tool
     purpose: Record Claude artifact publication and explicit review metadata.
