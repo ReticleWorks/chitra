@@ -320,6 +320,32 @@ capabilities:
         params: []
         mutates: true
 
+  - name: parallel-coordination
+    kind: tool
+    purpose: Publish advisory shared-resource presence and route direct questions to peer monitors.
+    when_to_use: Declare a resource before heavy use, inspect peer declarations, or ask a named peer to coordinate.
+    authority:
+      level: record
+      grants:
+        - Append presence to one named instance's file and read the union of all presence files.
+        - Enqueue one governed dispatch order for a named peer instance's session and read that order's durable result state.
+      excludes:
+        - Claim, lock, expire, steal, wait for, or grant authority over a shared resource.
+        - Create a peer socket, daemon, or implicit message consumer.
+        - Assert delivery or consumption that dispatchd did not already record durably.
+    default_enabled: true
+    commands:
+      - name: chitra-presence
+        description: Publish or list advisory shared-resource presence without blocking.
+        argv: [chitra-presence]
+        params: []
+        mutates: true
+      - name: chitra-peer
+        description: Send peer questions through the governed dispatch queue and read their truthful result state.
+        argv: [chitra-peer]
+        params: []
+        mutates: true
+
   - name: auto-merge
     kind: tool
     purpose: >-

@@ -424,7 +424,7 @@ def requeue_deferred_for_session(queue_dir: Path, session_ref: str) -> list[str]
     """
     orders_dir, _, _ = _ensure_queue_dirs(queue_dir)
     deferred_dir = queue_dir / "deferred"
-    dated: list[tuple[float, Path]] = []
+    dated: list[tuple[int, int, Path]] = []
     for path in deferred_dir.glob("*.json"):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -433,12 +433,13 @@ def requeue_deferred_for_session(queue_dir: Path, session_ref: str) -> list[str]
         if not isinstance(payload, dict) or payload.get("session_ref") != session_ref:
             continue
         try:
-            dated.append((path.stat().st_mtime, path))
+            stat = path.stat()
+            dated.append((stat.st_mtime_ns, stat.st_ino, path))
         except FileNotFoundError:
             continue
-    dated.sort(key=lambda item: item[0])
+    dated.sort(key=lambda item: item[:2])
     requeued: list[str] = []
-    for _, path in dated:
+    for _, _, path in dated:
         target = orders_dir / path.name
         try:
             path.replace(target)
@@ -503,18 +504,19 @@ def _requeue_lane_lock_deferred(queue_dir: Path, orders_dir: Path) -> list[Path]
     order plus an accurate retry count.
     """
     deferred_dir = queue_dir / "deferred"
-    dated: list[tuple[float, Path]] = []
+    dated: list[tuple[int, int, Path]] = []
     for path in deferred_dir.glob("*.json"):
         if not _lane_lock_retry_state_path(deferred_dir, path.stem).exists():
             continue
         try:
-            dated.append((path.stat().st_mtime, path))
+            stat = path.stat()
+            dated.append((stat.st_mtime_ns, stat.st_ino, path))
         except FileNotFoundError:
             continue
-    dated.sort(key=lambda item: item[0])
+    dated.sort(key=lambda item: item[:2])
 
     requeued: list[Path] = []
-    for _, path in dated:
+    for _, _, path in dated:
         target = orders_dir / path.name
         if target.exists():
             logger.error("dispatchd_lane_lock_deferred_target_exists", source=str(path), target=str(target))
@@ -1200,10 +1202,11 @@ def run_once(
     else:
         routing_config = _preloaded_routing_config
     policy = load_policy_config(policy_config_path) if isinstance(_preloaded_policy, _ConfigNotPreloaded) else _preloaded_policy
-    dated: list[tuple[float, Path]] = []
+    dated: list[tuple[int, int, Path]] = []
     for order_path in orders_dir.glob("*.json"):
         try:
-            dated.append((order_path.stat().st_mtime, order_path))
+            stat = order_path.stat()
+            dated.append((stat.st_mtime_ns, stat.st_ino, order_path))
         except FileNotFoundError:
             # Order file vanished between the glob and the stat (e.g. raced
             # by something else touching the queue dir). Skip it rather than
@@ -1212,7 +1215,7 @@ def run_once(
     # Snapshot ordinary pending work before moving retryable lane-lock
     # deferrals back into orders/. This makes every newly arrived order run
     # before a retry, while preserving FIFO within each group.
-    pending = [p for _, p in sorted(dated, key=lambda t: t[0])]
+    pending = [path for _, _, path in sorted(dated, key=lambda item: item[:2])]
     pending.extend(_requeue_lane_lock_deferred(queue_dir, orders_dir))
     out: list[DispatchResult] = []
     for order_path in pending:
