@@ -18,7 +18,7 @@ import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -32,6 +32,9 @@ LADDER_STAGES: tuple[str, ...] = ("nudge", "redirect", "rescue", "relaunch")
 _LANE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _HEX64_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+_CHECKPOINT_SCHEMA = "chitra.detect.checkpoint-receipt.v1"
+_CHECKPOINT_INTEGRITY_SCOPE = "entire checkpoint receipt with /integrity/digest omitted"
+_CHECKPOINT_CANONICALIZATION = "json.dumps(sort_keys=True,separators=(',',':'),ensure_ascii=False)"
 
 IncidentStage = Literal["nudge", "redirect", "rescue", "relaunch"]
 
@@ -50,6 +53,7 @@ class ConsumptionProof(BaseModel):
     ledger_entry: LedgerEntry
     ledger_key_hex: str = ""
     session_ref: str = ""
+    native_session_id: str = ""
     user_event_id: str
     turn_event_id: str
 
@@ -214,9 +218,10 @@ class IncidentStore:
             raise ValueError("only the rescue stage can be sealed for relaunch")
         if target.consumption is None:
             raise ValueError("rescue order consumption is required before sealing relaunch evidence")
-        if not _rescue_bundle_verified(self.state_root, target, bundle_sha256):
+        bundle = _rescue_bundle_verified(self.state_root, target, bundle_sha256)
+        if bundle is None:
             raise ValueError("rescue bundle hash does not match a governed RESCUE bundle")
-        if not _checkpoint_receipt_verified(self.state_root, target, bundle_sha256, checkpoint_ref):
+        if not _checkpoint_receipt_verified(self.state_root, target, bundle, checkpoint_ref):
             raise ValueError("checkpoint reference does not match a governed checkpoint receipt")
         advanced = target.model_copy(update={"rescue_bundle_sha256": bundle_sha256, "checkpoint_ref": checkpoint_ref})
         return self._append(advanced)
@@ -289,6 +294,12 @@ class ResponseLadder:
             return False
         if not proof.session_ref:
             return False
+        if (
+            proof.native_session_id
+            and proof.native_session_id != proof.session_ref
+            and proof.ledger_entry.routing_hint != proof.native_session_id
+        ):
+            return False
         if f":{record.lane}:" not in proof.ledger_entry.session_ref:
             return False
         events_by_id = {event.event_id: event for event in self._events}
@@ -298,7 +309,9 @@ class ResponseLadder:
             return False
         if user_event.lane != record.lane or turn_event.lane != record.lane:
             return False
-        if user_event.session_id != proof.session_ref or turn_event.session_id != proof.session_ref:
+        if not proof.native_session_id:
+            return False
+        if user_event.session_id != proof.native_session_id or turn_event.session_id != proof.native_session_id:
             return False
         if user_event.native_type != "user" or user_event.normalized_type in {
             CanonicalType.TOOL_CALL,
@@ -323,7 +336,9 @@ class ResponseLadder:
         return _next_final_boundary(self._events, user_position) == turn_event.event_id
 
 
-def _rescue_bundle_verified(state_root: Path, record: IncidentRecord, bundle_sha256: str) -> bool:
+def _rescue_bundle_verified(state_root: Path, record: IncidentRecord, bundle_sha256: str) -> Any | None:
+    from .rescue import BUNDLE_SCHEMA, RescueBundle
+
     for path in sorted((state_root / "rescue").glob("*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -331,26 +346,37 @@ def _rescue_bundle_verified(state_root: Path, record: IncidentRecord, bundle_sha
             continue
         if not isinstance(payload, dict):
             continue
-        if payload.get("bundle_sha256") != bundle_sha256:
+        try:
+            bundle = RescueBundle.model_validate(payload)
+        except ValueError:
             continue
-        unsigned = dict(payload)
-        unsigned.pop("bundle_sha256", None)
-        computed = hashlib.sha256(
-            json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-        ).hexdigest()
-        if computed != bundle_sha256:
+        if bundle.schema_name != BUNDLE_SCHEMA or bundle.bundle_sha256 != bundle_sha256:
+            continue
+        if bundle.compute_digest() != bundle_sha256:
             continue
         expected_session = record.consumption.session_ref if record.consumption else ""
-        if payload.get("lane") != record.lane or payload.get("session_ref") != expected_session:
+        if bundle.lane != record.lane or bundle.session_ref != expected_session:
             continue
-        if payload.get("checkpoint_requested") is not True:
+        if bundle.checkpoint_requested is not True:
             continue
-        return True
-    return False
+        if not _valid_rescue_process_identity(bundle.process_identity, expected_session=expected_session):
+            continue
+        if not _rescue_transcript_hash_verified(bundle.transcript_ref, bundle.transcript_sha256):
+            continue
+        if len(bundle.pane_capture) > 20000:
+            continue
+        if not isinstance(bundle.git_state, dict) or not bundle.git_state.get("head") or not bundle.git_state.get("branch"):
+            continue
+        if not bundle.contract.strip():
+            continue
+        if not any(record.fingerprint in entry for entry in bundle.incident_history):
+            continue
+        return bundle
+    return None
 
 
 def _checkpoint_receipt_verified(
-    state_root: Path, record: IncidentRecord, bundle_sha256: str, checkpoint_ref: str
+    state_root: Path, record: IncidentRecord, bundle: Any, checkpoint_ref: str
 ) -> bool:
     path = state_root / "checkpoints" / f"{checkpoint_ref}.json"
     try:
@@ -360,17 +386,78 @@ def _checkpoint_receipt_verified(
     if not isinstance(payload, dict):
         return False
     expected_session = record.consumption.session_ref if record.consumption else ""
+    expected_fields = {
+        "schema_name",
+        "checkpoint_ref",
+        "lane",
+        "session_ref",
+        "incident_fingerprint",
+        "rescue_bundle_sha256",
+        "target_pid",
+        "created_at",
+        "provenance",
+        "integrity",
+    }
+    if set(payload) != expected_fields:
+        return False
+    if payload.get("schema_name") != _CHECKPOINT_SCHEMA:
+        return False
+    if payload.get("checkpoint_ref") != checkpoint_ref:
+        return False
     if payload.get("lane") != record.lane or payload.get("session_ref") != expected_session:
         return False
-    if payload.get("fingerprint") not in {record.fingerprint, None} and payload.get("incident_fingerprint") != record.fingerprint:
+    if payload.get("incident_fingerprint") != record.fingerprint:
         return False
-    if payload.get("bundle_sha256") not in {bundle_sha256, None} and payload.get("rescue_bundle_sha256") != bundle_sha256:
+    if payload.get("rescue_bundle_sha256") != bundle.bundle_sha256:
         return False
-    return not (
-        payload.get("checkpoint_ref") not in {checkpoint_ref, None}
-        and payload.get("receipt_id") not in {checkpoint_ref, None}
-        and payload.get("id") != checkpoint_ref
-    )
+    target_pid = payload.get("target_pid")
+    if type(target_pid) is not int or target_pid <= 0 or target_pid != bundle.process_identity.get("target_pid"):
+        return False
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, dict) or provenance.get("kind") != "governed-checkpoint":
+        return False
+    if provenance.get("rescue_bundle_sha256") != bundle.bundle_sha256:
+        return False
+    return _checkpoint_integrity_verified(payload)
+
+
+def _valid_rescue_process_identity(identity: dict[str, Any], *, expected_session: str) -> bool:
+    if identity.get("session_ref") != expected_session:
+        return False
+    for key in ("target_pid", "capture_pid", "capture_ppid"):
+        value = identity.get(key)
+        if type(value) is not int or value <= 0:
+            return False
+    return True
+
+
+def _rescue_transcript_hash_verified(transcript_ref: str, transcript_sha256: str) -> bool:
+    if _HEX64_RE.fullmatch(transcript_sha256) is None:
+        return False
+    try:
+        payload = Path(transcript_ref).read_bytes()
+    except OSError:
+        return False
+    return hashlib.sha256(payload).hexdigest() == transcript_sha256
+
+
+def _checkpoint_integrity_verified(payload: dict[str, Any]) -> bool:
+    integrity = payload.get("integrity")
+    if not isinstance(integrity, dict):
+        return False
+    digest = integrity.get("digest")
+    if not isinstance(digest, str) or _HEX64_RE.fullmatch(digest) is None:
+        return False
+    if integrity.get("scope") != _CHECKPOINT_INTEGRITY_SCOPE:
+        return False
+    if integrity.get("canonicalization") != _CHECKPOINT_CANONICALIZATION:
+        return False
+    unsigned = dict(payload)
+    unsigned["integrity"] = {key: value for key, value in integrity.items() if key != "digest"}
+    computed = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+    return computed == digest
 
 
 def _payload_text(event: CanonicalEvent) -> str:

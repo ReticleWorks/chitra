@@ -39,6 +39,9 @@ from chitra.ledger import LedgerEntry, message_hash, sign
 
 FIXTURES = Path(__file__).parent / "fixtures" / "failure-modes"
 LANE = "claude"
+CHECKPOINT_SCHEMA = "chitra.detect.checkpoint-receipt.v1"
+CHECKPOINT_INTEGRITY_SCOPE = "entire checkpoint receipt with /integrity/digest omitted"
+CHECKPOINT_CANONICALIZATION = "json.dumps(sort_keys=True,separators=(',',':'),ensure_ascii=False)"
 
 
 def ingest_fixture(name: str, tmp_path: Path) -> tuple[CanonicalEvent, ...]:
@@ -385,6 +388,7 @@ def test_ladder_advances_only_after_proven_consumption(tmp_path: Path) -> None:
         return ConsumptionProof(
             ledger_entry=entry,
             session_ref=proof_session,
+            native_session_id=proof_session,
             user_event_id=user_event_id,
             turn_event_id=turn_event_id,
         )
@@ -492,6 +496,7 @@ def test_ladder_consumption_requires_exact_event_session(tmp_path: Path) -> None
         proof=ConsumptionProof(
             ledger_entry=entry,
             session_ref=session_ref,
+            native_session_id="native-session-id",
             user_event_id="wrong-user",
             turn_event_id="wrong-final",
         ),
@@ -499,23 +504,85 @@ def test_ladder_consumption_requires_exact_event_session(tmp_path: Path) -> None
     assert ladder.evaluate(lane=LANE, finding=finding, order_marker="redirect-1").action == "hold"
 
 
+def test_ladder_consumption_binds_governed_session_ref_to_native_session_id(
+    event_sets: dict[str, tuple[CanonicalEvent, ...]], tmp_path: Path
+) -> None:
+    key = b"k" * 32
+    sent_at = "2026-08-21T15:00:00+00:00"
+    session_ref = f"host:{LANE}:0.0"
+    native_session_id = event_sets["claude-unnecessary-steps"][0].session_id
+    text = "[C] nudge-1 please continue"
+    digest = message_hash(text)
+    entry = LedgerEntry(
+        order_id="order-nudge-1",
+        session_ref=session_ref,
+        tag="[C]",
+        routing_hint=native_session_id,
+        sig_v=4,
+        message_hash=digest,
+        sent_at=sent_at,
+        signature=sign(key, session_ref=session_ref, tag="[C]", digest=digest, sent_at=sent_at, routing_hint=native_session_id),
+    )
+    journal = (
+        event_sets["claude-unnecessary-steps"][0].model_copy(
+            update={
+                "event_id": "native-user",
+                "native_type": "user",
+                "normalized_type": CanonicalType.UNKNOWN,
+                "payload": {"text": text},
+            }
+        ),
+        _final(event_sets["claude-unnecessary-steps"]).model_copy(update={"event_id": "native-final"}),
+    )
+    assert journal[0].session_id == native_session_id
+    assert native_session_id != session_ref
+
+    store = IncidentStore(tmp_path, LANE)
+    ladder = ResponseLadder(store, journal_events=journal, ledger_key=key)
+    finding = Finding(
+        detector="unnecessary_steps",
+        fingerprint_seed={"signature": "stable"},
+        event_refs=("evt-1",),
+        unmet_item="done-1",
+        expected_next_progress="try a different approach",
+        detail="three identical reads",
+    )
+    assert ladder.evaluate(lane=LANE, finding=finding, order_marker="nudge-1").action == "open"
+    store.attach_consumption(
+        fingerprint=finding.fingerprint,
+        order_marker="nudge-1",
+        proof=ConsumptionProof(
+            ledger_entry=entry,
+            session_ref=session_ref,
+            native_session_id=native_session_id,
+            user_event_id="native-user",
+            turn_event_id="native-final",
+        ),
+    )
+    advanced = ladder.evaluate(lane=LANE, finding=finding, order_marker="redirect-1")
+    assert advanced.action == "advance"
+    assert advanced.stage == "redirect"
+
+
 def _write_verified_rescue_and_checkpoint(
     state_root: Path, record: IncidentRecord, *, session_ref: str, checkpoint_ref: str
 ) -> None:
+    transcript = state_root / "transcript.jsonl"
+    transcript.write_text('{"type":"user","message":{"content":"checkpoint me"}}\n', encoding="utf-8")
     payload = {
         "schema_name": "chitra.detect.rescue-bundle.v1",
         "lane": LANE,
         "session_ref": session_ref,
         "captured_at": "2026-08-21T15:00:00+00:00",
-        "transcript_ref": "/tmp/t.jsonl",
-        "transcript_sha256": "b" * 64,
-        "process_identity": {"target_pid": 12345},
+        "transcript_ref": str(transcript),
+        "transcript_sha256": hashlib.sha256(transcript.read_bytes()).hexdigest(),
+        "process_identity": {"target_pid": 12345, "capture_pid": 23456, "capture_ppid": 1234, "session_ref": session_ref},
         "pane_capture": "",
-        "git_state": {},
+        "git_state": {"branch": "w3/detectors-ladder", "head": "a" * 40},
         "untracked_files": [],
         "receipt_paths": [],
         "contract": "finish item done-1",
-        "incident_history": [],
+        "incident_history": [json.dumps({"fingerprint": record.fingerprint, "stage": record.stage}, sort_keys=True)],
         "open_asks": [],
         "checkpoint_requested": True,
     }
@@ -527,17 +594,31 @@ def _write_verified_rescue_and_checkpoint(
     checkpoints = state_root / "checkpoints"
     checkpoints.mkdir(exist_ok=True)
     (checkpoints / f"{checkpoint_ref}.json").write_text(
-        json.dumps(
-            {
-                "checkpoint_ref": checkpoint_ref,
-                "lane": LANE,
-                "session_ref": session_ref,
-                "fingerprint": record.fingerprint,
-                "bundle_sha256": digest,
-            }
-        ),
+        json.dumps(_checkpoint_receipt(checkpoint_ref, record, session_ref=session_ref, bundle_sha256=digest)),
         encoding="utf-8",
     )
+
+
+def _checkpoint_receipt(
+    checkpoint_ref: str, record: IncidentRecord, *, session_ref: str, bundle_sha256: str
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_name": CHECKPOINT_SCHEMA,
+        "checkpoint_ref": checkpoint_ref,
+        "lane": LANE,
+        "session_ref": session_ref,
+        "incident_fingerprint": record.fingerprint,
+        "rescue_bundle_sha256": bundle_sha256,
+        "target_pid": 12345,
+        "created_at": "2026-08-21T15:00:01+00:00",
+        "provenance": {"kind": "governed-checkpoint", "rescue_bundle_sha256": bundle_sha256},
+        "integrity": {"scope": CHECKPOINT_INTEGRITY_SCOPE, "canonicalization": CHECKPOINT_CANONICALIZATION},
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    integrity = dict(payload["integrity"])  # type: ignore[arg-type]
+    integrity["digest"] = digest
+    payload["integrity"] = integrity
+    return payload
 
 
 def _latest_rescue_sha(state_root: Path) -> str:
@@ -576,6 +657,7 @@ def test_rescue_seal_requires_verified_bundle_and_checkpoint(tmp_path: Path) -> 
                 signature=sign(key, session_ref=session_ref, tag="[C]", digest=digest, sent_at=sent_at),
             ),
             session_ref=session_ref,
+            native_session_id=session_ref,
             user_event_id=user_event_id,
             turn_event_id=turn_event_id,
         )
@@ -632,6 +714,80 @@ def test_rescue_seal_requires_verified_bundle_and_checkpoint(tmp_path: Path) -> 
         bundle_sha256=_latest_rescue_sha(tmp_path),
         checkpoint_ref="checkpoint-1",
     )
+
+
+def test_relaunch_rejects_skeleton_rescue_checkpoint_and_null_target_pid(tmp_path: Path) -> None:
+    session_ref = f"host:{LANE}:0.0"
+    entry = LedgerEntry(
+        order_id="order-rescue-1",
+        session_ref=session_ref,
+        tag="[C]",
+        sig_v=4,
+        message_hash="0" * 64,
+        sent_at="2026-08-21T15:00:00+00:00",
+        signature="sig",
+    )
+    proof = ConsumptionProof(
+        ledger_entry=entry,
+        session_ref=session_ref,
+        native_session_id="native-session",
+        user_event_id="user-1",
+        turn_event_id="turn-1",
+    )
+    finding = Finding(
+        detector="excessive_testing",
+        fingerprint_seed={"signature": "suite"},
+        event_refs=("evt-a",),
+        unmet_item="done-1",
+        expected_next_progress="change something before rerunning",
+        detail="suite repeated unchanged",
+    )
+    store = IncidentStore(tmp_path, LANE)
+    store._append(
+        IncidentRecord(
+            lane=LANE,
+            fingerprint=finding.fingerprint,
+            detector=finding.detector,
+            stage="rescue",
+            order_marker="rescue-1",
+            opened_at="2026-08-21T15:00:00+00:00",
+            event_refs=finding.event_refs,
+            unmet_item=finding.unmet_item,
+            expected_next_progress=finding.expected_next_progress,
+            detail=finding.detail,
+            consumption=proof,
+        )
+    )
+
+    rescue_dir = tmp_path / "rescue"
+    rescue_dir.mkdir()
+    skeleton = {"lane": LANE, "session_ref": session_ref, "checkpoint_requested": True}
+    skeleton["bundle_sha256"] = hashlib.sha256(
+        json.dumps(skeleton, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+    (rescue_dir / "bundle.json").write_text(json.dumps(skeleton), encoding="utf-8")
+    checkpoints = tmp_path / "checkpoints"
+    checkpoints.mkdir()
+    (checkpoints / "checkpoint-1.json").write_text(json.dumps({"lane": LANE, "session_ref": session_ref}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="governed RESCUE bundle"):
+        store.seal_rescue_checkpoint(
+            fingerprint=finding.fingerprint,
+            order_marker="rescue-1",
+            bundle_sha256=str(skeleton["bundle_sha256"]),
+            checkpoint_ref="checkpoint-1",
+        )
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="affected process identity"):
+        collect_rescue_bundle(
+            lane=LANE,
+            session_ref=session_ref,
+            worktree=tmp_path,
+            transcript_path=transcript,
+            process_identity={"target_pid": None},
+        )
 
 
 def test_rescue_bundle_is_bounded_hash_bound_and_brief_renders(tmp_path: Path) -> None:
