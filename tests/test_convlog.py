@@ -189,7 +189,9 @@ def test_stored_records_load_leniently_under_tightened_rules(tmp_path: Path) -> 
 
 
 def test_read_stored_brief_skips_write_path_gates() -> None:
-    payload = _payload(category="milestone", decision=None, recommendation="Please run the migration by hand tonight.", options=[], exhaustion=None)
+    payload = _payload(
+        category="milestone", decision=None, recommendation="Please run the migration by hand tonight.", options=[], exhaustion=None
+    )
 
     loaded = read_stored_brief(dict(payload))
 
@@ -227,7 +229,14 @@ def test_clean_decisionless_brief_passes_the_ask_scan() -> None:
 
 
 def test_smuggled_ask_scan_never_reads_source_quote() -> None:
-    brief = _brief(category="milestone", decision=None, recommendation="", source_quote=["Can you confirm the deploy window?"], options=[], exhaustion=None)
+    brief = _brief(
+        category="milestone",
+        decision=None,
+        recommendation="",
+        source_quote=["Can you confirm the deploy window?"],
+        options=[],
+        exhaustion=None,
+    )
 
     assert brief.source_quote == ["Can you confirm the deploy window?"]
 
@@ -331,7 +340,9 @@ def test_dedup_normalizes_case_and_whitespace_before_comparing() -> None:
     assert brief.exhaustion is not None
 
 
-@pytest.mark.parametrize("attempt", ["Ran the deploy script once more\nit hit the held lock.", "Ran the deploy script once more\rit hit the held lock."])
+@pytest.mark.parametrize(
+    "attempt", ["Ran the deploy script once more\nit hit the held lock.", "Ran the deploy script once more\rit hit the held lock."]
+)
 def test_newlines_in_attempts_are_rejected(attempt: str) -> None:
     with pytest.raises(BriefValidationError, match="one line"):
         _brief(
@@ -592,7 +603,9 @@ def test_batch_rule_and_revision_make_latest_brief_authoritative(tmp_path: Path,
 def test_decisionless_followup_does_not_retire_pending_ask(tmp_path: Path) -> None:
     path = tmp_path / "conversation.jsonl"
     thread_id = open_thread(path, brief=_brief(), raw_text="raw")
-    follow_up = _brief(category="milestone", decision=None, recommendation="I will return with a recommendation.", options=[], exhaustion=None)
+    follow_up = _brief(
+        category="milestone", decision=None, recommendation="I will return with a recommendation.", options=[], exhaustion=None
+    )
     append_operator_brief(path, thread_id=thread_id, brief=follow_up)
 
     threads = list_threads(path)
@@ -618,7 +631,7 @@ def test_newer_decision_bearing_brief_replaces_pending_ask(tmp_path: Path) -> No
 def test_decisionless_only_thread_is_never_pending(tmp_path: Path) -> None:
     path = tmp_path / "conversation.jsonl"
     brief = _brief(category="fyi", decision=None, recommendation="", options=[], exhaustion=None)
-    thread_id = open_thread(path, brief=brief, raw_text="raw")
+    open_thread(path, brief=brief, raw_text="raw")
 
     assert list_threads(path)[0].latest_brief.decision is None
     assert pending_threads(path) == []

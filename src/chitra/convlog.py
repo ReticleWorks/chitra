@@ -56,7 +56,7 @@ _RESULT_SEGMENT_ERROR = (
 )
 _MISSING_EXHAUSTION_ERROR = (
     "a decision may go to the operator only with an exhaustion record: "
-    f"list >= 2 distinct attempts with observed results (reason attempts_exhausted); "
+    "list >= 2 distinct attempts with observed results (reason attempts_exhausted); "
     "only credential, irreversible_consent, or operator_decision excuse going to the operator with fewer"
 )
 _SMUGGLED_ASK_MARKERS: tuple[str, ...] = (
