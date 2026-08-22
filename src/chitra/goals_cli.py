@@ -79,6 +79,18 @@ def _interview_required(root: Path, args: argparse.Namespace) -> dict[str, objec
     }
 
 
+def _current_nonce(nonce_path: Path) -> str:
+    """Read the currently issued nonce for a session, or an empty string when absent."""
+    try:
+        record = json.loads(nonce_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ""
+    if not isinstance(record, dict) or not isinstance(record.get("nonce"), str):
+        return ""
+    nonce: str = record["nonce"]
+    return nonce
+
+
 def _parse_interview_result(root: Path, args: argparse.Namespace) -> tuple[
     goal_store.InterviewReceipt,
     tuple[goal_store.EnrolledDoneWhenItem, ...],
@@ -322,6 +334,70 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _enroll_from_interview_result(root: Path, args: argparse.Namespace) -> goal_store.GoalRecord:
+    """Verify the interview nonce and enroll the goal as one lock-governed transaction.
+
+    The goals lock is held across nonce re-verification, provenance/item
+    construction, the goal commit, and the nonce consumption write, so a
+    replacement nonce issued concurrently by a changed ``set`` request can
+    neither be accepted by this stale parsed result nor overwritten by its
+    consumption marker.  The caller has already established that no enrolled
+    goal exists, and that fact is re-checked under the lock.
+
+    ``allow_strategic_change`` only widens the pre-existing-goal guard inside
+    ``_upsert_goal_locked``; with no existing record there is nothing to
+    compare strategic fields against, and a genuine stale second enrollment
+    still fails because the re-checked ``existing`` guard above raises first.
+    If the post-commit re-check finds a replaced nonce, the just-written goal
+    document is rolled back to its exact pre-commit bytes under the same lock,
+    so no partial enrollment survives and crash safety (atomic file
+    replacement throughout) is unchanged.
+    """
+    with locked_json_store(goal_store.goals_path(root)):
+        existing = goal_store.get_goal(args.root, args.session_ref)
+        if existing is not None:
+            raise goal_store.GoalValidationError("goal is already enrolled; its interview receipt and done items are frozen")
+        receipt, done_items, answers, nonce_path, nonce_record = _parse_interview_result(args.root, args)
+        done_when = goal_store.render_done_when_items(done_items)
+        intent = answers["intent"]
+        scope = f"Out of scope: {answers['out_of_scope']} Constraints: {answers['constraints']}"
+        requested_record = goal_store.GoalRecord(
+            session_ref=args.session_ref,
+            goal=args.goal,
+            done_when=done_when,
+            source=args.source,
+            status=args.status,
+            intent=intent,
+            scope=scope,
+            now=args.now,
+            last_verified=args.last_verified,
+            open_asks=tuple(args.open_ask),
+            needs=args.needs if args.needs is not None else "",
+            interview_receipt=receipt,
+            enrolled_done_when_items=done_items,
+            completion_proofs=(),
+        )
+        pre_commit_payload: dict[str, Any] | None
+        try:
+            loaded_document: Any = json.loads(goal_store.goals_path(root).read_text(encoding="utf-8"))
+            pre_commit_payload = loaded_document if isinstance(loaded_document, dict) else None
+        except FileNotFoundError:
+            pre_commit_payload = None
+        stored = goal_store._upsert_goal_locked(args.root, requested_record, allow_strategic_change=True)
+        try:
+            if nonce_record["nonce"] != _current_nonce(nonce_path):
+                raise ValueError("interview nonce was replaced before enrollment committed")
+        except ValueError:
+            if pre_commit_payload is None:
+                (goal_store.goals_path(root)).unlink(missing_ok=True)
+            else:
+                write_json_atomic(goal_store.goals_path(root), pre_commit_payload)
+            raise
+        nonce_record["consumed_at"] = stored.enrolled_at
+        write_json_atomic(nonce_path, nonce_record)
+    return stored
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     try:
@@ -337,43 +413,29 @@ def main(argv: list[str] | None = None) -> int:
             if existing is not None and args.interview_result is not None:
                 raise goal_store.GoalValidationError("goal is already enrolled; its interview receipt and done items are frozen")
 
-            nonce_path: Path | None = None
-            nonce_record: dict[str, Any] | None = None
-            if existing is None:
-                receipt, done_items, answers, nonce_path, nonce_record = _parse_interview_result(args.root, args)
-                done_when = goal_store.render_done_when_items(done_items)
-                intent = answers["intent"]
-                scope = f"Out of scope: {answers['out_of_scope']} Constraints: {answers['constraints']}"
-                completion_proofs: tuple[CompletionEvidence, ...] = ()
+            if existing is not None:
+                stored = goal_store.upsert_goal(
+                    args.root,
+                    goal_store.GoalRecord(
+                        session_ref=args.session_ref,
+                        goal=args.goal,
+                        done_when=args.done_when or existing.done_when,
+                        source=args.source,
+                        status=args.status,
+                        intent=args.intent if args.intent is not None else existing.intent,
+                        scope=args.scope if args.scope is not None else existing.scope,
+                        now=args.now,
+                        last_verified=args.last_verified,
+                        open_asks=tuple(args.open_ask),
+                        needs=args.needs if args.needs is not None else existing.needs,
+                        interview_receipt=existing.interview_receipt,
+                        enrolled_done_when_items=existing.enrolled_done_when_items,
+                        completion_proofs=existing.completion_proofs,
+                    ),
+                    clear_open_asks=args.clear_asks,
+                )
             else:
-                assert existing.interview_receipt is not None
-                receipt = existing.interview_receipt
-                done_items = existing.enrolled_done_when_items
-                done_when = args.done_when or existing.done_when
-                intent = args.intent if args.intent is not None else existing.intent
-                scope = args.scope if args.scope is not None else existing.scope
-                completion_proofs = existing.completion_proofs
-            requested_record = goal_store.GoalRecord(
-                session_ref=args.session_ref,
-                goal=args.goal,
-                done_when=done_when,
-                source=args.source,
-                status=args.status,
-                intent=intent,
-                scope=scope,
-                now=args.now,
-                last_verified=args.last_verified,
-                open_asks=tuple(args.open_ask),
-                needs=args.needs if args.needs is not None else (existing.needs if existing is not None else ""),
-                interview_receipt=receipt,
-                enrolled_done_when_items=done_items,
-                completion_proofs=completion_proofs,
-            )
-            stored = goal_store.upsert_goal(args.root, requested_record, clear_open_asks=args.clear_asks)
-            if nonce_path is not None and nonce_record is not None:
-                nonce_record["consumed_at"] = stored.enrolled_at
-                with locked_json_store(nonce_path):
-                    write_json_atomic(nonce_path, nonce_record)
+                stored = _enroll_from_interview_result(args.root, args)
             _print_record(stored)
         elif args.command == "get":
             found_record = goal_store.get_goal(args.root, args.session_ref)
