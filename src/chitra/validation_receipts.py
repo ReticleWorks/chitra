@@ -53,22 +53,24 @@ class TrustedValidator:
 
 
 _TRUSTED_VALIDATORS: dict[str, TrustedValidator] = {
-    "pytest": TrustedValidator(("pytest", "--version"), "artifact"),
-    "ruff": TrustedValidator(("ruff", "--version"), "artifact"),
-    "mypy": TrustedValidator(("mypy", "--version"), "artifact"),
+    "pytest": TrustedValidator(("pytest",), "artifact"),
+    "ruff": TrustedValidator(("ruff", "check"), "artifact"),
+    "mypy": TrustedValidator(("mypy",), "artifact"),
 }
 
 
-def _trusted_verifier_argv(name: str) -> tuple[str, ...]:
-    """Return the mapped verifier's argv, resolved through sys.executable.
+def _trusted_verifier_argv(name: str, target_path: str) -> tuple[str, ...]:
+    """Return the mapped verifier's fixed invocation over one exact target path.
 
-    Chitra runs the verifier implementation it ships with, never whatever a
-    PATH lookup would find first; this keeps the trusted invocation working in
-    venv-based test and daemon environments where the tools are not installed
-    as bare launchers.
+    The enrolled validator identity alone selects the program and its fixed
+    arguments; the only variable is the target path whose current content must
+    match the receipt binding.  Chitra runs the verifier implementation it
+    ships with, resolved through sys.executable, never whatever a PATH lookup
+    would find first and never a caller-chosen program, flag, or target such
+    as a presence-only `--version` check.
     """
     argv = _TRUSTED_VALIDATORS[name].argv
-    return (sys.executable, "-m", argv[0], *argv[1:])
+    return (sys.executable, "-m", argv[0], *argv[1:], target_path)
 
 
 class ReceiptError(ValueError):
@@ -415,6 +417,10 @@ def _receipt_target_digest(receipt: ValidationReceipt) -> str:
     return _text(_object(receipt.target["commit"], name="target.commit"), "sha", parent="target.commit")
 
 
+def _receipt_target_artifact_path(receipt: ValidationReceipt) -> str:
+    return _text(_object(receipt.target["artifact"], name="target.artifact"), "path", parent="target.artifact")
+
+
 def _pvr_origin(receipt: ValidationReceipt) -> str:
     if "command" in receipt.exercise:
         command = cast(list[str], receipt.exercise["command"])
@@ -519,11 +525,16 @@ def _validator_binding_issues(receipt: ValidationReceipt) -> list[str]:
     """Reject a declared exercise that is not bound to this validator identity."""
     name = _text(receipt.validator, "name", parent="validator")
     command = cast(list[str], receipt.exercise["command"])
-    expected = _trusted_verifier_argv(name)
+    if "artifact" not in receipt.target:
+        return [
+            f"{name}'s trusted verifier executes an exact artifact target; "
+            "this receipt declares no artifact target"
+        ]
+    expected = _trusted_verifier_argv(name, _receipt_target_artifact_path(receipt))
     if tuple(command) != expected:
         return [
             f"exercise.command {command!r} is not {name}'s trusted verifier invocation "
-            f"{list(expected)!r}; a caller-selected program cannot establish its PASS"
+            f"{list(expected)!r}; a caller-selected program or target cannot establish its PASS"
         ]
     return []
 
@@ -566,14 +577,15 @@ def _trusted_validator_target_issues(receipt: ValidationReceipt) -> list[str]:
 
 
 def _trusted_validator_result(receipt: ValidationReceipt, base: Path) -> int:
-    """Run the frozen identity's trusted verifier over the exact target identity.
+    """Run the frozen identity's trusted verifier against the exact current target.
 
-    The enrolled validator name, not the receipt author, selects the program:
-    Chitra's mapped verifier implementation runs against the exact current
-    target identity inside a verifier-controlled environment, and its observed
-    result is what supports the claimed PASS.  Any unmapped generic validator
-    identity, unreadable target, or failing verification counts as failure to
-    verify (125).
+    The enrolled validator name, not the receipt author, selects the program,
+    its fixed arguments, and the target: after the declared target's current
+    identity is hash-checked, Chitra's mapped verifier executes that exact
+    target file, and its observed result is what supports the claimed PASS.  A
+    presence-only or caller-authored exercise cannot stand in for it.  Any
+    unmapped generic validator identity, unreadable or changed target, unbound
+    exercise, or failing verification counts as failure to verify (125).
     """
     name = _text(receipt.validator, "name", parent="validator")
     trusted = _TRUSTED_VALIDATORS.get(name)
@@ -590,7 +602,7 @@ def _trusted_validator_result(receipt: ValidationReceipt, base: Path) -> int:
     }
     try:
         completed = subprocess.run(
-            [*_trusted_verifier_argv(name), str(Path(_receipt_target_digest(receipt)).name)],
+            [*_trusted_verifier_argv(name, _receipt_target_artifact_path(receipt))],
             check=False,
             capture_output=True,
             cwd=base,

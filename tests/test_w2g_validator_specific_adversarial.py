@@ -32,7 +32,7 @@ def _write_pytest_labeled_true_receipt(root: Path) -> Path:
     report = source / "evidence" / "report.json"
     report.parent.mkdir(parents=True)
     command = ["/bin/true"]
-    assert command != trusted_validator_argv()
+    assert command != trusted_validator_argv(str(report))
     report.write_text(
         json.dumps(
             {

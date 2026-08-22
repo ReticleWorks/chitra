@@ -59,11 +59,11 @@ def passing_completion_evidence(
     )
 
 
-def trusted_validator_argv() -> list[str]:
+def trusted_validator_argv(target_path: str) -> list[str]:
     """The exact argv Chitra's trusted pytest verifier runs for PASS receipts."""
     import sys
 
-    return [sys.executable, "-m", "pytest", "--version"]
+    return [sys.executable, "-m", "pytest", target_path]
 
 
 def ingest_passing_receipt(
@@ -75,22 +75,29 @@ def ingest_passing_receipt(
 ) -> Path:
     """Install a minimal hash-bound PASS receipt for goal-store tests."""
     source_dir = root / "test-receipt-sources" / hashlib.sha256(session_ref.encode()).hexdigest()
-    evidence_path = source_dir / "evidence" / "test-report.txt"
+    target_path = source_dir / "targets" / "test_receipt_target_passes.py"
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(
+        "def test_receipt_target_passes() -> None:\n    assert True\n",
+        encoding="utf-8",
+    )
+    evidence_path = source_dir / "evidence" / "test-report.json"
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
-    command = trusted_validator_argv()
+    command = trusted_validator_argv(str(target_path))
     evidence_path.write_text(
         json.dumps({"schema_version": "chitra-validator-report-v1", "command": command, "exit_code": 0}),
         encoding="utf-8",
     )
-    digest = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
     payload: dict[str, object] = {
         "receipt_name": receipt_name,
         "validator": {"name": validator, "version": "test"},
-        "target": {"artifact": {"path": str(evidence_path), "sha256": digest}},
+        "target": {"artifact": {"path": str(target_path), "sha256": hashlib.sha256(target_path.read_bytes()).hexdigest()}},
         "exercise": {"command": command},
         "result": {"status": "PASS", "validator_acceptance": True},
         "not_exercised": [],
-        "artifacts": [{"path": "evidence/test-report.txt", "kind": "report", "sha256": digest}],
+        "artifacts": [
+            {"path": "evidence/test-report.json", "kind": "report", "sha256": hashlib.sha256(evidence_path.read_bytes()).hexdigest()}
+        ],
         "produced_at": "2026-08-21T12:00:00Z",
         "integrity": {
             "algorithm": "sha256",
