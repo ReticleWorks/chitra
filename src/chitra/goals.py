@@ -55,6 +55,13 @@ SCHEMA = "chitra.goals.v3"
 # disposal, but their missing v3 enrollment contract can never pass launch,
 # enter a done state, or use completion close.
 SUPPORTED_SCHEMAS = (SCHEMA, "chitra.goals.v2", "chitra.goals.v1")
+# Reads tolerate every chitra.goals.v<N> document (unknown fields are ignored
+# on load), so a file written by a newer package can never crash a daemon at
+# load time; GOALS_SCHEMA_RE is the read gate, not SUPPORTED_SCHEMAS. Writes
+# keep the file's own schema label and refuse a file newer than SCHEMA unless
+# the caller explicitly migrates (see GoalsSchemaNewerError).
+GOALS_SCHEMA_RE = re.compile(r"^chitra\.goals\.v([0-9]+)$")
+GOALS_SCHEMA_NEWER_MESSAGE = "goals schema newer than installed package"
 
 INTERVIEW_QUESTION_IDS: tuple[str, ...] = ("intent", "done_when", "out_of_scope", "constraints")
 INTERVIEW_QUESTIONS: dict[str, str] = {
@@ -94,6 +101,10 @@ class GoalNotFoundError(KeyError):
     """Raised when an operation requires a goal record that is absent."""
 
 
+class GoalsSchemaNewerError(ValueError):
+    """Raised when a write would rewrite a goals.json newer than this package."""
+
+
 @pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True))
 class InterviewReceipt:
     """Immutable proof that all four enrollment questions were answered."""
@@ -114,9 +125,14 @@ class EnrolledDoneWhenItem:
     required_receipt: str
 
 
-@pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True))
+@pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True, extra="ignore"))
 class GoalRecord:
-    """The five canonical fields plus monitor-maintained tactical metadata."""
+    """The five canonical fields plus monitor-maintained tactical metadata.
+
+    ``extra="ignore"`` is the persisted-read contract: fields this package
+    does not know (written by a newer schema) are dropped in memory instead
+    of failing the load.
+    """
 
     session_ref: str
     goal: str
@@ -387,12 +403,66 @@ def goals_path(root: Path | None = None) -> Path:
     return (state_dir() if root is None else root) / "goals.json"
 
 
+def _schema_version(schema: object) -> int | None:
+    """Return the numeric version of a chitra.goals.v<N> string, else None."""
+    if not isinstance(schema, str):
+        return None
+    match = GOALS_SCHEMA_RE.fullmatch(schema)
+    return int(match.group(1)) if match else None
+
+
+def _installed_schema_version() -> int:
+    version = _schema_version(SCHEMA)
+    assert version is not None
+    return version
+
+
+def stored_file_schema(root: Path | None = None) -> str:
+    """Return this store's on-disk schema string without validating records.
+
+    Returns "" when the store does not exist yet or its document does not
+    carry a chitra.goals.v<N> schema.
+    """
+    try:
+        payload: Any = json.loads(goals_path(root).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ""
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    schema = payload.get("schema")
+    return schema if _schema_version(schema) is not None else ""
+
+
+def schema_is_newer_than_installed(schema: str) -> bool:
+    """Return whether a chitra.goals.v<N> string is newer than this package."""
+    version = _schema_version(schema)
+    return version is not None and version > _installed_schema_version()
+
+
+def goals_schema_newer_than_installed(root: Path | None = None) -> str | None:
+    """Return the store's file schema when it is newer than this package, else None.
+
+    Daemons use this to notice a store they must treat as read-only and to
+    journal that fact instead of exiting into a supervisor restart loop.
+    """
+    schema = stored_file_schema(root)
+    return schema if schema_is_newer_than_installed(schema) else None
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def load_goals(root: Path | None = None) -> list[GoalRecord]:
-    """Load records, backfilling legacy enrollment anchors in memory.
+def load_goals_document(root: Path | None = None) -> tuple[list[GoalRecord], str]:
+    """Load records plus the file's own ``file_schema``, backfilling legacy anchors.
+
+    Any ``chitra.goals.v<N>`` document loads; unknown top-level and per-record
+    fields are ignored in memory so a newer writer's file stays readable here
+    instead of crashing the reader. The returned second element is the file's
+    own schema label, which writers must keep unless an explicit migration
+    upgrades it (see ``GoalsSchemaNewerError``).
 
     Records written before enrollment anchors existed use their current
     ``done_when`` once, and persist that normalized anchor on their next write.
@@ -401,36 +471,76 @@ def load_goals(root: Path | None = None) -> list[GoalRecord]:
     try:
         payload: Any = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return []
-    if not isinstance(payload, dict) or payload.get("schema") not in SUPPORTED_SCHEMAS:
-        raise ValueError(f"goals.json is not one of: {', '.join(SUPPORTED_SCHEMAS)}")
+        return [], ""
+    if not isinstance(payload, dict):
+        raise ValueError("goals.json must be an object")
+    schema = payload.get("schema")
+    if not isinstance(schema, str) or _schema_version(schema) is None:
+        raise ValueError(f"goals.json schema must match {GOALS_SCHEMA_RE.pattern}, got {schema!r}")
     raw_goals = payload.get("goals")
     if not isinstance(raw_goals, list):
         raise ValueError("goals.json goals must be a list")
     document_updated_at = payload.get("updated_at", "")
     if not isinstance(document_updated_at, str):
         raise ValueError("goals.json updated_at must be a string")
-    return [GoalRecord.from_dict(item, legacy_enrolled_at=document_updated_at) for item in raw_goals]
+    records = [GoalRecord.from_dict(item, legacy_enrolled_at=document_updated_at) for item in raw_goals]
+    return records, schema
 
 
-def _write_goals(root: Path | None, records: list[GoalRecord]) -> None:
+def load_goals(root: Path | None = None) -> list[GoalRecord]:
+    """Load records, backfilling legacy enrollment anchors in memory.
+
+    Records written before enrollment anchors existed use their current
+    ``done_when`` once, and persist that normalized anchor on their next write.
+    """
+    records, _ = load_goals_document(root)
+    return records
+
+
+def _write_goals(root: Path | None, records: list[GoalRecord], *, migrate: bool = False) -> None:
+    """Atomically rewrite the store, keeping its own schema label.
+
+    A file labeled with a schema newer than this package's SCHEMA is refused
+    unless ``migrate`` is set: an installed 0.x daemon must never silently
+    rewrite a document it cannot fully understand. Any other readable file
+    keeps its own label -- writes never bump the schema implicitly.
+    """
     path = goals_path(root)
-    payload = {"schema": SCHEMA, "updated_at": _utc_now(), "goals": [record.to_dict() for record in records]}
+    file_schema = stored_file_schema(root)
+    target_schema = SCHEMA
+    if file_schema:
+        if schema_is_newer_than_installed(file_schema):
+            if not migrate:
+                raise GoalsSchemaNewerError(
+                    f"goals.json file schema {file_schema} is newer than installed package schema {SCHEMA}; "
+                    "refusing to rewrite it without --migrate"
+                )
+        else:
+            target_schema = file_schema
+    payload = {"schema": target_schema, "updated_at": _utc_now(), "goals": [record.to_dict() for record in records]}
     write_json_atomic(path, payload)
 
 
-def upsert_goal(root: Path | None, rec: GoalRecord, *, clear_open_asks: bool = False) -> GoalRecord:
+def upsert_goal(
+    root: Path | None,
+    rec: GoalRecord,
+    *,
+    clear_open_asks: bool = False,
+    migrate: bool = False,
+) -> GoalRecord:
     """Validate and atomically insert or update one record by ``session_ref``.
 
     An update with no incoming asks preserves any stored asks, so routine
     status or ``now`` revisions cannot silently retire an operator request.
     Pass ``clear_open_asks=True`` only for an explicit retirement path.
+    Pass ``migrate=True`` only for an operator-approved rewrite of a store
+    whose file schema is newer than this package's SCHEMA.
     """
     issues = validate_goal(rec, require_enrollment=False)
     if issues:
         raise GoalValidationError("; ".join(issues))
     with locked_json_store(goals_path(root)):
-        stored = _upsert_goal_locked(root, rec, clear_open_asks=clear_open_asks)
+        stored = _upsert_goal_locked(root, rec, clear_open_asks=clear_open_asks, migrate=migrate)
     logger.info("goal_mutated", session_ref=stored.session_ref, action="upsert")
     return stored
 
@@ -446,6 +556,7 @@ def _upsert_goal_locked(
     allow_completion_proofs: bool = False,
     allow_legacy_administrative: bool = False,
     mutation_time: str | None = None,
+    migrate: bool = False,
 ) -> GoalRecord:
     """The body of ``upsert_goal``, assuming the caller already holds
     ``locked_json_store``. Callers that must read-then-modify an existing
@@ -548,7 +659,7 @@ def _upsert_goal_locked(
     )
     records = [record for record in records if record.session_ref != rec.session_ref]
     records.append(stored)
-    _write_goals(root, records)
+    _write_goals(root, records, migrate=migrate)
     return stored
 
 
@@ -666,6 +777,7 @@ def update_now(
     now: str | None = None,
     status: GoalStatus | None = None,
     last_verified: str | None = None,
+    migrate: bool = False,
 ) -> GoalRecord:
     """Update only the current tactical state of an existing goal record."""
     if status in DONE_STATUSES:
@@ -682,6 +794,7 @@ def update_now(
                 status=existing.status if status is None else status,
                 last_verified=existing.last_verified if last_verified is None else last_verified,
             ),
+            migrate=migrate,
         )
     logger.info("goal_mutated", session_ref=stored.session_ref, action="upsert")
     return stored

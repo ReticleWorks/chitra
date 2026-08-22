@@ -25,11 +25,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from chitra._fsio import env_path, write_json_atomic
 from chitra.account_registry import RegistryEntry, load_registry
 from chitra.goals import (
+    GOALS_SCHEMA_NEWER_MESSAGE,
     LOAD_SHED_HOLD_REASON_PREFIX,
+    SCHEMA as GOALS_INSTALLED_SCHEMA,
     GoalRecord,
     GoalStatus,
     check_specification,
     due_goals,
+    goals_schema_newer_than_installed,
     list_goals,
     session_host,
     session_name,
@@ -48,6 +51,34 @@ DIGEST_FILENAME = "sweep-digest.json"
 SNAPSHOT_FILENAME = "sweep-digest-state.json"
 FLAGS_FILENAME = "flags.log"
 FLAG_SEVERITIES: frozenset[str] = frozenset({"CRIT", "IDLE"})
+
+# Roots whose newer-than-installed goals.json has already been journaled; a
+# long-running daemon notices once instead of writing the same warning into
+# the journal on every sweep.
+_SCHEMA_NOTICED_ROOTS: set[str] = set()
+
+
+def note_goals_schema_state(state_dir: Path) -> None:
+    """Journal one read-only notice when this store's file schema is newer.
+
+    The digest reads goal state only, so a newer goals.json keeps sweeping;
+    the notice records that this installed package must not write it instead
+    of exiting into a supervisor restart loop (the chitra.goals.v4 outage
+    class).
+    """
+    file_schema = goals_schema_newer_than_installed(state_dir)
+    if file_schema is None:
+        return
+    key = str(state_dir)
+    if key in _SCHEMA_NOTICED_ROOTS:
+        return
+    _SCHEMA_NOTICED_ROOTS.add(key)
+    logger.warning(
+        GOALS_SCHEMA_NEWER_MESSAGE,
+        state_dir=key,
+        file_schema=file_schema,
+        installed_schema=GOALS_INSTALLED_SCHEMA,
+    )
 
 
 class FlagRecord(BaseModel):
@@ -440,6 +471,7 @@ def compute_delta(previous: SweepSnapshot, current: SweepSnapshot, *, now: datet
 def run_once(config: SweepdConfig, *, now: datetime | None = None) -> SweepDigest:
     """Generate, publish, and then persist one delta baseline transaction."""
     current_now = datetime.now(UTC) if now is None else now
+    note_goals_schema_state(config.state_dir)
     previous = load_snapshot(config.snapshot_path)
     current = build_snapshot(config.state_dir, flags_path=config.flags_path, now=current_now)
     digest = compute_delta(previous, current, now=current_now)

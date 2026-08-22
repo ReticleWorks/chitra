@@ -20,6 +20,7 @@ from chitra.goals import (
     GoalRedirectRequiredError,
     GoalStatus,
     GoalValidationError,
+    GoalsSchemaNewerError,
     add_ask,
     check_specification,
     close_goal,
@@ -29,11 +30,13 @@ from chitra.goals import (
     hold_goal,
     list_goals,
     load_goals,
+    load_goals_document,
     main,
     mark_completion_gate_passed,
     redirect_goal,
     resolve_ask,
     resume_goal,
+    schema_is_newer_than_installed,
     session_host,
     session_name,
     update_now,
@@ -1084,6 +1087,149 @@ def test_concurrent_writers_adding_asks_to_the_same_lane_do_not_lose_each_other(
     stored = get_goal(tmp_path, "host-b:f2-77:0.0")
     assert stored is not None
     assert set(stored.open_asks) == set(asks)
+
+
+# --- schema compatibility: tolerant reads, gated writes (v1.1 P6) ---
+
+
+def _write_schema_document(root: Path, schema: str, *, extra_document_field: bool = False, extra_record_field: bool = False) -> None:
+    record_dict = _record().to_dict()
+    if extra_record_field:
+        record_dict["future_v4_field"] = {"nested": [1, 2, 3]}
+    document: dict[str, object] = {
+        "schema": schema,
+        "updated_at": "2026-08-22T00:00:00+00:00",
+        "goals": [record_dict],
+    }
+    if extra_document_field:
+        document["future_v4_envelope"] = "newer-writer-only"
+    (root / "goals.json").write_text(json.dumps(document), encoding="utf-8")
+
+
+def test_load_accepts_any_chitra_goals_version_and_ignores_unknown_fields(tmp_path: Path) -> None:
+    """A file written by a newer package (chitra.goals.v4+) loads here: any
+    chitra.goals.v<N> label is accepted and unknown top-level or per-record
+    fields are dropped in memory instead of crashing the reader -- the
+    outage class where an installed daemon died at load on a newer store."""
+    _write_schema_document(tmp_path, "chitra.goals.v4", extra_document_field=True, extra_record_field=True)
+
+    records, file_schema = load_goals_document(tmp_path)
+
+    assert file_schema == "chitra.goals.v4"
+    assert [record.session_ref for record in records] == [_record().session_ref]
+    assert records[0].goal == _record().goal
+    assert not hasattr(records[0], "future_v4_field")
+    assert load_goals(tmp_path) == records
+
+
+def test_load_still_refuses_a_label_outside_the_chitra_goals_family(tmp_path: Path) -> None:
+    """Tolerance is for newer versions of the same schema family, not for
+    arbitrary documents: a non-``chitra.goals.v<N>`` label still fails loud."""
+    _write_schema_document(tmp_path, "some.other.thing.v9")
+
+    with pytest.raises(ValueError, match="goals.json schema must match"):
+        load_goals(tmp_path)
+
+
+def test_write_keeps_an_older_file_its_own_schema_label(tmp_path: Path) -> None:
+    """Writes never bump the schema implicitly: a readable older store keeps
+    its own label after this package mutates it."""
+    upsert_goal(tmp_path, _record())
+    payload = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
+    payload["schema"] = "chitra.goals.v2"
+    (tmp_path / "goals.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    stored = update_now(tmp_path, _record().session_ref, now="revising under v2 label")
+
+    rewritten = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
+    assert rewritten["schema"] == "chitra.goals.v2"
+    assert get_goal(tmp_path, stored.session_ref) == stored
+
+
+def test_write_to_a_newer_store_is_refused_and_migrate_relabels_it(tmp_path: Path) -> None:
+    """An installed package must never silently rewrite a document it cannot
+    fully understand: the write refuses while the file's schema is newer than
+    SCHEMA, and migrate=True is the explicit operator-approved upgrade."""
+    upsert_goal(tmp_path, _record())
+    path = tmp_path / "goals.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["schema"] = "chitra.goals.v4"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(GoalsSchemaNewerError, match="newer than installed package schema"):
+        update_now(tmp_path, _record().session_ref, now="must refuse without migration")
+    assert json.loads(path.read_text(encoding="utf-8"))["schema"] == "chitra.goals.v4"
+
+    update_now(tmp_path, _record().session_ref, now="operator-approved rewrite", migrate=True)
+    migrated = json.loads(path.read_text(encoding="utf-8"))
+    assert migrated["schema"] == "chitra.goals.v3"
+    assert get_goal(tmp_path, _record().session_ref) is not None
+
+
+@pytest.mark.parametrize("schema", ["chitra.goals.v1", "chitra.goals.v2", "chitra.goals.v3", "chitra.goals.v7"])
+def test_schema_version_comparisons(schema: str) -> None:
+    version = int(schema.rsplit("v", 1)[1])
+    assert schema_is_newer_than_installed(schema) == (version > 3)
+
+
+def test_goal_cli_set_against_a_newer_store_exits_3_with_the_migrate_hint(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The v4-outage CLI contract: a write against a store labeled newer than
+    this package exits 3 with the --migrate hint, and the store's schema
+    label is untouched so a newer package can still read its own file."""
+    document = {"schema": "chitra.goals.v4", "updated_at": "2026-08-22T00:00:00+00:00", "goals": []}
+    (tmp_path / "goals.json").write_text(json.dumps(document), encoding="utf-8")
+    record = _record()
+    set_args = [
+        "set",
+        "--root",
+        str(tmp_path),
+        "--session-ref",
+        record.session_ref,
+        "--goal",
+        record.goal,
+        "--done-when",
+        record.done_when,
+        "--source",
+        record.source,
+    ]
+    assert main(set_args) == 2
+    required = json.loads(capsys.readouterr().out)
+    assert required["type"] == "INTERVIEW_REQUIRED"
+    result_path = tmp_path / "interview-result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "type": "INTERVIEW_RESULT",
+                "nonce": required["nonce"],
+                "receipt_name": required["receipt_name"],
+                "answers": {
+                    "intent": {"answer": "Deliver the requested deterministic goal behavior safely.", "provenance": "operator:test"},
+                    "done_when": {"answer": record.done_when, "provenance": "operator:test"},
+                    "out_of_scope": {"answer": "Unrelated board changes are excluded.", "provenance": "operator:test"},
+                    "constraints": {"answer": "Keep the change small and tested.", "provenance": "operator:test"},
+                },
+                "enrolled_done_when_items": [
+                    {
+                        "id": "done-1",
+                        "text": record.done_when,
+                        "validator": "pytest",
+                        "required_receipt": "tests-green",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main([*set_args, "--interview-result", str(result_path)])
+
+    assert exit_code == 3
+    captured = capsys.readouterr()
+    assert "newer than installed package schema" in captured.err
+    assert "--migrate" in captured.err
+    assert json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))["schema"] == "chitra.goals.v4"
 
 
 # ---------------------------------------------------------------------------
