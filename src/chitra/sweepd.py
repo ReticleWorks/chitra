@@ -27,7 +27,6 @@ from chitra.account_registry import RegistryEntry, load_registry
 from chitra.goals import (
     GOALS_SCHEMA_NEWER_MESSAGE,
     LOAD_SHED_HOLD_REASON_PREFIX,
-    SCHEMA as GOALS_INSTALLED_SCHEMA,
     GoalRecord,
     GoalStatus,
     check_specification,
@@ -36,6 +35,9 @@ from chitra.goals import (
     list_goals,
     session_host,
     session_name,
+)
+from chitra.goals import (
+    SCHEMA as GOALS_INSTALLED_SCHEMA,
 )
 from chitra.lane_config import enabled_lanes
 from chitra.rate_limit_state import Transaction, TransactionPhase, load_load_states, load_transactions

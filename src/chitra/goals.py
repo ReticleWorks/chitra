@@ -432,7 +432,7 @@ def stored_file_schema(root: Path | None = None) -> str:
     if not isinstance(payload, dict):
         return ""
     schema = payload.get("schema")
-    return schema if _schema_version(schema) is not None else ""
+    return schema if isinstance(schema, str) and _schema_version(schema) is not None else ""
 
 
 def schema_is_newer_than_installed(schema: str) -> bool:

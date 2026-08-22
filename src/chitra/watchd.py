@@ -58,9 +58,13 @@ from chitra.goal_enforcement import (
     review_watched_session,
 )
 from chitra.goals import (
+    GOALS_SCHEMA_NEWER_MESSAGE,
+    GoalsSchemaNewerError,
     GoalStatus,
+    SCHEMA as GOALS_INSTALLED_SCHEMA,
     add_ask,
     get_goal,
+    goals_schema_newer_than_installed,
     lane_id_from_session_ref,
     list_goals,
     mark_completion_gate_passed,
@@ -81,6 +85,34 @@ from chitra.systemd_notify import notify_ready, notify_watchdog
 from chitra.validation_receipts import record_enrolled_validator_runs, verified_disk_results
 
 logger = structlog.get_logger(__name__)
+
+# Roots whose newer-than-installed goals.json has already been journaled; a
+# long-running daemon notices once instead of writing the same warning into
+# the journal on every poll.
+_SCHEMA_NOTICED_ROOTS: set[str] = set()
+
+
+def note_goals_schema_state(goals_root: Path | None) -> None:
+    """Journal one read-only notice when this store's file schema is newer.
+
+    A newer goals.json never stops the watcher: goal state is treated as
+    read-only and the daemon keeps polling instead of exiting into a
+    supervisor restart loop (the chitra.goals.v4 outage class).
+    """
+    file_schema = goals_schema_newer_than_installed(goals_root)
+    if file_schema is None:
+        return
+    key = str(goals_root) if goals_root is not None else "<default-state-dir>"
+    if key in _SCHEMA_NOTICED_ROOTS:
+        return
+    _SCHEMA_NOTICED_ROOTS.add(key)
+    logger.warning(
+        GOALS_SCHEMA_NEWER_MESSAGE,
+        goals_root=key,
+        file_schema=file_schema,
+        installed_schema=GOALS_INSTALLED_SCHEMA,
+    )
+
 
 EVENT_LOG_ENV_VAR = "CHITRA_WATCHD_EVENT_LOG"
 INTERVAL_ENV_VAR = "CHITRA_WATCHD_INTERVAL"
@@ -936,8 +968,73 @@ class Watchd:
         assert self.status_broker is not None
         if self.status_broker.frozen:
             return 0
-        emitted = 0
         root = self.config.goals_root or self.config.state_dir
+        if goals_schema_newer_than_installed(root) is not None:
+            # Read-only degradation (the chitra.goals.v4 outage class): a
+            # store newer than this package refuses our writes, so skip goal
+            # mutations and keep polling instead of killing run_forever.
+            note_goals_schema_state(root)
+            return self._poll_panes_only()
+        try:
+            return self._poll_once_locked(root)
+        except GoalsSchemaNewerError:
+            # A newer store appeared mid-poll; degrade exactly as above.
+            note_goals_schema_state(root)
+            return 0
+
+    def _poll_panes_only(self) -> int:
+        """One sensing pass with goal state treated as read-only: pane events,
+        activity facts, and transcript-pipe faults still emit; every goal
+        mutation (turn-end review finalization, status writes, asks) is
+        skipped so the newer writer's file is never rewritten here."""
+        assert self.status_broker is not None
+        emitted = 0
+        for pane in list_panes(
+            runner=self.runner,
+            panes_override=self.config.panes_override,
+            session_names=self.config.session_names,
+            session_prefixes=self.config.session_prefixes,
+            excluded_session_prefixes=self.config.excluded_session_prefixes,
+            tmux_socket=self.config.tmux_socket,
+        ):
+            content = capture_pane(pane, runner=self.runner, tmux_socket=self.config.tmux_socket)
+            if content is None:
+                continue
+            self._save_raw_capture(pane.pane_id, content)
+            session_ref = self._session_ref(pane)
+            try:
+                self.status_broker.observe(
+                    pane_id=pane.pane_id,
+                    target=pane.target,
+                    session_ref=session_ref,
+                    lane_id=self.config.lane_id or pane.target,
+                    detected_agent=pane.backend,
+                    snapshot=content,
+                    tmux_socket=self.config.tmux_socket,
+                )
+            except StatusRuntimeError:
+                break
+            status = next(item for item in self.status_broker.statuses() if item.pane_id == pane.pane_id)
+            previous_revision = self.status_revisions.get(pane.pane_id)
+            changed = previous_revision is None or previous_revision != status.revision
+            if session_ref is not None:
+                emitted += self._check_transcript_pipe(pane, session_ref, last_change_at=datetime.now(UTC).isoformat())
+            self.status_states[pane.pane_id] = status.state
+            self.status_revisions[pane.pane_id] = status.revision
+            if previous_revision is None:
+                continue
+            if changed:
+                append_event(
+                    self.config.events_log,
+                    status_event_line(status),
+                    max_log_bytes=self.config.max_log_bytes,
+                )
+                emitted += 1
+        return emitted
+
+    def _poll_once_locked(self, root: Path) -> int:
+        assert self.status_broker is not None
+        emitted = 0
         existing_activity = {record.session_ref: record for record in load_lane_activity(root)}
         activity_updates: list[LaneActivity] = []
         for pane in list_panes(
