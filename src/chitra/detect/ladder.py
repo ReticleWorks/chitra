@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import json
 import os
 import re
 from collections.abc import Sequence
@@ -29,6 +30,8 @@ from .detectors import Finding
 LADDER_STAGES: tuple[str, ...] = ("nudge", "redirect", "rescue", "relaunch")
 
 _LANE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+_HEX64_RE = re.compile(r"[0-9a-f]{64}\Z")
+_SAFE_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 
 IncidentStage = Literal["nudge", "redirect", "rescue", "relaunch"]
 
@@ -89,6 +92,7 @@ class IncidentStore:
         if _LANE_RE.fullmatch(lane) is None:
             raise ValueError(f"unsafe lane name: {lane!r}")
         self.lane = lane
+        self.state_root = state_root
         self.directory = state_root / "incidents"
         self.path = self.directory / f"{lane}.jsonl"
         self.lock_path = self.directory / f"{lane}.lock"
@@ -197,7 +201,7 @@ class IncidentStore:
     def seal_rescue_checkpoint(
         self, *, fingerprint: str, order_marker: str, bundle_sha256: str, checkpoint_ref: str
     ) -> IncidentRecord:
-        if not bundle_sha256 or not checkpoint_ref:
+        if _HEX64_RE.fullmatch(bundle_sha256) is None or _SAFE_REF_RE.fullmatch(checkpoint_ref) is None:
             raise ValueError("rescue bundle hash and checkpoint reference are required")
         records = self.load()
         target = next(
@@ -208,6 +212,12 @@ class IncidentStore:
             raise KeyError(f"no incident for fingerprint {fingerprint!r} at marker {order_marker!r}")
         if target.stage != "rescue":
             raise ValueError("only the rescue stage can be sealed for relaunch")
+        if target.consumption is None:
+            raise ValueError("rescue order consumption is required before sealing relaunch evidence")
+        if not _rescue_bundle_verified(self.state_root, target, bundle_sha256):
+            raise ValueError("rescue bundle hash does not match a governed RESCUE bundle")
+        if not _checkpoint_receipt_verified(self.state_root, target, bundle_sha256, checkpoint_ref):
+            raise ValueError("checkpoint reference does not match a governed checkpoint receipt")
         advanced = target.model_copy(update={"rescue_bundle_sha256": bundle_sha256, "checkpoint_ref": checkpoint_ref})
         return self._append(advanced)
 
@@ -277,6 +287,8 @@ class ResponseLadder:
             return False
         if proof.session_ref and proof.ledger_entry.session_ref != proof.session_ref:
             return False
+        if not proof.session_ref:
+            return False
         if f":{record.lane}:" not in proof.ledger_entry.session_ref:
             return False
         events_by_id = {event.event_id: event for event in self._events}
@@ -285,6 +297,8 @@ class ResponseLadder:
         if user_event is None or turn_event is None:
             return False
         if user_event.lane != record.lane or turn_event.lane != record.lane:
+            return False
+        if user_event.session_id != proof.session_ref or turn_event.session_id != proof.session_ref:
             return False
         if user_event.native_type != "user" or user_event.normalized_type in {
             CanonicalType.TOOL_CALL,
@@ -307,6 +321,56 @@ class ResponseLadder:
         if turn_position <= user_position:
             return False
         return _next_final_boundary(self._events, user_position) == turn_event.event_id
+
+
+def _rescue_bundle_verified(state_root: Path, record: IncidentRecord, bundle_sha256: str) -> bool:
+    for path in sorted((state_root / "rescue").glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("bundle_sha256") != bundle_sha256:
+            continue
+        unsigned = dict(payload)
+        unsigned.pop("bundle_sha256", None)
+        computed = hashlib.sha256(
+            json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+        if computed != bundle_sha256:
+            continue
+        expected_session = record.consumption.session_ref if record.consumption else ""
+        if payload.get("lane") != record.lane or payload.get("session_ref") != expected_session:
+            continue
+        if payload.get("checkpoint_requested") is not True:
+            continue
+        return True
+    return False
+
+
+def _checkpoint_receipt_verified(
+    state_root: Path, record: IncidentRecord, bundle_sha256: str, checkpoint_ref: str
+) -> bool:
+    path = state_root / "checkpoints" / f"{checkpoint_ref}.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    expected_session = record.consumption.session_ref if record.consumption else ""
+    if payload.get("lane") != record.lane or payload.get("session_ref") != expected_session:
+        return False
+    if payload.get("fingerprint") not in {record.fingerprint, None} and payload.get("incident_fingerprint") != record.fingerprint:
+        return False
+    if payload.get("bundle_sha256") not in {bundle_sha256, None} and payload.get("rescue_bundle_sha256") != bundle_sha256:
+        return False
+    return not (
+        payload.get("checkpoint_ref") not in {checkpoint_ref, None}
+        and payload.get("receipt_id") not in {checkpoint_ref, None}
+        and payload.get("id") != checkpoint_ref
+    )
 
 
 def _payload_text(event: CanonicalEvent) -> str:

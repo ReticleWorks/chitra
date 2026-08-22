@@ -181,6 +181,33 @@ def _violated_scope_clause(text: str, clauses: Sequence[str]) -> str | None:
     return None
 
 
+def _semantic_scope_seed(
+    event: CanonicalEvent, input_value: object, *, violated: str, declared_worktree: str
+) -> dict[str, Any]:
+    cwd = event.payload.get("cwd")
+    input_cwd = input_value.get("cwd") if isinstance(input_value, dict) else None
+    work_cwd = input_cwd if isinstance(input_cwd, str) else cwd if isinstance(cwd, str) else None
+    paths = tuple(
+        sorted(
+            _semantic_path(path, declared_worktree=declared_worktree, cwd=work_cwd)
+            for path in _target_paths(input_value)
+        )
+    )
+    command = ""
+    if isinstance(input_value, dict):
+        raw_command = input_value.get("command")
+        if isinstance(raw_command, str):
+            command = " ".join(raw_command.lower().split())
+    elif isinstance(input_value, str):
+        command = " ".join(input_value.lower().split())
+    return {
+        "clause": violated,
+        "tool_name": event.payload.get("tool_name"),
+        "paths": paths,
+        "command": command,
+    }
+
+
 def detect_drift(
     events: Sequence[CanonicalEvent],
     *,
@@ -209,7 +236,12 @@ def detect_drift(
             findings.append(
                 Finding(
                     detector="drift",
-                    fingerprint_seed={"event_id": event.event_id, "clause": violated},
+                    fingerprint_seed=_semantic_scope_seed(
+                        event,
+                        input_value,
+                        violated=violated,
+                        declared_worktree=declared_worktree,
+                    ),
                     event_refs=(event.event_id,),
                     unmet_item=unmet,
                     expected_next_progress="return to the enrolled scope and produce evidence toward the first unmet done-when item",
@@ -279,6 +311,8 @@ def detect_unnecessary_steps(
             continue
         signature = _result_signature(event, results.get(event.native_join_id or ""))
         occurrences = seen.setdefault(signature, [])
+        if occurrences and _has_progress_between(events, progress_rows, occurrences[-1][0], position):
+            occurrences.clear()
         occurrences.append((position, event.event_id))
         if len(occurrences) < threshold:
             continue
@@ -329,7 +363,7 @@ def detect_excessive_testing(
             runs.append((position, signature, event))
     streak: list[tuple[int, str, CanonicalEvent]] = []
     for run in runs:
-        if streak and streak[-1][1] == run[1]:
+        if streak and streak[-1][1] == run[1] and not _has_progress_between(events, progress_rows, streak[-1][0], run[0]):
             streak.append(run)
         else:
             streak = [run]

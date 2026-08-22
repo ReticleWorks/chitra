@@ -96,6 +96,8 @@ def collect_rescue_bundle(
     """Gather the RESCUE evidence set. Read-only over the worktree."""
     if transcript_path is None:
         raise RuntimeError("RESCUE capture requires a transcript path")
+    if not process_identity or not any(key in process_identity for key in ("target_pid", "target_process_id", "process_id")):
+        raise RuntimeError("RESCUE capture requires affected process identity")
     status = _git(["status", "--porcelain=v1"], worktree)
     diff_staged = _git(["diff", "--cached"], worktree)
     diff_unstaged = _git(["diff"], worktree)
