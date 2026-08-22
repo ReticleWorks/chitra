@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from importlib import import_module
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 SCHEMA_CONVERSION_RECEIPT = "chitra.topology-conversion-receipt.v1"
 SCHEMA_GOALS_CONVERSION = "chitra.legacy-goals-conversion.v1"
@@ -22,6 +24,8 @@ SCHEMA_QUEUE_REPLAY = "chitra.dispatch-queue-replay.v1"
 SCHEMA_SHADOW_FINDINGS = "chitra.topology-shadow-findings.v1"
 SCHEMA_HANDOFF_RECEIPT = "chitra.authority-handoff-receipt.v1"
 SCHEMA_ROLLBACK_RECEIPT = "chitra.disposable-rollback-receipt.v1"
+SCHEMA_LIFECYCLE_PROOF = "chitra.authority-handoff-lifecycle-proof.v1"
+SCHEMA_NATIVE_CLIENT_PROOF = "chitra.native-client-proof.v1"
 SNAPSHOT_MARKER = ".chitra-disposable-snapshot"
 
 GOAL_SCHEMAS = {"chitra.goals.v1", "chitra.goals.v2", "chitra.goals.v3"}
@@ -134,6 +138,23 @@ def _safe_resolve(path: Path) -> Path:
     return path.expanduser().resolve(strict=False)
 
 
+def _canonical_event_model() -> type[Any]:
+    return cast(type[Any], import_module("chitra.journal.models").CanonicalEvent)
+
+
+def _goal_record_model() -> type[Any]:
+    return cast(type[Any], import_module("chitra.goals").GoalRecord)
+
+
+def _parse_iso8601(value: str, *, label: str) -> None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ConversionError(f"{label} must be an ISO8601 datetime") from exc
+    if parsed.tzinfo is None:
+        raise ConversionError(f"{label} must include a timezone")
+
+
 def _as_int(value: object) -> int:
     if isinstance(value, bool):
         return 0
@@ -169,6 +190,31 @@ def _goal_records(payload: Mapping[str, object], source: Path | str) -> list[dic
             raise ConversionError(f"{source} contains a non-object goal record")
         records.append(cast(dict[str, object], item))
     return records
+
+
+def _legacy_identity(record: Mapping[str, object]) -> tuple[str, str, str]:
+    session_ref = record.get("session_ref")
+    session = session_ref if isinstance(session_ref, str) and session_ref else "legacy-session"
+    parts = session.split(":")
+    instance = parts[0] if parts and parts[0] else "legacy"
+    lane = parts[1] if len(parts) > 1 and parts[1] else instance
+    return instance, lane, session
+
+
+def _source_transcript_identity(source_path: str) -> dict[str, object]:
+    try:
+        stat = Path(source_path).stat()
+    except OSError:
+        return {"path": source_path, "device": 0, "inode": 0, "generation": 0}
+    return {"path": source_path, "device": stat.st_dev, "inode": stat.st_ino, "generation": 0}
+
+
+def _legacy_observed_at(record: Mapping[str, object]) -> str:
+    for key in ("updated_at", "created_at"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return _utc_now()
 
 
 def convert_goals_document(
@@ -231,33 +277,54 @@ def convert_goals_document(
 
 def _w1_journal_record(record: Mapping[str, object], *, source_path: str, source_sha256: str, legacy_index: int) -> dict[str, object]:
     """Build the canonical per-record journal row a read-only converter can prove."""
-    session_ref = record.get("session_ref")
     payload_digest = _sha256_bytes(_canonical_bytes(record))
-    return {
-        "schema": "chitra.normalized-event-journal.v1",
+    instance, lane, session_id = _legacy_identity(record)
+    event = {
+        "schema": "chitra.journal.event.v1",
         "event_id": f"legacy-goal:{source_sha256}:{legacy_index}",
-        "source": {"path": source_path, "sha256": source_sha256, "legacy_index": legacy_index},
-        "session_ref": session_ref if isinstance(session_ref, str) else "",
+        "instance": instance,
+        "lane": lane,
+        "client": "codex",
+        "client_version": SCHEMA_GOALS_CONVERSION,
+        "process_id": "legacy-goals-converter",
+        "transcript": _source_transcript_identity(source_path),
+        "session_id": session_id,
+        "resume_id": None,
+        "observed_at": _legacy_observed_at(record),
+        "native_time": _legacy_observed_at(record),
         "native_type": "legacy_goal_record",
-        "normalized_type": "legacy_goal_imported_display_only",
+        "native_join_id": None,
+        "raw_byte_range": None,
+        "raw_sha256": payload_digest,
+        "lifecycle_receipt": None,
+        "normalized_type": "unknown",
+        "goal_ref": session_id,
+        "item_ref": None,
         "payload_sha256": payload_digest,
+        "payload_digest": payload_digest,
         "normalizer_version": SCHEMA_GOALS_CONVERSION,
+        "payload": {
+            "source": {"path": source_path, "sha256": source_sha256, "legacy_index": legacy_index},
+            "legacy_record_sha256": payload_digest,
+            "display_only": True,
+            "administrative_dispose_only": True,
+        },
+        "raw_record": dict(record),
     }
+    return cast(dict[str, object], _canonical_event_model().model_validate(event).model_dump(mode="json", by_alias=True))
 
 
 def _w2_enrollment_record(record: Mapping[str, object], *, legacy_index: int, is_terminal: bool) -> dict[str, object]:
     """Bind the legacy record to W2 enrollment without inventing interviews."""
-    session_ref = record.get("session_ref")
-    return {
-        "schema": "chitra.goal.v2.enrollment-boundary.v1",
-        "legacy_index": legacy_index,
-        "session_ref": session_ref if isinstance(session_ref, str) else "",
-        "interview_receipt": None,
-        "enrolled_done_when_items": [],
-        "completion_proofs": [],
-        "completion_eligible": False,
-        "requires_old_authority_or_fresh_interview": not is_terminal,
-    }
+    goal_record_model = _goal_record_model()
+    parsed = goal_record_model.from_dict(record)
+    converted = cast(dict[str, object], parsed.to_dict())
+    converted["legacy_index"] = legacy_index
+    converted["legacy_display_only"] = True
+    converted["completion_eligible"] = False
+    converted["requires_old_authority_or_fresh_interview"] = not is_terminal
+    goal_record_model.from_dict(converted)
+    return converted
 
 
 def _queue_stage(relative_path: str) -> str:
@@ -565,8 +632,17 @@ def _conversion_receipt(
         for entry in queue_entries
     ]
     goal_records = cast(list[Mapping[str, object]], reread_goals.get("records", []))
-    w1_bound = all(isinstance(record.get("w1_journal_record"), Mapping) for record in goal_records)
-    w2_bound = all(isinstance(record.get("w2_enrollment_record"), Mapping) for record in goal_records)
+    w1_bound = True
+    w2_bound = True
+    for record in goal_records:
+        try:
+            _canonical_event_model().model_validate(record.get("w1_journal_record"))
+        except Exception:
+            w1_bound = False
+        try:
+            _goal_record_model().from_dict(record.get("w2_enrollment_record"))
+        except Exception:
+            w2_bound = False
     legacy_dispositions = [
         cast(Mapping[str, object], record.get("disposition"))
         for record in goal_records
@@ -682,7 +758,7 @@ def build_authority_handoff_receipt(
     native_client: Mapping[str, object] | None = None,
     cutover_sequence: Sequence[str] = ("old-drained", "old-stopped", "old-write-denied", "new-started", "new-write-proved"),
 ) -> dict[str, object]:
-    """Seal a pure handoff proof; callers provide externally observed facts."""
+    """Seal an artifact-backed authority handoff proof."""
     if old_writer.role != "old" or new_writer.role != "new":
         raise ConversionError("handoff requires one old writer and one new writer")
     required_sequence = ("old-drained", "old-stopped", "old-write-denied", "new-started", "new-write-proved")
@@ -728,12 +804,43 @@ def build_authority_handoff_receipt(
             issues.append(f"instance binding {key} is empty")
         if key.endswith("_sha256") and not _is_sha256(value):
             issues.append(f"instance binding {key} must be a SHA-256 digest")
-    if not transcript_bindings or not all(_is_sha256(binding) for binding in transcript_bindings):
-        issues.append("transcript bindings must contain externally observed SHA-256 digests")
+    expected_bindings = {
+        "namespace": instance,
+        "old_unit": old_writer.unit,
+        "new_unit": new_writer.unit,
+        "old_process": old_writer.process,
+        "new_process": new_writer.process,
+        "old_package": old_writer.package,
+        "new_package": new_writer.package,
+        "last_old_order_sha256": old_writer.last_order_sha256,
+        "pre_state_sha256": pre_state_sha256,
+        "post_state_sha256": post_state_sha256,
+        "rollback_checkpoint_sha256": rollback_checkpoint_sha256,
+    }
+    for key, expected in expected_bindings.items():
+        if bindings.get(key) != expected:
+            issues.append(f"instance binding {key} contradicts observed handoff fact")
+    verified_transcripts: list[dict[str, object]] = []
+    if not transcript_bindings:
+        issues.append("transcript bindings must name externally observed transcript files")
+    for raw_path in transcript_bindings:
+        path = _safe_resolve(Path(raw_path))
+        if not path.exists() or not path.is_file():
+            issues.append(f"transcript binding {raw_path} does not exist")
+            continue
+        verified_transcripts.append({"path": str(path), "sha256": _sha256_file(path)})
     lifecycle_by_kind = {str(item.get("kind")): item for item in lifecycle_receipts if isinstance(item, Mapping)}
     missing_lifecycle = sorted(REQUIRED_LIFECYCLE_RECEIPTS - set(lifecycle_by_kind))
     if missing_lifecycle:
         issues.append(f"missing lifecycle receipts: {', '.join(missing_lifecycle)}")
+    lifecycle_role_by_kind = {
+        "old_drained": "old",
+        "old_stopped": "old",
+        "old_write_denied": "old",
+        "new_started": "new",
+        "new_write_proved": "new",
+    }
+    verified_lifecycle: list[dict[str, object]] = []
     for lifecycle_receipt in lifecycle_receipts:
         for key in ("kind", "observer", "subject", "observed_at"):
             value = lifecycle_receipt.get(key)
@@ -741,8 +848,64 @@ def build_authority_handoff_receipt(
                 issues.append(f"lifecycle receipt {lifecycle_receipt.get('kind', '<unknown>')} missing {key}")
         if not _is_sha256(lifecycle_receipt.get("artifact_sha256")):
             issues.append(f"lifecycle receipt {lifecycle_receipt.get('kind', '<unknown>')} missing artifact hash")
+        observed_at = lifecycle_receipt.get("observed_at")
+        if isinstance(observed_at, str) and observed_at:
+            try:
+                _parse_iso8601(observed_at, label=f"lifecycle receipt {lifecycle_receipt.get('kind', '<unknown>')} observed_at")
+            except ConversionError as exc:
+                issues.append(str(exc))
+        artifact_path = lifecycle_receipt.get("artifact_path")
+        if not isinstance(artifact_path, str) or not artifact_path:
+            issues.append(f"lifecycle receipt {lifecycle_receipt.get('kind', '<unknown>')} missing artifact_path")
+            continue
+        path = _safe_resolve(Path(artifact_path))
+        if not path.exists() or not path.is_file():
+            issues.append(f"lifecycle receipt {lifecycle_receipt.get('kind', '<unknown>')} artifact_path does not exist")
+            continue
+        actual_sha = _sha256_file(path)
+        if lifecycle_receipt.get("artifact_sha256") != actual_sha:
+            issues.append(f"lifecycle receipt {lifecycle_receipt.get('kind', '<unknown>')} artifact hash does not match bytes read")
+            continue
+        try:
+            artifact = _load_json(path)
+        except ConversionError as exc:
+            issues.append(str(exc))
+            continue
+        kind = str(lifecycle_receipt.get("kind"))
+        if artifact.get("schema") != SCHEMA_LIFECYCLE_PROOF:
+            issues.append(f"lifecycle receipt {kind} artifact schema is invalid")
+        for key in ("kind", "observer", "subject", "observed_at"):
+            if artifact.get(key) != lifecycle_receipt.get(key):
+                issues.append(f"lifecycle receipt {kind} artifact {key} contradicts receipt")
+        try:
+            _parse_iso8601(str(artifact.get("observed_at", "")), label=f"lifecycle receipt {kind} artifact observed_at")
+        except ConversionError as exc:
+            issues.append(str(exc))
+        expected_role = lifecycle_role_by_kind.get(kind)
+        writer = old_writer if expected_role == "old" else new_writer
+        if artifact.get("instance") != instance:
+            issues.append(f"lifecycle receipt {kind} artifact instance contradicts handoff instance")
+        if artifact.get("writer_role") != expected_role:
+            issues.append(f"lifecycle receipt {kind} artifact writer_role is invalid")
+        for key, expected in (
+            ("unit", writer.unit),
+            ("process", writer.process),
+            ("package", writer.package),
+            ("state_root", bindings.get("state_root", "")),
+        ):
+            if artifact.get(key) != expected:
+                issues.append(f"lifecycle receipt {kind} artifact {key} contradicts binding")
+        if kind == "old_stopped" and artifact.get("stopped") is not True:
+            issues.append("old_stopped lifecycle artifact must prove stopped=true")
+        if kind == "old_write_denied" and artifact.get("can_write") is not False:
+            issues.append("old_write_denied lifecycle artifact must prove can_write=false")
+        if kind == "new_started" and artifact.get("started") is not True:
+            issues.append("new_started lifecycle artifact must prove started=true")
+        if kind == "new_write_proved" and artifact.get("can_write") is not True:
+            issues.append("new_write_proved lifecycle artifact must prove can_write=true")
+        verified_lifecycle.append({**dict(lifecycle_receipt), "artifact_path": str(path), "artifact_sha256": actual_sha})
     client = dict(native_client or {})
-    for key in ("client_name", "version", "path", "path_sha256"):
+    for key in ("client_name", "version", "path", "path_sha256", "version_proof_path", "version_proof_sha256"):
         value = client.get(key)
         if not isinstance(value, str) or not value:
             issues.append(f"native client binding {key} is missing")
@@ -750,6 +913,38 @@ def build_authority_handoff_receipt(
         issues.append("native client path_sha256 must be a SHA-256 digest")
     if client.get("update_suppression") is not False:
         issues.append("native client binding must prove no update-suppression flag")
+    client_path_value = client.get("path")
+    if isinstance(client_path_value, str) and client_path_value:
+        client_path = _safe_resolve(Path(client_path_value))
+        if not client_path.exists() or not client_path.is_file():
+            issues.append("native client path does not exist")
+        elif not os.access(client_path, os.X_OK):
+            issues.append("native client path is not executable")
+        else:
+            actual_client_sha = _sha256_file(client_path)
+            if client.get("path_sha256") != actual_client_sha:
+                issues.append("native client path_sha256 does not match executable bytes")
+            client["path"] = str(client_path)
+    proof_path_value = client.get("version_proof_path")
+    if isinstance(proof_path_value, str) and proof_path_value:
+        proof_path = _safe_resolve(Path(proof_path_value))
+        if not proof_path.exists() or not proof_path.is_file():
+            issues.append("native client version proof path does not exist")
+        else:
+            actual_proof_sha = _sha256_file(proof_path)
+            if client.get("version_proof_sha256") != actual_proof_sha:
+                issues.append("native client version proof hash does not match bytes read")
+            try:
+                proof = _load_json(proof_path)
+            except ConversionError as exc:
+                issues.append(str(exc))
+            else:
+                if proof.get("schema") != SCHEMA_NATIVE_CLIENT_PROOF:
+                    issues.append("native client version proof schema is invalid")
+                for key in ("client_name", "version", "path", "path_sha256", "update_suppression"):
+                    if proof.get(key) != client.get(key):
+                        issues.append(f"native client version proof {key} contradicts binding")
+            client["version_proof_path"] = str(proof_path)
     handoff_receipt: dict[str, object] = {
         "schema": SCHEMA_HANDOFF_RECEIPT,
         "produced_at": _utc_now(),
@@ -761,8 +956,8 @@ def build_authority_handoff_receipt(
             "rollback_checkpoint": rollback_checkpoint_sha256,
         },
         "instance_bindings": bindings,
-        "transcript_bindings": list(transcript_bindings),
-        "lifecycle_receipts": [dict(item) for item in lifecycle_receipts],
+        "transcript_bindings": verified_transcripts,
+        "lifecycle_receipts": verified_lifecycle,
         "native_client": client,
         "cutover_sequence": list(cutover_sequence),
         "exactly_one_writer": len(active_writers) == 1 and active_writers == [new_writer.name],
@@ -873,7 +1068,9 @@ def restore_snapshot(snapshot_dir: Path, state_root: Path, *, allow_v3_loss: boo
     marker = _load_json(marker_path)
     snapshot_payload_dir = snapshot_dir / "state-root"
     _validate_snapshot_payload(snapshot_dir, marker)
-    if _contains_v3_or_receipts(state_root) and not allow_v3_loss:
+    if allow_v3_loss and _contains_v3_or_receipts(state_root):
+        raise ConversionError("allow_v3_loss cannot bypass protected v2/v3 enrollment or validation evidence")
+    if _contains_v3_or_receipts(state_root):
         raise ConversionError("rollback would lose v2/v3 enrollment or validation evidence")
     if state_root == Path("/") or len(state_root.parts) < 3:
         raise ConversionError("refusing to restore an unsafe state root")

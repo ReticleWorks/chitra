@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import shutil
 import tomllib
+from importlib import import_module
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -33,6 +34,20 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _canonical_event_model() -> type[Any]:
+    return cast(type[Any], import_module("chitra.journal.models").CanonicalEvent)
+
+
+def _goal_record_model() -> type[Any]:
+    return cast(type[Any], import_module("chitra.goals").GoalRecord)
+
+
+def _write_executable(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o755)
 
 
 def _legacy_state(root: Path) -> None:
@@ -93,8 +108,14 @@ def test_conversion_reconciles_counts_hashes_and_marks_legacy_records_not_done(t
     }
     assert receipt["input_counts"] == {"legacy_goals": 2, "dispatch_queue_entries": 4}
     assert goals["output_counts"]["legacy_goal_records"] == 2
-    assert all(isinstance(record["w1_journal_record"], dict) for record in goals["records"])
-    assert all(isinstance(record["w2_enrollment_record"], dict) for record in goals["records"])
+    assert [_canonical_event_model().model_validate(record["w1_journal_record"]).schema_name for record in goals["records"]] == [
+        "chitra.journal.event.v1",
+        "chitra.journal.event.v1",
+    ]
+    assert [_goal_record_model().from_dict(record["w2_enrollment_record"]).session_ref for record in goals["records"]] == [
+        "host:lane-a:%1",
+        "host:lane-b:%2",
+    ]
     assert all(record["disposition"]["done_transition_allowed"] is False for record in goals["records"])
     assert all(record["disposition"]["completion_eligible"] is False for record in goals["records"])
     assert [entry["relative_path"] for entry in queue["entries"]] == [
@@ -160,33 +181,71 @@ def _instance_bindings() -> dict[str, str]:
     }
 
 
-def _lifecycle_receipts() -> list[dict[str, object]]:
-    return [
-        {
+def _lifecycle_receipts(tmp_path: Path, bindings: dict[str, str]) -> list[dict[str, object]]:
+    receipts: list[dict[str, object]] = []
+    for kind, hex_digit, role, unit_key, process_key, package_key, booleans in (
+        ("old_drained", "5", "old", "old_unit", "old_process", "old_package", {"stopped": False, "started": False, "can_write": False}),
+        ("old_stopped", "6", "old", "old_unit", "old_process", "old_package", {"stopped": True, "started": False, "can_write": False}),
+        ("old_write_denied", "7", "old", "old_unit", "old_process", "old_package", {"stopped": True, "started": False, "can_write": False}),
+        ("new_started", "8", "new", "new_unit", "new_process", "new_package", {"stopped": False, "started": True, "can_write": True}),
+        ("new_write_proved", "9", "new", "new_unit", "new_process", "new_package", {"stopped": False, "started": True, "can_write": True}),
+    ):
+        artifact = {
+            "schema": "chitra.authority-handoff-lifecycle-proof.v1",
             "kind": kind,
             "observer": "external-test-harness",
             "subject": f"monitor:{kind}",
             "observed_at": "2026-08-22T00:00:00+00:00",
-            "artifact_sha256": hex_digit * 64,
+            "instance": "monitor",
+            "writer_role": role,
+            "unit": bindings[unit_key],
+            "process": bindings[process_key],
+            "package": bindings[package_key],
+            "state_root": bindings["state_root"],
+            "artifact_nonce": hex_digit * 64,
+            **booleans,
         }
-        for kind, hex_digit in (
-            ("old_drained", "5"),
-            ("old_stopped", "6"),
-            ("old_write_denied", "7"),
-            ("new_started", "8"),
-            ("new_write_proved", "9"),
+        path = tmp_path / "lifecycle" / f"{kind}.json"
+        _write_json(path, artifact)
+        receipts.append(
+            {
+                "kind": kind,
+                "observer": artifact["observer"],
+                "subject": artifact["subject"],
+                "observed_at": artifact["observed_at"],
+                "artifact_path": str(path),
+                "artifact_sha256": _sha256_file(path),
+            }
         )
-    ]
+    return receipts
 
 
-def _native_client() -> dict[str, object]:
-    return {
-        "client_name": "claude",
-        "version": "2.1.238",
-        "path": "/usr/local/bin/claude",
-        "path_sha256": "b" * 64,
+def _native_client(tmp_path: Path) -> dict[str, object]:
+    client_path = tmp_path / "bin" / "codex"
+    _write_executable(client_path, "#!/bin/sh\nprintf 'codex 0.149.0\\n'\n")
+    client_sha = _sha256_file(client_path)
+    proof = {
+        "schema": "chitra.native-client-proof.v1",
+        "client_name": "codex",
+        "version": "0.149.0",
+        "path": str(client_path.resolve()),
+        "path_sha256": client_sha,
         "update_suppression": False,
     }
+    proof_path = tmp_path / "native-client-proof.json"
+    _write_json(proof_path, proof)
+    return {
+        **proof,
+        "version_proof_path": str(proof_path),
+        "version_proof_sha256": _sha256_file(proof_path),
+    }
+
+
+def _transcript_binding(tmp_path: Path) -> str:
+    transcript = tmp_path / "transcripts" / "session.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text('{"type":"event","message":"observed"}\n', encoding="utf-8")
+    return str(transcript)
 
 
 def test_shadow_scan_never_writes_inside_live_state_or_dispatches(tmp_path: Path) -> None:
@@ -202,7 +261,7 @@ def test_shadow_scan_never_writes_inside_live_state_or_dispatches(tmp_path: Path
         run_shadow_scan(state, state / "shadow")
 
 
-def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycle_bindings() -> None:
+def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycle_bindings(tmp_path: Path) -> None:
     old_writer = WriterObservation(
         name="old-dispatchd",
         role="old",
@@ -225,6 +284,7 @@ def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycl
         can_write=True,
         action_receipt_sha256="b" * 64,
     )
+    bindings = _instance_bindings()
     handoff = build_authority_handoff_receipt(
         instance="monitor",
         old_writer=old_writer,
@@ -232,10 +292,10 @@ def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycl
         pre_state_sha256="c" * 64,
         post_state_sha256="d" * 64,
         rollback_checkpoint_sha256="e" * 64,
-        transcript_bindings=("f" * 64,),
-        instance_bindings=_instance_bindings(),
-        lifecycle_receipts=_lifecycle_receipts(),
-        native_client=_native_client(),
+        transcript_bindings=(_transcript_binding(tmp_path),),
+        instance_bindings=bindings,
+        lifecycle_receipts=_lifecycle_receipts(tmp_path, bindings),
+        native_client=_native_client(tmp_path),
     )
     assert handoff["exactly_one_writer"] is True
     blank_writer = WriterObservation(name="", role="old", unit="", process="", package="", stopped=True, started=False, can_write=False)
@@ -267,10 +327,27 @@ def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycl
             pre_state_sha256="c" * 64,
             post_state_sha256="d" * 64,
             rollback_checkpoint_sha256="e" * 64,
-            transcript_bindings=("f" * 64,),
-            instance_bindings=_instance_bindings(),
-            lifecycle_receipts=_lifecycle_receipts(),
-            native_client=_native_client(),
+            transcript_bindings=(_transcript_binding(tmp_path),),
+            instance_bindings=bindings,
+            lifecycle_receipts=_lifecycle_receipts(tmp_path, bindings),
+            native_client=_native_client(tmp_path),
+        )
+    contradictory = dict(bindings)
+    contradictory["old_unit"] = "fabricated.service"
+    fake_client = dict(_native_client(tmp_path))
+    fake_client["path"] = str(tmp_path / "missing-codex")
+    with pytest.raises(ConversionError, match="contradicts|does not exist"):
+        build_authority_handoff_receipt(
+            instance="monitor",
+            old_writer=old_writer,
+            new_writer=new_writer,
+            pre_state_sha256="c" * 64,
+            post_state_sha256="d" * 64,
+            rollback_checkpoint_sha256="e" * 64,
+            transcript_bindings=(_transcript_binding(tmp_path),),
+            instance_bindings=contradictory,
+            lifecycle_receipts=_lifecycle_receipts(tmp_path, bindings),
+            native_client=fake_client,
         )
 
 
@@ -311,6 +388,9 @@ def test_rollback_validates_snapshot_before_touching_destination_and_refuses_v2_
     _write_json(state / "goals.json", enrolled)
     with pytest.raises(ConversionError, match="v2/v3 enrollment"):
         restore_snapshot(snapshot, state)
+    assert json.loads((state / "goals.json").read_text(encoding="utf-8"))["schema"] == "chitra.goals.v2"
+    with pytest.raises(ConversionError, match="allow_v3_loss cannot bypass"):
+        restore_snapshot(snapshot, state, allow_v3_loss=True)
     assert json.loads((state / "goals.json").read_text(encoding="utf-8"))["schema"] == "chitra.goals.v2"
 
     corrupt_state = tmp_path / "corrupt-state"
