@@ -75,11 +75,9 @@ def note_goals_schema_state(state_dir: Path) -> None:
     if key in _SCHEMA_NOTICED_ROOTS:
         return
     _SCHEMA_NOTICED_ROOTS.add(key)
-    logger.warning(
-        GOALS_SCHEMA_NEWER_MESSAGE,
-        state_dir=key,
-        file_schema=file_schema,
-        installed_schema=GOALS_INSTALLED_SCHEMA,
+    print(
+        f"{GOALS_SCHEMA_NEWER_MESSAGE} state_dir={key} file_schema={file_schema} "
+        f"installed_schema={GOALS_INSTALLED_SCHEMA}"
     )
 
 
