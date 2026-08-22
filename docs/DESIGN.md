@@ -16,6 +16,24 @@ Done conditions belong to the operator and the material used to enroll a session
 
 `chitra.close_gate` compares the exact frozen item IDs, receipt names, validators, passing results, and concrete citations. Watchd runs this binding before `done-pending-close`, persists the validated proofs, and completion close repeats the same deterministic check before deletion. Free-form delivered items and operator acknowledgements cannot satisfy completion. A reasoned administrative discard remains available, but it is logged as not done.
 
+### Registered validators
+
+Every enrolled done item names a validator from the instance's registered-validator file, and only Chitra executes it. The lane's own `CHITRA-COMPLETION: {...}` line remains a trigger and an item binding; its claimed `validator_result` is discarded. At a completion-claim turn-end, `watchd` runs the registered argv itself, stores the hash-bound W12 receipt at `validation-receipts/<required_receipt>.json` with the observed exit code as the result, and the gate reads that disk result — a lane claiming `pass` over a failing registered validator stays `completion-disputed`.
+
+The registry lives at `<state root>/validators.json`; set `CHITRA_VALIDATORS_FILE` to point at another path (the launcher is expected to ship and manage this file in a later fleet-repo change). It maps validator names to one command each:
+
+```json
+{
+  "suite": {"argv": ["/usr/bin/env", "pytest", "-q"], "timeout_s": 120.0, "runs_as": "ci"}
+}
+```
+
+- `argv` (required): the exact command Chitra executes; an entry with no arguments is invalid.
+- `timeout_s` (optional, default 120): seconds before the run fails closed.
+- `runs_as` (optional): declared execution identity, recorded verbatim on the receipt.
+
+Enrollment refuses any done item whose validator is not a key in this registry (`chitra-goals set` exits non-zero with `validator not registered`), so a report cannot be a registered command. A missing file is an empty registry. An unrunnable or timed-out validator records exit code 125 — it can never produce a passing receipt. Where a validator name is both registered and legacy-trusted, the registered entry governs execution and verification.
+
 ## Distribution and packaging
 
 - **Distribution:** Published on PyPI as `chitra-monitor` and installable via `pip install chitra-monitor`. Alternatively, you can install a pinned revision from GitHub with `pip install git+https://github.com/ReticleWorks/chitra.git@<tag>` (replace `<tag>` with a released version). The build backend (hatchling, standards-based `pyproject.toml`) makes publishing and installation straightforward.

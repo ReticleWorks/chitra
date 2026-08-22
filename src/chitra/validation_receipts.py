@@ -18,6 +18,7 @@ import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -26,6 +27,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from chitra._fsio import locked_json_store, parse_iso8601, write_json_atomic
 from chitra.completion_gate import CompletionEvidence, EnrolledDoneWhenItemLike, completion_receipt_issues
 from chitra.state_paths import state_dir
+from chitra.validator_registry import (
+    UNRUNNABLE_EXIT_CODE,
+    RegisteredValidator,
+    load_validators,
+    run_registered_validator,
+)
 
 _TOP_LEVEL_FIELDS = {
     "receipt_name",
@@ -71,6 +78,15 @@ def _trusted_verifier_argv(name: str, target_path: str) -> tuple[str, ...]:
     """
     argv = _TRUSTED_VALIDATORS[name].argv
     return (sys.executable, "-m", argv[0], *argv[1:], target_path)
+
+
+def _trusted_verifier_argv_or_none(name: str) -> tuple[str, ...] | None:
+    """Return the mapped verifier's invocation shape, or None when unmapped."""
+    trusted = _TRUSTED_VALIDATORS.get(name)
+    if trusted is None:
+        return None
+    argv = trusted.argv
+    return (sys.executable, "-m", argv[0], *argv[1:], "<target>")
 
 
 class ReceiptError(ValueError):
@@ -172,6 +188,13 @@ def receipt_path(root: Path | None, session_ref: str, receipt_name: str) -> Path
     if _SAFE_RECEIPT_NAME_RE.fullmatch(receipt_name) is None:
         raise ReceiptError("receipt_name must be a path-safe stable name")
     return receipts_root(root) / f"{receipt_name}.json"
+
+
+def receipt_name(value: str) -> str:
+    """Validate a receipt name before any path or file is derived from it."""
+    if _SAFE_RECEIPT_NAME_RE.fullmatch(value) is None:
+        raise ReceiptError("receipt_name must be a path-safe stable name")
+    return value
 
 
 def _canonical_digest(payload: Mapping[str, object]) -> str:
@@ -509,7 +532,7 @@ def _generic_validator_issues(receipt: ValidationReceipt, base: Path) -> list[st
     issues: list[str] = []
     if raw_report["command"] != command:
         issues.append("validator report command does not match the receipt exercise")
-    issues.extend(_validator_binding_issues(receipt))
+    issues.extend(_validator_binding_issues(receipt, base))
     actual_exit_code = _trusted_validator_result(receipt, base)
     if actual_exit_code != exit_code:
         issues.append(
@@ -521,16 +544,41 @@ def _generic_validator_issues(receipt: ValidationReceipt, base: Path) -> list[st
     return issues
 
 
-def _validator_binding_issues(receipt: ValidationReceipt) -> list[str]:
-    """Reject a declared exercise that is not bound to this validator identity."""
+def _base_of(receipt: ValidationReceipt) -> Path:
+    """Return the receipt directory implied by the receipt's own target path."""
+    return Path(_receipt_target_artifact_path(receipt)).parent
+
+
+def _registered_validator_entry(name: str, base: Path) -> RegisteredValidator | None:
+    """Resolve the registry entry for ``name`` from the receipt's own instance.
+
+    ``base`` is the receipt directory, so verification reads the same
+    ``validators.json`` the producing state root holds -- never whatever a
+    process-wide environment variable or default happens to name.
+    """
+    return load_validators(_state_root_for_receipt_dir(base)).get(name)
+
+
+def _state_root_for_receipt_dir(base: Path) -> Path:
+    """Return the state root that owns a receipt directory."""
+    return base.parent if base.name == "validation-receipts" else base
+
+
+def _validator_binding_issues(receipt: ValidationReceipt, base: Path | None = None) -> list[str]:
+    """Reject a declared exercise that is not bound to this validator identity.
+
+    ``base`` is the receipt directory when the caller knows it; without it the
+    registry resolves from the directory implied by the receipt's own bound
+    artifact path.
+    """
     name = _text(receipt.validator, "name", parent="validator")
     command = cast(list[str], receipt.exercise["command"])
     if "artifact" not in receipt.target:
-        return [
-            f"{name}'s trusted verifier executes an exact artifact target; "
-            "this receipt declares no artifact target"
-        ]
-    expected = _trusted_verifier_argv(name, _receipt_target_artifact_path(receipt))
+        return [f"{name}'s trusted verifier executes an exact artifact target; this receipt declares no artifact target"]
+    registered = _registered_validator_entry(name, base if base is not None else _base_of(receipt))
+    expected = tuple(registered.argv) if registered is not None else _trusted_verifier_argv_or_none(name)
+    if expected is None:
+        return [f"validator {name!r} has no trusted verifier invocation; its exercise cannot establish a PASS"]
     if tuple(command) != expected:
         return [
             f"exercise.command {command!r} is not {name}'s trusted verifier invocation "
@@ -589,10 +637,15 @@ def _trusted_validator_result(receipt: ValidationReceipt, base: Path) -> int:
     """
     name = _text(receipt.validator, "name", parent="validator")
     trusted = _TRUSTED_VALIDATORS.get(name)
-    if trusted is None:
+    registered = _registered_validator_entry(name, base)
+    if trusted is None and registered is None:
         return 125
-    if _validator_binding_issues(receipt):
+    if _validator_binding_issues(receipt, base):
         return 125
+    if registered is not None:
+        exit_code, output = run_registered_validator(registered)
+        del output
+        return exit_code
     if _trusted_validator_target_issues(receipt):
         return 125
     environment = {
@@ -751,3 +804,147 @@ def require_verified_completion_receipts(
             )
         verified_proofs.append(proof.model_copy(update={"kind": "artifact", "citation": str(path)}))
     return tuple(verified_proofs)
+
+
+def _write_text_atomic(path: Path, content: str) -> None:
+    """Atomically replace ``path`` with ``content`` through a temp file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as stream:
+            temporary = stream.name
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
+
+
+def record_registered_run(
+    root: Path | None,
+    session_ref: str,
+    item: EnrolledDoneWhenItemLike,
+    entry: RegisteredValidator | None,
+    *,
+    produced_at: str | None = None,
+    output: str | None = None,
+) -> CompletionEvidence:
+    """Run one registered validator, store its receipt, and return its proof.
+
+    Chitra — never the lane — executes the registry argv and writes the W12
+    envelope to ``validation-receipts/<required_receipt>.json`` with the
+    observed exit code as the result. A rerun overwrites both the evidence
+    artifacts and the receipt atomically; the newest execution is the proof.
+    A missing registry entry (``entry=None``) fails closed as exit 125 so an
+    enrolled item whose validator later vanishes still leaves a stored FAIL.
+    """
+    receipt_name(item.required_receipt)
+    if entry is None:
+        exit_code, output = UNRUNNABLE_EXIT_CODE, (f"registered validator {item.validator!r} is not in this instance's validators.json")
+    else:
+        exit_code, output = run_registered_validator(entry)
+    directory = receipts_root(root)
+    directory.mkdir(parents=True, exist_ok=True)
+    output_path = directory / f"{item.required_receipt}.output.log"
+    report_path = directory / f"{item.required_receipt}.report.json"
+    _write_text_atomic(output_path, output + ("\n" if output else ""))
+    report = {
+        "schema_version": "chitra-validator-report-v1",
+        "command": list(entry.argv) if entry is not None else [],
+        "exit_code": exit_code,
+    }
+    _write_text_atomic(report_path, json.dumps(report, sort_keys=True))
+    status = "PASS" if exit_code == 0 else "FAIL"
+    payload: dict[str, object] = {
+        "receipt_name": item.required_receipt,
+        "validator": {
+            "name": item.validator,
+            "version": "registered" if entry is not None else "unregistered",
+            **({"runs_as": entry.runs_as} if entry is not None else {}),
+        },
+        "target": {
+            "artifact": {
+                "path": str(output_path),
+                "sha256": _hash_file(output_path),
+            }
+        },
+        "exercise": {"command": list(entry.argv) if entry is not None else [f"<unregistered:{item.validator}>"]},
+        "result": {"status": status, "validator_acceptance": exit_code == 0},
+        "not_exercised": [],
+        "artifacts": [
+            {
+                "path": output_path.name,
+                "kind": "output",
+                "sha256": _hash_file(output_path),
+            },
+            {
+                "path": report_path.name,
+                "kind": "report",
+                "sha256": _hash_file(report_path),
+            },
+        ],
+        "produced_at": produced_at or datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "integrity": {
+            "algorithm": "sha256",
+            "canonicalization": _CANONICALIZATION,
+            "scope": _INTEGRITY_SCOPE,
+            "hand_authored_fields": [],
+        },
+    }
+    integrity = cast("dict[str, object]", payload["integrity"])
+    integrity["digest"] = _canonical_digest(payload)
+    destination = receipt_path(root, session_ref, item.required_receipt)
+    with locked_json_store(destination):
+        write_json_atomic(destination, payload, fsync=True)
+        os.chmod(destination, 0o600)
+    return CompletionEvidence(
+        kind="artifact",
+        done_when_item_id=item.id,
+        receipt_name=item.required_receipt,
+        validator=item.validator,
+        validator_result="pass" if exit_code == 0 else "fail",
+        citation=str(destination),
+    )
+
+
+def record_enrolled_validator_runs(
+    root: Path | None,
+    session_ref: str,
+    items: Sequence[EnrolledDoneWhenItemLike],
+) -> tuple[CompletionEvidence, ...]:
+    """Execute every enrolled item's registered validator and store receipts.
+
+    An item whose validator is not a registry key gets the fail-closed exit
+    125 result stored on disk, so it can never pass and every enrolled item
+    leaves an explicit receipt explaining why completion stays disputed.
+    """
+    registry = load_validators(root)
+    return tuple(record_registered_run(root, session_ref, item, registry.get(item.validator)) for item in items)
+
+
+def verified_disk_results(
+    root: Path | None,
+    session_ref: str,
+    items: Sequence[EnrolledDoneWhenItemLike],
+) -> dict[str, str]:
+    """Read every enrolled item's receipt back and return integrity-checked results.
+
+    The completion gate consumes this map instead of the runner's in-memory
+    proofs: a receipt counts as ``pass`` only when its stored file loads,
+    self-verifies, re-executes cleanly, and holds a PASS result. Anything
+    missing, forged, stale, or failing closes as ``fail``.
+    """
+    results: dict[str, str] = {}
+    for item in items:
+        try:
+            eligible = verify_receipt(root, session_ref, item.required_receipt).completion_eligible
+        except ReceiptError:
+            eligible = False
+        results[item.required_receipt] = "pass" if eligible else "fail"
+    return results

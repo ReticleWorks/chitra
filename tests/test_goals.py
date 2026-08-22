@@ -593,6 +593,14 @@ def test_goal_cli_outputs_open_asks_needs_and_scan_recording_requires_a_lane(tmp
     assert "--record requires --session-ref" in capsys.readouterr().err
 
 
+def _done_item_args(record: GoalRecord) -> list[str]:
+    quoted_text = json.dumps(record.done_when)
+    return [
+        "--done-item",
+        f"id=done-1 text={quoted_text} validator=pytest receipt=tests-green",
+    ]
+
+
 def test_goal_cli_seeds_clears_and_scans_open_asks(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     record = _record()
     set_args = [
@@ -603,15 +611,13 @@ def test_goal_cli_seeds_clears_and_scans_open_asks(tmp_path: Path, capsys: pytes
         record.session_ref,
         "--goal",
         record.goal,
-        "--done-when",
-        record.done_when,
         "--source",
         record.source,
     ]
     _cli_enroll(
         tmp_path,
         capsys,
-        set_args,
+        [*set_args, *_done_item_args(record)],
         done_when=record.done_when,
         extra_args=["--open-ask", "1. Seed one?", "--open-ask", "2. Seed two."],
     )
@@ -648,8 +654,6 @@ def test_goal_cli_set_preserves_needs_when_omitted(tmp_path: Path, capsys: pytes
         record.session_ref,
         "--goal",
         record.goal,
-        "--done-when",
-        record.done_when,
         "--source",
         record.source,
     ]
@@ -657,7 +661,7 @@ def test_goal_cli_set_preserves_needs_when_omitted(tmp_path: Path, capsys: pytes
     _cli_enroll(
         tmp_path,
         capsys,
-        set_args,
+        [*set_args, *_done_item_args(record)],
         done_when=record.done_when,
         extra_args=["--needs", "you: run the interview"],
     )
@@ -678,8 +682,6 @@ def test_goal_cli_set_redirect_now_and_check_paths(tmp_path: Path, capsys: pytes
         record.session_ref,
         "--goal",
         record.goal,
-        "--done-when",
-        record.done_when,
         "--source",
         record.source,
         "--intent",
@@ -687,7 +689,7 @@ def test_goal_cli_set_redirect_now_and_check_paths(tmp_path: Path, capsys: pytes
         "--scope",
         record.scope,
     ]
-    _cli_enroll(tmp_path, capsys, set_args, done_when=record.done_when)
+    _cli_enroll(tmp_path, capsys, [*set_args, *_done_item_args(record)], done_when=record.done_when)
     assert main([*set_args, "--goal", "Ship a revised deterministic goals store safely now."]) == 1
     assert "chitra-goals redirect --reason" in capsys.readouterr().err
 
@@ -1082,3 +1084,117 @@ def test_concurrent_writers_adding_asks_to_the_same_lane_do_not_lose_each_other(
     stored = get_goal(tmp_path, "host-b:f2-77:0.0")
     assert stored is not None
     assert set(stored.open_asks) == set(asks)
+
+
+# ---------------------------------------------------------------------------
+# registered validators at enrollment (P4)
+# ---------------------------------------------------------------------------
+
+
+def test_goal_cli_set_rejects_a_validator_that_is_not_registered(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    record = _record()
+    set_args = [
+        "set",
+        "--root",
+        str(tmp_path),
+        "--session-ref",
+        record.session_ref,
+        "--goal",
+        record.goal,
+        "--source",
+        record.source,
+    ]
+    assert main(set_args) == 2
+    required = json.loads(capsys.readouterr().out)
+    result_path = tmp_path / "interview-result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "type": "INTERVIEW_RESULT",
+                "nonce": required["nonce"],
+                "receipt_name": required["receipt_name"],
+                "answers": {
+                    "intent": {"answer": "Deliver the requested deterministic goal behavior safely.", "provenance": "operator:test"},
+                    "done_when": {"answer": record.done_when, "provenance": "operator:test"},
+                    "out_of_scope": {"answer": "Unrelated board changes are excluded.", "provenance": "operator:test"},
+                    "constraints": {"answer": "Keep the change small and tested.", "provenance": "operator:test"},
+                },
+                "enrolled_done_when_items": [
+                    {
+                        "id": "done-1",
+                        "text": record.done_when,
+                        "validator": "lane-reports-done",
+                        "required_receipt": "tests-green",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main([*set_args, "--interview-result", str(result_path)]) == 1
+    assert "validator not registered" in capsys.readouterr().err
+    assert get_goal(tmp_path, record.session_ref) is None
+
+
+def test_goal_cli_refuses_free_text_done_when_on_a_new_record(tmp_path: Path) -> None:
+    record = _record()
+
+    exit_code = main(
+        [
+            "set",
+            "--root",
+            str(tmp_path),
+            "--session-ref",
+            record.session_ref,
+            "--goal",
+            record.goal,
+            "--done-when",
+            "all tests pass and the deploy landed",
+            "--source",
+            record.source,
+        ]
+    )
+
+    assert exit_code == 1
+    assert not (tmp_path / "goals.json").exists()
+
+
+def test_goal_cli_refuses_done_item_on_an_existing_record(tmp_path: Path) -> None:
+    stored = upsert_goal(tmp_path, _record())
+
+    exit_code = main(
+        [
+            "set",
+            "--root",
+            str(tmp_path),
+            "--session-ref",
+            stored.session_ref,
+            "--goal",
+            stored.goal,
+            "--source",
+            stored.source,
+            "--done-item",
+            "id=done-2 text=New condition validator=pytest receipt=other-green",
+        ]
+    )
+
+    assert exit_code == 1
+
+
+def test_done_item_parser_accepts_quoted_values_and_rejects_bad_specs() -> None:
+    from chitra.goals_cli import _parse_done_item_specs
+
+    items = _parse_done_item_specs(['id=done-1 text="The full suite passes." validator=pytest receipt=tests-green'])
+    assert len(items) == 1
+    assert items[0].id == "done-1"
+    assert items[0].text == "The full suite passes."
+    assert items[0].validator == "pytest"
+    assert items[0].required_receipt == "tests-green"
+
+    with pytest.raises(ValueError, match="malformed token"):
+        _parse_done_item_specs(["id=done-1 nonsense"])
+    with pytest.raises(ValueError, match="missing"):
+        _parse_done_item_specs(['id=done-1 text="Ship it"'])
+    with pytest.raises(ValueError, match="not parsable"):
+        _parse_done_item_specs(["id='unterminated"])
