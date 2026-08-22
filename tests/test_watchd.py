@@ -538,10 +538,9 @@ def test_turn_end_without_claim_is_finished_unverified_not_idle_green(tmp_path: 
     )
     watcher.poll_once()
     watcher.poll_once()
-    for _ in range(50):
-        stored = get_goal(tmp_path, goal.session_ref)
-        assert stored is not None
-        if len(reviewer.calls) == 2:
+    review_log = tmp_path / "completion_reviews.jsonl"
+    for _ in range(100):
+        if len(reviewer.calls) == 2 and review_log.exists():
             break
         threading.Event().wait(0.01)
         watcher.poll_once()
@@ -550,7 +549,7 @@ def test_turn_end_without_claim_is_finished_unverified_not_idle_green(tmp_path: 
     assert stored.status == "turn-finished-unverified"
     assert "without a completion claim" in stored.now
     assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
-    review = json.loads((tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8"))
+    review = json.loads(review_log.read_text(encoding="utf-8"))
     assert review["condition"] == "turn_end_without_completion_claim"
     assert review["review_verdict"] == "accept"
     assert "accepted the turn end" in review["summary"]
