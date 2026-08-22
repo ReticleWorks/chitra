@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,6 +29,53 @@ from chitra.convlog import (
     render_group,
     validate_brief,
 )
+from chitra.evidence import EvidenceHandle
+
+
+class _AcceptingResolver:
+    """Stub resolver for tests that exercise structure, not evidence lookup."""
+
+    def resolve(self, handle: EvidenceHandle) -> str | None:
+        return None
+
+
+class _RejectingResolver:
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+    def resolve(self, handle: EvidenceHandle) -> str | None:
+        return self.reason
+
+
+def _attempt(action: str, result: str, evidence: object) -> dict[str, object]:
+    return {"action": action, "result": result, "evidence": evidence}
+
+
+def _write_ledger(path: Path, *order_ids: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {"order_id": order_id, "session_ref": "host-b:feeds:0.0", "tag": "follow-up", "sent_at": "2026-08-22T09:00:00+00:00"}
+        for order_id in order_ids
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def _write_self_transcript(path: Path, *, command: str, exit_code: int, tool_use_id: str = "tu_capture_1") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    events = [
+        {"type": "tool_use", "id": tool_use_id, "name": "Bash", "input": {"command": command}},
+        {"type": "tool_result", "tool_use_id": tool_use_id, "content": f"pane text\nexit code: {exit_code}"},
+    ]
+    path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+
+
+def _real_evidence_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Write a real ledger and self transcript the default resolver can check."""
+    state = tmp_path / "state"
+    _write_ledger(state / "ledger.jsonl", "ord-feeds-layout-1")
+    _write_self_transcript(state / "self-transcript.jsonl", command="chitra-tmux-capture feeds-reader --pane harness-pi", exit_code=0)
+    monkeypatch.setenv("CHITRA_STATE_DIR", str(state))
+    return state
 
 
 def _payload(**changes: object) -> dict[str, object]:
@@ -48,8 +96,16 @@ def _payload(**changes: object) -> dict[str, object]:
         "exhaustion": {
             "reason": "attempts_exhausted",
             "attempts": [
-                "Shipped the combined-feed prototype to the reader test -> it passed the preference check.",
-                "Asked the work session to pick a default feed layout -> it deferred the product call.",
+                {
+                    "action": "Shipped the combined-feed prototype to the reader test",
+                    "result": "it passed the preference check.",
+                    "evidence": {"kind": "command", "ref": "chitra-tmux-capture feeds-reader --pane harness-pi", "exit_status": 0},
+                },
+                {
+                    "action": "Asked the work session to pick a default feed layout",
+                    "result": "it deferred the product call.",
+                    "evidence": {"kind": "order", "ref": "ord-feeds-layout-1"},
+                },
             ],
             "residual_blocker": "Only the operator can pick between one combined feed and separate feeds.",
         },
@@ -61,18 +117,20 @@ def _payload(**changes: object) -> dict[str, object]:
 
 
 def _brief(**changes: object) -> OperatorBrief:
-    return validate_brief(_payload(**changes))
+    return validate_brief(_payload(**changes), evidence_resolver=_AcceptingResolver())
 
 
 def test_valid_brief_round_trip_render_log_and_read_back(tmp_path: Path) -> None:
     brief = _brief()
-    thread_id = open_thread(tmp_path / "conversation.jsonl", brief=brief, raw_text="Full raw session message.")
+    thread_id = open_thread(
+        tmp_path / "conversation.jsonl", brief=brief, raw_text="Full raw session message.", evidence_resolver=_AcceptingResolver()
+    )
 
     entries = entries_for_thread(tmp_path / "conversation.jsonl", thread_id)
     assert [entry.kind for entry in entries] == ["session_msg", "operator_brief"]
     assert entries[0].payload == {"text": "Full raw session message.", "source_ref": brief.source_ref}
     assert entries[1].schema_ == "chitra.convlog.v2"
-    assert validate_brief(entries[1].payload["brief"]) == brief
+    assert validate_brief(entries[1].payload["brief"], evidence_resolver=_AcceptingResolver()) == brief
     assert entries[1].payload["brief"]["subject"] == "Feeds digest compiler"
     assert entries[1].payload["brief"]["progress"] == "implementation-ready; final interface choice pending"
     assert entries[1].payload["rendered"] == render_brief(brief)
@@ -98,7 +156,7 @@ def test_v1_entry_loads_with_empty_grounding_fields(tmp_path: Path) -> None:
     entries = read_entries(path)
 
     assert entries[0].schema_ == "chitra.convlog.v1"
-    loaded_brief = validate_brief(entries[0].payload["brief"])
+    loaded_brief = validate_brief(entries[0].payload["brief"], evidence_resolver=_AcceptingResolver())
     assert loaded_brief.subject == ""
     assert loaded_brief.progress == ""
     assert render_brief(loaded_brief).splitlines()[0] == "This is Feeds digest redesign (F2) (host-b:feeds:0.0)."
@@ -263,7 +321,7 @@ def test_single_attempt_attempts_exhausted_fails() -> None:
         _brief(
             exhaustion={
                 "reason": "attempts_exhausted",
-                "attempts": ["Ran the reprovision command by hand again -> blocked by the held lock."],
+                "attempts": [{"action": "Ran the reprovision command by hand again", "result": "blocked by the held lock."}],
                 "residual_blocker": "The held lock still blocks every retry.",
             }
         )
@@ -272,39 +330,56 @@ def test_single_attempt_attempts_exhausted_fails() -> None:
 @pytest.mark.parametrize(
     "attempt",
     [
-        "Run -> the pipeline refused the token outright.",
-        "Asked the work session for an explicit ruling -> nope",
-        "Presented the retry token twice more without any separator at all",
-        "Retried the deploy once more by hand after hours ->      ",
+        {"action": "   ", "result": "the pipeline refused the token outright."},
+        {"action": "Asked the work session for an explicit ruling", "result": ""},
+        {"action": "Presented the retry token twice more"},
     ],
 )
-def test_attempt_must_split_on_last_arrow_into_action_and_result(attempt: str) -> None:
-    with pytest.raises(BriefValidationError, match=r"last '->' separator"):
+def test_attempt_action_and_result_must_be_non_blank(attempt: dict[str, str]) -> None:
+    with pytest.raises(BriefValidationError):
         _brief(
             exhaustion={
                 "reason": "attempts_exhausted",
-                "attempts": [attempt, "Shipped the fixed build to staging overnight -> it deployed cleanly."],
+                "attempts": [attempt, {"action": "Shipped the fixed build to staging overnight", "result": "it deployed cleanly."}],
                 "residual_blocker": "The held lock still blocks every retry.",
             }
         )
 
 
-def test_attempt_segments_split_on_the_last_arrow() -> None:
+def test_legacy_string_attempt_coerces_on_the_last_arrow() -> None:
     attempt = "Retried the deploy twice by hand after the first refusal -> second try -> it hit the same lock."
-    brief = _brief(
+    payload = _payload(
         exhaustion={
             "reason": "attempts_exhausted",
-            "attempts": [attempt, "Shipped the fixed build to staging overnight -> it deployed cleanly."],
+            "attempts": [attempt, {"action": "Shipped the fixed build to staging overnight", "result": "it deployed cleanly."}],
             "residual_blocker": "The held lock still blocks every retry.",
-        }
+        },
+        recommendation_basis="research",
     )
 
+    brief = OperatorBrief.model_validate(payload)
+
     assert brief.exhaustion is not None
-    assert brief.exhaustion.attempts[0] == attempt
+    assert brief.exhaustion.attempts[0].action == "Retried the deploy twice by hand after the first refusal -> second try"
+    assert brief.exhaustion.attempts[0].result == "it hit the same lock."
+    assert brief.exhaustion.attempts[0].evidence is None
+    with pytest.raises(BriefValidationError, match="evidence handle missing"):
+        validate_brief(payload, evidence_resolver=_AcceptingResolver())
+
+
+def test_attempt_without_evidence_handle_is_rejected() -> None:
+    with pytest.raises(BriefValidationError, match="attempt 1: evidence handle missing"):
+        _brief(
+            exhaustion={
+                "reason": "attempts_exhausted",
+                "attempts": [{"action": "Ran the reprovision command by hand again", "result": "blocked by the held lock."}],
+                "residual_blocker": "The held lock still blocks every retry.",
+            }
+        )
 
 
 def test_duplicate_attempts_are_rejected() -> None:
-    repeated = "ran the reprovision command -> blocked by the held lock"
+    repeated = _attempt("ran the reprovision command", "blocked by the held lock", {"kind": "order", "ref": "ord-lock-1"})
     with pytest.raises(BriefValidationError, match="distinct"):
         _brief(
             exhaustion={
@@ -316,9 +391,9 @@ def test_duplicate_attempts_are_rejected() -> None:
 
 
 def test_dedup_normalizes_case_and_whitespace_before_comparing() -> None:
-    first = "Ran the deploy script once more -> it hit the held lock."
-    second = "ran THE deploy script ONCE  MORE -> it hit the held lock."
-    third = "Asked the work session for a ruling -> it punted back to us."
+    first = _attempt("Ran the deploy script once more", "it hit the held lock.", {"kind": "order", "ref": "ord-deploy-1"})
+    second = _attempt("ran THE deploy script ONCE  MORE", "it hit the held lock.", {"kind": "order", "ref": "ord-deploy-2"})
+    third = _attempt("Asked the work session for a ruling", "it punted back to us.", {"kind": "order", "ref": "ord-ask-1"})
 
     with pytest.raises(BriefValidationError, match="without case or extra whitespace"):
         _brief(
@@ -329,12 +404,11 @@ def test_dedup_normalizes_case_and_whitespace_before_comparing() -> None:
             }
         )
 
-    spaced = "Ran the deploy script once more -> it hit the held lock."
     brief = _brief(
         exhaustion={
             "reason": "attempts_exhausted",
             "attempts": [first, third],
-            "residual_blocker": f"The held lock still blocks every {spaced and 'retry'}.",
+            "residual_blocker": "The held lock still blocks every retry.",
         }
     )
     assert brief.exhaustion is not None
@@ -360,40 +434,51 @@ def test_newline_in_residual_blocker_is_rejected() -> None:
         _brief(exhaustion={"reason": "attempts_exhausted", "attempts": _payload()["exhaustion"]["attempts"], "residual_blocker": blocker})  # type: ignore[arg-type]
 
 
-def test_plain_english_check_applies_to_attempts_and_residual_blocker() -> None:
-    fragment_attempt = "Ran the reprovision command by hand again -> blocked by the held lock"
-    with pytest.raises(BriefValidationError, match="reads like a fragment"):
-        _brief(
-            exhaustion={
-                "reason": "attempts_exhausted",
-                "attempts": [fragment_attempt, "Shipped the fixed build to staging overnight -> it deployed cleanly."],
-                "residual_blocker": "The held lock still blocks every retry.",
-            }
-        )
+def test_exhaustion_fields_are_evidence_and_skip_the_jargon_filter() -> None:
+    attempts = [
+        _attempt(
+            "Nudged the lane about the held deploy lock",
+            "the nudge found the lane still blocked by the lock.",
+            {"kind": "order", "ref": "ord-lock-nudge-1"},
+        ),
+        "Ran the reprovision command by hand again -> blocked by the held lock",
+    ]
+    payload = _payload(
+        exhaustion={
+            "reason": "attempts_exhausted",
+            "attempts": attempts,
+            "residual_blocker": "Still stuck on the same held deploy lock",
+        }
+    )
 
-    with pytest.raises(BriefValidationError, match="reads like a fragment"):
-        _brief(
-            exhaustion={
-                "reason": "attempts_exhausted",
-                "attempts": [
-                    "Ran the reprovision command by hand again -> blocked by the held lock.",
-                    "Shipped the fixed build to staging overnight -> it deployed cleanly.",
-                ],
-                "residual_blocker": "Still stuck on the same held deploy lock",
-            }
-        )
+    brief = OperatorBrief.model_validate(payload)
+
+    assert [attempt.action for attempt in brief.exhaustion.attempts] == [
+        attempts[0]["action"],
+        "Ran the reprovision command by hand again",
+    ]  # type: ignore[index]
+    assert [attempt.result for attempt in brief.exhaustion.attempts] == [
+        attempts[0]["result"],
+        "blocked by the held lock",
+    ]  # type: ignore[index]
+    with pytest.raises(BriefValidationError, match="evidence handle missing"):
+        validate_brief(payload, evidence_resolver=_AcceptingResolver())
 
 
 def test_credential_reason_with_truthful_record_passes_without_keywords() -> None:
-    attempt = "Presented the retry token to the registry -> the registry refused it outright."
+    attempt = _attempt(
+        "Presented the retry token to the registry",
+        "the registry refused it outright.",
+        {"kind": "verb_refusal", "ref": "chitra-registry-push"},
+    )
     blocker = "Only a human account can approve this access today."
     brief = _brief(recommendation_basis="research", exhaustion={"reason": "credential", "attempts": [attempt], "residual_blocker": blocker})
 
     assert brief.exhaustion is not None
-    assert brief.exhaustion.attempts == [attempt]
+    assert brief.exhaustion.attempts[0].action == "Presented the retry token to the registry"
     rendered = render_brief(brief)
     assert "TRIED:" in rendered
-    assert f"- {attempt}" in rendered
+    assert "- Presented the retry token to the registry -> the registry refused it outright." in rendered
     assert f"OPERATOR-ONLY BECAUSE: {blocker}" in rendered
 
 
@@ -407,7 +492,7 @@ def test_credential_reason_requires_one_observed_refusal() -> None:
 
 
 def test_credential_reason_validates_present_attempts_identically() -> None:
-    with pytest.raises(BriefValidationError, match=r"last '->' separator"):
+    with pytest.raises(BriefValidationError, match="must be non-empty"):
         _brief(
             exhaustion={
                 "reason": "credential",
@@ -421,9 +506,7 @@ def test_credential_reason_validates_present_attempts_identically() -> None:
     ("basis", "matches"),
     [("operator-preference", None), ("research", r'"operator-preference"')],
 )
-def test_operator_decision_reason_binds_to_recommendation_basis(
-    basis: str, matches: str | None
-) -> None:
+def test_operator_decision_reason_binds_to_recommendation_basis(basis: str, matches: str | None) -> None:
     blocker = "Picking the vendor name is a pure preference call nobody else can make."
     exhaustion = {
         "reason": "operator_decision",
@@ -452,12 +535,16 @@ def test_irreversible_consent_reason_allows_missing_attempts_and_needs_a_real_bl
 
 
 def test_credential_reason_with_attempts_renders_tried_and_operator_only_line() -> None:
-    attempt = "Presented the retry token to the registry -> the registry refused it outright."
+    attempt = _attempt(
+        "Presented the retry token to the registry",
+        "the registry refused it outright.",
+        {"kind": "verb_refusal", "ref": "chitra-registry-push"},
+    )
     blocker = "Only a human account can approve this access today."
     brief = _brief(exhaustion={"reason": "credential", "attempts": [attempt], "residual_blocker": blocker})
     rendered = render_brief(brief).splitlines()
 
-    assert rendered[rendered.index("TRIED:") + 1] == f"- {attempt}"
+    assert rendered[rendered.index("TRIED:") + 1] == "- Presented the retry token to the registry -> the registry refused it outright."
     assert f"OPERATOR-ONLY BECAUSE: {blocker}" in rendered
     assert rendered.index("TRIED:") < rendered.index(f"OPERATOR-ONLY BECAUSE: {blocker}") < rendered.index("— from the session, verbatim —")
 
@@ -530,8 +617,8 @@ def test_decisionless_brief_says_nothing_is_ready_to_answer() -> None:
 def test_render_group_numbers_briefs(tmp_path: Path) -> None:
     first = _brief()
     second = _brief(session_ref="host-b:other:0.0", program="Other program (F3)")
-    first_thread = open_thread(tmp_path / "conversation.jsonl", brief=first, raw_text="first")
-    second_thread = open_thread(tmp_path / "conversation.jsonl", brief=second, raw_text="second")
+    first_thread = open_thread(tmp_path / "conversation.jsonl", brief=first, raw_text="first", evidence_resolver=_AcceptingResolver())
+    second_thread = open_thread(tmp_path / "conversation.jsonl", brief=second, raw_text="second", evidence_resolver=_AcceptingResolver())
     grouped = render_group(pending_threads(tmp_path / "conversation.jsonl"), now=datetime.now(UTC))
 
     assert first_thread in {thread.thread_id for thread in pending_threads(tmp_path / "conversation.jsonl")}
@@ -541,11 +628,31 @@ def test_render_group_numbers_briefs(tmp_path: Path) -> None:
     assert "\n\n[2] — open 0m\n  This is" in grouped
 
 
-def test_cli_four_rung_lifecycle_show_list_and_pending(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_four_rung_lifecycle_show_list_and_pending(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = tmp_path / "conversation.jsonl"
+    state = _real_evidence_state(tmp_path, monkeypatch)
+    transcript_arg = ["--self-transcript", str(state / "self-transcript.jsonl")]
     json_path = tmp_path / "brief.json"
     json_path.write_text(json.dumps(_payload()), encoding="utf-8")
-    assert main(["brief", "--convlog-path", str(path), "--session-ref", "host-b:feeds:0.0", "--json", str(json_path), "--raw", "raw"]) == 0
+    assert (
+        main(
+            [
+                "brief",
+                "--convlog-path",
+                str(path),
+                "--session-ref",
+                "host-b:feeds:0.0",
+                "--json",
+                str(json_path),
+                "--raw",
+                "raw",
+                *transcript_arg,
+            ]
+        )
+        == 0
+    )
     captured = capsys.readouterr()
     assert captured.out.startswith("This is")
     thread_id = captured.err.strip().removeprefix("thread=")
@@ -554,9 +661,7 @@ def test_cli_four_rung_lifecycle_show_list_and_pending(tmp_path: Path, capsys: p
     assert "[1] — open" in capsys.readouterr().out
     assert main(["rule", "--convlog-path", str(path), "--thread", thread_id, "--text", "Ship option 1."]) == 0
     assert (
-        main(
-            ["directive", "--convlog-path", str(path), "--thread", thread_id, "--text", "Ship the combined feed.", "--order-id", "ord-1"]
-        )
+        main(["directive", "--convlog-path", str(path), "--thread", thread_id, "--text", "Ship the combined feed.", "--order-id", "ord-1"])
         == 0
     )
     assert main(["show", "--convlog-path", str(path), "--thread", thread_id]) == 0
@@ -568,10 +673,18 @@ def test_cli_four_rung_lifecycle_show_list_and_pending(tmp_path: Path, capsys: p
     assert capsys.readouterr().out == "No pending decisions.\n"
 
 
-def test_batch_rule_and_revision_make_latest_brief_authoritative(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_batch_rule_and_revision_make_latest_brief_authoritative(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = tmp_path / "conversation.jsonl"
-    first = open_thread(path, brief=_brief(), raw_text="first")
-    second = open_thread(path, brief=_brief(session_ref="host-b:second:0.0", program="Second program (F3)"), raw_text="second")
+    state = _real_evidence_state(tmp_path, monkeypatch)
+    first = open_thread(path, brief=_brief(), raw_text="first", evidence_resolver=_AcceptingResolver())
+    second = open_thread(
+        path,
+        brief=_brief(session_ref="host-b:second:0.0", program="Second program (F3)"),
+        raw_text="second",
+        evidence_resolver=_AcceptingResolver(),
+    )
 
     assert main(["rule", "--convlog-path", str(path), "--thread", first, "--thread", second, "--text", "Proceed.", "--via", "slack"]) == 0
     assert pending_threads(path) == []
@@ -590,6 +703,8 @@ def test_batch_rule_and_revision_make_latest_brief_authoritative(tmp_path: Path,
                 revised.session_ref,
                 "--json",
                 str(revised_path),
+                "--self-transcript",
+                str(state / "self-transcript.jsonl"),
             ]
         )
         == 0
@@ -602,7 +717,7 @@ def test_batch_rule_and_revision_make_latest_brief_authoritative(tmp_path: Path,
 
 def test_decisionless_followup_does_not_retire_pending_ask(tmp_path: Path) -> None:
     path = tmp_path / "conversation.jsonl"
-    thread_id = open_thread(path, brief=_brief(), raw_text="raw")
+    thread_id = open_thread(path, brief=_brief(), raw_text="raw", evidence_resolver=_AcceptingResolver())
     follow_up = _brief(
         category="milestone", decision=None, recommendation="I will return with a recommendation.", options=[], exhaustion=None
     )
@@ -617,9 +732,9 @@ def test_decisionless_followup_does_not_retire_pending_ask(tmp_path: Path) -> No
 
 def test_newer_decision_bearing_brief_replaces_pending_ask(tmp_path: Path) -> None:
     path = tmp_path / "conversation.jsonl"
-    thread_id = open_thread(path, brief=_brief(), raw_text="raw")
+    thread_id = open_thread(path, brief=_brief(), raw_text="raw", evidence_resolver=_AcceptingResolver())
     revised = _brief(decision="Should the combined feed include alerts?", recommendation="No; keep alerts separate.")
-    append_operator_brief(path, thread_id=thread_id, brief=revised)
+    append_operator_brief(path, thread_id=thread_id, brief=revised, evidence_resolver=_AcceptingResolver())
 
     threads = list_threads(path)
 
@@ -665,7 +780,7 @@ def test_pending_age_rendering_is_stable(tmp_path: Path) -> None:
 
 def test_direct_helpers_complete_four_rungs(tmp_path: Path) -> None:
     path = tmp_path / "conversation.jsonl"
-    thread_id = open_thread(path, brief=_brief(), raw_text="raw")
+    thread_id = open_thread(path, brief=_brief(), raw_text="raw", evidence_resolver=_AcceptingResolver())
     append_ruling(path, thread_id=thread_id, text="yes")
     append_directive(path, thread_id=thread_id, text="do it", order_id=None)
     assert list_threads(path)[0].pending is False
@@ -674,7 +789,7 @@ def test_direct_helpers_complete_four_rungs(tmp_path: Path) -> None:
 @pytest.mark.parametrize("state", ["moot", "superseded"])
 def test_event_resolution_retires_thread_with_truthful_basis(tmp_path: Path, state: str) -> None:
     path = tmp_path / "conversation.jsonl"
-    thread_id = open_thread(path, brief=_brief(), raw_text="raw")
+    thread_id = open_thread(path, brief=_brief(), raw_text="raw", evidence_resolver=_AcceptingResolver())
     append_resolution(
         path,
         thread_id=thread_id,
@@ -693,11 +808,298 @@ def test_event_resolution_retires_thread_with_truthful_basis(tmp_path: Path, sta
 
 def test_cli_can_mark_multiple_threads_moot(tmp_path: Path) -> None:
     path = tmp_path / "conversation.jsonl"
-    first = open_thread(path, brief=_brief(), raw_text="first")
-    second = open_thread(path, brief=_brief(session_ref="host-b:other:0.0", program="Other program (F3)"), raw_text="second")
-    assert main([
-        "retire", "--convlog-path", str(path), "--thread", first, "--thread", second,
-        "--state", "moot", "--basis", "Events resolved both questions.",
-        "--citation", "evidence/current-state.md", "--authority", "The monitor applied the operator's standing guidance.",
-    ]) == 0
+    first = open_thread(path, brief=_brief(), raw_text="first", evidence_resolver=_AcceptingResolver())
+    second = open_thread(
+        path,
+        brief=_brief(session_ref="host-b:other:0.0", program="Other program (F3)"),
+        raw_text="second",
+        evidence_resolver=_AcceptingResolver(),
+    )
+    assert (
+        main(
+            [
+                "retire",
+                "--convlog-path",
+                str(path),
+                "--thread",
+                first,
+                "--thread",
+                second,
+                "--state",
+                "moot",
+                "--basis",
+                "Events resolved both questions.",
+                "--citation",
+                "evidence/current-state.md",
+                "--authority",
+                "The monitor applied the operator's standing guidance.",
+            ]
+        )
+        == 0
+    )
     assert [thread.state for thread in list_threads(path)] == ["moot", "moot"]
+
+
+def _fabricated_15_payload(*, order_ref: object) -> dict[str, object]:
+    """The critique's finding 1.5 incident: invented capture plus invented ledger order."""
+    return _payload(
+        decision="Should I ask you to run the npm install on tophand, or wait for the package pin?",
+        recommendation="Ask you for the install because the pin blocks every retry.",
+        exhaustion={
+            "reason": "attempts_exhausted",
+            "attempts": [
+                _attempt(
+                    "Ran chitra-tmux-capture harness-pi over the grant",
+                    "the pane shows the dependency prompt.",
+                    {"kind": "command", "ref": "chitra-tmux-capture harness-pi", "exit_status": 0},
+                ),
+                _attempt(
+                    "Queued follow-up message to harness-pi",
+                    "no new turn in its transcript after ten minutes.",
+                    {"kind": "order", "ref": order_ref},
+                ),
+            ],
+            "residual_blocker": "The install needs a shell on tophand that the grant does not expose.",
+        },
+    )
+
+
+def test_fabricated_brief_from_finding_15_is_rejected_at_write_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = tmp_path / "state"
+    _write_ledger(state / "ledger.jsonl", "ord-unrelated-1")
+    _write_self_transcript(state / "self-transcript.jsonl", command="chitra-status --json", exit_code=0)
+    monkeypatch.setenv("CHITRA_STATE_DIR", str(state))
+
+    with pytest.raises(BriefValidationError) as excinfo:
+        validate_brief(_fabricated_15_payload(order_ref="9f2c"), self_transcript=state / "self-transcript.jsonl")
+
+    assert "attempt 2: order 9f2c not found in ledger" in str(excinfo.value)
+
+
+def test_same_brief_with_real_order_and_capture_is_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = tmp_path / "state"
+    _write_ledger(state / "ledger.jsonl", "ord-npm-followup-1")
+    _write_self_transcript(state / "self-transcript.jsonl", command="chitra-tmux-capture harness-pi", exit_code=0)
+    monkeypatch.setenv("CHITRA_STATE_DIR", str(state))
+
+    brief = validate_brief(_fabricated_15_payload(order_ref="ord-npm-followup-1"), self_transcript=state / "self-transcript.jsonl")
+
+    assert brief.exhaustion is not None and len(brief.exhaustion.attempts) == 2
+
+
+def test_command_evidence_with_wrong_exit_status_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = tmp_path / "state"
+    _write_ledger(state / "ledger.jsonl", "ord-feeds-layout-1")
+    _write_self_transcript(state / "self-transcript.jsonl", command="chitra-tmux-capture feeds-reader --pane harness-pi", exit_code=3)
+    monkeypatch.setenv("CHITRA_STATE_DIR", str(state))
+    payload = _payload()
+
+    with pytest.raises(BriefValidationError, match=r"command 'chitra-tmux-capture feeds-reader --pane harness-pi' exited 3"):
+        validate_brief(payload, self_transcript=state / "self-transcript.jsonl")
+
+
+def test_command_evidence_without_any_capture_in_the_transcript_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = tmp_path / "state"
+    _write_ledger(state / "ledger.jsonl", "ord-feeds-layout-1")
+    _write_self_transcript(state / "self-transcript.jsonl", command="chitra-status --json", exit_code=0)
+    monkeypatch.setenv("CHITRA_STATE_DIR", str(state))
+
+    with pytest.raises(BriefValidationError, match="no Bash tool use mentioning 'chitra-tmux-capture feeds-reader"):
+        validate_brief(_payload(), self_transcript=state / "self-transcript.jsonl")
+
+
+def test_command_evidence_without_a_recorded_result_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = tmp_path / "state"
+    _write_ledger(state / "ledger.jsonl", "ord-feeds-layout-1")
+    (state / "self-transcript.jsonl").write_text(
+        json.dumps(
+            {"type": "tool_use", "id": "tu_1", "name": "Bash", "input": {"command": "chitra-tmux-capture feeds-reader --pane harness-pi"}}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CHITRA_STATE_DIR", str(state))
+
+    with pytest.raises(BriefValidationError, match="no recorded result in self transcript"):
+        validate_brief(_payload(), self_transcript=state / "self-transcript.jsonl")
+
+
+def test_transcript_evidence_checks_path_and_line_digest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = tmp_path / "state"
+    _write_ledger(state / "ledger.jsonl", "ord-x")
+    monkeypatch.setenv("CHITRA_STATE_DIR", str(state))
+    quoted = "the lane answered: the feed layout is the operator's product call."
+    transcript = tmp_path / "lane-session.jsonl"
+    transcript.write_text(quoted + "\n", encoding="utf-8")
+    digest = hashlib.sha256(quoted.encode("utf-8")).hexdigest()
+
+    attempt = _attempt(
+        "Read the lane session transcript",
+        "it deferred the product call.",
+        {"kind": "transcript", "ref": str(transcript), "sha256": digest},
+    )
+    payload = _payload(
+        exhaustion={"reason": "attempts_exhausted", "attempts": [attempt], "residual_blocker": "Only the operator can pick."}
+    )
+    payload["exhaustion"]["attempts"].append(
+        _attempt("Shipped the combined-feed prototype", "it passed the preference check.", {"kind": "order", "ref": "ord-x"})
+    )
+
+    assert validate_brief(payload).exhaustion is not None
+
+    payload["exhaustion"]["attempts"][0]["evidence"]["sha256"] = "0" * 64  # type: ignore[index]
+    with pytest.raises(BriefValidationError, match=f"no line in {transcript} hashes to"):
+        validate_brief(payload)
+
+    payload["exhaustion"]["attempts"][0]["evidence"]["ref"] = str(tmp_path / "missing.jsonl")  # type: ignore[index]
+    with pytest.raises(BriefValidationError, match="transcript not found"):
+        validate_brief(payload)
+
+
+@pytest.mark.parametrize("exit_code,expected", [(1, None), (0, "did not fail in self transcript; no refusal was observed")])
+def test_verb_refusal_evidence_requires_an_observed_nonzero_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int, expected: str | None
+) -> None:
+    state = tmp_path / "state"
+    _write_ledger(state / "ledger.jsonl", "ord-feeds-layout-1")
+    _write_self_transcript(
+        state / "self-transcript.jsonl", command="chitra grant chitra-registry-push --token retry-1", exit_code=exit_code
+    )
+    monkeypatch.setenv("CHITRA_STATE_DIR", str(state))
+    attempt = _attempt(
+        "Presented the retry token to the registry",
+        "the registry refused it outright.",
+        {"kind": "verb_refusal", "ref": "chitra-registry-push"},
+    )
+    payload = _payload(
+        recommendation_basis="research",
+        exhaustion={
+            "reason": "credential",
+            "attempts": [attempt],
+            "residual_blocker": "Only a human account can approve this access today.",
+        },
+    )
+    if expected is None:
+        assert validate_brief(payload, self_transcript=state / "self-transcript.jsonl").exhaustion is not None
+    else:
+        with pytest.raises(BriefValidationError, match=f"grant verb 'chitra-registry-push' {expected}"):
+            validate_brief(payload, self_transcript=state / "self-transcript.jsonl")
+
+
+@pytest.mark.parametrize("digest", [None, "deadbeef"])
+def test_transcript_evidence_requires_a_valid_sha256(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, digest: str | None) -> None:
+    state = tmp_path / "state"
+    _write_ledger(state / "ledger.jsonl", "ord-x")
+    monkeypatch.setenv("CHITRA_STATE_DIR", str(state))
+    transcript = tmp_path / "lane-session.jsonl"
+    transcript.write_text("the lane deferred the product call.\n", encoding="utf-8")
+    evidence: dict[str, object] = {"kind": "transcript", "ref": str(transcript)}
+    if digest is not None:
+        evidence["sha256"] = digest
+    attempt = _attempt("Read the lane session transcript", "it deferred the product call.", evidence)
+    payload = _payload(
+        exhaustion={"reason": "attempts_exhausted", "attempts": [attempt], "residual_blocker": "Only the operator can pick."}
+    )
+    payload["exhaustion"]["attempts"].append(  # type: ignore[index]
+        _attempt("Shipped the combined-feed prototype", "it passed the preference check.", {"kind": "order", "ref": "ord-x"})
+    )
+
+    with pytest.raises(BriefValidationError, match="sha256"):
+        validate_brief(payload)
+
+
+def test_transcript_evidence_requires_an_absolute_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    state = tmp_path / "state"
+    _write_ledger(state / "ledger.jsonl", "ord-x")
+    monkeypatch.setenv("CHITRA_STATE_DIR", str(state))
+    quoted = "the lane answered: the feed layout is the operator's product call."
+    (tmp_path / "lane-session.jsonl").write_text(quoted + "\n", encoding="utf-8")
+    digest = hashlib.sha256(quoted.encode("utf-8")).hexdigest()
+    attempt = _attempt(
+        "Read the lane session transcript",
+        "it deferred the product call.",
+        {"kind": "transcript", "ref": "lane-session.jsonl", "sha256": digest},
+    )
+    payload = _payload(
+        exhaustion={"reason": "attempts_exhausted", "attempts": [attempt], "residual_blocker": "Only the operator can pick."}
+    )
+    payload["exhaustion"]["attempts"].append(  # type: ignore[index]
+        _attempt("Shipped the combined-feed prototype", "it passed the preference check.", {"kind": "order", "ref": "ord-x"})
+    )
+
+    with pytest.raises(BriefValidationError, match="absolute"):
+        validate_brief(payload)
+
+
+def test_tool_result_before_its_tool_use_in_one_record_is_not_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = tmp_path / "state"
+    _write_ledger(state / "ledger.jsonl", "ord-feeds-layout-1")
+    command = "chitra-tmux-capture feeds-reader --pane harness-pi"
+    reordered = {
+        "events": [
+            {"type": "tool_result", "tool_use_id": "tu_capture_1", "content": "pane text\nexit code: 0"},
+            {"type": "tool_use", "id": "tu_capture_1", "name": "Bash", "input": {"command": command}},
+        ]
+    }
+    (state / "self-transcript.jsonl").write_text(json.dumps(reordered) + "\n", encoding="utf-8")
+    monkeypatch.setenv("CHITRA_STATE_DIR", str(state))
+
+    with pytest.raises(BriefValidationError, match="no recorded result in self transcript"):
+        validate_brief(_payload(), self_transcript=state / "self-transcript.jsonl")
+
+
+def test_verb_refusal_requires_a_bash_tool_use_not_any_tool_event(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = tmp_path / "state"
+    _write_ledger(state / "ledger.jsonl", "ord-feeds-layout-1")
+    events = [
+        {
+            "type": "tool_use",
+            "id": "tu_note_1",
+            "name": "TodoWrite",
+            "input": {"todos": ["retry chitra-registry-push with token retry-1"]},
+        },
+        {"type": "tool_result", "tool_use_id": "tu_note_1", "content": "todos updated\nexit code: 1"},
+    ]
+    (state / "self-transcript.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+    monkeypatch.setenv("CHITRA_STATE_DIR", str(state))
+    attempt = _attempt(
+        "Presented the retry token to the registry",
+        "the registry refused it outright.",
+        {"kind": "verb_refusal", "ref": "chitra-registry-push"},
+    )
+    payload = _payload(
+        exhaustion={
+            "reason": "credential",
+            "attempts": [attempt],
+            "residual_blocker": "Only a human account can approve this access today.",
+        },
+    )
+
+    with pytest.raises(BriefValidationError, match="no Bash tool use mentioning 'chitra-registry-push'"):
+        validate_brief(payload, self_transcript=state / "self-transcript.jsonl")
+
+
+def test_rejecting_resolver_reason_is_reported_with_attempt_index() -> None:
+    with pytest.raises(BriefValidationError, match="attempt 2: ledger exploded"):
+        validate_brief(_payload(), evidence_resolver=_RejectingResolver("ledger exploded"))
+
+
+def test_default_resolver_reports_missing_self_transcript_for_command_evidence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    _write_ledger(state / "ledger.jsonl", "ord-feeds-layout-1")
+    monkeypatch.setenv("CHITRA_STATE_DIR", str(state))
+    monkeypatch.delenv("CHITRA_SELF_TRANSCRIPT", raising=False)
+
+    with pytest.raises(BriefValidationError, match="--self-transcript or set CHITRA_SELF_TRANSCRIPT"):
+        validate_brief(_payload())
+
+
+def test_env_var_self_transcript_is_honored_by_the_default_resolver(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = tmp_path / "state"
+    _write_ledger(state / "ledger.jsonl", "ord-feeds-layout-1")
+    _write_self_transcript(state / "self-transcript.jsonl", command="chitra-tmux-capture feeds-reader --pane harness-pi", exit_code=0)
+    monkeypatch.setenv("CHITRA_STATE_DIR", str(state))
+    monkeypatch.setenv("CHITRA_SELF_TRANSCRIPT", str(state / "self-transcript.jsonl"))
+
+    assert validate_brief(_payload()).exhaustion is not None
