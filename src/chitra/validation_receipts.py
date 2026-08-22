@@ -444,10 +444,13 @@ def _pvr_report_accepted(verdict: object) -> bool:
 
 
 def _generic_validator_issues(receipt: ValidationReceipt, base: Path) -> list[str]:
-    """Fail closed on PASS claims that lack a machine-readable validator report."""
+    """Fail closed on PASS claims that lack a trusted validator execution."""
     status = cast(str, receipt.result["status"])
     if status != "PASS":
         return []
+    command = receipt.exercise.get("command")
+    if not isinstance(command, list):
+        return ["PASS with a live_boundary exercise cannot be verified by the generic validator path"]
     report_artifact = next((item for item in receipt.artifacts if item.kind == "report"), None)
     if report_artifact is None:
         return ["PASS requires a hash-bound validator report artifact"]
@@ -457,21 +460,52 @@ def _generic_validator_issues(receipt: ValidationReceipt, base: Path) -> list[st
         return [f"validator report is unreadable: {exc}"]
     if not isinstance(raw_report, dict):
         return ["validator report must be a JSON object"]
-    required = {"schema_version", "exit_code"}
-    command = receipt.exercise.get("command")
-    if isinstance(command, list):
-        required.add("command")
+    required = {"schema_version", "command", "exit_code"}
     if set(raw_report) != required or raw_report.get("schema_version") != "chitra-validator-report-v1":
         return ["validator report does not have the exact chitra-validator-report-v1 shape"]
     exit_code = raw_report.get("exit_code")
     if not isinstance(exit_code, int) or isinstance(exit_code, bool):
         return ["validator report exit_code must be an integer"]
     issues: list[str] = []
-    if isinstance(command, list) and raw_report["command"] != command:
+    if raw_report["command"] != command:
         issues.append("validator report command does not match the receipt exercise")
-    if exit_code != 0:
+    actual_exit_code = _trusted_exit_code(list(command))
+    if actual_exit_code != exit_code:
+        issues.append(
+            f"trusted re-execution of the receipt exercise exited {actual_exit_code}; "
+            f"the caller-authored report claims exit_code={exit_code}"
+        )
+    elif exit_code != 0:
         issues.append(f"validator report records failure (exit_code={exit_code}); it cannot support PASS")
     return issues
+
+
+def _trusted_exit_code(command: list[str]) -> int:
+    """Re-execute the declared exercise under the verifier's own authority.
+
+    Caller-authored hashes prove only that the report bytes were not modified
+    after authorship; an independent execution of the declared command is what
+    establishes its result.  The verifier controls the environment and working
+    directory so a caller cannot influence the observed exit code, and any
+    command that cannot be executed here counts as a failure to verify.
+    """
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key in ("LANG", "LC_ALL", "TMPDIR")
+    }
+    try:
+        completed = subprocess.run(
+            list(command),
+            check=False,
+            capture_output=True,
+            cwd=tempfile.gettempdir(),
+            env=environment,
+            timeout=60.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 125
+    return completed.returncode
 
 
 def verify_receipt_file(path: Path, *, verify_current_target: bool = True) -> ReceiptVerification:

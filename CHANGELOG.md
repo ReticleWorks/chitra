@@ -119,6 +119,11 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   `chitra-validator-report-v1` report whose command and exit code support the
   claim, checked at ingest and again at close. A self-asserted `PASS` over a
   failing report can no longer close an item.
+- The generic verifier no longer takes a PASS result from caller-authored
+  report text alone. A claimed exit code must be re-established by an
+  independent trusted execution of the declared exercise command in a
+  verifier-controlled environment, so a hash-consistent report that lies about
+  a failing command can no longer close an item.
 - Receipts are stored at `<state-root>/validation-receipts/<receipt_name>.json`
   as DESIGN-v3 section 2 requires, without the undocumented session-hash
   directory.

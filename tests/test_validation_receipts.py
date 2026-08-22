@@ -57,7 +57,7 @@ def _negative_receipt(root: Path, status: str) -> Path:
         "receipt_name": receipt_name,
         "validator": {"name": "pytest", "version": "test"},
         "target": {"artifact": {"path": str(artifact), "sha256": artifact_digest}},
-        "exercise": {"command": ["pytest", "-q"]},
+        "exercise": {"command": ["/bin/true"]},
         "result": {"status": status, "validator_acceptance": False},
         "not_exercised": not_exercised,
         "artifacts": [{"path": "evidence/result.txt", "kind": "report", "sha256": artifact_digest}],
