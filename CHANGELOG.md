@@ -20,6 +20,15 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.14.10] - 2026-08-22
+
+### Added
+
+- Add W3 canonical-journal detectors for drift, unnecessary steps,
+  excessive testing, document dithering, and false completion, plus the
+  consumption-bound response ladder, RESCUE bundle capture, relaunch brief
+  generation, injected failure fixtures, and false-positive controls.
+
 ## [0.14.8] - 2026-08-22
 
 ### Fixed
