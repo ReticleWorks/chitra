@@ -69,6 +69,7 @@ chitra-merge = "chitra.merge_cli:main"
 chitra-failover = "chitra.failover_cli:main"
 chitra-presence = "chitra.presence_cli:main"
 chitra-peer = "chitra.peer_cli:main"
+chitra-convert = "tools.convert.topology:main"
 polyphony-chitra-merged = "chitra.merged:main"
 
 [project.urls]
@@ -78,7 +79,7 @@ Issues = "https://github.com/ReticleWorks/chitra/issues"
 Changelog = "https://github.com/ReticleWorks/chitra/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/chitra", "src/boardd"]
+packages = ["src/chitra", "src/boardd", "tools"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
