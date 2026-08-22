@@ -204,3 +204,90 @@ def test_monitor_contract_binds_session_and_context() -> None:
     other = MonitorContract.create(session_ref="s", context="different")
     assert contract.contract_id == again.contract_id
     assert contract.contract_id != other.contract_id
+
+
+def test_a_cli_mode_conflicting_with_the_envelope_mode_is_rejected(run_cli, capsys) -> None:
+    envelope = {
+        "mode": "lane",
+        "session_ref": "localhost:monitor:0.1",
+        "final_message": "Board refreshed; nothing open.",
+    }
+    code, _stdout, stderr = run_cli(envelope, _accept)
+
+    assert code != 0
+    assert "mode" in stderr
+
+
+def test_a_forged_reviewer_identity_is_not_emitted(tmp_path, run_cli) -> None:
+    def forging(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        completed = _accept(command, json.loads(command[2].rsplit("\nINPUT=", 1)[1]))
+        verdict = json.loads(completed.stdout)
+        verdict["reviewer_id"] = "forged-reviewer"
+
+        return subprocess.CompletedProcess(command, 0, json.dumps(verdict), "")
+
+    snapshot = _goal_snapshot(tmp_path)
+    envelope = {
+        "mode": "lane",
+        "session_ref": snapshot["session_ref"],
+        "final_message": "Continuing against the recorded goal.",
+        "goal": snapshot,
+    }
+    code, stdout, stderr = run_cli(envelope, forging)
+
+    assert code != 0
+    assert stdout == ""
+    assert "identity" in stderr
+
+
+def test_a_tampered_goal_binding_is_not_emitted(tmp_path, run_cli) -> None:
+    def tampering(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        completed = _accept(command, json.loads(command[2].rsplit("\nINPUT=", 1)[1]))
+        verdict = json.loads(completed.stdout)
+        verdict["goal_contract_id"] = "sha256:" + "0" * 64
+        return subprocess.CompletedProcess(command, 0, json.dumps(verdict), "")
+
+    snapshot = _goal_snapshot(tmp_path)
+    envelope = {
+        "mode": "lane",
+        "session_ref": snapshot["session_ref"],
+        "final_message": "Continuing against the recorded goal.",
+        "goal": snapshot,
+    }
+    code, stdout, stderr = run_cli(envelope, tampering)
+
+    assert code != 0
+    assert stdout == ""
+    assert "binding" in stderr
+
+
+def test_a_lane_goal_with_a_supplied_contract_id_must_recompute_it(tmp_path, run_cli) -> None:
+    snapshot = _goal_snapshot(tmp_path)
+    forged = dict(snapshot)
+    forged["contract_id"] = "sha256:" + "1" * 64
+    envelope = {
+        "mode": "lane",
+        "session_ref": snapshot["session_ref"],
+        "final_message": "Continuing.",
+        "goal": forged,
+    }
+    code, _stdout, stderr = run_cli(envelope, _accept)
+
+    assert code != 0
+    assert "contract_id" in stderr
+
+
+def test_a_lane_envelope_session_must_match_the_goal_session(tmp_path, run_cli) -> None:
+    snapshot = _goal_snapshot(tmp_path)
+    other = dict(snapshot)
+    other["session_ref"] = "localhost:lane:9.9"
+    envelope = {
+        "mode": "lane",
+        "session_ref": "localhost:lane:9.9",
+        "final_message": "Continuing.",
+        "goal": snapshot,
+    }
+    code, _stdout, stderr = run_cli(envelope, _accept)
+
+    assert code != 0
+    assert "session" in stderr

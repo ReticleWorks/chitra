@@ -23,6 +23,7 @@ from chitra.goal_enforcement import (
     ClaudeProcessReviewer,
     FrozenGoal,
     ReviewerProcessError,
+    _validate_bound_review,
 )
 from chitra.review_rubric import (
     GoalReviewError,
@@ -48,14 +49,22 @@ class ReviewEnvelope(BaseModel):
 
 
 def _frozen_goal_from_envelope(goal: dict[str, object]) -> FrozenGoal:
+    """Strict-validate the seven goal fields and recompute their contract id.
+
+    A caller-supplied ``contract_id`` is never trusted: the snapshot is
+    content-addressed here so a forged binding cannot cross the CLI boundary.
+    """
     fields = ("session_ref", "intent", "goal", "done_when", "scope", "source", "goal_version")
     missing = [name for name in fields if name not in goal]
     if missing:
         raise GoalReviewError("lane goal envelope is missing required fields: " + ", ".join(missing))
     payload = {name: goal[name] for name in fields}
     supplied = goal.get("contract_id")
-    contract_id = supplied if isinstance(supplied, str) else contract_id_for(payload)
-    return FrozenGoal.model_validate({**payload, "contract_id": contract_id})
+    if isinstance(supplied, str) and supplied != contract_id_for(payload):
+        raise GoalReviewError(
+            f"lane goal envelope carries contract_id {supplied!r}, which does not match its content ({contract_id_for(payload)})"
+        )
+    return FrozenGoal.model_validate({**payload, "contract_id": contract_id_for(payload)})
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -82,12 +91,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"chitra-review: invalid envelope: {exc}", file=sys.stderr)
         return 2
     try:
+        if envelope.mode != args.mode:
+            raise GoalReviewError(
+                f"--mode {args.mode} conflicts with the envelope's mode={envelope.mode}; pass matching modes"
+            )
         behavior = WatchedSessionBehavior.from_turn(envelope.session_ref, envelope.final_message)
         contract: FrozenGoal | MonitorContract
-        if envelope.mode == "lane":
+        if args.mode == "lane":
             if envelope.goal is None:
                 raise GoalReviewError("mode=lane requires a goal snapshot in the envelope")
             contract = _frozen_goal_from_envelope(envelope.goal)
+            if envelope.session_ref != contract.session_ref:
+                raise GoalReviewError(
+                    f"envelope session {envelope.session_ref!r} does not match the frozen goal session {contract.session_ref!r}"
+                )
         else:
             contract = MonitorContract.create(session_ref=envelope.session_ref, context=envelope.context)
         verdict = ClaudeProcessReviewer(
@@ -97,6 +114,7 @@ def main(argv: list[str] | None = None) -> int:
             runner=subprocess.run,
             attempts=REVIEWER_ATTEMPTS,
         ).review(contract, behavior, envelope.reviewer_id)
+        _validate_bound_review(verdict, reviewer_id=envelope.reviewer_id, goal=contract, behavior=behavior)
     except (GoalReviewError, ReviewerProcessError, ValidationError) as exc:
         print(f"chitra-review: {exc}", file=sys.stderr)
         return 3
