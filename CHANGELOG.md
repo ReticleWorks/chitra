@@ -20,6 +20,47 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.14.8] - 2026-08-22
+
+### Fixed
+
+- Presence records now serialize the contractual `mode` field with value
+  `using` or `released`, as DESIGN-v3 section 5 requires, instead of a
+  differently named `state` field; every other record binding and the
+  append/merge behavior are unchanged.
+- Direct peer questions now enter the existing governed session-message path:
+  `chitra-peer say` enqueues a real dispatch order bound to the target session
+  and text for `dispatchd` to deliver and verify. The shared-dir mirror is
+  non-authoritative, and locally recorded receipts only ever mirror
+  dispatchd's own durable results, so they can no longer claim delivery that
+  did not happen.
+
+## [0.14.7] - 2026-08-22
+
+### Fixed
+
+- Presence records now bind each declaration to its session, goal references,
+  purpose, and journal event reference, as DESIGN-v3 section 5 requires.
+- Peer messages now record a dispatch receipt on delivery and a consumption
+  receipt when the peer consumes, instead of bypassing the governed
+  session-message path.
+
+## [0.14.6] - 2026-08-22
+
+### Added
+
+- Add per-instance, append-only advisory presence for shared resources. Readers
+  merge every writer file and report peers without locks, expiry, stealing, or
+  exclusive claims.
+- Add atomic file-per-message peer inboxes with stable ordering and idempotent
+  retry IDs. The `chitra-presence` and `chitra-peer` commands expose both
+  library surfaces without adding a daemon or socket.
+
+### Fixed
+
+- Preserve nanosecond modification times with an inode tie-breaker when
+  ordering dispatch queues, so same-tick writes retain FIFO order on Linux.
+
 ## [0.14.5] - 2026-08-22
 
 ### Fixed
