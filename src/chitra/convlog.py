@@ -31,7 +31,7 @@ import structlog
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from chitra._fsio import parse_iso8601
-from chitra.plain_english import require_plain_english
+from chitra.plain_english import plain_english_issues, require_plain_english
 from chitra.state_paths import default_convlog_path
 
 logger = structlog.get_logger(__name__)
@@ -42,6 +42,35 @@ type ConversationResolution = Literal["moot", "superseded"]
 type BriefCategory = Literal["decision", "incident", "milestone", "fyi"]
 type RecommendationBasis = Literal["research", "operator-preference"]
 _BARE_CODENAME = re.compile(r"(?:[A-Za-z]*-?\d+|\d+-\d+)", re.IGNORECASE)
+type ExhaustionReason = Literal["credential", "irreversible_consent", "operator_decision", "attempts_exhausted"]
+_ATTEMPT_SEPARATOR = "->"
+_OBSERVED_RESULT = f"an observed result after the '{_ATTEMPT_SEPARATOR}' separator"
+_ATTEMPT_MIN_LENGTH = 20
+_ATTEMPT_ACTION_MIN_LENGTH = 8
+_ATTEMPT_RESULT_MIN_LENGTH = 5
+_BLOCKER_MIN_LENGTH = 20
+_RESULT_SEGMENT_ERROR = (
+    f"each attempt must split on its last '{_ATTEMPT_SEPARATOR}' separator into a non-blank action part "
+    f"of at least {_ATTEMPT_ACTION_MIN_LENGTH} characters and a non-blank observed-result part of at least "
+    f"{_ATTEMPT_RESULT_MIN_LENGTH} characters (both measured after stripping surrounding whitespace)"
+)
+_MISSING_EXHAUSTION_ERROR = (
+    "a decision may go to the operator only with an exhaustion record: "
+    f"list >= 2 distinct attempts with observed results (reason attempts_exhausted); "
+    "only credential, irreversible_consent, or operator_decision excuse going to the operator with fewer"
+)
+_SMUGGLED_ASK_MARKERS: tuple[str, ...] = (
+    "operator must",
+    "operator needs to",
+    "operator should",
+    "you must",
+    "you need to",
+    "you should run",
+    "please run",
+    "please install",
+    "can you ",
+    "could you ",
+)
 
 
 class BriefValidationError(ValueError):
@@ -71,6 +100,24 @@ class BriefOption(BaseModel):
         return require_plain_english(value, field="option consequence")
 
 
+class ExhaustionRecord(BaseModel):
+    """Proof that agent-resolvable work was exhausted before a brief asked the operator.
+
+    The exhaustion gate enforces STRUCTURE, not vocabulary: an explicit reason,
+    an explicit residual blocker, and attempts that each record an action tried
+    with its observed result. Structure makes every record a falsifiable claim
+    that an auditor can check against the session transcript. There are no
+    keyword whitelists anywhere in this gate: vocabulary tests reject truthful
+    records while passing magic-word stuffing. Fabrication is deterred by
+    post-hoc audit (reviewer codes plus random deep audits), not by string
+    matching.
+    """
+
+    reason: ExhaustionReason
+    attempts: list[str] = Field(default_factory=list)
+    residual_blocker: str
+
+
 class OperatorBrief(BaseModel):
     """A caller-composed, deterministic-to-render operator brief."""
 
@@ -84,6 +131,7 @@ class OperatorBrief(BaseModel):
     recommendation: str = ""
     recommendation_basis: RecommendationBasis = "research"
     options: list[BriefOption] = Field(default_factory=list)
+    exhaustion: ExhaustionRecord | None = None
     source_quote: list[str] = Field(min_length=1, max_length=4)
     source_ref: str = Field(min_length=1)
 
@@ -210,8 +258,105 @@ def _parse_at(value: str) -> datetime:
     )
 
 
+def _collapsed_key(value: str) -> str:
+    """Normalize an attempt so case, padding, and spacing cannot fake a new try."""
+    return " ".join(value.casefold().strip().split())
+
+
+def _exhaustion_problems(brief: OperatorBrief) -> list[str]:
+    """Return every structural defect in the brief's exhaustion record."""
+    record = brief.exhaustion
+    if record is None:
+        return []
+    problems: list[str] = []
+    if "\n" in record.residual_blocker or "\r" in record.residual_blocker:
+        problems.append("residual_blocker must be one line: '\\n' and '\\r' are rejected")
+    seen: dict[str, int] = {}
+    for index, attempt in enumerate(record.attempts, start=1):
+        key = _collapsed_key(attempt)
+        if not key:
+            problems.append(f"attempt {index} must be non-empty")
+        elif key in seen:
+            problems.append(
+                f"attempt {index} repeats attempt {seen[key]} once compared without case or extra whitespace; "
+                "attempts must be distinct records of distinct tries"
+            )
+        else:
+            seen[key] = index
+        if "\n" in attempt or "\r" in attempt:
+            problems.append(f"attempt {index} must be one line: '\\n' and '\\r' are rejected")
+        stripped = attempt.strip()
+        if len(stripped) < _ATTEMPT_MIN_LENGTH:
+            problems.append(
+                f"attempt {index} must be at least {_ATTEMPT_MIN_LENGTH} characters and name the action tried and {_OBSERVED_RESULT}"
+            )
+        action, _, result = attempt.rpartition(_ATTEMPT_SEPARATOR)
+        if len(action.strip()) < _ATTEMPT_ACTION_MIN_LENGTH or len(result.strip()) < _ATTEMPT_RESULT_MIN_LENGTH:
+            problems.append(f"attempt {index}: {_RESULT_SEGMENT_ERROR}")
+        problems.extend(plain_english_issues(attempt, field=f"attempt {index}"))
+    stripped_blocker = record.residual_blocker.strip()
+    if record.reason == "attempts_exhausted":
+        if len(record.attempts) < 2:
+            problems.append(
+                f"reason attempts_exhausted requires at least 2 distinct attempts, each naming the action tried and {_OBSERVED_RESULT}"
+            )
+    else:
+        if len(stripped_blocker) < _BLOCKER_MIN_LENGTH:
+            problems.append(
+                f"reason {record.reason} requires a residual_blocker of at least {_BLOCKER_MIN_LENGTH} characters "
+                "naming what still stands after the attempts"
+            )
+        if record.reason == "credential" and len(record.attempts) < 1:
+            problems.append("reason credential requires at least 1 attempt: record the access you tried and the refusal you observed")
+        if record.reason == "operator_decision" and brief.recommendation_basis != "operator-preference":
+            problems.append('reason operator_decision is valid only when recommendation_basis is "operator-preference"')
+    problems.extend(plain_english_issues(record.residual_blocker, field="residual_blocker"))
+    return problems
+
+
+def _smuggled_ask_problems(brief: OperatorBrief) -> list[str]:
+    """Reject operator-directed imperatives smuggled into decisionless briefs."""
+    if brief.decision is not None:
+        return []
+    problems: list[str] = []
+    for field_name, text in (("recommendation", brief.recommendation), ("stage", brief.stage), ("progress", brief.progress)):
+        lowered = text.casefold()
+        marker = next((candidate for candidate in _SMUGGLED_ASK_MARKERS if candidate in lowered), None)
+        if marker is not None:
+            problems.append(
+                f"{field_name} hides an operator-directed ask ({marker.strip()!r}): "
+                "promote the ask into decision with an exhaustion record, or remove it from the brief"
+            )
+    return problems
+
+
+def _write_path_problems(brief: OperatorBrief) -> list[str]:
+    problems: list[str] = []
+    if brief.decision is not None and brief.exhaustion is None:
+        problems.append(_MISSING_EXHAUSTION_ERROR)
+    problems.extend(_exhaustion_problems(brief))
+    problems.extend(_smuggled_ask_problems(brief))
+    return problems
+
+
 def validate_brief(payload: object) -> OperatorBrief:
-    """Validate one caller payload and normalize Pydantic errors for callers."""
+    """Validate one caller payload on the strict write path and normalize errors for callers."""
+    try:
+        brief = OperatorBrief.model_validate(payload)
+    except ValidationError as exc:
+        raise BriefValidationError(str(exc)) from exc
+    problems = _write_path_problems(brief)
+    if problems:
+        raise BriefValidationError("; ".join(problems))
+    return brief
+
+
+def read_stored_brief(payload: object) -> OperatorBrief:
+    """Load one stored brief leniently so records written before a rule change stay readable.
+
+    Stored records never re-run the write-path gates (exhaustion structure,
+    smuggled asks); only the shape checks that predate their storage apply.
+    """
     try:
         return OperatorBrief.model_validate(payload)
     except ValidationError as exc:
@@ -243,6 +388,21 @@ def _grounding_line(brief: OperatorBrief) -> str:
     return f"{line}."
 
 
+def _exhaustion_lines(brief: OperatorBrief) -> list[str]:
+    record = brief.exhaustion
+    if record is None:
+        return []
+    lines: list[str] = []
+    if record.attempts:
+        lines.append("TRIED:")
+        lines.extend(f"- {attempt}" for attempt in record.attempts)
+    if record.reason == "attempts_exhausted":
+        lines.append(record.residual_blocker)
+    else:
+        lines.append(f"OPERATOR-ONLY BECAUSE: {record.residual_blocker}")
+    return lines
+
+
 def render_brief(brief: OperatorBrief) -> str:
     """Render one brief in the fixed plain-text BLUF layout."""
     if brief.decision is not None:
@@ -270,6 +430,7 @@ def render_brief(brief: OperatorBrief) -> str:
         ]
         if brief.recommendation:
             lines.append(f"Recommendation: {brief.recommendation}")
+    lines.extend(_exhaustion_lines(brief))
     lines.append("— from the session, verbatim —")
     lines.extend(f"> {quote}" for quote in brief.source_quote)
     return "\n".join(lines)
@@ -382,6 +543,7 @@ def append_session_message(convlog_path: Path, *, thread_id: str, session_ref: s
 
 def append_operator_brief(convlog_path: Path, *, thread_id: str, brief: OperatorBrief) -> ConversationEntry:
     """Record a validated brief and its deterministic rendering."""
+    brief = validate_brief(brief)
     _require_thread(convlog_path, thread_id)
     rendered = render_brief(brief)
     return append_entry(
@@ -396,6 +558,7 @@ def append_operator_brief(convlog_path: Path, *, thread_id: str, brief: Operator
 def open_thread(convlog_path: Path, *, brief: OperatorBrief, raw_text: str) -> str:
     """Open a new thread by recording its raw message before its first brief."""
     thread_id = uuid.uuid4().hex[:12]
+    validate_brief(brief)
     append_session_message(convlog_path, thread_id=thread_id, session_ref=brief.session_ref, text=raw_text, source_ref=brief.source_ref)
     append_operator_brief(convlog_path, thread_id=thread_id, brief=brief)
     return thread_id
@@ -453,13 +616,25 @@ def append_resolution(
     )
 
 
+def _entry_carries_decision(entry: ConversationEntry) -> bool:
+    payload_brief = entry.payload.get("brief") if isinstance(entry.payload, dict) else None
+    decision = payload_brief.get("decision") if isinstance(payload_brief, dict) else None
+    return isinstance(decision, str) and bool(decision.strip())
+
+
 def _thread_from_entries(thread_id: str, entries: list[ConversationEntry]) -> ConversationThread | None:
+    """Derive thread state from the last decision-bearing brief.
+
+    A decisionless follow-up brief must not retire a pending ask, so the ask's
+    brief stays authoritative until a newer decision-bearing brief replaces it.
+    """
     brief_entries = [entry for entry in entries if entry.kind == "operator_brief"]
     if not brief_entries:
         return None
-    latest = brief_entries[-1]
+    decision_bearing = [entry for entry in brief_entries if _entry_carries_decision(entry)]
+    latest = decision_bearing[-1] if decision_bearing else brief_entries[-1]
     try:
-        brief = validate_brief(latest.payload["brief"])
+        brief = read_stored_brief(latest.payload["brief"])
     except (BriefValidationError, KeyError):
         logger.warning("convlog_invalid_brief_entry", thread_id=thread_id, seq=latest.seq)
         return None
