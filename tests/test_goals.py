@@ -18,9 +18,9 @@ from chitra.goals import (
     GoalNotFoundError,
     GoalRecord,
     GoalRedirectRequiredError,
+    GoalsSchemaNewerError,
     GoalStatus,
     GoalValidationError,
-    GoalsSchemaNewerError,
     add_ask,
     check_specification,
     close_goal,
@@ -1203,7 +1203,10 @@ def test_goal_cli_set_against_a_newer_store_exits_3_with_the_migrate_hint(
                 "nonce": required["nonce"],
                 "receipt_name": required["receipt_name"],
                 "answers": {
-                    "intent": {"answer": "Deliver the requested deterministic goal behavior safely for operators.", "provenance": "operator:test"},
+                    "intent": {
+                        "answer": "Deliver the requested deterministic goal behavior safely for operators.",
+                        "provenance": "operator:test",
+                    },
                     "done_when": {"answer": record.done_when, "provenance": "operator:test"},
                     "out_of_scope": {"answer": "Unrelated board changes are excluded.", "provenance": "operator:test"},
                     "constraints": {"answer": "Keep the change small and tested.", "provenance": "operator:test"},

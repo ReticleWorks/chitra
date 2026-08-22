@@ -16,13 +16,15 @@ from _goal_fixtures import enrollment_fields
 from chitra.goals import (
     GoalNotFoundError,
     GoalRecord,
-    GoalsSchemaNewerError as GoalStoreError,
     GoalValidationError,
     get_goal,
     load_goals,
     successor_session_ref,
     transfer_goal,
     upsert_goal,
+)
+from chitra.goals import (
+    GoalsSchemaNewerError as GoalStoreError,
 )
 from chitra.goals_cli import main
 

@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from _goal_fixtures import enrollment_fields
 
 from chitra.account_registry import update_registry
