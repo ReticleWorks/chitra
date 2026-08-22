@@ -986,6 +986,100 @@ def test_verb_refusal_evidence_requires_an_observed_nonzero_exit(
             validate_brief(payload, self_transcript=state / "self-transcript.jsonl")
 
 
+@pytest.mark.parametrize("digest", [None, "deadbeef"])
+def test_transcript_evidence_requires_a_valid_sha256(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, digest: str | None) -> None:
+    state = tmp_path / "state"
+    _write_ledger(state / "ledger.jsonl", "ord-x")
+    monkeypatch.setenv("CHITRA_STATE_DIR", str(state))
+    transcript = tmp_path / "lane-session.jsonl"
+    transcript.write_text("the lane deferred the product call.\n", encoding="utf-8")
+    evidence: dict[str, object] = {"kind": "transcript", "ref": str(transcript)}
+    if digest is not None:
+        evidence["sha256"] = digest
+    attempt = _attempt("Read the lane session transcript", "it deferred the product call.", evidence)
+    payload = _payload(
+        exhaustion={"reason": "attempts_exhausted", "attempts": [attempt], "residual_blocker": "Only the operator can pick."}
+    )
+    payload["exhaustion"]["attempts"].append(  # type: ignore[index]
+        _attempt("Shipped the combined-feed prototype", "it passed the preference check.", {"kind": "order", "ref": "ord-x"})
+    )
+
+    with pytest.raises(BriefValidationError, match="sha256"):
+        validate_brief(payload)
+
+
+def test_transcript_evidence_requires_an_absolute_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    state = tmp_path / "state"
+    _write_ledger(state / "ledger.jsonl", "ord-x")
+    monkeypatch.setenv("CHITRA_STATE_DIR", str(state))
+    quoted = "the lane answered: the feed layout is the operator's product call."
+    (tmp_path / "lane-session.jsonl").write_text(quoted + "\n", encoding="utf-8")
+    digest = hashlib.sha256(quoted.encode("utf-8")).hexdigest()
+    attempt = _attempt(
+        "Read the lane session transcript",
+        "it deferred the product call.",
+        {"kind": "transcript", "ref": "lane-session.jsonl", "sha256": digest},
+    )
+    payload = _payload(
+        exhaustion={"reason": "attempts_exhausted", "attempts": [attempt], "residual_blocker": "Only the operator can pick."}
+    )
+    payload["exhaustion"]["attempts"].append(  # type: ignore[index]
+        _attempt("Shipped the combined-feed prototype", "it passed the preference check.", {"kind": "order", "ref": "ord-x"})
+    )
+
+    with pytest.raises(BriefValidationError, match="absolute"):
+        validate_brief(payload)
+
+
+def test_tool_result_before_its_tool_use_in_one_record_is_not_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = tmp_path / "state"
+    _write_ledger(state / "ledger.jsonl", "ord-feeds-layout-1")
+    command = "chitra-tmux-capture feeds-reader --pane harness-pi"
+    reordered = {
+        "events": [
+            {"type": "tool_result", "tool_use_id": "tu_capture_1", "content": "pane text\nexit code: 0"},
+            {"type": "tool_use", "id": "tu_capture_1", "name": "Bash", "input": {"command": command}},
+        ]
+    }
+    (state / "self-transcript.jsonl").write_text(json.dumps(reordered) + "\n", encoding="utf-8")
+    monkeypatch.setenv("CHITRA_STATE_DIR", str(state))
+
+    with pytest.raises(BriefValidationError, match="no recorded result in self transcript"):
+        validate_brief(_payload(), self_transcript=state / "self-transcript.jsonl")
+
+
+def test_verb_refusal_requires_a_bash_tool_use_not_any_tool_event(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = tmp_path / "state"
+    _write_ledger(state / "ledger.jsonl", "ord-feeds-layout-1")
+    events = [
+        {
+            "type": "tool_use",
+            "id": "tu_note_1",
+            "name": "TodoWrite",
+            "input": {"todos": ["retry chitra-registry-push with token retry-1"]},
+        },
+        {"type": "tool_result", "tool_use_id": "tu_note_1", "content": "todos updated\nexit code: 1"},
+    ]
+    (state / "self-transcript.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+    monkeypatch.setenv("CHITRA_STATE_DIR", str(state))
+    attempt = _attempt(
+        "Presented the retry token to the registry",
+        "the registry refused it outright.",
+        {"kind": "verb_refusal", "ref": "chitra-registry-push"},
+    )
+    payload = _payload(
+        exhaustion={
+            "reason": "credential",
+            "attempts": [attempt],
+            "residual_blocker": "Only a human account can approve this access today.",
+        },
+    )
+
+    with pytest.raises(BriefValidationError, match="no Bash tool use mentioning 'chitra-registry-push'"):
+        validate_brief(payload, self_transcript=state / "self-transcript.jsonl")
+
+
 def test_rejecting_resolver_reason_is_reported_with_attempt_index() -> None:
     with pytest.raises(BriefValidationError, match="attempt 2: ledger exploded"):
         validate_brief(_payload(), evidence_resolver=_RejectingResolver("ledger exploded"))

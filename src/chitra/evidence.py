@@ -30,6 +30,7 @@ SELF_TRANSCRIPT_ENV_VAR = "CHITRA_SELF_TRANSCRIPT"
 type EvidenceKind = Literal["command", "order", "transcript", "verb_refusal"]
 
 _EXIT_IN_TEXT = re.compile(r"exit(?: code| status)?[: =]+(\d+)", re.IGNORECASE)
+_SHA256_DIGEST = re.compile(r"[0-9a-fA-F]{64}")
 
 
 class EvidenceHandle(BaseModel):
@@ -153,7 +154,7 @@ class FilesystemEvidenceResolver:
         transcript = self.self_transcript
         if transcript is None:
             return f"self transcript not available (pass --self-transcript or set {SELF_TRANSCRIPT_ENV_VAR})"
-        result_id, problem = self._scan_transcript_for_run(transcript, needle=handle.ref, tool_name=None)
+        result_id, problem = self._scan_transcript_for_run(transcript, needle=handle.ref, tool_name="Bash")
         if problem is not None:
             return problem
         assert result_id is not None
@@ -167,19 +168,23 @@ class FilesystemEvidenceResolver:
     def _scan_transcript_for_run(self, transcript: Path, *, needle: str, tool_name: str | None) -> tuple[str | None, str | None]:
         pending: dict[str, str] = {}
         for payload in _iter_json_objects(transcript):
-            for use in _find_events(payload, "tool_use"):
-                name = str(use.get("name", ""))
-                input_text = _tool_input_text(use)
-                if tool_name is not None and name != tool_name:
+            for node in _walk(payload):
+                if not isinstance(node, dict):
                     continue
-                if needle in input_text:
-                    use_id = str(use.get("id", ""))
-                    if use_id:
-                        pending[use_id] = input_text
-            for result in _find_events(payload, "tool_result"):
-                result_id = str(result.get("tool_use_id", ""))
-                if result_id in pending:
-                    return result_id, None
+                match node.get("type"):
+                    case "tool_use":
+                        name = str(node.get("name", ""))
+                        if tool_name is not None and name != tool_name:
+                            continue
+                        input_text = _tool_input_text(node)
+                        if needle in input_text:
+                            use_id = str(node.get("id", ""))
+                            if use_id:
+                                pending[use_id] = input_text
+                    case "tool_result":
+                        result_id = str(node.get("tool_use_id", ""))
+                        if result_id in pending:
+                            return result_id, None
         if pending:
             return next(iter(pending)), f"no recorded result in self transcript for {needle!r}"
         looked_for = f"{tool_name} tool use mentioning {needle!r}" if tool_name else f"tool use mentioning {needle!r}"
@@ -209,13 +214,15 @@ class FilesystemEvidenceResolver:
         return f"order {handle.ref} not found in ledger"
 
     def _resolve_transcript_line(self, handle: EvidenceHandle) -> str | None:
+        if handle.sha256 is None or not _SHA256_DIGEST.fullmatch(handle.sha256):
+            return f"transcript evidence requires the sha256 of the cited line (64 hex characters), got {handle.sha256!r}"
         path = Path(handle.ref)
+        if not path.is_absolute():
+            return f"transcript ref must be an absolute path, got {handle.ref!r}"
         try:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             return f"transcript not found: {handle.ref}"
-        if handle.sha256 is None:
-            return None
         wanted = handle.sha256.casefold()
         for line in lines:
             if hashlib.sha256(line.rstrip("\r\n").encode("utf-8")).hexdigest() == wanted:
