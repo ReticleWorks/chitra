@@ -13,20 +13,23 @@ from chitra.presence import PresenceError
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="chitra-peer", description="Send and read atomic file-per-message peer notes.")
+    parser = argparse.ArgumentParser(prog="chitra-peer", description="Send direct peer questions through the governed dispatch queue.")
     parser.add_argument("--shared-dir", type=Path, default=None, help="Coordination root; defaults to CHITRA_SHARED_DIR.")
+    parser.add_argument("--queue-dir", type=Path, default=None, help="Dispatch queue root; defaults to CHITRA_STATE_DIR/queue.")
     sub = parser.add_subparsers(dest="verb", required=True)
 
-    sending = sub.add_parser("say", help="Write one message into a peer instance's inbox.")
+    sending = sub.add_parser("say", help="Enqueue one question for a peer instance's governed session.")
     sending.add_argument("instance", help="Recipient instance.")
     sending.add_argument("text")
+    sending.add_argument("--session", default=None, help="Target tmux session name; defaults to the instance.")
+    sending.add_argument("--pane", default="main", help="Target pane within the session.")
     sending.add_argument("--from-instance", default=None, dest="sender")
     sending.add_argument("--message-id", default=None)
 
-    reading = sub.add_parser("inbox", help="Read an inbox in stable order without consuming it.")
+    reading = sub.add_parser("inbox", help="Read the non-authoritative mirror inbox in stable order.")
     reading.add_argument("instance", nargs="?", default=None, help="Defaults to CHITRA_INSTANCE.")
 
-    consuming = sub.add_parser("consume", help="Consume pending messages and record consumption receipts.")
+    consuming = sub.add_parser("consume", help="Refresh receipts from dispatchd's durable results; never hides a message.")
     consuming.add_argument("instance", nargs="?", default=None, help="Defaults to CHITRA_INSTANCE.")
     return parser
 
@@ -36,9 +39,12 @@ def run(args: argparse.Namespace) -> int:
         message = say(
             args.instance,
             args.text,
+            session=args.session,
+            pane=args.pane,
             sender=args.sender,
             message_id=args.message_id,
             root=args.shared_dir,
+            queue_dir=args.queue_dir,
         )
         print(json.dumps(message.to_dict(), indent=2, sort_keys=True))
         return 0
@@ -46,7 +52,9 @@ def run(args: argparse.Namespace) -> int:
     if instance is None:
         raise PeerMessageError("inbox instance is required when CHITRA_INSTANCE is unset")
     verb_messages = (
-        consume(instance, root=args.shared_dir) if args.verb == "consume" else inbox(instance, root=args.shared_dir)
+        consume(instance, root=args.shared_dir, queue_dir=args.queue_dir)
+        if args.verb == "consume"
+        else inbox(instance, root=args.shared_dir)
     )
     print(json.dumps([message.to_dict() for message in verb_messages], indent=2, sort_keys=True))
     return 0

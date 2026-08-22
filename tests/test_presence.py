@@ -57,7 +57,7 @@ def test_release_is_explicit_and_never_expires_by_age(tmp_path: Path) -> None:
     assert list_presence(root=tmp_path) == []
     latest = list_presence(root=tmp_path, include_released=True)
     assert len(latest) == 1
-    assert latest[0].state == "released"
+    assert latest[0].mode == "released"
 
 
 def test_a_partial_tail_is_not_a_presence_record(tmp_path: Path) -> None:
@@ -94,7 +94,8 @@ def test_records_carry_session_goal_purpose_and_journal_bindings(tmp_path: Path)
 
     line = (tmp_path / "presence" / "monitor-a.jsonl").read_text(encoding="utf-8").strip()
     payload = json.loads(line)
-    assert set(payload) >= {"instance", "session", "resource", "lanes", "state", "goal_refs", "purpose", "journal_ref"}
+    assert set(payload) >= {"instance", "session", "resource", "lanes", "mode", "goal_refs", "purpose", "journal_ref"}
+    assert payload["mode"] in {"using", "released"}
 
 
 def test_releasing_one_session_does_not_hide_another_active_session(tmp_path: Path) -> None:

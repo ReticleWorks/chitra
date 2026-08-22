@@ -12,7 +12,7 @@ from pathlib import Path
 SHARED_DIR_ENV_VAR = "CHITRA_SHARED_DIR"
 DEFAULT_SHARED_DIR = Path("/var/lib/polyphony-chitra-coordination")
 _INSTANCE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
-_STATES = frozenset({"using", "released"})
+_MODES = frozenset({"using", "released"})
 
 
 class PresenceError(ValueError):
@@ -27,7 +27,7 @@ class PresenceRecord:
     session: str
     resource: str
     lanes: tuple[str, ...]
-    state: str
+    mode: str
     since: str
     note: str
     goal_refs: tuple[str, ...]
@@ -40,7 +40,7 @@ class PresenceRecord:
             "session": self.session,
             "resource": self.resource,
             "lanes": list(self.lanes),
-            "state": self.state,
+            "mode": self.mode,
             "since": self.since,
             "note": self.note,
             "goal_refs": list(self.goal_refs),
@@ -56,7 +56,7 @@ class PresenceRecord:
         session = payload.get("session")
         resource = payload.get("resource")
         lanes = payload.get("lanes")
-        state = payload.get("state")
+        mode = payload.get("mode")
         since = payload.get("since")
         note = payload.get("note")
         goal_refs = payload.get("goal_refs")
@@ -71,8 +71,8 @@ class PresenceRecord:
             raise PresenceError("presence resource must be a non-empty string")
         if not isinstance(lanes, list) or not all(isinstance(lane, str) and lane.strip() for lane in lanes):
             raise PresenceError("presence lanes must be non-empty strings")
-        if state not in _STATES:
-            raise PresenceError("presence state must be using or released")
+        if mode not in _MODES:
+            raise PresenceError("presence mode must be using or released")
         if not isinstance(since, str):
             raise PresenceError("presence since must be an ISO-8601 string")
         _normalize_time(since)
@@ -89,7 +89,7 @@ class PresenceRecord:
             session,
             resource,
             tuple(lanes),
-            state,
+            mode,
             since,
             note,
             tuple(goal_refs),
@@ -136,7 +136,7 @@ def append_presence(
     *,
     session: str,
     lanes: tuple[str, ...] | list[str] = (),
-    state: str,
+    mode: str,
     note: str = "",
     since: datetime | str | None = None,
     goal_refs: tuple[str, ...] | list[str] = (),
@@ -149,8 +149,8 @@ def append_presence(
         raise PresenceError("resource must be non-empty")
     if not session.strip():
         raise PresenceError("session must be non-empty")
-    if state not in _STATES:
-        raise PresenceError("state must be using or released")
+    if mode not in _MODES:
+        raise PresenceError("mode must be using or released")
     normalized_lanes = tuple(dict.fromkeys(lane.strip() for lane in lanes if lane.strip()))
     if len(normalized_lanes) != len(lanes):
         raise PresenceError("lanes must be unique, non-empty strings")
@@ -162,7 +162,7 @@ def append_presence(
         session=session,
         resource=resource,
         lanes=normalized_lanes,
-        state=state,
+        mode=mode,
         since=_normalize_time(since),
         note=note,
         goal_refs=normalized_goal_refs,
@@ -208,7 +208,7 @@ def list_presence(*, root: Path | None = None, include_released: bool = False) -
                         latest[(record.instance, record.session, record.resource)] = record
         except OSError:
             continue
-    records = latest.values() if include_released else (record for record in latest.values() if record.state == "using")
+    records = latest.values() if include_released else (record for record in latest.values() if record.mode == "using")
     return sorted(records, key=lambda record: (record.instance, record.resource))
 
 
@@ -237,7 +237,7 @@ def announce_using(
         resource,
         session=session,
         lanes=lanes,
-        state="using",
+        mode="using",
         note=note,
         since=since,
         goal_refs=goal_refs,
@@ -267,7 +267,7 @@ def announce_released(
         resource,
         session=session,
         lanes=lanes,
-        state="released",
+        mode="released",
         note=note,
         since=since,
         goal_refs=goal_refs,

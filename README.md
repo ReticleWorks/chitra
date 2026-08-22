@@ -149,8 +149,10 @@ The full set — ssh options, triage log paths, transcript globs — is document
 presence file and prints peers already using the same resource. It never waits,
 claims, expires, steals, or grants authority. Use `released` to append an
 explicit release and `list` to merge all instance files. `chitra-peer say
-<instance> <text>` atomically writes one file in the named peer's inbox;
-`chitra-peer inbox` reads the inbox named by `CHITRA_INSTANCE` in stable order.
+<instance> <text>` enqueues a real dispatch order for the named peer's session
+so `dispatchd` delivers it with its own verification receipts; `chitra-peer
+inbox` reads a non-authoritative mirror of what was asked, never proof that it
+arrived.
 
 **Routing.** A caller can tag a `DispatchOrder` with an opaque `task_type`. If a routing config is set, `dispatchd` maps that to a `routing_hint` (a model/harness preference the caller's system uses); an explicit `routing_hint` always wins. chitra carries both fields through `DispatchResult` and, for a successful delivery, the signed ledger; it does not make routing decisions beyond the configured lookup.
 
