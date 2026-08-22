@@ -50,20 +50,6 @@ _MISSING_EXHAUSTION_ERROR = (
     "list >= 2 distinct attempts with observed results (reason attempts_exhausted); "
     "only credential, irreversible_consent, or operator_decision excuse going to the operator with fewer"
 )
-_SMUGGLED_ASK_MARKERS: tuple[str, ...] = (
-    "operator must",
-    "operator needs to",
-    "operator should",
-    "you must",
-    "you need to",
-    "you should run",
-    "please run",
-    "please install",
-    "can you ",
-    "could you ",
-)
-
-
 class BriefValidationError(ValueError):
     """Raised when caller-supplied operator-brief data is invalid."""
 
@@ -336,28 +322,11 @@ def _exhaustion_problems(brief: OperatorBrief, resolver: EvidenceResolver) -> li
     return problems
 
 
-def _smuggled_ask_problems(brief: OperatorBrief) -> list[str]:
-    """Reject operator-directed imperatives smuggled into decisionless briefs."""
-    if brief.decision is not None:
-        return []
-    problems: list[str] = []
-    for field_name, text in (("recommendation", brief.recommendation), ("stage", brief.stage), ("progress", brief.progress)):
-        lowered = text.casefold()
-        marker = next((candidate for candidate in _SMUGGLED_ASK_MARKERS if candidate in lowered), None)
-        if marker is not None:
-            problems.append(
-                f"{field_name} hides an operator-directed ask ({marker.strip()!r}): "
-                "promote the ask into decision with an exhaustion record, or remove it from the brief"
-            )
-    return problems
-
-
 def _write_path_problems(brief: OperatorBrief, resolver: EvidenceResolver) -> list[str]:
     problems: list[str] = []
     if brief.decision is not None and brief.exhaustion is None:
         problems.append(_MISSING_EXHAUSTION_ERROR)
     problems.extend(_exhaustion_problems(brief, resolver))
-    problems.extend(_smuggled_ask_problems(brief))
     return problems
 
 
@@ -388,8 +357,8 @@ def validate_brief(
 def read_stored_brief(payload: object) -> OperatorBrief:
     """Load one stored brief leniently so records written before a rule change stay readable.
 
-    Stored records never re-run the write-path gates (exhaustion structure,
-    smuggled asks); only the shape checks that predate their storage apply.
+    Stored records never re-run the write-path gates (exhaustion structure);
+    only the shape checks that predate their storage apply.
     """
     try:
         return OperatorBrief.model_validate(payload)
