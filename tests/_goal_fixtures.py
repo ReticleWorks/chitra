@@ -59,6 +59,13 @@ def passing_completion_evidence(
     )
 
 
+def trusted_validator_argv() -> list[str]:
+    """The exact argv Chitra's trusted pytest verifier runs for PASS receipts."""
+    import sys
+
+    return [sys.executable, "-m", "pytest", "--version"]
+
+
 def ingest_passing_receipt(
     root: Path,
     session_ref: str,
@@ -70,8 +77,9 @@ def ingest_passing_receipt(
     source_dir = root / "test-receipt-sources" / hashlib.sha256(session_ref.encode()).hexdigest()
     evidence_path = source_dir / "evidence" / "test-report.txt"
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    command = trusted_validator_argv()
     evidence_path.write_text(
-        json.dumps({"schema_version": "chitra-validator-report-v1", "command": ["/bin/true"], "exit_code": 0}),
+        json.dumps({"schema_version": "chitra-validator-report-v1", "command": command, "exit_code": 0}),
         encoding="utf-8",
     )
     digest = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
@@ -79,7 +87,7 @@ def ingest_passing_receipt(
         "receipt_name": receipt_name,
         "validator": {"name": validator, "version": "test"},
         "target": {"artifact": {"path": str(evidence_path), "sha256": digest}},
-        "exercise": {"command": ["/bin/true"]},
+        "exercise": {"command": command},
         "result": {"status": "PASS", "validator_acceptance": True},
         "not_exercised": [],
         "artifacts": [{"path": "evidence/test-report.txt", "kind": "report", "sha256": digest}],

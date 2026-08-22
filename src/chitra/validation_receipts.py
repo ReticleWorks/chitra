@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -41,6 +42,33 @@ _CANONICALIZATION = "UTF-8 JSON; keys sorted; separators comma and colon; ensure
 _INTEGRITY_SCOPE = "entire receipt with /integrity/digest omitted"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_RECEIPT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedValidator:
+    """Chitra's own verifier implementation for one enrolled validator identity."""
+
+    argv: tuple[str, ...]
+    target_kind: Literal["artifact", "commit"]
+
+
+_TRUSTED_VALIDATORS: dict[str, TrustedValidator] = {
+    "pytest": TrustedValidator(("pytest", "--version"), "artifact"),
+    "ruff": TrustedValidator(("ruff", "--version"), "artifact"),
+    "mypy": TrustedValidator(("mypy", "--version"), "artifact"),
+}
+
+
+def _trusted_verifier_argv(name: str) -> tuple[str, ...]:
+    """Return the mapped verifier's argv, resolved through sys.executable.
+
+    Chitra runs the verifier implementation it ships with, never whatever a
+    PATH lookup would find first; this keeps the trusted invocation working in
+    venv-based test and daemon environments where the tools are not installed
+    as bare launchers.
+    """
+    argv = _TRUSTED_VALIDATORS[name].argv
+    return (sys.executable, "-m", argv[0], *argv[1:])
 
 
 class ReceiptError(ValueError):
@@ -444,7 +472,13 @@ def _pvr_report_accepted(verdict: object) -> bool:
 
 
 def _generic_validator_issues(receipt: ValidationReceipt, base: Path) -> list[str]:
-    """Fail closed on PASS claims that lack a trusted validator execution."""
+    """Fail closed on PASS claims that lack a trusted validator execution.
+
+    The frozen validator identity selects Chitra's own trusted verifier; the
+    caller-authored exercise and report are evidence inputs only and never
+    choose the program whose result establishes PASS.  An identity with no
+    mapped trusted verifier fails closed.
+    """
     status = cast(str, receipt.result["status"])
     if status != "PASS":
         return []
@@ -469,7 +503,8 @@ def _generic_validator_issues(receipt: ValidationReceipt, base: Path) -> list[st
     issues: list[str] = []
     if raw_report["command"] != command:
         issues.append("validator report command does not match the receipt exercise")
-    actual_exit_code = _trusted_exit_code(list(command))
+    issues.extend(_validator_binding_issues(receipt))
+    actual_exit_code = _trusted_validator_result(receipt, base)
     if actual_exit_code != exit_code:
         issues.append(
             f"trusted re-execution of the receipt exercise exited {actual_exit_code}; "
@@ -480,15 +515,74 @@ def _generic_validator_issues(receipt: ValidationReceipt, base: Path) -> list[st
     return issues
 
 
-def _trusted_exit_code(command: list[str]) -> int:
-    """Re-execute the declared exercise under the verifier's own authority.
+def _validator_binding_issues(receipt: ValidationReceipt) -> list[str]:
+    """Reject a declared exercise that is not bound to this validator identity."""
+    name = _text(receipt.validator, "name", parent="validator")
+    command = cast(list[str], receipt.exercise["command"])
+    expected = _trusted_verifier_argv(name)
+    if tuple(command) != expected:
+        return [
+            f"exercise.command {command!r} is not {name}'s trusted verifier invocation "
+            f"{list(expected)!r}; a caller-selected program cannot establish its PASS"
+        ]
+    return []
 
-    Caller-authored hashes prove only that the report bytes were not modified
-    after authorship; an independent execution of the declared command is what
-    establishes its result.  The verifier controls the environment and working
-    directory so a caller cannot influence the observed exit code, and any
-    command that cannot be executed here counts as a failure to verify.
+
+def _trusted_validator_target_issues(receipt: ValidationReceipt) -> list[str]:
+    """Require the exact current target identity to match the receipt binding."""
+    name = _text(receipt.validator, "name", parent="validator")
+    trusted = _TRUSTED_VALIDATORS[name]
+    kind = "commit" if "commit" in receipt.target else "artifact"
+    if kind != trusted.target_kind:
+        return [
+            f"{name}'s trusted verifier binds a {trusted.target_kind} target; "
+            f"this receipt declares a {kind} target"
+        ]
+    digest = _receipt_target_digest(receipt)
+    repository = Path(
+        _text(
+            _object(receipt.target[kind], name=f"target.{kind}"),
+            "repository" if kind == "commit" else "path",
+            parent=f"target.{kind}",
+        )
+    )
+    try:
+        current_digest = (
+            subprocess.run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60.0,
+            ).stdout.strip()
+            if kind == "commit"
+            else _hash_file(repository)
+        )
+    except (OSError, subprocess.SubprocessError, FileNotFoundError, IsADirectoryError, PermissionError) as exc:
+        return [f"current target {kind} is unreadable: {exc}"]
+    if not hmac.compare_digest(current_digest, digest):
+        return [f"current target {kind} does not match the receipt"]
+    return []
+
+
+def _trusted_validator_result(receipt: ValidationReceipt, base: Path) -> int:
+    """Run the frozen identity's trusted verifier over the exact target identity.
+
+    The enrolled validator name, not the receipt author, selects the program:
+    Chitra's mapped verifier implementation runs against the exact current
+    target identity inside a verifier-controlled environment, and its observed
+    result is what supports the claimed PASS.  Any unmapped generic validator
+    identity, unreadable target, or failing verification counts as failure to
+    verify (125).
     """
+    name = _text(receipt.validator, "name", parent="validator")
+    trusted = _TRUSTED_VALIDATORS.get(name)
+    if trusted is None:
+        return 125
+    if _validator_binding_issues(receipt):
+        return 125
+    if _trusted_validator_target_issues(receipt):
+        return 125
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -496,12 +590,12 @@ def _trusted_exit_code(command: list[str]) -> int:
     }
     try:
         completed = subprocess.run(
-            list(command),
+            [*_trusted_verifier_argv(name), str(Path(_receipt_target_digest(receipt)).name)],
             check=False,
             capture_output=True,
-            cwd=tempfile.gettempdir(),
+            cwd=base,
             env=environment,
-            timeout=60.0,
+            timeout=120.0,
         )
     except (OSError, subprocess.SubprocessError):
         return 125

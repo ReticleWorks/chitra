@@ -212,7 +212,7 @@ def test_fabricated_pass_with_failing_validator_report_cannot_close(tmp_path: Pa
     goal = upsert_goal(tmp_path, _goal(receipt_name="self-asserted-pytest-pass"))
     source = _self_asserted_pass_receipt(tmp_path, command=["/usr/bin/false"], report_exit_code=1)
 
-    with pytest.raises(ReceiptError, match="cannot support PASS"):
+    with pytest.raises(ReceiptError, match="cannot support PASS|cannot establish its PASS"):
         ingest_receipt(tmp_path, goal.session_ref, source)
 
     stored = tmp_path / "validation-receipts" / "self-asserted-pytest-pass.json"
