@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import tomllib
 from pathlib import Path
 from typing import cast
 
@@ -22,6 +23,16 @@ from tools.convert import (
 def _write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _legacy_state(root: Path) -> None:
@@ -72,21 +83,31 @@ def test_conversion_reconciles_counts_hashes_and_marks_legacy_records_not_done(t
 
     assert receipt["reconciliation"] == {
         "goal_counts_match": True,
+        "metadata_preflight_only": False,
+        "w1_journal_records_bound": True,
+        "w2_enrollment_records_bound": True,
         "queue_count_order_identity_hashes_preserved": True,
         "legacy_goals_marked_display_dispose_only": True,
         "legacy_goals_may_claim_done": False,
         "status": "PASS",
     }
-    assert receipt["input_counts"] == {"legacy_goals": 2, "dispatch_queue_entries": 3}
+    assert receipt["input_counts"] == {"legacy_goals": 2, "dispatch_queue_entries": 4}
     assert goals["output_counts"]["legacy_goal_records"] == 2
+    assert all(isinstance(record["w1_journal_record"], dict) for record in goals["records"])
+    assert all(isinstance(record["w2_enrollment_record"], dict) for record in goals["records"])
     assert all(record["disposition"]["done_transition_allowed"] is False for record in goals["records"])
     assert all(record["disposition"]["completion_eligible"] is False for record in goals["records"])
     assert [entry["relative_path"] for entry in queue["entries"]] == [
         "queue.tsv",
+        "queue.tsv",
         "queue/orders/order-3.json",
         "queue/results/order-1.json",
     ]
-    assert [entry["ordinal"] for entry in queue["entries"]] == [0, 1, 2]
+    assert [entry["ordinal"] for entry in queue["entries"]] == [0, 1, 2, 3]
+    assert [entry["identity"] for entry in queue["entries"]] == ["1", "2", "order-3", "order-1"]
+    artifacts = cast(dict[str, dict[str, str]], receipt["artifacts"])
+    assert artifacts["legacy_goals_conversion"]["sha256"] == _sha256_file(out / "legacy-goals-conversion.json")
+    assert artifacts["dispatch_queue_replay"]["sha256"] == _sha256_file(out / "dispatch-queue-replay.json")
 
 
 def test_w10_snapshot_metadata_reconciles_expected_legacy_topology(tmp_path: Path) -> None:
@@ -96,13 +117,18 @@ def test_w10_snapshot_metadata_reconciles_expected_legacy_topology(tmp_path: Pat
 
     receipt = convert_w10_snapshot(snapshot, tmp_path / "w10-out")
 
-    assert receipt["mode"] == "w10-snapshot"
+    assert receipt["mode"] == "w10-topology-preflight"
     input_counts = cast(dict[str, object], receipt["input_counts"])
     output_counts = cast(dict[str, object], receipt["output_counts"])
     reconciliation = cast(dict[str, object], receipt["reconciliation"])
-    assert input_counts["legacy_goals"] == 27
-    assert output_counts["legacy_goal_records"] == 27
-    assert reconciliation["goal_counts_match"] is True
+    assert input_counts["legacy_goals"] == 0
+    assert output_counts["legacy_goal_records"] == 0
+    assert reconciliation["metadata_preflight_only"] is True
+    assert reconciliation["status"] == "PREFLIGHT_ONLY"
+    goals = json.loads((tmp_path / "w10-out" / "legacy-goals-conversion.json").read_text(encoding="utf-8"))
+    assert goals["input_counts"]["metadata_goal_count"] == 27
+    assert len(goals["goal_file_manifests"]) == 2
+    assert goals["records"] == []
     queue = json.loads((tmp_path / "w10-out" / "dispatch-queue-replay.json").read_text(encoding="utf-8"))
     queue_entries = cast(list[dict[str, object]], queue["entries"])
     assert {entry["sha256"] for entry in queue_entries if entry["relative_path"] == "queue.tsv"} == {
@@ -111,10 +137,61 @@ def test_w10_snapshot_metadata_reconciles_expected_legacy_topology(tmp_path: Pat
     }
 
 
-def test_shadow_handoff_and_rollback_prove_no_dispatch_one_writer_and_no_state_loss(tmp_path: Path) -> None:
+def _instance_bindings() -> dict[str, str]:
+    return {
+        "namespace": "monitor",
+        "state_root": "/var/lib/polyphony-chitra",
+        "goals_sha256": "1" * 64,
+        "queue_sha256": "2" * 64,
+        "old_unit": "chitra-dispatchd.service",
+        "new_unit": "polyphony-chitra-dispatchd@monitor.service",
+        "old_process": "pid:100",
+        "new_process": "pid:200",
+        "old_package": "chitra 0.11.0",
+        "new_package": "chitra 0.14.10",
+        "old_tmux_socket": "/tmp/old.sock",
+        "new_tmux_socket": "/tmp/new.sock",
+        "lane_worktrees_sha256": "3" * 64,
+        "last_old_order_sha256": "a" * 64,
+        "last_old_event_sha256": "4" * 64,
+        "pre_state_sha256": "c" * 64,
+        "post_state_sha256": "d" * 64,
+        "rollback_checkpoint_sha256": "e" * 64,
+    }
+
+
+def _lifecycle_receipts() -> list[dict[str, object]]:
+    return [
+        {
+            "kind": kind,
+            "observer": "external-test-harness",
+            "subject": f"monitor:{kind}",
+            "observed_at": "2026-08-22T00:00:00+00:00",
+            "artifact_sha256": hex_digit * 64,
+        }
+        for kind, hex_digit in (
+            ("old_drained", "5"),
+            ("old_stopped", "6"),
+            ("old_write_denied", "7"),
+            ("new_started", "8"),
+            ("new_write_proved", "9"),
+        )
+    ]
+
+
+def _native_client() -> dict[str, object]:
+    return {
+        "client_name": "claude",
+        "version": "2.1.238",
+        "path": "/usr/local/bin/claude",
+        "path_sha256": "b" * 64,
+        "update_suppression": False,
+    }
+
+
+def test_shadow_scan_never_writes_inside_live_state_or_dispatches(tmp_path: Path) -> None:
     state = tmp_path / "state"
     shadow = tmp_path / "shadow"
-    snapshot = tmp_path / "snapshot"
     _legacy_state(state)
 
     findings = run_shadow_scan(state, shadow)
@@ -124,6 +201,8 @@ def test_shadow_handoff_and_rollback_prove_no_dispatch_one_writer_and_no_state_l
     with pytest.raises(ConversionError, match="shadow output"):
         run_shadow_scan(state, state / "shadow")
 
+
+def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycle_bindings() -> None:
     old_writer = WriterObservation(
         name="old-dispatchd",
         role="old",
@@ -153,8 +232,22 @@ def test_shadow_handoff_and_rollback_prove_no_dispatch_one_writer_and_no_state_l
         pre_state_sha256="c" * 64,
         post_state_sha256="d" * 64,
         rollback_checkpoint_sha256="e" * 64,
+        transcript_bindings=("f" * 64,),
+        instance_bindings=_instance_bindings(),
+        lifecycle_receipts=_lifecycle_receipts(),
+        native_client=_native_client(),
     )
     assert handoff["exactly_one_writer"] is True
+    blank_writer = WriterObservation(name="", role="old", unit="", process="", package="", stopped=True, started=False, can_write=False)
+    with pytest.raises(ConversionError, match="missing|transcript|native|lifecycle"):
+        build_authority_handoff_receipt(
+            instance="",
+            old_writer=blank_writer,
+            new_writer=new_writer,
+            pre_state_sha256="",
+            post_state_sha256="",
+            rollback_checkpoint_sha256="",
+        )
     old_writer_still_active = WriterObservation(
         name="old-dispatchd",
         role="old",
@@ -174,7 +267,17 @@ def test_shadow_handoff_and_rollback_prove_no_dispatch_one_writer_and_no_state_l
             pre_state_sha256="c" * 64,
             post_state_sha256="d" * 64,
             rollback_checkpoint_sha256="e" * 64,
+            transcript_bindings=("f" * 64,),
+            instance_bindings=_instance_bindings(),
+            lifecycle_receipts=_lifecycle_receipts(),
+            native_client=_native_client(),
         )
+
+
+def test_rollback_validates_snapshot_before_touching_destination_and_refuses_v2_evidence_loss(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    snapshot = tmp_path / "snapshot"
+    _legacy_state(state)
 
     checkpoint = snapshot_state_root(state, snapshot)
     (state / "goals.json").write_text("changed", encoding="utf-8")
@@ -183,3 +286,45 @@ def test_shadow_handoff_and_rollback_prove_no_dispatch_one_writer_and_no_state_l
     assert rollback["status"] == "PASS"
     assert rollback["restored_manifest_sha256"] == checkpoint["manifest_sha256"]
     assert (state / "queue" / "orders" / "order-3.json").exists()
+
+    enrolled = {
+        "schema": "chitra.goals.v2",
+        "updated_at": "2026-08-22T00:00:00+00:00",
+        "goals": [
+            {
+                "session_ref": "host:lane-a:%1",
+                "goal": "keep enrolled state",
+                "done_when": "receipt exists",
+                "source": "test",
+                "status": "working",
+                "created_at": "2026-08-22T00:00:00+00:00",
+                "updated_at": "2026-08-22T00:00:00+00:00",
+                "now": "",
+                "last_verified": "",
+                "interview_receipt": {"name": "enroll", "completed_at": "2026-08-22T00:00:00+00:00"},
+                "enrolled_done_when_items": [
+                    {"id": "item", "text": "receipt exists", "validator": "pytest", "required_receipt": "tests-green"}
+                ],
+            }
+        ],
+    }
+    _write_json(state / "goals.json", enrolled)
+    with pytest.raises(ConversionError, match="v2/v3 enrollment"):
+        restore_snapshot(snapshot, state)
+    assert json.loads((state / "goals.json").read_text(encoding="utf-8"))["schema"] == "chitra.goals.v2"
+
+    corrupt_state = tmp_path / "corrupt-state"
+    corrupt_snapshot = tmp_path / "corrupt-snapshot"
+    _legacy_state(corrupt_state)
+    snapshot_state_root(corrupt_state, corrupt_snapshot)
+    (corrupt_snapshot / "state-root" / "goals.json").write_text("corrupt", encoding="utf-8")
+    before = (corrupt_state / "goals.json").read_text(encoding="utf-8")
+    with pytest.raises(ConversionError, match="manifest"):
+        restore_snapshot(corrupt_snapshot, corrupt_state)
+    assert (corrupt_state / "goals.json").read_text(encoding="utf-8") == before
+
+
+def test_converter_is_packaged_and_exposed_as_entrypoint() -> None:
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    assert "tools" in pyproject["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"]
+    assert pyproject["project"]["scripts"]["chitra-convert"] == "tools.convert.topology:main"

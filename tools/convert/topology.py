@@ -28,6 +28,29 @@ GOAL_SCHEMAS = {"chitra.goals.v1", "chitra.goals.v2", "chitra.goals.v3"}
 LEGACY_GOAL_SCHEMAS = {"chitra.goals.v1", "chitra.goals.v2"}
 TERMINAL_GOAL_STATUSES = {"done-pending-verification", "done-pending-close"}
 QUEUE_STAGES = ("orders", "in_flight", "deferred", "results", "processed", "invalid")
+REQUIRED_INSTANCE_BINDINGS = frozenset(
+    (
+        "namespace",
+        "state_root",
+        "goals_sha256",
+        "queue_sha256",
+        "old_unit",
+        "new_unit",
+        "old_process",
+        "new_process",
+        "old_package",
+        "new_package",
+        "old_tmux_socket",
+        "new_tmux_socket",
+        "lane_worktrees_sha256",
+        "last_old_order_sha256",
+        "last_old_event_sha256",
+        "pre_state_sha256",
+        "post_state_sha256",
+        "rollback_checkpoint_sha256",
+    )
+)
+REQUIRED_LIFECYCLE_RECEIPTS = frozenset(("old_drained", "old_stopped", "old_write_denied", "new_started", "new_write_proved"))
 
 
 class ConversionError(ValueError):
@@ -88,6 +111,10 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
 def _write_json(path: Path, payload: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -113,6 +140,12 @@ def _as_int(value: object) -> int:
     if isinstance(value, int):
         return value
     return 0
+
+
+def _as_mapping(value: object, *, name: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise ConversionError(f"{name} must be an object")
+    return cast(Mapping[str, object], value)
 
 
 def _is_relative_to(path: Path, parent: Path) -> bool:
@@ -168,6 +201,8 @@ def convert_goals_document(
                 "legacy_status": status_text,
                 "legacy_record_sha256": _sha256_bytes(_canonical_bytes(record)),
                 "legacy_record": record,
+                "w1_journal_record": _w1_journal_record(record, source_path=source_path, source_sha256=source_sha256, legacy_index=index),
+                "w2_enrollment_record": _w2_enrollment_record(record, legacy_index=index, is_terminal=is_terminal),
                 "disposition": {
                     "display_only": True,
                     "administrative_dispose_only": True,
@@ -194,6 +229,37 @@ def convert_goals_document(
     return converted_doc
 
 
+def _w1_journal_record(record: Mapping[str, object], *, source_path: str, source_sha256: str, legacy_index: int) -> dict[str, object]:
+    """Build the canonical per-record journal row a read-only converter can prove."""
+    session_ref = record.get("session_ref")
+    payload_digest = _sha256_bytes(_canonical_bytes(record))
+    return {
+        "schema": "chitra.normalized-event-journal.v1",
+        "event_id": f"legacy-goal:{source_sha256}:{legacy_index}",
+        "source": {"path": source_path, "sha256": source_sha256, "legacy_index": legacy_index},
+        "session_ref": session_ref if isinstance(session_ref, str) else "",
+        "native_type": "legacy_goal_record",
+        "normalized_type": "legacy_goal_imported_display_only",
+        "payload_sha256": payload_digest,
+        "normalizer_version": SCHEMA_GOALS_CONVERSION,
+    }
+
+
+def _w2_enrollment_record(record: Mapping[str, object], *, legacy_index: int, is_terminal: bool) -> dict[str, object]:
+    """Bind the legacy record to W2 enrollment without inventing interviews."""
+    session_ref = record.get("session_ref")
+    return {
+        "schema": "chitra.goal.v2.enrollment-boundary.v1",
+        "legacy_index": legacy_index,
+        "session_ref": session_ref if isinstance(session_ref, str) else "",
+        "interview_receipt": None,
+        "enrolled_done_when_items": [],
+        "completion_proofs": [],
+        "completion_eligible": False,
+        "requires_old_authority_or_fresh_interview": not is_terminal,
+    }
+
+
 def _queue_stage(relative_path: str) -> str:
     if relative_path == "queue.tsv":
         return "legacy_tsv"
@@ -203,18 +269,70 @@ def _queue_stage(relative_path: str) -> str:
     return "other"
 
 
-def _queue_entry_from_file(root: Path, path: Path) -> dict[str, object]:
+def _identity_from_json_payload(payload: Mapping[str, object], fallback: str) -> str:
+    for key in ("order_id", "id", "receipt_name"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return fallback
+
+
+def _queue_entries_from_tsv(root: Path, path: Path) -> list[dict[str, object]]:
     rel = path.relative_to(root).as_posix()
     data = path.read_bytes()
-    entry: dict[str, object] = {
+    source_sha = _sha256_bytes(data)
+    entries: list[dict[str, object]] = []
+    offset = 0
+    for line_number, raw_line in enumerate(data.splitlines(keepends=True), start=1):
+        start = offset
+        offset += len(raw_line)
+        logical = raw_line.rstrip(b"\r\n")
+        if not logical:
+            continue
+        text = logical.decode("utf-8", errors="surrogateescape")
+        columns = text.split("\t")
+        identity = columns[0] if columns and columns[0] else f"{rel}:{line_number}"
+        entry: dict[str, object] = {
+            "relative_path": rel,
+            "stage": "legacy_tsv",
+            "logical_kind": "tsv_order",
+            "identity": identity,
+            "order_id": identity,
+            "session_ref": columns[1] if len(columns) > 1 else "",
+            "source_file_sha256": source_sha,
+            "sha256": _sha256_bytes(logical),
+            "size": len(logical),
+            "line_number": line_number,
+            "byte_start": start,
+            "byte_end": start + len(logical),
+        }
+        entries.append(entry)
+    return entries
+
+
+def _queue_entry_from_json_file(root: Path, path: Path) -> dict[str, object]:
+    rel = path.relative_to(root).as_posix()
+    data = path.read_bytes()
+    stage = _queue_stage(rel)
+    payload: Mapping[str, object] = {}
+    if path.suffix == ".json":
+        try:
+            parsed = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ConversionError(f"{path} is not a valid dispatch JSON entry: {exc}") from exc
+        payload = _as_mapping(parsed, name=str(path))
+    identity = _identity_from_json_payload(payload, path.stem)
+    session_ref = payload.get("session_ref")
+    return {
         "relative_path": rel,
-        "stage": _queue_stage(rel),
+        "stage": stage,
+        "logical_kind": "json_order",
+        "identity": identity,
+        "order_id": identity,
+        "session_ref": session_ref if isinstance(session_ref, str) else "",
         "sha256": _sha256_bytes(data),
         "size": len(data),
     }
-    if rel == "queue.tsv":
-        entry["line_count"] = 0 if not data else data.count(b"\n") + int(not data.endswith(b"\n"))
-    return entry
 
 
 def queue_replay_from_root(root: Path, *, produced_at: str | None = None) -> dict[str, object]:
@@ -228,7 +346,12 @@ def queue_replay_from_root(root: Path, *, produced_at: str | None = None) -> dic
         for path in sorted(queue_root.rglob("*")):
             if path.is_file():
                 candidates.append(path)
-    entries = [_queue_entry_from_file(root, path) for path in candidates]
+    entries: list[dict[str, object]] = []
+    for path in candidates:
+        if path.name == "queue.tsv":
+            entries.extend(_queue_entries_from_tsv(root, path))
+        else:
+            entries.append(_queue_entry_from_json_file(root, path))
     for ordinal, entry in enumerate(entries):
         entry["ordinal"] = ordinal
     replay: dict[str, object] = {
@@ -322,36 +445,34 @@ def _snapshot_queue_manifests(snapshot: Mapping[str, object]) -> list[dict[str, 
 
 
 def convert_w10_snapshot(snapshot_path: Path, output_dir: Path) -> dict[str, object]:
-    """Write a receipt binding the W10 snapshot's legacy counts and hashes."""
+    """Write a topology preflight receipt for W10 metadata-only snapshots."""
     snapshot = _load_json(snapshot_path)
     snapshot_sha = _sha256_file(snapshot_path)
     goals = _snapshot_goals_manifests(snapshot)
     queues = _snapshot_queue_manifests(snapshot)
-    converted_goals = [
+    goal_manifests = [
         {
             **entry,
-            "disposition": {
-                "display_only": True,
-                "administrative_dispose_only": True,
-                "done_transition_allowed": False,
-                "completion_eligible": False,
-                "requires_old_authority_or_fresh_interview": True,
-            },
+            "preflight_only": True,
+            "conversion_status": "metadata_only_record_not_converted",
         }
         for entry in goals
     ]
     goals_artifact: dict[str, object] = {
         "schema": SCHEMA_GOALS_CONVERSION,
         "produced_at": _utc_now(),
-        "source": {"path": str(snapshot_path), "sha256": snapshot_sha, "mode": "w10-snapshot-metadata"},
-        "input_counts": {"goals": sum(_as_int(entry.get("goal_count")) for entry in goals), "goals_files": len(goals)},
-        "output_counts": {"legacy_goal_records": sum(_as_int(entry.get("goal_count")) for entry in goals)},
-        "records": converted_goals,
+        "source": {"path": str(snapshot_path), "sha256": snapshot_sha, "mode": "w10-topology-preflight"},
+        "input_counts": {"metadata_goal_count": sum(_as_int(entry.get("goal_count")) for entry in goals), "goals_files": len(goals)},
+        "output_counts": {"legacy_goal_records": 0},
+        "records": [],
+        "goal_file_manifests": goal_manifests,
+        "w1_journal_records": [],
+        "w2_enrollment_records": [],
     }
     queue_artifact: dict[str, object] = {
         "schema": SCHEMA_QUEUE_REPLAY,
         "produced_at": _utc_now(),
-        "source": {"path": str(snapshot_path), "sha256": snapshot_sha, "mode": "w10-snapshot-metadata"},
+        "source": {"path": str(snapshot_path), "sha256": snapshot_sha, "mode": "w10-topology-preflight"},
         "entry_count": len(queues),
         "entries": queues,
     }
@@ -363,7 +484,7 @@ def convert_w10_snapshot(snapshot_path: Path, output_dir: Path) -> dict[str, obj
     _write_json(goals_path, goals_artifact)
     _write_json(queue_path, queue_artifact)
     receipt = _conversion_receipt(
-        mode="w10-snapshot",
+        mode="w10-topology-preflight",
         source=str(snapshot_path),
         source_sha256=snapshot_sha,
         goals_artifact=goals_artifact,
@@ -389,8 +510,10 @@ def convert_state_root(state_root: Path, output_dir: Path) -> dict[str, object]:
     )
     queue_artifact = queue_replay_from_root(state_root)
     output_dir.mkdir(parents=True, exist_ok=True)
-    _write_json(output_dir / "legacy-goals-conversion.json", goals_artifact)
-    _write_json(output_dir / "dispatch-queue-replay.json", queue_artifact)
+    goals_path = output_dir / "legacy-goals-conversion.json"
+    queue_path = output_dir / "dispatch-queue-replay.json"
+    _write_json(goals_path, goals_artifact)
+    _write_json(queue_path, queue_artifact)
     receipt = _conversion_receipt(
         mode="state-root",
         source=str(state_root),
@@ -412,9 +535,51 @@ def _conversion_receipt(
     queue_artifact: Mapping[str, object],
     output_dir: Path,
 ) -> dict[str, object]:
-    goal_input_count = _as_int(cast(Mapping[str, object], goals_artifact["input_counts"]).get("goals"))
+    goals_path = output_dir / "legacy-goals-conversion.json"
+    queue_path = output_dir / "dispatch-queue-replay.json"
+    reread_goals = _load_json(goals_path)
+    reread_queue = _load_json(queue_path)
+    input_counts = _as_mapping(goals_artifact["input_counts"], name="goal input_counts")
+    _as_mapping(reread_goals["output_counts"], name="goal output_counts")
+    goal_input_count = _as_int(input_counts.get("goals"))
+    if mode == "w10-topology-preflight":
+        goal_input_count = 0
     goal_output_count = _as_int(cast(Mapping[str, object], goals_artifact["output_counts"]).get("legacy_goal_records"))
+    queue_entries = cast(list[Mapping[str, object]], reread_queue.get("entries", []))
     queue_input_count = _as_int(queue_artifact.get("entry_count"))
+    queue_output_count = _as_int(reread_queue.get("entry_count"))
+    expected_identities = [
+        (
+            entry.get("ordinal"),
+            entry.get("identity", f"{entry.get('relative_path')}:{entry.get('line_number', '')}"),
+            entry.get("sha256"),
+        )
+        for entry in cast(list[Mapping[str, object]], queue_artifact.get("entries", []))
+    ]
+    reread_identities = [
+        (
+            entry.get("ordinal"),
+            entry.get("identity", f"{entry.get('relative_path')}:{entry.get('line_number', '')}"),
+            entry.get("sha256"),
+        )
+        for entry in queue_entries
+    ]
+    goal_records = cast(list[Mapping[str, object]], reread_goals.get("records", []))
+    w1_bound = all(isinstance(record.get("w1_journal_record"), Mapping) for record in goal_records)
+    w2_bound = all(isinstance(record.get("w2_enrollment_record"), Mapping) for record in goal_records)
+    legacy_dispositions = [
+        cast(Mapping[str, object], record.get("disposition"))
+        for record in goal_records
+        if isinstance(record.get("disposition"), Mapping)
+    ]
+    queue_reconciles = queue_input_count == queue_output_count and expected_identities == reread_identities
+    goal_reconciles = goal_input_count == goal_output_count and w1_bound and w2_bound
+    if mode == "w10-topology-preflight":
+        status = "PREFLIGHT_ONLY"
+    elif goal_reconciles and queue_reconciles:
+        status = "PASS"
+    else:
+        status = "FAIL"
     receipt: dict[str, object] = {
         "schema": SCHEMA_CONVERSION_RECEIPT,
         "produced_at": _utc_now(),
@@ -422,12 +587,12 @@ def _conversion_receipt(
         "source": {"path": source, "sha256": source_sha256},
         "artifacts": {
             "legacy_goals_conversion": {
-                "path": str(output_dir / "legacy-goals-conversion.json"),
-                "sha256": goals_artifact["sha256"],
+                "path": str(goals_path),
+                "sha256": _sha256_file(goals_path),
             },
             "dispatch_queue_replay": {
-                "path": str(output_dir / "dispatch-queue-replay.json"),
-                "sha256": queue_artifact["sha256"],
+                "path": str(queue_path),
+                "sha256": _sha256_file(queue_path),
             },
         },
         "input_counts": {
@@ -436,14 +601,21 @@ def _conversion_receipt(
         },
         "output_counts": {
             "legacy_goal_records": goal_output_count,
-            "dispatch_queue_entries": queue_input_count,
+            "dispatch_queue_entries": queue_output_count,
         },
         "reconciliation": {
+            "metadata_preflight_only": mode == "w10-topology-preflight",
             "goal_counts_match": goal_input_count == goal_output_count,
-            "queue_count_order_identity_hashes_preserved": True,
-            "legacy_goals_marked_display_dispose_only": True,
-            "legacy_goals_may_claim_done": False,
-            "status": "PASS" if goal_input_count == goal_output_count else "FAIL",
+            "w1_journal_records_bound": w1_bound,
+            "w2_enrollment_records_bound": w2_bound,
+            "queue_count_order_identity_hashes_preserved": queue_reconciles,
+            "legacy_goals_marked_display_dispose_only": bool(goal_records)
+            and len(legacy_dispositions) == len(goal_records)
+            and all(disposition.get("display_only") is True for disposition in legacy_dispositions),
+            "legacy_goals_may_claim_done": any(
+                disposition.get("done_transition_allowed") is True for disposition in legacy_dispositions
+            ),
+            "status": status,
         },
     }
     receipt["sha256"] = _sha256_bytes(_canonical_bytes(receipt))
@@ -505,6 +677,9 @@ def build_authority_handoff_receipt(
     post_state_sha256: str,
     rollback_checkpoint_sha256: str,
     transcript_bindings: Sequence[str] = (),
+    instance_bindings: Mapping[str, str] | None = None,
+    lifecycle_receipts: Sequence[Mapping[str, object]] = (),
+    native_client: Mapping[str, object] | None = None,
     cutover_sequence: Sequence[str] = ("old-drained", "old-stopped", "old-write-denied", "new-started", "new-write-proved"),
 ) -> dict[str, object]:
     """Seal a pure handoff proof; callers provide externally observed facts."""
@@ -515,6 +690,16 @@ def build_authority_handoff_receipt(
         raise ConversionError("cutover sequence must drain old writer, stop it, deny its writes, then start and prove the new writer")
     active_writers = [writer.name for writer in (old_writer, new_writer) if writer.can_write]
     issues: list[str] = []
+    for writer in (old_writer, new_writer):
+        for field, value in writer.to_dict().items():
+            if field in {"stopped", "started", "can_write", "last_order_sha256", "action_receipt_sha256"}:
+                continue
+            if not isinstance(value, str) or not value:
+                issues.append(f"{writer.role} writer {field} is missing")
+        if writer.role == "old" and not _is_sha256(writer.last_order_sha256):
+            issues.append("old writer last order hash is missing")
+        if writer.role == "new" and not _is_sha256(writer.action_receipt_sha256):
+            issues.append("new writer action receipt hash is missing")
     if not old_writer.stopped:
         issues.append("old writer is not stopped")
     if old_writer.can_write:
@@ -525,7 +710,47 @@ def build_authority_handoff_receipt(
         issues.append("new writer has not proved a write")
     if len(active_writers) != 1:
         issues.append("exactly one writer must be able to act")
-    receipt: dict[str, object] = {
+    if not instance:
+        issues.append("instance is missing")
+    for label, value in (
+        ("pre_state_sha256", pre_state_sha256),
+        ("post_state_sha256", post_state_sha256),
+        ("rollback_checkpoint_sha256", rollback_checkpoint_sha256),
+    ):
+        if not _is_sha256(value):
+            issues.append(f"{label} must be a SHA-256 digest")
+    bindings = dict(instance_bindings or {})
+    missing_bindings = sorted(REQUIRED_INSTANCE_BINDINGS - set(bindings))
+    if missing_bindings:
+        issues.append(f"missing instance bindings: {', '.join(missing_bindings)}")
+    for key, value in bindings.items():
+        if not isinstance(value, str) or not value:
+            issues.append(f"instance binding {key} is empty")
+        if key.endswith("_sha256") and not _is_sha256(value):
+            issues.append(f"instance binding {key} must be a SHA-256 digest")
+    if not transcript_bindings or not all(_is_sha256(binding) for binding in transcript_bindings):
+        issues.append("transcript bindings must contain externally observed SHA-256 digests")
+    lifecycle_by_kind = {str(item.get("kind")): item for item in lifecycle_receipts if isinstance(item, Mapping)}
+    missing_lifecycle = sorted(REQUIRED_LIFECYCLE_RECEIPTS - set(lifecycle_by_kind))
+    if missing_lifecycle:
+        issues.append(f"missing lifecycle receipts: {', '.join(missing_lifecycle)}")
+    for lifecycle_receipt in lifecycle_receipts:
+        for key in ("kind", "observer", "subject", "observed_at"):
+            value = lifecycle_receipt.get(key)
+            if not isinstance(value, str) or not value:
+                issues.append(f"lifecycle receipt {lifecycle_receipt.get('kind', '<unknown>')} missing {key}")
+        if not _is_sha256(lifecycle_receipt.get("artifact_sha256")):
+            issues.append(f"lifecycle receipt {lifecycle_receipt.get('kind', '<unknown>')} missing artifact hash")
+    client = dict(native_client or {})
+    for key in ("client_name", "version", "path", "path_sha256"):
+        value = client.get(key)
+        if not isinstance(value, str) or not value:
+            issues.append(f"native client binding {key} is missing")
+    if not _is_sha256(client.get("path_sha256")):
+        issues.append("native client path_sha256 must be a SHA-256 digest")
+    if client.get("update_suppression") is not False:
+        issues.append("native client binding must prove no update-suppression flag")
+    handoff_receipt: dict[str, object] = {
         "schema": SCHEMA_HANDOFF_RECEIPT,
         "produced_at": _utc_now(),
         "instance": instance,
@@ -535,16 +760,19 @@ def build_authority_handoff_receipt(
             "post_handoff": post_state_sha256,
             "rollback_checkpoint": rollback_checkpoint_sha256,
         },
+        "instance_bindings": bindings,
         "transcript_bindings": list(transcript_bindings),
+        "lifecycle_receipts": [dict(item) for item in lifecycle_receipts],
+        "native_client": client,
         "cutover_sequence": list(cutover_sequence),
         "exactly_one_writer": len(active_writers) == 1 and active_writers == [new_writer.name],
         "issues": issues,
         "status": "PASS" if not issues else "FAIL",
     }
-    receipt["sha256"] = _sha256_bytes(_canonical_bytes(receipt))
+    handoff_receipt["sha256"] = _sha256_bytes(_canonical_bytes(handoff_receipt))
     if issues:
         raise ConversionError("; ".join(issues))
-    return receipt
+    return handoff_receipt
 
 
 def _file_manifest(root: Path) -> list[dict[str, object]]:
@@ -597,9 +825,42 @@ def _contains_v3_or_receipts(root: Path) -> bool:
     if not goals.exists():
         return False
     try:
-        return _load_json(goals).get("schema") == "chitra.goals.v3"
+        payload = _load_json(goals)
     except ConversionError:
         return False
+    if payload.get("schema") == "chitra.goals.v3":
+        return True
+    if payload.get("schema") == "chitra.goals.v2":
+        records = payload.get("goals")
+        if isinstance(records, list):
+            return any(
+                isinstance(record, Mapping)
+                and (
+                    bool(record.get("interview_receipt"))
+                    or bool(record.get("enrolled_done_when_items"))
+                    or bool(record.get("completion_proofs"))
+                )
+                for record in records
+            )
+    return False
+
+
+def _validate_snapshot_payload(snapshot_dir: Path, marker: Mapping[str, object]) -> None:
+    snapshot_payload_dir = snapshot_dir / "state-root"
+    manifest_path = snapshot_dir / "manifest.json"
+    if not snapshot_payload_dir.exists():
+        raise ConversionError("rollback snapshot payload is missing")
+    if not manifest_path.exists():
+        raise ConversionError("rollback snapshot manifest is missing")
+    manifest_payload = _load_json(manifest_path)
+    files = manifest_payload.get("files")
+    if not isinstance(files, list):
+        raise ConversionError("rollback snapshot manifest files must be a list")
+    expected_hash = marker.get("manifest_sha256")
+    manifest_hash = _manifest_digest(cast(list[Mapping[str, object]], files))
+    payload_hash = _manifest_digest(_file_manifest(snapshot_payload_dir))
+    if manifest_hash != expected_hash or payload_hash != expected_hash:
+        raise ConversionError("rollback snapshot manifest does not match payload")
 
 
 def restore_snapshot(snapshot_dir: Path, state_root: Path, *, allow_v3_loss: bool = False) -> dict[str, object]:
@@ -611,10 +872,9 @@ def restore_snapshot(snapshot_dir: Path, state_root: Path, *, allow_v3_loss: boo
         raise ConversionError("rollback snapshot marker is missing")
     marker = _load_json(marker_path)
     snapshot_payload_dir = snapshot_dir / "state-root"
-    if not snapshot_payload_dir.exists():
-        raise ConversionError("rollback snapshot payload is missing")
+    _validate_snapshot_payload(snapshot_dir, marker)
     if _contains_v3_or_receipts(state_root) and not allow_v3_loss:
-        raise ConversionError("rollback would lose v3 enrollment or validation evidence")
+        raise ConversionError("rollback would lose v2/v3 enrollment or validation evidence")
     if state_root == Path("/") or len(state_root.parts) < 3:
         raise ConversionError("refusing to restore an unsafe state root")
     state_root.mkdir(parents=True, exist_ok=True)
