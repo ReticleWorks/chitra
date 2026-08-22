@@ -18,8 +18,7 @@ from chitra.policy_config import (
     UsagePolicy,
     load_policy_config,
     resolve_guidance,
-)
-from chitra.policy_config import GatePolicy, INCIDENT_COMPLETION_DEFERRAL_PHRASES  # noqa: F401
+)  # noqa: F401
 from chitra.state_paths import default_ledger_key_path, default_ledger_path, default_queue_dir
 
 
