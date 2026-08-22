@@ -16,6 +16,7 @@ from _goal_fixtures import enrollment_fields
 from chitra.goals import (
     GoalNotFoundError,
     GoalRecord,
+    GoalsSchemaNewerError as GoalStoreError,
     GoalValidationError,
     get_goal,
     load_goals,
@@ -182,15 +183,23 @@ def test_a_v1_document_still_loads_and_carries_empty_linkage(tmp_path: Path) -> 
     assert loaded[0].transferred_to == ""
 
 
-def test_an_unknown_schema_is_still_refused(tmp_path: Path) -> None:
+def test_an_unknown_schema_is_refused_but_a_newer_v_n_reads_tolerantly(tmp_path: Path) -> None:
     _enrol(tmp_path)
     path = tmp_path / "goals.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["schema"] = "chitra.goals.v9"
+    payload["schema"] = "not-a-chitra-goals-schema"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="chitra.goals.v3"):
+    with pytest.raises(ValueError, match="goals.json schema must match"):
         load_goals(tmp_path)
+
+    # A newer chitra.goals.v<N> document is readable by this package (the
+    # v3/v4 outage class); writing it back is what stays refused.
+    payload["schema"] = "chitra.goals.v9"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert [record.session_ref for record in load_goals(tmp_path)] == [ORIGINAL]
+    with pytest.raises(GoalStoreError, match="newer than installed package schema"):
+        transfer_goal(tmp_path, ORIGINAL, to_backend="claude", digest=DIGEST, reason=REASON)
 
 
 def test_transfer_starts_nothing(tmp_path: Path) -> None:

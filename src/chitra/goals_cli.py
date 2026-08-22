@@ -205,6 +205,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     set_command.add_argument("--now", default="")
     set_command.add_argument("--last-verified", default="")
     set_command.add_argument("--interview-result", type=Path)
+    set_command.add_argument(
+        "--migrate",
+        action="store_true",
+        help="Rewrite goals.json at this package's schema when its file schema is newer.",
+    )
     set_command.add_argument("--needs", default=None, help="Specific human action required to unblock this lane.")
     asks_group = set_command.add_mutually_exclusive_group()
     asks_group.add_argument("--open-ask", action="append", default=[])
@@ -384,7 +389,7 @@ def _enroll_from_interview_result(root: Path, args: argparse.Namespace) -> goal_
             pre_commit_payload = loaded_document if isinstance(loaded_document, dict) else None
         except FileNotFoundError:
             pre_commit_payload = None
-        stored = goal_store._upsert_goal_locked(args.root, requested_record, allow_strategic_change=True)
+        stored = goal_store._upsert_goal_locked(args.root, requested_record, allow_strategic_change=True, migrate=args.migrate)
         try:
             with locked_json_store(nonce_path):
                 persisted_nonce_record = _read_nonce_record(nonce_path)
@@ -439,6 +444,7 @@ def main(argv: list[str] | None = None) -> int:
                         completion_proofs=existing.completion_proofs,
                     ),
                     clear_open_asks=args.clear_asks,
+                    migrate=args.migrate,
                 )
             else:
                 stored = _enroll_from_interview_result(args.root, args)
@@ -575,6 +581,10 @@ def main(argv: list[str] | None = None) -> int:
     except goal_store.GoalRedirectRequiredError as exc:
         print(f"chitra-goals: {exc}; use chitra-goals redirect --reason ...", file=sys.stderr)
         return 1
+    except goal_store.GoalsSchemaNewerError as exc:
+        print(f"chitra-goals: {exc}", file=sys.stderr)
+        print("chitra-goals: re-run chitra-goals set with --migrate to rewrite goals.json at the installed schema", file=sys.stderr)
+        return 3
     except (goal_store.GoalValidationError, goal_store.GoalNotFoundError, OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"chitra-goals: {exc}", file=sys.stderr)
         return 1

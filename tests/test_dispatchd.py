@@ -17,7 +17,7 @@ import chitra.dispatchd as dispatchd_mod
 import chitra.ledger as ledger_mod
 from chitra.dispatch import DISPATCH_VERIFY_WAIT_SECONDS, DispatchOrder, DispatchResult, DispatchStatus, LaneLock, LaneLockError
 from chitra.dispatchd import build_arg_parser, main, process_one_order, requeue_deferred_for_session, resolve_session_prefixes, run_once
-from chitra.goals import GoalRecord, hold_goal, upsert_goal
+from chitra.goals import GOALS_SCHEMA_NEWER_MESSAGE, GoalRecord, hold_goal, upsert_goal
 from chitra.policy_config import PolicyConfig
 from chitra.reasoning import DecisionAttestation
 from chitra.routing_config import ROUTING_CONFIG_ENV_VAR, RoutingConfig
@@ -1798,3 +1798,56 @@ def test_run_forever_uses_shipped_defaults_when_no_config_has_loaded(monkeypatch
 
     assert observed[0][0] is None
     assert observed[0][1] == PolicyConfig()
+
+
+def _newer_store_document(root: Path) -> None:
+    """A synthetic chitra.goals.v4 store: this package's schema family, but a
+    version the installed package neither fully understands nor may rewrite."""
+    record = GoalRecord(
+        session_ref="host-a:f2:0.0",
+        goal="Ship the tested deterministic goals store safely.",
+        done_when="The full suite and static checks pass.",
+        source="task-file:/tmp/goal-store.md",
+        status="working",
+        **enrollment_fields("The full suite and static checks pass."),
+    ).to_dict()
+    record["future_v4_field"] = {"unknown": True}
+    (root / "goals.json").write_text(
+        json.dumps({"schema": "chitra.goals.v4", "updated_at": "2026-08-22T00:00:00+00:00", "goals": [record]}),
+        encoding="utf-8",
+    )
+
+
+def test_daemon_runs_read_only_against_a_newer_goals_schema(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """The v4-outage rule: dispatchd starts and drains its queue against a
+    goals.json labeled newer than the installed package. It journals the
+    read-only degradation once instead of crashing into a supervisor restart
+    loop, and never rewrites the file's own schema label."""
+    _newer_store_document(tmp_path)
+    queue_dir = tmp_path / "queue"
+    order = DispatchOrder(order_id="ord-v4", session_ref="localhost:s:0.0", nudge="hi")
+
+    def fake_dispatch(order: DispatchOrder, **kwargs: Any) -> DispatchResult:
+        return DispatchResult(order_id=order.order_id, session_ref=order.session_ref, status=DispatchStatus.SENT, reason="sent: test")
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", fake_dispatch)
+        orders_dir = queue_dir / "orders"
+        orders_dir.mkdir(parents=True)
+        (orders_dir / f"{order.order_id}.json").write_text(order.model_dump_json(), encoding="utf-8")
+        results = run_once(
+            queue_dir,
+            lock_dir=tmp_path / "locks",
+            ledger_path=tmp_path / "ledger.jsonl",
+            ledger_key_path=tmp_path / "ledger.key",
+            goals_root=tmp_path,
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert len(results) == 1
+    assert results[0].status == DispatchStatus.SENT
+    notices = [line for line in capsys.readouterr().out.splitlines() if GOALS_SCHEMA_NEWER_MESSAGE in line]
+    assert len(notices) == 1
+    assert json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))["schema"] == "chitra.goals.v4"
