@@ -32,9 +32,7 @@ LADDER_STAGES: tuple[str, ...] = ("nudge", "redirect", "rescue", "relaunch")
 _LANE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _HEX64_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
-_CHECKPOINT_SCHEMA = "chitra.detect.checkpoint-receipt.v1"
-_CHECKPOINT_INTEGRITY_SCOPE = "entire checkpoint receipt with /integrity/digest omitted"
-_CHECKPOINT_CANONICALIZATION = "json.dumps(sort_keys=True,separators=(',',':'),ensure_ascii=False)"
+_PROCESS_IDENTITY_KEYS = ("target_pid", "target_uid", "target_gid", "target_start_time", "target_comm", "target_exe")
 
 IncidentStage = Literal["nudge", "redirect", "rescue", "relaunch"]
 
@@ -294,11 +292,10 @@ class ResponseLadder:
             return False
         if not proof.session_ref:
             return False
-        if (
-            proof.native_session_id
-            and proof.native_session_id != proof.session_ref
-            and proof.ledger_entry.routing_hint != proof.native_session_id
-        ):
+        if proof.native_session_id != proof.session_ref:
+            if proof.ledger_entry.native_session_id != proof.native_session_id:
+                return False
+        elif proof.ledger_entry.native_session_id and proof.ledger_entry.native_session_id != proof.native_session_id:
             return False
         if f":{record.lane}:" not in proof.ledger_entry.session_ref:
             return False
@@ -378,6 +375,16 @@ def _rescue_bundle_verified(state_root: Path, record: IncidentRecord, bundle_sha
 def _checkpoint_receipt_verified(
     state_root: Path, record: IncidentRecord, bundle: Any, checkpoint_ref: str
 ) -> bool:
+    from .rescue import (
+        CHECKPOINT_CANONICALIZATION,
+        CHECKPOINT_PROVENANCE_KIND,
+        CHECKPOINT_SCHEMA,
+        CHECKPOINT_SCHEMA_VERSION,
+        CHECKPOINT_SIGNATURE_SCOPE,
+        CHECKPOINT_WRITER,
+        verify_checkpoint_receipt_signature,
+    )
+
     path = state_root / "checkpoints" / f"{checkpoint_ref}.json"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -385,22 +392,28 @@ def _checkpoint_receipt_verified(
         return False
     if not isinstance(payload, dict):
         return False
+    if not verify_checkpoint_receipt_signature(payload, state_root=state_root):
+        return False
     expected_session = record.consumption.session_ref if record.consumption else ""
     expected_fields = {
         "schema_name",
+        "schema_version",
         "checkpoint_ref",
         "lane",
         "session_ref",
         "incident_fingerprint",
         "rescue_bundle_sha256",
-        "target_pid",
+        "target_process_identity",
         "created_at",
+        "writer_identity",
+        "ledger_binding",
         "provenance",
-        "integrity",
+        "anti_replay_nonce",
+        "signature",
     }
     if set(payload) != expected_fields:
         return False
-    if payload.get("schema_name") != _CHECKPOINT_SCHEMA:
+    if payload.get("schema_name") != CHECKPOINT_SCHEMA or payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
         return False
     if payload.get("checkpoint_ref") != checkpoint_ref:
         return False
@@ -410,25 +423,38 @@ def _checkpoint_receipt_verified(
         return False
     if payload.get("rescue_bundle_sha256") != bundle.bundle_sha256:
         return False
-    target_pid = payload.get("target_pid")
-    if type(target_pid) is not int or target_pid <= 0 or target_pid != bundle.process_identity.get("target_pid"):
+    if not _checkpoint_target_identity_matches(payload.get("target_process_identity"), bundle.process_identity):
+        return False
+    if not _checkpoint_ledger_binding_matches(payload.get("ledger_binding"), record):
         return False
     provenance = payload.get("provenance")
-    if not isinstance(provenance, dict) or provenance.get("kind") != "governed-checkpoint":
+    if not isinstance(provenance, dict) or provenance.get("kind") != CHECKPOINT_PROVENANCE_KIND:
         return False
-    if provenance.get("rescue_bundle_sha256") != bundle.bundle_sha256:
+    if provenance.get("writer") != CHECKPOINT_WRITER:
         return False
-    return _checkpoint_integrity_verified(payload)
+    if provenance.get("signature_scope") != CHECKPOINT_SIGNATURE_SCOPE:
+        return False
+    if provenance.get("canonicalization") != CHECKPOINT_CANONICALIZATION:
+        return False
+    nonce = payload.get("anti_replay_nonce")
+    return isinstance(nonce, str) and len(nonce) >= 16
 
 
 def _valid_rescue_process_identity(identity: dict[str, Any], *, expected_session: str) -> bool:
     if identity.get("session_ref") != expected_session:
         return False
-    for key in ("target_pid", "capture_pid", "capture_ppid"):
+    for key in ("target_pid", "capture_pid", "capture_ppid", "target_uid", "target_gid"):
         value = identity.get(key)
-        if type(value) is not int or value <= 0:
+        if type(value) is not int or (key.endswith("pid") and value <= 0):
             return False
-    return True
+    start_time = identity.get("target_start_time")
+    if not isinstance(start_time, str) or not start_time.isdigit():
+        return False
+    comm = identity.get("target_comm")
+    if not isinstance(comm, str) or not comm:
+        return False
+    exe = identity.get("target_exe")
+    return isinstance(exe, str)
 
 
 def _rescue_transcript_hash_verified(transcript_ref: str, transcript_sha256: str) -> bool:
@@ -441,23 +467,25 @@ def _rescue_transcript_hash_verified(transcript_ref: str, transcript_sha256: str
     return hashlib.sha256(payload).hexdigest() == transcript_sha256
 
 
-def _checkpoint_integrity_verified(payload: dict[str, Any]) -> bool:
-    integrity = payload.get("integrity")
-    if not isinstance(integrity, dict):
+def _checkpoint_target_identity_matches(receipt_identity: Any, bundle_identity: dict[str, Any]) -> bool:
+    if not isinstance(receipt_identity, dict):
         return False
-    digest = integrity.get("digest")
-    if not isinstance(digest, str) or _HEX64_RE.fullmatch(digest) is None:
+    return all(receipt_identity.get(key) == bundle_identity.get(key) for key in _PROCESS_IDENTITY_KEYS)
+
+
+def _checkpoint_ledger_binding_matches(binding: Any, record: IncidentRecord) -> bool:
+    if not isinstance(binding, dict) or record.consumption is None:
         return False
-    if integrity.get("scope") != _CHECKPOINT_INTEGRITY_SCOPE:
-        return False
-    if integrity.get("canonicalization") != _CHECKPOINT_CANONICALIZATION:
-        return False
-    unsigned = dict(payload)
-    unsigned["integrity"] = {key: value for key, value in integrity.items() if key != "digest"}
-    computed = hashlib.sha256(
-        json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-    ).hexdigest()
-    return computed == digest
+    entry = record.consumption.ledger_entry
+    expected = {
+        "order_id": entry.order_id,
+        "session_ref": entry.session_ref,
+        "native_session_id": entry.native_session_id,
+        "message_hash": entry.message_hash,
+        "sent_at": entry.sent_at,
+        "signature": entry.signature,
+    }
+    return binding == expected
 
 
 def _payload_text(event: CanonicalEvent) -> str:

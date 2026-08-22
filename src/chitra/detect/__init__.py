@@ -23,6 +23,7 @@ from .rescue import (
     RescueBundle,
     collect_rescue_bundle,
     generate_relaunch_brief,
+    write_checkpoint_receipt,
     write_rescue_bundle,
 )
 
@@ -45,5 +46,6 @@ __all__ = [
     "detect_false_done",
     "detect_unnecessary_steps",
     "generate_relaunch_brief",
+    "write_checkpoint_receipt",
     "write_rescue_bundle",
 ]

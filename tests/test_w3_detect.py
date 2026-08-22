@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -23,6 +24,8 @@ from chitra.detect import (
     detect_false_done,
     detect_unnecessary_steps,
     generate_relaunch_brief,
+    write_checkpoint_receipt,
+    write_rescue_bundle,
 )
 from chitra.goals import EnrolledDoneWhenItem
 from chitra.journal import (
@@ -35,7 +38,7 @@ from chitra.journal import (
     ProgressClassification,
 )
 from chitra.journal.models import ByteRange, TranscriptIdentity
-from chitra.ledger import LedgerEntry, message_hash, sign
+from chitra.ledger import LedgerEntry, append_entry, message_hash, sign
 
 FIXTURES = Path(__file__).parent / "fixtures" / "failure-modes"
 LANE = "claude"
@@ -441,7 +444,9 @@ def test_ladder_advances_only_after_proven_consumption(tmp_path: Path) -> None:
     blocked = ladder.evaluate(lane=LANE, finding=finding, order_marker="relaunch-1")
     assert blocked.action == "hold"
     assert "RESCUE" in blocked.reason
-    _write_verified_rescue_and_checkpoint(tmp_path, rescue.record, session_ref=session_ref, checkpoint_ref="checkpoint-1")
+    consumed_rescue = store.latest(finding.fingerprint)
+    assert consumed_rescue is not None
+    _write_verified_rescue_and_checkpoint(tmp_path, consumed_rescue, session_ref=session_ref, checkpoint_ref="checkpoint-1")
     store.seal_rescue_checkpoint(
         fingerprint=finding.fingerprint,
         order_marker="rescue-1",
@@ -512,17 +517,20 @@ def test_ladder_consumption_binds_governed_session_ref_to_native_session_id(
     session_ref = f"host:{LANE}:0.0"
     native_session_id = event_sets["claude-unnecessary-steps"][0].session_id
     text = "[C] nudge-1 please continue"
-    digest = message_hash(text)
-    entry = LedgerEntry(
+    entry = append_entry(
+        tmp_path / "ledger.jsonl",
         order_id="order-nudge-1",
         session_ref=session_ref,
         tag="[C]",
-        routing_hint=native_session_id,
-        sig_v=4,
-        message_hash=digest,
+        routing_hint="opus-4.8@claude-code+zdr",
+        nudge=text,
+        key=key,
+        native_session_id=native_session_id,
         sent_at=sent_at,
-        signature=sign(key, session_ref=session_ref, tag="[C]", digest=digest, sent_at=sent_at, routing_hint=native_session_id),
     )
+    assert entry.routing_hint == "opus-4.8@claude-code+zdr"
+    assert entry.native_session_id == native_session_id
+    assert entry.sig_v == 5
     journal = (
         event_sets["claude-unnecessary-steps"][0].model_copy(
             update={
@@ -567,58 +575,27 @@ def test_ladder_consumption_binds_governed_session_ref_to_native_session_id(
 def _write_verified_rescue_and_checkpoint(
     state_root: Path, record: IncidentRecord, *, session_ref: str, checkpoint_ref: str
 ) -> None:
-    transcript = state_root / "transcript.jsonl"
+    worktree = state_root / "rescue-worktree"
+    worktree.mkdir()
+    subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "w3@example.invalid"], cwd=worktree, check=True)
+    subprocess.run(["git", "config", "user.name", "W3 Test"], cwd=worktree, check=True)
+    (worktree / "tracked.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=worktree, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, capture_output=True, text=True)
+    transcript = worktree / "transcript.jsonl"
     transcript.write_text('{"type":"user","message":{"content":"checkpoint me"}}\n', encoding="utf-8")
-    payload = {
-        "schema_name": "chitra.detect.rescue-bundle.v1",
-        "lane": LANE,
-        "session_ref": session_ref,
-        "captured_at": "2026-08-21T15:00:00+00:00",
-        "transcript_ref": str(transcript),
-        "transcript_sha256": hashlib.sha256(transcript.read_bytes()).hexdigest(),
-        "process_identity": {"target_pid": 12345, "capture_pid": 23456, "capture_ppid": 1234, "session_ref": session_ref},
-        "pane_capture": "",
-        "git_state": {"branch": "w3/detectors-ladder", "head": "a" * 40},
-        "untracked_files": [],
-        "receipt_paths": [],
-        "contract": "finish item done-1",
-        "incident_history": [json.dumps({"fingerprint": record.fingerprint, "stage": record.stage}, sort_keys=True)],
-        "open_asks": [],
-        "checkpoint_requested": True,
-    }
-    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
-    payload["bundle_sha256"] = digest
-    rescue_dir = state_root / "rescue"
-    rescue_dir.mkdir(exist_ok=True)
-    (rescue_dir / "bundle.json").write_text(json.dumps(payload), encoding="utf-8")
-    checkpoints = state_root / "checkpoints"
-    checkpoints.mkdir(exist_ok=True)
-    (checkpoints / f"{checkpoint_ref}.json").write_text(
-        json.dumps(_checkpoint_receipt(checkpoint_ref, record, session_ref=session_ref, bundle_sha256=digest)),
-        encoding="utf-8",
+    bundle = collect_rescue_bundle(
+        lane=LANE,
+        session_ref=session_ref,
+        worktree=worktree,
+        transcript_path=transcript,
+        contract_text="finish item done-1",
+        incidents=(record,),
+        process_identity={"target_pid": os.getpid()},
     )
-
-
-def _checkpoint_receipt(
-    checkpoint_ref: str, record: IncidentRecord, *, session_ref: str, bundle_sha256: str
-) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "schema_name": CHECKPOINT_SCHEMA,
-        "checkpoint_ref": checkpoint_ref,
-        "lane": LANE,
-        "session_ref": session_ref,
-        "incident_fingerprint": record.fingerprint,
-        "rescue_bundle_sha256": bundle_sha256,
-        "target_pid": 12345,
-        "created_at": "2026-08-21T15:00:01+00:00",
-        "provenance": {"kind": "governed-checkpoint", "rescue_bundle_sha256": bundle_sha256},
-        "integrity": {"scope": CHECKPOINT_INTEGRITY_SCOPE, "canonicalization": CHECKPOINT_CANONICALIZATION},
-    }
-    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
-    integrity = dict(payload["integrity"])  # type: ignore[arg-type]
-    integrity["digest"] = digest
-    payload["integrity"] = integrity
-    return payload
+    write_rescue_bundle(bundle, state_root)
+    write_checkpoint_receipt(bundle=bundle, record=record, state_root=state_root, checkpoint_ref=checkpoint_ref)
 
 
 def _latest_rescue_sha(state_root: Path) -> str:
@@ -707,7 +684,9 @@ def test_rescue_seal_requires_verified_bundle_and_checkpoint(tmp_path: Path) -> 
             bundle_sha256="0" * 64,
             checkpoint_ref="checkpoint-1",
         )
-    _write_verified_rescue_and_checkpoint(tmp_path, rescue.record, session_ref=session_ref, checkpoint_ref="checkpoint-1")
+    consumed_rescue = store.latest(finding.fingerprint)
+    assert consumed_rescue is not None
+    _write_verified_rescue_and_checkpoint(tmp_path, consumed_rescue, session_ref=session_ref, checkpoint_ref="checkpoint-1")
     store.seal_rescue_checkpoint(
         fingerprint=finding.fingerprint,
         order_marker="rescue-1",
@@ -716,7 +695,7 @@ def test_rescue_seal_requires_verified_bundle_and_checkpoint(tmp_path: Path) -> 
     )
 
 
-def test_relaunch_rejects_skeleton_rescue_checkpoint_and_null_target_pid(tmp_path: Path) -> None:
+def test_relaunch_rejects_self_authored_checkpoint_and_null_target_pid(tmp_path: Path) -> None:
     session_ref = f"host:{LANE}:0.0"
     entry = LedgerEntry(
         order_id="order-rescue-1",
@@ -761,25 +740,71 @@ def test_relaunch_rejects_skeleton_rescue_checkpoint_and_null_target_pid(tmp_pat
 
     rescue_dir = tmp_path / "rescue"
     rescue_dir.mkdir()
-    skeleton = {"lane": LANE, "session_ref": session_ref, "checkpoint_requested": True}
-    skeleton["bundle_sha256"] = hashlib.sha256(
-        json.dumps(skeleton, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    bundle_payload = {
+        "schema_name": "chitra.detect.rescue-bundle.v1",
+        "lane": LANE,
+        "session_ref": session_ref,
+        "captured_at": "2026-08-21T15:00:00+00:00",
+        "transcript_ref": str(transcript),
+        "transcript_sha256": hashlib.sha256(transcript.read_bytes()).hexdigest(),
+        "process_identity": {
+            "target_pid": 999999,
+            "target_uid": 1000,
+            "target_gid": 1000,
+            "target_start_time": "123456789",
+            "target_comm": "fake-agent",
+            "target_exe": "/tmp/fake-agent",
+            "capture_pid": 888888,
+            "capture_ppid": 777777,
+            "session_ref": session_ref,
+        },
+        "pane_capture": "",
+        "git_state": {"branch": "w3/detectors-ladder", "head": "a" * 40},
+        "untracked_files": [],
+        "receipt_paths": [],
+        "contract": "finish item done-1",
+        "incident_history": [json.dumps({"fingerprint": finding.fingerprint, "stage": "rescue"}, sort_keys=True)],
+        "open_asks": [],
+        "checkpoint_requested": True,
+    }
+    bundle_payload["bundle_sha256"] = hashlib.sha256(
+        json.dumps(bundle_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     ).hexdigest()
-    (rescue_dir / "bundle.json").write_text(json.dumps(skeleton), encoding="utf-8")
+    (rescue_dir / "bundle.json").write_text(json.dumps(bundle_payload), encoding="utf-8")
     checkpoints = tmp_path / "checkpoints"
     checkpoints.mkdir()
-    (checkpoints / "checkpoint-1.json").write_text(json.dumps({"lane": LANE, "session_ref": session_ref}), encoding="utf-8")
+    (checkpoints / "checkpoint-1.json").write_text(
+        json.dumps(
+            {
+                "schema_name": CHECKPOINT_SCHEMA,
+                "schema_version": 2,
+                "checkpoint_ref": "checkpoint-1",
+                "lane": LANE,
+                "session_ref": session_ref,
+                "incident_fingerprint": finding.fingerprint,
+                "rescue_bundle_sha256": bundle_payload["bundle_sha256"],
+                "target_process_identity": bundle_payload["process_identity"],
+                "created_at": "2026-08-21T15:00:01+00:00",
+                "writer_identity": {"writer_pid": 1},
+                "ledger_binding": {"order_id": entry.order_id},
+                "provenance": {"kind": "governed-rescue-checkpoint"},
+                "anti_replay_nonce": "caller-made",
+                "signature": hashlib.sha256(b"caller can self-hash").hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
 
-    with pytest.raises(ValueError, match="governed RESCUE bundle"):
+    with pytest.raises(ValueError, match="checkpoint reference"):
         store.seal_rescue_checkpoint(
             fingerprint=finding.fingerprint,
             order_marker="rescue-1",
-            bundle_sha256=str(skeleton["bundle_sha256"]),
+            bundle_sha256=str(bundle_payload["bundle_sha256"]),
             checkpoint_ref="checkpoint-1",
         )
 
-    transcript = tmp_path / "transcript.jsonl"
-    transcript.write_text("{}\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="affected process identity"):
         collect_rescue_bundle(
             lane=LANE,
@@ -814,11 +839,12 @@ def test_rescue_bundle_is_bounded_hash_bound_and_brief_renders(tmp_path: Path) -
         pane_capture="pane tail",
         contract_text="finish item done-1 with a verified receipt",
         open_asks=("Need operator answer about X",),
-        process_identity={"target_pid": 12345},
+        process_identity={"target_pid": os.getpid()},
     )
     assert bundle.bundle_sha256
     assert bundle.transcript_sha256
-    assert bundle.process_identity["target_pid"] == 12345
+    assert bundle.process_identity["target_pid"] == os.getpid()
+    assert bundle.process_identity["target_start_time"]
     assert bundle.git_state["diff_staged"]
     assert bundle.git_state["diff_unstaged"]
     assert bundle.checkpoint_requested is True
