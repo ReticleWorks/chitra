@@ -6,6 +6,7 @@ import json
 import subprocess
 import threading
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from chitra.dispatch import DispatchOrder
 from chitra.goal_enforcement import ReviewerVerdict, ReviewFinding
 from chitra.goals import GoalRecord, get_goal, upsert_goal
 from chitra.lane_activity import load_lane_activity
+from chitra.orders import DispatchResult, DispatchStatus
 from chitra.triaged import ReceivingOutputs, parse_event_line, run_once
 from chitra.watchd import (
     Pane,
@@ -239,6 +241,29 @@ class _RejectingReviewer:
         )
 
 
+class _DeferringReviewer:
+    """Rejects a question turn as deferred_to_operator, citing it verbatim."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def review(self, goal, behavior, reviewer_id: str) -> ReviewerVerdict:
+        self.calls.append(reviewer_id)
+        return ReviewerVerdict(
+            reviewer_id=reviewer_id,
+            goal_contract_id=goal.contract_id,
+            behavior_sha256=behavior.behavior_sha256,
+            verdict="reject",
+            findings=(
+                ReviewFinding(
+                    code="deferred_to_operator",
+                    detail="The turn hands a command the session can run itself to the operator.",
+                    citation="Can you run npm install on tophand for me?",
+                ),
+            ),
+        )
+
+
 def _tracked_goal(root: Path) -> GoalRecord:
     goal = upsert_goal(
         root,
@@ -309,6 +334,9 @@ It reviews every finished lane turn before any done state is trusted.
 {_LIVE_PROOF_LINE}
 \u276f
 """
+_DEFERRAL_QUESTION_TURN = "Can you run npm install on tophand for me?\nI will pick it up once it is there.\n\u276f\n"
+_TOOL_ACTIVE_TURN = "\u23fa Bash(pytest -q)\n  \u23bf  1 passed in 0.02s\nSuite output above.\n\u276f\n"
+_TOOL_ACTIVE_TURN_AFTER_ORDER = "\u23fa Bash(chitra-goals now)\n  \u23bf  recorded\nStill on it.\n\u276f\n"
 
 
 def test_poll_once_does_not_block_on_a_slow_reviewer_and_later_drains_it(tmp_path: Path) -> None:
@@ -499,15 +527,157 @@ def test_turn_end_without_claim_is_finished_unverified_not_idle_green(tmp_path: 
     )
     watcher.poll_once()
     watcher.poll_once()
+    for _ in range(50):
+        stored = get_goal(tmp_path, goal.session_ref)
+        assert stored is not None
+        if len(reviewer.calls) == 2:
+            break
+        threading.Event().wait(0.01)
+        watcher.poll_once()
 
     stored = get_goal(tmp_path, goal.session_ref)
     assert stored is not None
     assert stored.status == "turn-finished-unverified"
     assert "without a completion claim" in stored.now
+    assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
+    review = json.loads((tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8"))
+    assert review["condition"] == "turn_end_without_completion_claim"
+    assert review["review_verdict"] == "accept"
+    assert "accepted the turn end" in review["summary"]
+
+
+def test_tool_active_turn_without_trigger_skips_isolated_review(tmp_path: Path) -> None:
+    goal = _tracked_goal(tmp_path)
+    reviewer = _AcceptingReviewer()
+
+    captures = iter(["Working... esc to interrupt\n", _TOOL_ACTIVE_TURN])
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures, _TOOL_ACTIVE_TURN))
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"),
+        runner=runner,
+        reviewer=reviewer,
+    )
+    watcher.poll_once()
+    watcher.poll_once()
+
+    stored = get_goal(tmp_path, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "turn-finished-unverified"
+    assert "isolated review was not run" in stored.now
     assert reviewer.calls == []
     review = json.loads((tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8"))
+    assert review["condition"] == "turn_end_without_completion_claim"
     assert review["review_verdict"] == "unavailable"
     assert "isolated review was not run" in review["summary"]
+
+
+def test_question_turn_without_completion_word_gets_deferral_review_and_nudge(tmp_path: Path) -> None:
+    goal = _tracked_goal(tmp_path)
+    reviewer = _DeferringReviewer()
+    state = {"finished": False}
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            content = _DEFERRAL_QUESTION_TURN if state["finished"] else "working on the implementation\nesc to interrupt\n❯\n"
+            return _completed(command, content)
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"),
+        runner=runner,
+        reviewer=reviewer,
+    )
+    try:
+        watcher.poll_once()
+        state["finished"] = True
+        watcher.poll_once()
+        orders: list[Path] = []
+        for _ in range(50):
+            orders = list((tmp_path / "queue" / "orders").glob("*.json"))
+            if orders:
+                break
+            threading.Event().wait(0.05)
+            watcher.poll_once()
+
+        assert len(orders) == 1
+        order = DispatchOrder.model_validate_json(orders[0].read_text(encoding="utf-8"))
+        assert order.session_ref == goal.session_ref
+        assert order.message_kind == "reasoned_nudge"
+        assert "in-authority" in order.nudge
+        assert order.decision_attestation is not None
+        assert order.decision_attestation.review_verdict == "reject"
+        assert order.decision_attestation.operator_confirmed is True
+        assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
+        stored = get_goal(tmp_path, goal.session_ref)
+        assert stored is not None
+        assert stored.status == "blocked"
+        review = json.loads((tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8"))
+        assert review["condition"] == "turn_end_without_completion_claim"
+        assert review["review_verdict"] == "reject"
+    finally:
+        watcher.shutdown()
+
+
+def test_delivered_order_triggers_review_of_next_turn_end(tmp_path: Path) -> None:
+    goal = _tracked_goal(tmp_path)
+    reviewer = _AcceptingReviewer()
+    captures = iter(
+        [
+            "working\nesc to interrupt\n❯\n",
+            _TOOL_ACTIVE_TURN,
+            "working the delivered order\nesc to interrupt\n❯\n",
+            _TOOL_ACTIVE_TURN_AFTER_ORDER,
+        ]
+    )
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures, _TOOL_ACTIVE_TURN_AFTER_ORDER))
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"),
+        runner=runner,
+        reviewer=reviewer,
+    )
+    try:
+        watcher.poll_once()
+        watcher.poll_once()
+        assert reviewer.calls == []
+
+        result = DispatchResult(
+            order_id="order-1",
+            session_ref=goal.session_ref,
+            status=DispatchStatus.SENT,
+            at=datetime.now(UTC).isoformat(),
+        )
+        results_dir = tmp_path / "queue" / "results"
+        results_dir.mkdir(parents=True)
+        (results_dir / "order-1.json").write_text(result.model_dump_json(), encoding="utf-8")
+
+        watcher.poll_once()
+        for _ in range(50):
+            if len(reviewer.calls) == 2:
+                break
+            threading.Event().wait(0.01)
+            watcher.poll_once()
+
+        assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
+        records = [json.loads(line) for line in (tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert [record["review_verdict"] for record in records] == ["unavailable", "accept"]
+    finally:
+        watcher.shutdown()
 
 
 def test_list_panes_uses_live_tmux_enumeration_and_deduplicates_pane_id() -> None:

@@ -2,9 +2,11 @@
 
 The events log remains a small wire contract consumed by ``chitra.triaged``.
 At a detected turn-end, this watcher also forces the deterministic completion
-boundary. Completion claims launch isolated watched-session reviewers against
-the lane's frozen goal; ordinary turns do not. Review metadata is written only
-to Chitra-owned ledgers and never to pane text.
+boundary. Isolated watched-session reviewers see a turn end that carries a
+completion claim, asks a question, made zero observable tool calls, or
+followed a delivered dispatch order -- the turn shapes that carry deferral,
+idle, and false-blocker defections, not just completion claims. Review
+metadata is written only to Chitra-owned ledgers and never to pane text.
 """
 
 from __future__ import annotations
@@ -61,6 +63,7 @@ from chitra.goals import (
 from chitra.lane_activity import LaneActivity, LaneBackend, load_lane_activity, upsert_lane_activity
 from chitra.lane_config import enabled_lanes
 from chitra.live_handoff import perform_live_handoff
+from chitra.orders import DispatchResult, DispatchStatus
 from chitra.policy_config import load_policy_config
 from chitra.reasoned_dispatch import abstaining_oracle, build_reasoned_dispatch
 from chitra.reasoning import Oracle, PrinciplesIndex
@@ -110,6 +113,11 @@ _VOLATILE_LINE_RE = re.compile(
     r"^[\s]*[·✻✽✳✢✶*●○◐◯]|tokens\b|🪟|⏵⏵|esc to interrupt|ctrl\+b|^─+$|^[\s]*$|Press up to edit|globalVersion: [0-9.]+"
 )
 _TIMING_CHROME_RE = re.compile(r"\([0-9]+m? ?[0-9]*s?[^)]*\)")
+# Rendered tool-activity chrome in a captured turn: Claude Code draws each tool
+# call as "⏺ Tool(...)" with its result under "⎿", Codex draws each action as
+# "• verb ...". None of these glyphs are stripped as volatile chrome, so a turn
+# whose normalized capture shows no such line made zero observable tool calls.
+_TOOL_ACTIVITY_RE = re.compile(r"^\s*(?:⏺|⎿|•)\s*\S")
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 ReviewKey = tuple[str, str]
 
@@ -461,6 +469,10 @@ class Watchd:
     clock: Callable[[], float] = time.monotonic
     reviewed_turns: set[ReviewKey] = field(default_factory=set)
     pending_reviews: dict[ReviewKey, PendingCompletionReview] = field(default_factory=dict)
+    # pane_id -> ISO timestamp of that pane's previous reviewed turn end. A
+    # dispatch order sent after this watermark preceded the current turn.
+    turn_end_watermarks: dict[str, str] = field(default_factory=dict)
+    _started_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat(), init=False, repr=False)
     _review_executor: ThreadPoolExecutor = field(init=False, repr=False)
     _review_executor_shutdown: bool = field(default=False, init=False, repr=False)
 
@@ -510,9 +522,10 @@ class Watchd:
         review_log = self.config.completion_review_log or self.config.state_dir / "completion_reviews.jsonl"
         completion_verdict = pending.turn_audit.completion.verdict if pending.turn_audit.completion is not None else None
         ask = ""
-        if pending.turn_audit.condition == "turn_end_without_completion_claim":
+        if review_signal is None and not review_error:
+            # The turn-end gate decided this shape needs no isolated review.
             status: GoalStatus = "turn-finished-unverified"
-            summary = f"{pending.turn_audit.summary}; no completion claim, so isolated review was not run"
+            summary = f"{pending.turn_audit.summary}; isolated review was not run for this turn end"
             review_verdict: Literal["accept", "reject", "unavailable"] = "unavailable"
         elif review_signal is None:
             status = "blocked"
@@ -528,10 +541,14 @@ class Watchd:
             status = "done-pending-close"
             summary = pending.turn_audit.summary
             review_verdict = "accept"
-        else:
+        elif pending.turn_audit.condition == "completion_claim":
             status = "completion-disputed"
             summary = pending.turn_audit.summary
             ask = "Resolve the cited completion-gate gaps before treating this lane as complete."
+            review_verdict = "accept"
+        else:
+            status = "turn-finished-unverified"
+            summary = f"{pending.turn_audit.summary}; isolated review accepted the turn end with no completion claim"
             review_verdict = "accept"
 
         if status == "done-pending-close":
@@ -621,6 +638,37 @@ class Watchd:
                     continue
             del self.pending_reviews[key]
 
+    def _turn_followed_delivered_order(self, session_ref: str, *, since: str) -> bool:
+        """Whether dispatchd recorded a sent order for this session after ``since``."""
+        queue_dir = self.config.queue_dir or self.config.state_dir / "queue"
+        results = queue_dir / "results"
+        if not results.is_dir():
+            return False
+        for path in sorted(results.glob("*.json")):
+            try:
+                result = DispatchResult.model_validate_json(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if result.session_ref == session_ref and result.status == DispatchStatus.SENT and result.at > since:
+                return True
+        return False
+
+    def _turn_end_requires_review(self, session_ref: str, text: str, *, since: str) -> bool:
+        """Structural triggers that send one enrolled lane's turn end to review.
+
+        A completion claim always reviews. So does a turn that asks a question,
+        a turn that made zero observable tool calls, and a turn that answers a
+        delivered dispatch order -- the shapes that carry deferral, idle, and
+        false-blocker defections a completion-claim regex never sees.
+        """
+        if is_completion_claim(text):
+            return True
+        if "?" in text:
+            return True
+        if self._turn_followed_delivered_order(session_ref, since=since):
+            return True
+        return not any(_TOOL_ACTIVITY_RE.match(line) for line in text.splitlines())
+
     def _review_turn_end(self, pane: Pane, content: str) -> None:
         """Run the cheap gate inline and schedule completion review off-thread."""
         text = "\n".join(normalize(content)).strip()
@@ -695,7 +743,9 @@ class Watchd:
             last_verified=goal.last_verified,
             future=Future(),
         )
-        if not is_completion_claim(text):
+        since = self.turn_end_watermarks.get(pane.pane_id, self._started_at)
+        self.turn_end_watermarks[pane.pane_id] = datetime.now(UTC).isoformat()
+        if not self._turn_end_requires_review(session_ref, text, since=since):
             self.reviewed_turns.add(key)
             self._finalize_turn_review(pending, review_signal=None)
             return
