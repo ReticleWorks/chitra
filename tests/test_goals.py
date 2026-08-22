@@ -1189,8 +1189,8 @@ def test_goal_cli_set_against_a_newer_store_exits_3_with_the_migrate_hint(
         record.session_ref,
         "--goal",
         record.goal,
-        "--done-when",
-        record.done_when,
+        "--done-item",
+        f"id=done-1 text={json.dumps(record.done_when)} validator=pytest receipt=tests-green",
         "--source",
         record.source,
     ]
