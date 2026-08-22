@@ -23,6 +23,7 @@ from chitra.close_gate import RequiredItem, _recorded_descopes, require_structur
 from chitra.completion_gate import CompletionEvidence, require_completion_receipts
 from chitra.plain_english import require_plain_english
 from chitra.state_paths import state_dir
+from chitra.validation_receipts import ReceiptError, require_verified_completion_receipts
 
 logger = structlog.get_logger(__name__)
 
@@ -681,8 +682,14 @@ def mark_completion_gate_passed(
         if enrollment_issues:
             raise GoalValidationError("completion requires a valid interview enrollment: " + "; ".join(enrollment_issues))
         try:
-            require_completion_receipts(existing.enrolled_done_when_items, completion_evidence)
-        except ValueError as exc:
+            verified_evidence = require_verified_completion_receipts(
+                root,
+                existing.session_ref,
+                existing.enrolled_done_when_items,
+                completion_evidence,
+            )
+            require_completion_receipts(existing.enrolled_done_when_items, verified_evidence)
+        except (ReceiptError, ValueError) as exc:
             raise GoalValidationError(str(exc)) from exc
         stored = _upsert_goal_locked(
             root,
@@ -691,7 +698,7 @@ def mark_completion_gate_passed(
                 now=now,
                 status="done-pending-close",
                 last_verified=last_verified,
-                completion_proofs=tuple(completion_evidence),
+                completion_proofs=verified_evidence,
             ),
             allow_done_transition=True,
             allow_completion_proofs=True,
@@ -984,7 +991,13 @@ def close_goal(
             enrollment_issues = validate_enrollment_contract(closed)
             if enrollment_issues:
                 raise GoalValidationError("completion close requires a valid interview enrollment: " + "; ".join(enrollment_issues))
-            proofs = tuple(completion_evidence) or closed.completion_proofs
+            claimed_proofs = tuple(completion_evidence) or closed.completion_proofs
+            proofs = require_verified_completion_receipts(
+                root,
+                closed.session_ref,
+                closed.enrolled_done_when_items,
+                claimed_proofs,
+            )
             require_structured_close_inventory(closed.enrolled_done_when_items, proofs)
         _write_goals(root, [record for record in records if record.session_ref != session_ref])
     logger.info(
