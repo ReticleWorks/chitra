@@ -29,6 +29,8 @@ from .detectors import Finding
 
 LADDER_STAGES: tuple[str, ...] = ("nudge", "redirect", "rescue", "relaunch")
 
+CONSUMED_CHECKPOINT_SCHEMA = "chitra.detect.consumed-checkpoint.v1"
+
 _LANE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _HEX64_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
@@ -126,19 +128,23 @@ class IncidentStore:
             os.chmod(self.lock_path, 0o600)
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             try:
-                fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-                try:
-                    os.fchmod(fd, 0o600)
-                    encoded = (record.model_dump_json() + "\n").encode()
-                    view = memoryview(encoded)
-                    while view:
-                        written = os.write(fd, view)
-                        view = view[written:]
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
+                return self._append_locked(record)
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def _append_locked(self, record: IncidentRecord) -> IncidentRecord:
+        """Durably append one record. The caller must hold ``lock_path``."""
+        fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            encoded = (record.model_dump_json() + "\n").encode()
+            view = memoryview(encoded)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         return record
 
     def open_incident(self, *, lane: str, finding: Finding, order_marker: str) -> IncidentRecord:
@@ -219,10 +225,56 @@ class IncidentStore:
         bundle = _rescue_bundle_verified(self.state_root, target, bundle_sha256)
         if bundle is None:
             raise ValueError("rescue bundle hash does not match a governed RESCUE bundle")
-        if not _checkpoint_receipt_verified(self.state_root, target, bundle, checkpoint_ref):
+        nonce = _checkpoint_receipt_nonce(self.state_root, target, bundle, checkpoint_ref)
+        if nonce is None:
             raise ValueError("checkpoint reference does not match a governed checkpoint receipt")
         advanced = target.model_copy(update={"rescue_bundle_sha256": bundle_sha256, "checkpoint_ref": checkpoint_ref})
-        return self._append(advanced)
+        return self._consume_receipt_and_seal(advanced, checkpoint_ref=checkpoint_ref, nonce=nonce)
+
+    def _consume_receipt_and_seal(
+        self, record: IncidentRecord, *, checkpoint_ref: str, nonce: str
+    ) -> IncidentRecord:
+        """Spend a checkpoint receipt exactly once, then append its seal.
+
+        The duplicate-receipt check, the durable consumption record, and the
+        incident append all happen under one exclusive hold of the incident
+        lock, so two racers (or a replay after restart, which re-reads the
+        same durable consumption log) can never both proceed. The consumption
+        row is fsync'd *before* the incident row: a crash between the two
+        leaves the receipt spent with no sealed row -- a retry fails closed,
+        never appending a second sealed row for one receipt.
+        """
+        self.directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.directory, 0o700)
+        with self.lock_path.open("a", encoding="utf-8") as lock:
+            os.chmod(self.lock_path, 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                consumed_refs, consumed_nonces = _load_consumed_checkpoints(self.state_root)
+                if checkpoint_ref in consumed_refs or nonce in consumed_nonces:
+                    raise ValueError(
+                        f"checkpoint receipt {checkpoint_ref!r} was already consumed; a receipt seals exactly once"
+                    )
+                latest = next(
+                    (
+                        candidate
+                        for candidate in reversed(self.load())
+                        if candidate.fingerprint == record.fingerprint
+                    ),
+                    None,
+                )
+                if latest is not None and (latest.checkpoint_ref or latest.rescue_bundle_sha256):
+                    raise ValueError("incident rescue stage is already sealed")
+                _append_consumed_checkpoint(
+                    self.state_root,
+                    checkpoint_ref=checkpoint_ref,
+                    nonce=nonce,
+                    lane=self.lane,
+                    fingerprint=record.fingerprint,
+                )
+                return self._append_locked(record)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def _utc_now() -> str:
@@ -372,9 +424,16 @@ def _rescue_bundle_verified(state_root: Path, record: IncidentRecord, bundle_sha
     return None
 
 
-def _checkpoint_receipt_verified(
+def _checkpoint_receipt_nonce(
     state_root: Path, record: IncidentRecord, bundle: Any, checkpoint_ref: str
-) -> bool:
+) -> str | None:
+    """Verify a governed checkpoint receipt and return its anti-replay nonce.
+
+    Returns ``None`` when the receipt is missing, forged, unbound to this
+    incident and bundle, or carries no usable nonce. The returned nonce is
+    not yet proof of freshness -- the caller must durably consume it (see
+    ``IncidentStore._consume_receipt_and_seal``) before honoring the seal.
+    """
     from .rescue import (
         CHECKPOINT_CANONICALIZATION,
         CHECKPOINT_PROVENANCE_KIND,
@@ -389,11 +448,11 @@ def _checkpoint_receipt_verified(
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return False
+        return None
     if not isinstance(payload, dict):
-        return False
+        return None
     if not verify_checkpoint_receipt_signature(payload, state_root=state_root):
-        return False
+        return None
     expected_session = record.consumption.session_ref if record.consumption else ""
     expected_fields = {
         "schema_name",
@@ -412,32 +471,96 @@ def _checkpoint_receipt_verified(
         "signature",
     }
     if set(payload) != expected_fields:
-        return False
+        return None
     if payload.get("schema_name") != CHECKPOINT_SCHEMA or payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
-        return False
+        return None
     if payload.get("checkpoint_ref") != checkpoint_ref:
-        return False
+        return None
     if payload.get("lane") != record.lane or payload.get("session_ref") != expected_session:
-        return False
+        return None
     if payload.get("incident_fingerprint") != record.fingerprint:
-        return False
+        return None
     if payload.get("rescue_bundle_sha256") != bundle.bundle_sha256:
-        return False
+        return None
     if not _checkpoint_target_identity_matches(payload.get("target_process_identity"), bundle.process_identity):
-        return False
+        return None
     if not _checkpoint_ledger_binding_matches(payload.get("ledger_binding"), record):
-        return False
+        return None
     provenance = payload.get("provenance")
     if not isinstance(provenance, dict) or provenance.get("kind") != CHECKPOINT_PROVENANCE_KIND:
-        return False
+        return None
     if provenance.get("writer") != CHECKPOINT_WRITER:
-        return False
+        return None
     if provenance.get("signature_scope") != CHECKPOINT_SIGNATURE_SCOPE:
-        return False
+        return None
     if provenance.get("canonicalization") != CHECKPOINT_CANONICALIZATION:
-        return False
+        return None
     nonce = payload.get("anti_replay_nonce")
-    return isinstance(nonce, str) and len(nonce) >= 16
+    if not isinstance(nonce, str) or len(nonce) < 16:
+        return None
+    return nonce
+
+
+def _consumed_checkpoints_path(state_root: Path) -> Path:
+    return state_root / "checkpoints" / ".consumed-checkpoints.jsonl"
+
+
+def _load_consumed_checkpoints(state_root: Path) -> tuple[set[str], set[str]]:
+    """Return the checkpoint refs and nonces earlier seals durably consumed.
+
+    Survives restarts by construction: the log is an append-only file under
+    the state root, so a replayed receipt is rejected even by a fresh
+    process that never saw the original seal.
+    """
+    refs: set[str] = set()
+    nonces: set[str] = set()
+    try:
+        lines = _consumed_checkpoints_path(state_root).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return refs, nonces
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        ref = payload.get("checkpoint_ref")
+        if isinstance(ref, str) and ref:
+            refs.add(ref)
+        stored_nonce = payload.get("anti_replay_nonce")
+        if isinstance(stored_nonce, str) and stored_nonce:
+            nonces.add(stored_nonce)
+    return refs, nonces
+
+
+def _append_consumed_checkpoint(
+    state_root: Path, *, checkpoint_ref: str, nonce: str, lane: str, fingerprint: str
+) -> None:
+    directory = state_root / "checkpoints"
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    row = {
+        "schema_name": CONSUMED_CHECKPOINT_SCHEMA,
+        "checkpoint_ref": checkpoint_ref,
+        "anti_replay_nonce": nonce,
+        "lane": lane,
+        "incident_fingerprint": fingerprint,
+        "consumed_at": _utc_now(),
+    }
+    encoded = (json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
+    fd = os.open(_consumed_checkpoints_path(state_root), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        view = memoryview(encoded)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _valid_rescue_process_identity(identity: dict[str, Any], *, expected_session: str) -> bool:

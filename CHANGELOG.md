@@ -20,6 +20,19 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.14.12] - 2026-08-22
+
+### Fixed
+
+- Bind dispatch delivery-ledger rows to the adapter-native session identity
+  normalized from the confirmed lane transcript (signature version 5,
+  never derived from routing_hint), so genuine deliveries advance the W3
+  ladder while cross-session evidence fails closed.
+- Make rescue checkpoint receipts single-create and their consumption
+  atomic: a seal now durably spends the receipt's reference and anti-replay
+  nonce under the incident lock before appending, rejecting duplicate or
+  replayed receipts exactly once ever, including after restart.
+
 ## [0.14.11] - 2026-08-22
 
 ### Fixed

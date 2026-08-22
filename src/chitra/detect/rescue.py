@@ -322,7 +322,12 @@ def write_checkpoint_receipt(
     directory.mkdir(parents=True, exist_ok=True)
     os.chmod(directory, 0o700)
     path = directory / f"{checkpoint_ref}.json"
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as exc:
+        raise ValueError(
+            f"checkpoint reference {checkpoint_ref!r} was already issued; receipt creation is single-use"
+        ) from exc
     try:
         os.fchmod(fd, 0o600)
         encoded = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode()

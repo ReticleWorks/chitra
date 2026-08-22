@@ -27,6 +27,17 @@ from chitra.detect import (
     write_checkpoint_receipt,
     write_rescue_bundle,
 )
+from chitra.detect.ladder import CONSUMED_CHECKPOINT_SCHEMA
+from chitra.detect.rescue import (
+    CHECKPOINT_PROVENANCE_KIND,
+    CHECKPOINT_SCHEMA_VERSION,
+    CHECKPOINT_SIGNATURE_SCOPE,
+    CHECKPOINT_WRITER,
+    RescueBundle,
+    load_or_create_checkpoint_key,
+    sign_checkpoint_receipt,
+)
+from chitra.dispatchd import _ensure_delivery_ledger
 from chitra.goals import EnrolledDoneWhenItem
 from chitra.journal import (
     CanonicalEvent,
@@ -39,6 +50,7 @@ from chitra.journal import (
 )
 from chitra.journal.models import ByteRange, TranscriptIdentity
 from chitra.ledger import LedgerEntry, append_entry, message_hash, sign
+from chitra.orders import DispatchOrder, DispatchResult, DispatchStatus
 
 FIXTURES = Path(__file__).parent / "fixtures" / "failure-modes"
 LANE = "claude"
@@ -863,3 +875,251 @@ def test_rescue_bundle_is_bounded_hash_bound_and_brief_renders(tmp_path: Path) -
 def test_every_failure_mode_fixture_ingests_cleanly() -> None:
     names = [path.stem for path in sorted(FIXTURES.glob("*.jsonl"))]
     assert len(names) == 8
+
+
+def test_dispatch_delivery_ledger_binds_native_session_identity(tmp_path: Path) -> None:
+    """The production dispatch ledger producer signs the normalized native
+    session identity from the confirmed transcript (never from
+    routing_hint), genuine consumption advances, and cross-session evidence
+    is rejected."""
+    transcript = tmp_path / "lane-transcript.jsonl"
+    transcript.write_bytes((FIXTURES / "claude-unnecessary-steps.jsonl").read_bytes())
+    context = NormalizationContext(
+        instance="w3-fixture",
+        lane=LANE,
+        client=Client.CLAUDE,
+        client_version="2.1.229",
+    )
+    with JournalIngestor(state_root=tmp_path / "journal", transcript_path=transcript, context=context) as ingestor:
+        observed = ingestor.poll().observed
+    native_session_id = observed[0].session_id
+    assert native_session_id and native_session_id != f"host:{LANE}:0.0"
+
+    session_ref = f"host:{LANE}:0.0"
+    nudge = "[C] nudge-native please continue"
+    order = DispatchOrder(order_id="order-native-1", session_ref=session_ref, nudge=nudge)
+    result = DispatchResult(
+        order_id=order.order_id,
+        session_ref=session_ref,
+        status=DispatchStatus.SENT,
+        reason="sent",
+        transcript_path=str(transcript),
+    )
+    result.routing_hint = "opus-4.8@claude-code+zdr"
+    result.resolved_zdr = True
+    entry = _ensure_delivery_ledger(
+        order,
+        result,
+        ledger_path=tmp_path / "ledger.jsonl",
+        ledger_key_path=tmp_path / "ledger.key",
+    )
+    assert entry.sig_v == 5
+    assert entry.native_session_id == native_session_id
+    assert result.native_session_id == native_session_id
+    assert entry.routing_hint == "opus-4.8@claude-code+zdr"
+
+    journal = (
+        observed[0].model_copy(
+            update={
+                "event_id": "dispatch-user",
+                "native_type": "user",
+                "normalized_type": CanonicalType.UNKNOWN,
+                "payload": {"text": nudge},
+            }
+        ),
+        _final(observed).model_copy(update={"event_id": "dispatch-final"}),
+    )
+    assert journal[0].session_id == native_session_id
+    key = (tmp_path / "ledger.key").read_bytes()
+    store = IncidentStore(tmp_path, LANE)
+    ladder = ResponseLadder(store, journal_events=journal, ledger_key=key)
+    finding = Finding(
+        detector="unnecessary_steps",
+        fingerprint_seed={"signature": "stable"},
+        event_refs=("evt-1",),
+        unmet_item="done-1",
+        expected_next_progress="try a different approach",
+        detail="three identical reads",
+    )
+    assert ladder.evaluate(lane=LANE, finding=finding, order_marker="nudge-native").action == "open"
+    store.attach_consumption(
+        fingerprint=finding.fingerprint,
+        order_marker="nudge-native",
+        proof=ConsumptionProof(
+            ledger_entry=entry,
+            session_ref=session_ref,
+            native_session_id="host:claude:a-different-session",
+            user_event_id="dispatch-user",
+            turn_event_id="dispatch-final",
+        ),
+    )
+    assert ladder.evaluate(lane=LANE, finding=finding, order_marker="redirect-1").action == "hold"
+    store.attach_consumption(
+        fingerprint=finding.fingerprint,
+        order_marker="nudge-native",
+        proof=ConsumptionProof(
+            ledger_entry=entry,
+            session_ref=session_ref,
+            native_session_id=native_session_id,
+            user_event_id="dispatch-user",
+            turn_event_id="dispatch-final",
+        ),
+    )
+    advanced = ladder.evaluate(lane=LANE, finding=finding, order_marker="redirect-1")
+    assert advanced.action == "advance"
+    assert advanced.stage == "redirect"
+
+
+def _rescue_stage_incident(tmp_path: Path) -> tuple[IncidentStore, Finding, str]:
+    key = b"k" * 32
+    session_ref = f"host:{LANE}:0.0"
+    sent_at = "2026-08-21T15:00:00+00:00"
+
+    def user_event(event_id: str, marker: str) -> CanonicalEvent:
+        return _event(
+            event_id,
+            CanonicalType.UNKNOWN,
+            native_type="user",
+            payload={"text": f"[C] {marker} please continue"},
+            session_id=session_ref,
+        )
+
+    def final_event(event_id: str) -> CanonicalEvent:
+        return _event(event_id, CanonicalType.FINAL_RESPONSE, payload={"text": "done"}, session_id=session_ref)
+
+    def proof(marker: str, user_event_id: str, turn_event_id: str) -> ConsumptionProof:
+        text = f"[C] {marker} please continue"
+        digest = message_hash(text)
+        return ConsumptionProof(
+            ledger_entry=LedgerEntry(
+                order_id=f"order-{marker}",
+                session_ref=session_ref,
+                tag="[C]",
+                sig_v=4,
+                message_hash=digest,
+                sent_at=sent_at,
+                signature=sign(key, session_ref=session_ref, tag="[C]", digest=digest, sent_at=sent_at),
+            ),
+            session_ref=session_ref,
+            native_session_id=session_ref,
+            user_event_id=user_event_id,
+            turn_event_id=turn_event_id,
+        )
+
+    journal = (
+        user_event("user-1", "nudge-1"),
+        final_event("turn-1"),
+        user_event("user-2", "redirect-1"),
+        final_event("turn-2"),
+        user_event("user-3", "rescue-1"),
+        final_event("turn-3"),
+    )
+    store = IncidentStore(tmp_path, LANE)
+    ladder = ResponseLadder(store, journal_events=journal, ledger_key=key)
+    finding = Finding(
+        detector="excessive_testing",
+        fingerprint_seed={"signature": "suite"},
+        event_refs=("evt-a",),
+        unmet_item="done-1",
+        expected_next_progress="change something before rerunning",
+        detail="suite repeated unchanged",
+    )
+    assert ladder.evaluate(lane=LANE, finding=finding, order_marker="nudge-1").action == "open"
+    store.attach_consumption(fingerprint=finding.fingerprint, order_marker="nudge-1", proof=proof("nudge-1", "user-1", "turn-1"))
+    assert ladder.evaluate(lane=LANE, finding=finding, order_marker="redirect-1").action == "advance"
+    store.attach_consumption(fingerprint=finding.fingerprint, order_marker="redirect-1", proof=proof("redirect-1", "user-2", "turn-2"))
+    assert ladder.evaluate(lane=LANE, finding=finding, order_marker="rescue-1").action == "advance"
+    store.attach_consumption(fingerprint=finding.fingerprint, order_marker="rescue-1", proof=proof("rescue-1", "user-3", "turn-3"))
+    return store, finding, session_ref
+
+
+def test_checkpoint_seal_rejects_duplicate_receipt_nonce_and_appends_once(tmp_path: Path) -> None:
+    """One governed checkpoint receipt seals exactly once: the duplicate
+    check, durable consumption, and the incident append are atomic, survive
+    restart, and reject replayed refs and replayed nonces alike."""
+    store, finding, session_ref = _rescue_stage_incident(tmp_path)
+    consumed_rescue = store.latest(finding.fingerprint)
+    assert consumed_rescue is not None
+    _write_verified_rescue_and_checkpoint(tmp_path, consumed_rescue, session_ref=session_ref, checkpoint_ref="checkpoint-1")
+    bundle_sha256 = _latest_rescue_sha(tmp_path)
+
+    def seal(store_: IncidentStore, checkpoint_ref: str) -> None:
+        store_.seal_rescue_checkpoint(
+            fingerprint=finding.fingerprint,
+            order_marker="rescue-1",
+            bundle_sha256=bundle_sha256,
+            checkpoint_ref=checkpoint_ref,
+        )
+
+    rows_after_open = len(store.load())
+    seal(store, "checkpoint-1")
+    sealed = [record for record in store.load() if record.checkpoint_ref]
+    assert len(sealed) == 1
+    assert sealed[0].checkpoint_ref == "checkpoint-1"
+    assert len(store.load()) == rows_after_open + 1
+
+    with pytest.raises(ValueError, match="already consumed"):
+        seal(store, "checkpoint-1")
+    assert len(store.load()) == rows_after_open + 1
+
+    fresh = IncidentStore(tmp_path, LANE)
+    with pytest.raises(ValueError, match="already consumed"):
+        seal(fresh, "checkpoint-1")
+    assert len(fresh.load()) == rows_after_open + 1
+
+    receipt = json.loads((tmp_path / "checkpoints" / "checkpoint-1.json").read_text(encoding="utf-8"))
+    entry = sealed[0].consumption.ledger_entry
+    assert receipt["anti_replay_nonce"]
+    replayed_nonce_payload = {
+        "schema_name": CHECKPOINT_SCHEMA,
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "checkpoint_ref": "checkpoint-2",
+        "lane": LANE,
+        "session_ref": session_ref,
+        "incident_fingerprint": finding.fingerprint,
+        "rescue_bundle_sha256": bundle_sha256,
+        "target_process_identity": receipt["target_process_identity"],
+        "created_at": "2026-08-21T15:00:02+00:00",
+        "writer_identity": receipt["writer_identity"],
+        "ledger_binding": {
+            "order_id": entry.order_id,
+            "session_ref": entry.session_ref,
+            "native_session_id": entry.native_session_id,
+            "message_hash": entry.message_hash,
+            "sent_at": entry.sent_at,
+            "signature": entry.signature,
+        },
+        "provenance": {
+            "kind": CHECKPOINT_PROVENANCE_KIND,
+            "writer": CHECKPOINT_WRITER,
+            "signature_scope": CHECKPOINT_SIGNATURE_SCOPE,
+            "canonicalization": CHECKPOINT_CANONICALIZATION,
+        },
+        "anti_replay_nonce": receipt["anti_replay_nonce"],
+        "signature": "",
+    }
+    replayed_nonce_payload["signature"] = sign_checkpoint_receipt(
+        replayed_nonce_payload, key=load_or_create_checkpoint_key(tmp_path)
+    )
+    (tmp_path / "checkpoints" / "checkpoint-2.json").write_text(
+        json.dumps(replayed_nonce_payload), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="already consumed"):
+        seal(store, "checkpoint-2")
+    assert len(store.load()) == rows_after_open + 1
+    assert [record for record in store.load() if record.checkpoint_ref] == sealed
+
+    bundle = RescueBundle.model_validate(
+        json.loads(next((tmp_path / "rescue").glob("*.json")).read_text(encoding="utf-8"))
+    )
+    with pytest.raises(ValueError, match="already issued"):
+        write_checkpoint_receipt(
+            bundle=bundle,
+            record=store.latest(finding.fingerprint),
+            state_root=tmp_path,
+            checkpoint_ref="checkpoint-1",
+        )
+    consumed_log = json.loads((tmp_path / "checkpoints" / ".consumed-checkpoints.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert consumed_log["schema_name"] == CONSUMED_CHECKPOINT_SCHEMA
+    assert consumed_log["checkpoint_ref"] == "checkpoint-1"
+    assert consumed_log["anti_replay_nonce"] == receipt["anti_replay_nonce"]
