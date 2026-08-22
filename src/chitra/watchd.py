@@ -678,6 +678,12 @@ class Watchd:
         assert self.status_broker is not None
         if self.status_broker.frozen:
             return
+        root = self.config.goals_root or self.config.state_dir
+        if goals_schema_newer_than_installed(root) is not None:
+            # Review finalization writes goals. Keep ready reviews queued until
+            # a package that understands the newer store can apply them.
+            note_goals_schema_state(root)
+            return
         for key, pending in list(self.pending_reviews.items()):
             if not pending.future.done():
                 continue
@@ -966,7 +972,6 @@ class Watchd:
 
     def poll_once(self) -> int:
         """Capture panes and emit only semantic status transitions."""
-        self._drain_completed_reviews()
         assert self.status_broker is not None
         if self.status_broker.frozen:
             return 0
@@ -978,6 +983,7 @@ class Watchd:
             note_goals_schema_state(root)
             return self._poll_panes_only()
         try:
+            self._drain_completed_reviews()
             return self._poll_once_locked(root)
         except GoalsSchemaNewerError:
             # A newer store appeared mid-poll; degrade exactly as above.

@@ -935,6 +935,37 @@ def test_watchd_survives_a_newer_goals_store_read_only(tmp_path: Path, capsys: p
     assert len(notices) == 1
 
 
+def test_watchd_does_not_drain_completed_reviews_before_newer_schema_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ready review must not get a goal-write attempt against a newer store.
+
+    ``poll_once`` drains ready review futures before capturing panes. That
+    drain is itself a goal-writing path, so the newer-schema guard must run
+    before it.
+    """
+    goal = _tracked_goal(tmp_path)
+    payload = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
+    payload["schema"] = "chitra.goals.v4"
+    (tmp_path / "goals.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    watcher = Watchd(WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"), runner=lambda _: _completed([], ""))
+
+    def drain(_watcher: Watchd) -> None:
+        from chitra.goals import update_now
+
+        update_now(tmp_path, goal.session_ref, now="must remain read-only")
+
+    monkeypatch.setattr(Watchd, "_drain_completed_reviews", drain)
+    try:
+        assert watcher.poll_once() == 0
+    finally:
+        monkeypatch.undo()
+        watcher.shutdown()
+
+    assert json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))["schema"] == "chitra.goals.v4"
+
+
 def test_list_panes_uses_live_tmux_enumeration_and_deduplicates_pane_id() -> None:
     seen_commands: list[Sequence[str]] = []
 
