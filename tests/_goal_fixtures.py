@@ -83,7 +83,10 @@ def ingest_passing_receipt(
     )
     evidence_path = source_dir / "evidence" / "test-report.json"
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
-    command = trusted_validator_argv(str(target_path))
+    from chitra.validator_registry import load_validators
+
+    entry = load_validators().get(validator)
+    command = list(entry.argv) if entry is not None else trusted_validator_argv(str(target_path))
     evidence_path.write_text(
         json.dumps({"schema_version": "chitra-validator-report-v1", "command": command, "exit_code": 0}),
         encoding="utf-8",

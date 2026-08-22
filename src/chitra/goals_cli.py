@@ -6,7 +6,9 @@ import argparse
 import hashlib
 import json
 import secrets
+import shlex
 import sys
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,39 @@ from chitra.lane_read import extract_open_asks, read_last_assistant_message
 from chitra.policy_config import load_policy_config, resolve_guidance
 from chitra.state_paths import state_dir
 
+_DONE_ITEM_KEYS = ("id", "text", "validator", "receipt")
+
+
+def _parse_done_item_specs(specs: Sequence[str]) -> tuple[goal_store.EnrolledDoneWhenItem, ...]:
+    """Parse repeated ``--done-item`` specs into frozen done items."""
+    items: list[goal_store.EnrolledDoneWhenItem] = []
+    for position, spec in enumerate(specs, start=1):
+        fields: dict[str, str] = {}
+        try:
+            tokens = shlex.split(spec)
+        except ValueError as exc:
+            raise ValueError(f"--done-item {position} is not parsable: {exc}") from exc
+        for token in tokens:
+            key, separator, value = token.partition("=")
+            if not separator or key not in _DONE_ITEM_KEYS or key in fields:
+                raise ValueError(
+                    f"--done-item {position} has malformed token {token!r}; "
+                    f"expected one key=value per token with keys {' '.join(_DONE_ITEM_KEYS)}"
+                )
+            fields[key] = value
+        missing = [key for key in _DONE_ITEM_KEYS if key not in fields]
+        if missing:
+            raise ValueError(f"--done-item {position} is missing {', '.join(missing)}")
+        items.append(
+            goal_store.EnrolledDoneWhenItem(
+                id=fields["id"],
+                text=fields["text"],
+                validator=fields["validator"],
+                required_receipt=fields["receipt"],
+            )
+        )
+    return tuple(items)
+
 
 def _interview_nonce_path(root: Path, session_ref: str) -> Path:
     token = hashlib.sha256(session_ref.encode("utf-8")).hexdigest()
@@ -31,6 +66,7 @@ def _set_request_sha256(args: argparse.Namespace) -> str:
         "session_ref": args.session_ref,
         "goal": args.goal,
         "done_when": args.done_when,
+        "done_items": list(getattr(args, "done_item", ()) or ()),
         "source": args.source,
         "intent": args.intent,
         "scope": args.scope,
@@ -149,16 +185,20 @@ def _parse_interview_result(root: Path, args: argparse.Namespace) -> tuple[
         ordered_answers.append({"question": question, "answer": entry["answer"].strip(), "provenance": provenance})
 
     raw_items = payload.get("enrolled_done_when_items", payload.get("done_when_items"))
-    if not isinstance(raw_items, list):
-        raise ValueError("interview result enrolled_done_when_items must be a list")
-    try:
-        items = tuple(goal_store.EnrolledDoneWhenItem(**item) for item in raw_items if isinstance(item, dict))
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"invalid enrolled done item: {exc}") from exc
-    if len(items) != len(raw_items):
-        raise ValueError("interview result done items must be objects")
-    if not items:
-        raise ValueError("interview result enrolled_done_when_items must contain at least one item")
+    done_item_specs = _parse_done_item_specs(args.done_item)
+    if done_item_specs:
+        items = done_item_specs
+    else:
+        if not isinstance(raw_items, list):
+            raise ValueError("interview result enrolled_done_when_items must be a list")
+        try:
+            items = tuple(goal_store.EnrolledDoneWhenItem(**item) for item in raw_items if isinstance(item, dict))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid enrolled done item: {exc}") from exc
+        if len(items) != len(raw_items):
+            raise ValueError("interview result done items must be objects")
+        if not items:
+            raise ValueError("interview result enrolled_done_when_items must contain at least one item")
     answers_sha256 = hashlib.sha256(
         json.dumps(ordered_answers, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -198,6 +238,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     set_command.add_argument("--session-ref", required=True)
     set_command.add_argument("--goal", required=True)
     set_command.add_argument("--done-when", default="", help="Display-only proposal; interviewed done items become the stored value.")
+    set_command.add_argument(
+        "--done-item",
+        action="append",
+        default=[],
+        metavar="ID=<id> TEXT=<...> VALIDATOR=<registry-name> RECEIPT=<name>",
+        help=(
+            "Structured frozen done condition for a new enrollment; repeat once per item. "
+            "Quote values containing spaces. Free-text --done-when is refused on a new record."
+        ),
+    )
     set_command.add_argument("--source", required=True)
     set_command.add_argument("--intent", default=None)
     set_command.add_argument("--scope", default=None)
@@ -409,6 +459,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "set":
             existing = goal_store.get_goal(args.root, args.session_ref)
+            if existing is None and args.done_when.strip():
+                raise goal_store.GoalValidationError(
+                    "free-text --done-when is refused on a new record; enroll structured --done-item conditions"
+                )
+            if existing is not None and args.done_item:
+                raise goal_store.GoalValidationError("--done-item applies only to a new enrollment")
             if existing is None and args.interview_result is None:
                 print(json.dumps(_interview_required(args.root, args), indent=2, sort_keys=True))
                 return 2
