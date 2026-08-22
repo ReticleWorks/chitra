@@ -79,16 +79,13 @@ def _interview_required(root: Path, args: argparse.Namespace) -> dict[str, objec
     }
 
 
-def _current_nonce(nonce_path: Path) -> str:
-    """Read the currently issued nonce for a session, or an empty string when absent."""
+def _read_nonce_record(nonce_path: Path) -> dict[str, Any] | None:
+    """Read the persisted nonce record under an already-held nonce lock."""
     try:
-        record = json.loads(nonce_path.read_text(encoding="utf-8"))
+        loaded: Any = json.loads(nonce_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return ""
-    if not isinstance(record, dict) or not isinstance(record.get("nonce"), str):
-        return ""
-    nonce: str = record["nonce"]
-    return nonce
+        return None
+    return loaded if isinstance(loaded, dict) else None
 
 
 def _parse_interview_result(root: Path, args: argparse.Namespace) -> tuple[
@@ -348,9 +345,13 @@ def _enroll_from_interview_result(root: Path, args: argparse.Namespace) -> goal_
     ``_upsert_goal_locked``; with no existing record there is nothing to
     compare strategic fields against, and a genuine stale second enrollment
     still fails because the re-checked ``existing`` guard above raises first.
-    If the post-commit re-check finds a replaced nonce, the just-written goal
-    document is rolled back to its exact pre-commit bytes under the same lock,
-    so no partial enrollment survives and crash safety (atomic file
+    The final nonce comparison and the consumption write are one critical
+    section under the nonce lock itself (nested inside the fixed
+    goals→nonce order, the same order issuance uses), so a replacement nonce
+    cannot slip in between that comparison and consumption: either the
+    verified nonce is still current when it is consumed, or the just-written
+    goal document is rolled back to its exact pre-commit bytes under the same
+    goals lock and the enrollment fails closed.  Crash safety (atomic file
     replacement throughout) is unchanged.
     """
     with locked_json_store(goal_store.goals_path(root)):
@@ -385,16 +386,21 @@ def _enroll_from_interview_result(root: Path, args: argparse.Namespace) -> goal_
             pre_commit_payload = None
         stored = goal_store._upsert_goal_locked(args.root, requested_record, allow_strategic_change=True)
         try:
-            if nonce_record["nonce"] != _current_nonce(nonce_path):
-                raise ValueError("interview nonce was replaced before enrollment committed")
+            with locked_json_store(nonce_path):
+                persisted_nonce_record = _read_nonce_record(nonce_path)
+                if (
+                    persisted_nonce_record is None
+                    or persisted_nonce_record.get("nonce") != nonce_record["nonce"]
+                ):
+                    raise ValueError("interview nonce was replaced before enrollment committed")
+                nonce_record["consumed_at"] = stored.enrolled_at
+                write_json_atomic(nonce_path, nonce_record)
         except ValueError:
             if pre_commit_payload is None:
                 (goal_store.goals_path(root)).unlink(missing_ok=True)
             else:
                 write_json_atomic(goal_store.goals_path(root), pre_commit_payload)
             raise
-        nonce_record["consumed_at"] = stored.enrolled_at
-        write_json_atomic(nonce_path, nonce_record)
     return stored
 
 
