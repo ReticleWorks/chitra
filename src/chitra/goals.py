@@ -24,6 +24,8 @@ from chitra.completion_gate import CompletionEvidence, require_completion_receip
 from chitra.plain_english import require_plain_english
 from chitra.state_paths import state_dir
 from chitra.validation_receipts import ReceiptError, require_verified_completion_receipts
+from chitra.validation_receipts import receipt_name as safe_receipt_name
+from chitra.validator_registry import load_validators
 
 logger = structlog.get_logger(__name__)
 
@@ -278,9 +280,15 @@ def render_done_when_items(items: Sequence[EnrolledDoneWhenItem]) -> str:
     return "; ".join(item.text.strip() for item in items)
 
 
-def validate_enrollment_contract(rec: GoalRecord) -> list[str]:
-    """Return violations of the v3 atomic interview enrollment contract."""
+def validate_enrollment_contract(rec: GoalRecord, *, root: Path | None = None) -> list[str]:
+    """Return violations of the v3 atomic interview enrollment contract.
+
+    When ``root`` is provided, every enrolled item's validator must be a key
+    in that instance's registered-validator file; a validator the registry
+    does not name is a self-reported proof and cannot be enrolled.
+    """
     issues: list[str] = []
+    registered_validators = load_validators(root) if root is not None else None
     receipt = rec.interview_receipt
     if receipt is None:
         issues.append("interview_receipt is required")
@@ -305,6 +313,7 @@ def validate_enrollment_contract(rec: GoalRecord) -> list[str]:
     if not rec.enrolled_done_when_items:
         issues.append("enrolled_done_when_items must contain at least one item")
     seen_ids: set[str] = set()
+    seen_receipts: set[str] = set()
     for item in rec.enrolled_done_when_items:
         if not item.id.strip():
             issues.append("enrolled done item id must be non-empty")
@@ -317,6 +326,19 @@ def validate_enrollment_contract(rec: GoalRecord) -> list[str]:
             issues.append(f"enrolled done item {item.id!r} validator must be non-empty")
         if not item.required_receipt.strip():
             issues.append(f"enrolled done item {item.id!r} required_receipt must be non-empty")
+        elif item.required_receipt in seen_receipts:
+            issues.append(
+                f"enrolled done item {item.id!r} required receipt {item.required_receipt!r} is duplicated; "
+                "one receipt name cannot stand in for two independent validator results"
+            )
+        else:
+            try:
+                safe_receipt_name(item.required_receipt)
+            except ReceiptError:
+                issues.append(f"enrolled done item {item.id!r} required receipt {item.required_receipt!r} must be a path-safe stable name")
+        seen_receipts.add(item.required_receipt)
+        if registered_validators is not None and item.validator not in registered_validators:
+            issues.append(f"enrolled done item {item.id!r} validator not registered: {item.validator!r}")
     rendered = render_done_when_items(rec.enrolled_done_when_items)
     if rec.enrolled_done_when_items and rec.done_when.strip() != rendered:
         issues.append("done_when must be generated from enrolled_done_when_items")
@@ -443,7 +465,7 @@ def _upsert_goal_locked(
     if existing is not None and not _strategic_fields_match(existing, rec) and not allow_strategic_change:
         raise GoalRedirectRequiredError("strategic goal fields changed; use chitra-goals redirect --reason ...")
     if existing is None:
-        enrollment_issues = validate_enrollment_contract(rec)
+        enrollment_issues = validate_enrollment_contract(rec, root=root)
         if enrollment_issues:
             raise GoalValidationError("; ".join(enrollment_issues))
     now = _utc_now() if mutation_time is None else mutation_time

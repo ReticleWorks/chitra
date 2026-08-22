@@ -7,7 +7,7 @@ import fcntl
 import hashlib
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol, cast
@@ -91,8 +91,21 @@ class EnrolledDoneWhenItemLike(Protocol):
 def completion_receipt_issues(
     enrolled_items: Sequence[EnrolledDoneWhenItemLike],
     evidence: Sequence[CompletionEvidence],
+    *,
+    verified_results: Mapping[str, str] | None = None,
 ) -> list[str]:
-    """Return exact item, receipt, validator, result, and citation gaps."""
+    """Return exact item, receipt, validator, result, and citation gaps.
+
+    When ``verified_results`` is provided it maps receipt names to the
+    results stored on disk by Chitra's own validator execution; claimed
+    ``validator_result`` values are then ignored entirely.
+    """
+
+    def _result_passes(proof: CompletionEvidence) -> bool:
+        if verified_results is None:
+            return proof.validator_result == "pass"
+        return verified_results.get(proof.receipt_name or "") == "pass"
+
     issues: list[str] = []
     for item in enrolled_items:
         item_proofs = [proof for proof in evidence if proof.done_when_item_id == item.id]
@@ -107,7 +120,7 @@ def completion_receipt_issues(
         if not validated:
             issues.append(f"done item {item.id!r} requires validator {item.validator!r}")
             continue
-        passing = [proof for proof in validated if proof.validator_result == "pass" and evidence_is_concrete(proof)]
+        passing = [proof for proof in validated if _result_passes(proof) and evidence_is_concrete(proof)]
         if not passing:
             issues.append(f"done item {item.id!r} has no passing validator result with a concrete citation")
     return issues
@@ -252,11 +265,22 @@ def _parse_structured_completion_evidence(line: str) -> CompletionEvidence | Non
         "citation",
     }.issubset(payload):
         return None
+    # The lane's JSON line is only a trigger and an item binding: its own
+    # validator_result is discarded because only Chitra's executed and stored
+    # result may establish a pass.
+    payload = {key: value for key, value in payload.items() if key != "validator_result"}
     payload.setdefault("kind", "artifact")
     try:
         return CompletionEvidence.model_validate(payload)
     except ValueError:
         return None
+
+
+def has_structured_completion_line(text: str) -> bool:
+    """Return whether any pane line carries a structured completion payload."""
+    return any(
+        _parse_structured_completion_evidence(raw_line.strip()) is not None for raw_line in text.splitlines()
+    )
 
 
 def evaluate_completion_claim(
@@ -267,6 +291,7 @@ def evaluate_completion_claim(
     policy: GatePolicy | None = None,
     open_asks: Sequence[str] = (),
     blockers: Sequence[str] = (),
+    verified_results: Mapping[str, str] | None = None,
 ) -> CompletionAudit:
     """Require cited deploy/live proof and an honest completion posture."""
     if policy is None:
@@ -293,7 +318,7 @@ def evaluate_completion_claim(
         if not item.validator or not item.required_receipt:
             per_item_evidence_gap.append(item.text)
             continue
-        if completion_receipt_issues((cast(EnrolledDoneWhenItemLike, item),), valid):
+        if completion_receipt_issues((cast(EnrolledDoneWhenItemLike, item),), valid, verified_results=verified_results):
             per_item_evidence_gap.append(item.text)
     blocked_todos = [item.text for item in todo_items if item.status.lower() in {"blocked", "stalled"}]
     posture_mismatch = bool(blocked_todos and not open_asks and not blockers)
@@ -344,6 +369,7 @@ def evaluate_turn_end(
     policy: GatePolicy | None = None,
     open_asks: Sequence[str] = (),
     blockers: Sequence[str] = (),
+    verified_results: Mapping[str, str] | None = None,
 ) -> TurnEndAudit:
     """Force a review at turn-end while distinguishing a non-completion turn."""
     if not is_completion_claim(transcript_text):
@@ -358,6 +384,7 @@ def evaluate_turn_end(
         policy=policy,
         open_asks=open_asks,
         blockers=blockers,
+        verified_results=verified_results,
     )
     return TurnEndAudit(condition="completion_claim", completion=completion, summary=completion.summary)
 
