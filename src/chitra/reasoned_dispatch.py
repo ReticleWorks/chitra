@@ -25,12 +25,11 @@ from chitra.reasoning import (
     OracleVerdict,
     PrinciplesIndex,
 )
+from chitra.review_rubric import PERSISTENCE_FINDING_CODES
 
 _COMPLETION_FINDINGS: frozenset[FindingCode] = frozenset({"hedged_completion", "unsupported_completion"})
 _DRIFT_FINDINGS: frozenset[FindingCode] = frozenset({"goal_drift", "smuggled_redirect"})
-_PERSISTENCE_FINDINGS: frozenset[FindingCode] = frozenset(
-    {"false_blocker", "deferred_to_operator", "idle_no_action", "unverified_claim"}
-)
+_PERSISTENCE_FINDINGS = PERSISTENCE_FINDING_CODES
 _REVIEW_REJECTION_GATE = "watched-session review rejected the lane behavior"
 
 
