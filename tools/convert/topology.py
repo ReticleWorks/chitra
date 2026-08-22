@@ -28,6 +28,7 @@ SCHEMA_HANDOFF_RECEIPT = "chitra.authority-handoff-receipt.v1"
 SCHEMA_ROLLBACK_RECEIPT = "chitra.disposable-rollback-receipt.v1"
 SCHEMA_LIFECYCLE_PROOF = "chitra.authority-handoff-lifecycle-proof.v1"
 SCHEMA_NATIVE_CLIENT_PROOF = "chitra.native-client-proof.v1"
+SCHEMA_AUTHORITY_ENROLLMENT = "chitra.authority-enrollment.v1"
 SNAPSHOT_MARKER = ".chitra-disposable-snapshot"
 
 GOAL_SCHEMAS = {"chitra.goals.v1", "chitra.goals.v2", "chitra.goals.v3"}
@@ -70,7 +71,6 @@ REQUIRED_INSTANCE_BINDINGS = frozenset(
 REQUIRED_LIFECYCLE_RECEIPTS = frozenset(("old_drained", "old_stopped", "old_write_denied", "new_started", "new_write_proved"))
 APPROVED_NATIVE_CLIENTS = frozenset(("codex",))
 APPROVED_NATIVE_CLIENT_PATHS = {"codex": ("/usr/local/bin/codex", "/usr/bin/codex", "/opt/chitra/venv/bin/codex")}
-AUTHORITY_LEDGER_TAG = "[authority-handoff]"
 LIFECYCLE_ARTIFACT_FIELDS = frozenset(
     (
         "schema",
@@ -281,37 +281,82 @@ def _process_executable_sha256(process: str) -> tuple[Path, str] | None:
     return exe_path, _sha256_file(exe_path)
 
 
-def _goals_have_enrolled_authority(path: Path) -> bool:
+def _process_cgroup(process: str) -> str | None:
+    """Return the measured kernel cgroup string for one live pid, if readable."""
+    pid = _pid_from_process(process)
+    if pid is None:
+        return None
     try:
-        payload = _load_json(path)
-    except ConversionError:
+        return (Path("/proc") / str(pid) / "cgroup").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def _goals_have_enrolled_authority(path: Path, *, state_root: Path, issues: list[str]) -> bool:
+    """Bind the goals document to the repository's real v3 enrollment contract.
+
+    Presence of enrollment-shaped fields proves nothing; the document is
+    parsed through ``chitra.goals`` and each record must satisfy the atomic
+    interview-enrollment contract exactly as the governed store would enforce
+    it.
+    """
+    del path
+    try:
+        goals_module = import_module("chitra.goals")
+        load_goals = goals_module.load_goals
+        validate_enrollment_contract = goals_module.validate_enrollment_contract
+        records = load_goals(state_root)
+    except Exception as exc:
+        issues.append(f"governed goal authority cannot be loaded through chitra.goals: {exc}")
         return False
-    if payload.get("schema") not in {"chitra.goals.v2", "chitra.goals.v3"}:
+    if not records:
+        issues.append("governed state root has no enrolled goal records")
         return False
-    goals = payload.get("goals")
-    if not isinstance(goals, list):
-        return False
-    for item in goals:
-        if not isinstance(item, Mapping):
+    enrolled = False
+    for record in records:
+        violations = validate_enrollment_contract(record)
+        if violations:
+            issues.append(f"goal record {record.session_ref} violates the v3 enrollment contract: {'; '.join(violations)}")
             continue
-        receipt = item.get("interview_receipt")
-        enrolled_items = item.get("enrolled_done_when_items")
-        enrolled_at = item.get("enrolled_at")
-        if isinstance(receipt, Mapping) and isinstance(enrolled_items, list) and enrolled_items:
-            return True
-        if isinstance(enrolled_at, str) and enrolled_at and isinstance(enrolled_items, list) and enrolled_items:
-            return True
-    return False
+        if record.interview_receipt is not None and record.enrolled_done_when_items:
+            enrolled = True
+    if not enrolled:
+        issues.append("governed state root lacks contract-valid enrolled goal authority")
+    return enrolled
 
 
-def _governed_lane_binding(instance: str, state_root: Path, tmux_socket: Path, issues: list[str]) -> dict[str, object] | None:
+def _governed_lane_binding(
+    instance: str,
+    state_root: Path,
+    tmux_socket: Path,
+    issues: list[str],
+    *,
+    anchor_manifest_sha256: str,
+) -> dict[str, object] | None:
+    """Load the lane manifest from the verifier-pinned system path only.
+
+    The caller's ``CHITRA_LANES_FILE`` environment override is deliberately
+    ignored here: the authority gate must judge the claimant against the
+    machine-declared manifest named by the trust anchor, never against a file
+    the claimant selected.
+    """
     try:
-        load_lanes = import_module("chitra.lane_config").load_lanes
+        lane_config = import_module("chitra.lane_config")
+        load_lanes = lane_config.load_lanes
+        pinned_manifest = Path(lane_config.DEFAULT_LANES_FILE)
     except Exception as exc:  # pragma: no cover - import failure is reported as a conversion issue
         issues.append(f"governed lane manifest cannot be imported: {exc}")
         return None
     try:
-        lanes = load_lanes()
+        manifest_sha256 = _sha256_file(pinned_manifest)
+    except OSError as exc:
+        issues.append(f"verifier-pinned governed lane manifest cannot be read: {pinned_manifest}: {exc}")
+        return None
+    if manifest_sha256 != anchor_manifest_sha256:
+        issues.append("governed lane manifest does not match the machine-provisioned trust-anchor declaration")
+        return None
+    try:
+        lanes = load_lanes(pinned_manifest)
     except ValueError as exc:
         issues.append(f"governed lane manifest cannot be loaded: {exc}")
         return None
@@ -320,6 +365,8 @@ def _governed_lane_binding(instance: str, state_root: Path, tmux_socket: Path, i
         issues.append("governed lane manifest must declare exactly one matching instance")
         return None
     lane = matching[0]
+    if not lane.enabled:
+        issues.append("governed lane manifest declares the instance disabled")
     if _safe_resolve(lane.state_dir) != state_root:
         issues.append("governed lane manifest state_dir contradicts observed state root")
     if _safe_resolve(lane.tmux_socket) != tmux_socket:
@@ -342,42 +389,211 @@ def _approved_native_client_path(client_name: str) -> Path | None:
     return None
 
 
+def _read_ledger_lines(ledger_path: Path, issues: list[str]) -> list[dict[str, object]]:
+    try:
+        lines = ledger_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        issues.append(f"authority ledger cannot be read: {exc}")
+        return []
+    parsed: list[dict[str, object]] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            issues.append("authority ledger contains a malformed line")
+            return []
+        if not isinstance(payload, dict):
+            issues.append("authority ledger contains a non-object line")
+            return []
+        parsed.append(payload)
+    return parsed
+
+
+def _signed_entry_from_raw(
+    raw_entry: Mapping[str, object],
+    *,
+    anchor: object,
+    label: str,
+    issues: list[str],
+) -> bool:
+    """Verify one raw ledger line's HMAC signature under the machine anchor key.
+
+    The signature covers the canonical ledger field set exactly as
+    ``chitra.ledger`` computes it; nothing about the caller's environment can
+    influence the key.
+    """
+    ledger_module = import_module("chitra.ledger")
+    LedgerEntry = ledger_module.LedgerEntry
+    verify_entry = ledger_module.verify_entry
+    try:
+        entry = LedgerEntry.model_validate(dict(raw_entry))
+    except ValueError as exc:
+        issues.append(f"{label} ledger entry is invalid: {exc}")
+        return False
+    if not verify_entry(entry, key=anchor.key):  # type: ignore[attr-defined]
+        issues.append(f"{label} ledger entry signature does not verify under the machine-provisioned authority key")
+        return False
+    return True
+
+
+def _verify_authority_enrollment_chain(
+    *,
+    anchor: object,
+    state_root: Path,
+    instance: str,
+    proof: dict[str, object],
+    ledger_lines: list[dict[str, object]],
+    bindings: Mapping[str, str],
+    new_process_exe: tuple[Path, str] | None,
+    tmux_sessions: Mapping[str, object],
+    governed_lane: Mapping[str, object] | None,
+    issues: list[str],
+) -> dict[str, object] | None:
+    """Require an anchor-signed pre-existing enrollment and bind it to observations.
+
+    The enrollment entry is written by the provisioning ceremony before any
+    handoff exists.  Its signed payload names the operational world — lane,
+    goals digest, units, package identity, measured writer executable and
+    cgroup, tmux sockets and sessions — and every claim here is re-measured
+    against the observed system rather than trusted from the bundle.
+    """
+    enrollment_order_id = proof.get("enrollment_order_id")
+    if not isinstance(enrollment_order_id, str) or not enrollment_order_id:
+        issues.append("authority proof enrollment_order_id is missing")
+        return None
+    enrollment_raw = next((line for line in ledger_lines if line.get("order_id") == enrollment_order_id), None)
+    if enrollment_raw is None:
+        issues.append("pre-existing anchor-signed authority enrollment is missing from the governed ledger")
+        return None
+    if not _signed_entry_from_raw(enrollment_raw, anchor=anchor, label="authority enrollment", issues=issues):
+        return None
+    enrollment_payload = enrollment_raw.get("enrollment")
+    if not isinstance(enrollment_payload, Mapping):
+        issues.append("authority enrollment entry carries no signed enrollment payload")
+        return None
+    expected_digest = _sha256_bytes(_canonical_bytes(dict(enrollment_payload)))
+    if enrollment_raw.get("message_hash") != expected_digest:
+        issues.append("authority enrollment payload hash does not match its signed ledger digest")
+    if enrollment_raw.get("session_ref") != f"authority:{instance}":
+        issues.append("authority enrollment session_ref does not bind the handoff instance")
+    if enrollment_raw.get("tag") != import_module("chitra.handoff_authority").ENROLLMENT_TAG:
+        issues.append("authority enrollment tag is not the governed enrollment tag")
+
+    def mismatch(field: str) -> None:
+        issues.append(f"observed {field} contradicts the anchor-signed authority enrollment")
+
+    def declared(field: str) -> object:
+        return enrollment_payload.get(field)
+
+    if declared("schema") != SCHEMA_AUTHORITY_ENROLLMENT:
+        mismatch("enrollment schema")
+    if declared("instance") != instance or declared("lane_id") != instance:
+        mismatch("enrollment identity")
+    if declared("state_root") != str(state_root):
+        mismatch("state root")
+    goals_path_value = bindings.get("goals_path", "")
+    if declared("goals_sha256") != bindings.get("goals_sha256") or (
+        goals_path_value and declared("goals_sha256") != _sha256_file(Path(goals_path_value))
+    ):
+        mismatch("goals document identity")
+    if declared("new_unit") != bindings.get("new_unit") or declared("old_unit") != bindings.get("old_unit"):
+        mismatch("writer units")
+    if declared("new_package") != bindings.get("new_package") or declared("old_package") != bindings.get("old_package"):
+        mismatch("writer packages")
+    if declared("new_process") != bindings.get("new_process"):
+        mismatch("live new-writer process identity")
+    distribution = declared("new_package_distribution")
+    version = declared("new_package_version")
+    if isinstance(distribution, str) and isinstance(version, str) and distribution and version:
+        try:
+            installed_version = import_module("importlib.metadata").version(distribution)
+        except Exception:
+            installed_version = ""
+        if installed_version != version:
+            mismatch("installed package build identity")
+    else:
+        mismatch("declared package build identity")
+    if new_process_exe is None:
+        issues.append("new writer executable cannot be compared against the anchor-signed enrollment")
+    elif declared("new_process_exe_sha256") != new_process_exe[1]:
+        mismatch("live new-writer executable identity")
+    cgroup = _process_cgroup(bindings.get("new_process", ""))
+    if cgroup is None or declared("new_process_cgroup") != cgroup:
+        mismatch("live new-writer unit/cgroup identity")
+    old_socket = bindings.get("old_tmux_socket", "")
+    new_socket = bindings.get("new_tmux_socket", "")
+    if declared("old_tmux_socket") != old_socket or declared("new_tmux_socket") != new_socket:
+        mismatch("tmux socket roots")
+    expected_new_session = str(governed_lane.get("tmux_session")) if governed_lane else None
+    observed_new_session = cast("dict[str, object] | None", tmux_sessions.get("new"))
+    if expected_new_session is None or observed_new_session is None or observed_new_session.get("session_name") != expected_new_session:
+        mismatch("new tmux session bound to the authenticated manifest")
+    observed_old_session = cast("dict[str, object] | None", tmux_sessions.get("old"))
+    declared_old_session = declared("old_tmux_session")
+    old_session_ok = observed_old_session is not None and isinstance(declared_old_session, str)
+    if not old_session_ok or cast("dict[str, object]", observed_old_session).get("session_name") != declared_old_session:
+        mismatch("old tmux session bound to the anchor-signed enrollment")
+    enrolled_at = declared("enrolled_at")
+    if not isinstance(enrolled_at, str) or not enrolled_at:
+        mismatch("enrollment time")
+    return {
+        "enrollment_order_id": enrollment_order_id,
+        "enrollment": dict(enrollment_payload),
+        "enrollment_ledger_digest": str(enrollment_raw.get("message_hash", "")),
+        "enrolled_at": enrolled_at if isinstance(enrolled_at, str) else "",
+    }
+
+
 def _verify_authority_ledger_proof(
     *,
     authority_proof: Mapping[str, object] | None,
     state_root: Path | None,
     instance: str,
     expected_payload: Mapping[str, object],
+    bindings: Mapping[str, str],
+    new_process_exe: tuple[Path, str] | None,
+    governed_lane: Mapping[str, object] | None,
+    tmux_sessions: Mapping[str, object],
     issues: list[str],
 ) -> dict[str, object]:
+    """Verify the handoff against the pinned machine trust anchor only.
+
+    The verifier never creates a signing key, an enrollment, or a ledger
+    entry, never reads a key from the caller-selected state root, and fails
+    closed when the machine-provisioned anchor is absent.  A caller-minted
+    key cannot satisfy this gate even with otherwise valid hashes.
+    """
     if state_root is None:
         issues.append("authority ledger proof requires an observed governed state root")
         return {}
     proof = dict(authority_proof or {})
-    for key in ("order_id", "ledger_entry"):
+    for key in ("enrollment_order_id", "order_id", "ledger_entry"):
         if key not in proof:
             issues.append(f"authority ledger proof {key} is missing")
+    try:
+        anchor_module = import_module("chitra.handoff_authority")
+        anchor = anchor_module.load_machine_anchor()
+    except Exception as exc:
+        issues.append(f"machine handoff-authority anchor is unavailable; failing closed: {exc}")
+        return proof
     entry_payload = proof.get("ledger_entry")
     if not isinstance(entry_payload, Mapping):
         issues.append("authority ledger proof ledger_entry must be an object")
         return proof
     ledger_path = state_root / "ledger.jsonl"
-    key_path = state_root / "ledger.key"
-    if not key_path.exists() or not key_path.is_file():
-        issues.append("authority ledger key is missing from governed state root")
-        return proof
     if not ledger_path.exists() or not ledger_path.is_file():
-        issues.append("authority ledger is missing from governed state root")
+        issues.append("governed authority ledger is missing from the observed state root")
         return proof
     try:
         ledger_module = import_module("chitra.ledger")
         LedgerEntry = ledger_module.LedgerEntry
-        verify_entry = ledger_module.verify_entry
     except Exception as exc:  # pragma: no cover - import failure is reported as a conversion issue
         issues.append(f"authority ledger verifier cannot be imported: {exc}")
         return proof
     try:
-        entry = LedgerEntry.model_validate(entry_payload)
+        entry = LedgerEntry.model_validate(dict(entry_payload))
     except ValueError as exc:
         issues.append(f"authority ledger entry is invalid: {exc}")
         return proof
@@ -386,22 +602,39 @@ def _verify_authority_ledger_proof(
         issues.append("authority ledger entry order_id contradicts proof")
     if entry.session_ref != f"authority:{instance}":
         issues.append("authority ledger entry session_ref does not bind the handoff instance")
-    if entry.tag != AUTHORITY_LEDGER_TAG:
+    if entry.tag != anchor_module.HANDOFF_TAG:
         issues.append("authority ledger entry tag is not the governed handoff tag")
     if entry.message_hash != expected_digest:
         issues.append("authority ledger entry hash does not bind the observed handoff payload")
-    try:
-        hmac_key = key_path.read_bytes()
-    except OSError as exc:
-        issues.append(f"authority ledger key cannot be read: {exc}")
-        return proof
-    if not verify_entry(entry, key=hmac_key):
-        issues.append("authority ledger entry signature is invalid")
-    entry_json = entry.model_dump_json()
-    if entry_json not in ledger_path.read_text(encoding="utf-8").splitlines():
+    _signed_entry_from_raw(entry_payload, anchor=anchor, label="authority handoff proof", issues=issues)
+    ledger_lines = _read_ledger_lines(ledger_path, issues)
+    handoff_line = next((line for line in ledger_lines if line.get("order_id") == entry.order_id), None)
+    if handoff_line is None:
         issues.append("authority ledger entry is not present in the governed append-only ledger")
+    else:
+        if dict(handoff_line) != dict(entry_payload):
+            issues.append("authority ledger proof does not exactly match the signed governed ledger entry")
+        _signed_entry_from_raw(handoff_line, anchor=anchor, label="authority handoff", issues=issues)
+    enrollment = _verify_authority_enrollment_chain(
+        anchor=anchor,
+        state_root=state_root,
+        instance=instance,
+        proof=proof,
+        ledger_lines=ledger_lines,
+        bindings=bindings,
+        new_process_exe=new_process_exe,
+        tmux_sessions=tmux_sessions,
+        governed_lane=governed_lane,
+        issues=issues,
+    )
+    proof["authority_anchor"] = {
+        "path": str(anchor.path),
+        "sha256": anchor.sha256,
+        "provisioned_at": anchor.provisioned_at,
+        "lanes_manifest_sha256": anchor.lanes_manifest_sha256,
+    }
+    proof["enrollment"] = dict(enrollment or {})
     proof["ledger_path"] = str(ledger_path)
-    proof["ledger_key_path"] = str(key_path)
     proof["payload_sha256"] = expected_digest
     return proof
 
@@ -1241,12 +1474,33 @@ def build_authority_handoff_receipt(
             issues=issues,
         )
         goals_path_value = bindings.get("goals_path")
-        if isinstance(goals_path_value, str) and not _goals_have_enrolled_authority(Path(goals_path_value)):
+        if isinstance(goals_path_value, str) and not _goals_have_enrolled_authority(
+            Path(goals_path_value), state_root=observed_state_root, issues=issues
+        ):
             issues.append("governed state root lacks enrolled goal authority")
     governed_lane: dict[str, object] | None = None
     new_tmux_socket_value = bindings.get("new_tmux_socket")
-    if observed_state_root is not None and isinstance(new_tmux_socket_value, str) and new_tmux_socket_value:
-        governed_lane = _governed_lane_binding(instance, observed_state_root, Path(new_tmux_socket_value), issues)
+    anchor_probe: dict[str, object] = {}
+    if observed_state_root is not None:
+        try:
+            anchor_module_probe = import_module("chitra.handoff_authority")
+            loaded_anchor = anchor_module_probe.load_machine_anchor()
+            anchor_probe = {
+                "path": str(loaded_anchor.path),
+                "sha256": loaded_anchor.sha256,
+                "provisioned_at": loaded_anchor.provisioned_at,
+                "lanes_manifest_sha256": loaded_anchor.lanes_manifest_sha256,
+            }
+        except Exception as exc:
+            issues.append(f"machine handoff-authority anchor is unavailable; failing closed: {exc}")
+    if observed_state_root is not None and isinstance(new_tmux_socket_value, str) and new_tmux_socket_value and anchor_probe:
+        governed_lane = _governed_lane_binding(
+            instance,
+            observed_state_root,
+            Path(new_tmux_socket_value),
+            issues,
+            anchor_manifest_sha256=str(anchor_probe["lanes_manifest_sha256"]),
+        )
     verified_transcripts: list[dict[str, object]] = []
     if not transcript_bindings:
         issues.append("transcript bindings must name externally observed transcript files")
@@ -1449,6 +1703,10 @@ def build_authority_handoff_receipt(
         state_root=observed_state_root,
         instance=instance,
         expected_payload=authority_payload,
+        bindings=bindings,
+        new_process_exe=new_process_exe,
+        governed_lane=governed_lane,
+        tmux_sessions=tmux_sessions,
         issues=issues,
     )
     handoff_receipt: dict[str, object] = {

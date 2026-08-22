@@ -41,14 +41,14 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _canonical_bytes(payload: object) -> bytes:
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-
-
 def _sha256_bytes(data: bytes) -> str:
     import hashlib
 
     return hashlib.sha256(data).hexdigest()
+
+
+def _canonical_bytes(payload: object) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
 def _file_manifest(root: Path) -> list[dict[str, object]]:
@@ -82,6 +82,10 @@ def _goal_record_model() -> type[Any]:
 
 def _ledger_module() -> Any:
     return import_module("chitra.ledger")
+
+
+def _handoff_authority_module() -> Any:
+    return import_module("chitra.handoff_authority")
 
 
 def _legacy_state(root: Path) -> None:
@@ -192,37 +196,48 @@ def test_w10_snapshot_metadata_reconciles_expected_legacy_topology(tmp_path: Pat
     }
 
 
-def _instance_bindings(state_root: Path, old_socket: Path, new_socket: Path, old_process: str, new_process: str) -> dict[str, str]:
-    _write_json(
-        state_root / "goals.json",
-        {
-            "schema": "chitra.goals.v3",
-            "updated_at": "2026-08-22T00:00:00+00:00",
-            "goals": [
-                {
-                    "session_ref": "authority:monitor",
-                    "goal": "complete the governed authority handoff",
-                    "done_when": "the signed handoff proof verifies",
-                    "source": "task-file:W4f",
-                    "status": "working",
-                    "created_at": "2026-08-22T00:00:00+00:00",
-                    "updated_at": "2026-08-22T00:00:00+00:00",
-                    "now": "",
-                    "last_verified": "",
-                    "interview_receipt": {"name": "authority-enrollment", "completed_at": "2026-08-22T00:00:00+00:00"},
-                    "enrolled_at": "2026-08-22T00:00:00+00:00",
-                    "enrolled_done_when_items": [
-                        {
-                            "id": "signed-handoff",
-                            "text": "the signed handoff proof verifies",
-                            "validator": "chitra-authority-verifier",
-                            "required_receipt": "authority-ledger",
-                        }
+def _enrolled_goals_document(state_root: Path) -> dict[str, object]:
+    return {
+        "schema": "chitra.goals.v3",
+        "updated_at": "2026-08-22T00:00:00+00:00",
+        "goals": [
+            {
+                "session_ref": "authority:monitor",
+                "goal": "complete the governed authority handoff",
+                "done_when": "the signed handoff proof verifies",
+                "source": "task-file:test",
+                "status": "working",
+                "created_at": "2026-08-22T00:00:00+00:00",
+                "updated_at": "2026-08-22T00:00:00+00:00",
+                "now": "",
+                "last_verified": "",
+                "interview_receipt": {
+                    "name": "authority-enrollment",
+                    "completed_at": "2026-08-22T00:00:00+00:00",
+                    "answers_sha256": _sha256_bytes(b"operator answers"),
+                    "provenance": [
+                        "operator:interview",
+                        "source:task-file:test",
+                        "operator:confirmation",
+                        "source:program-record",
                     ],
-                }
-            ],
-        },
-    )
+                },
+                "enrolled_at": "2026-08-22T00:00:00+00:00",
+                "enrolled_done_when_items": [
+                    {
+                        "id": "signed-handoff",
+                        "text": "the signed handoff proof verifies",
+                        "validator": "chitra-authority-verifier",
+                        "required_receipt": "authority-ledger",
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def _instance_bindings(state_root: Path, old_socket: Path, new_socket: Path, old_process: str, new_process: str) -> dict[str, str]:
+    _write_json(state_root / "goals.json", _enrolled_goals_document(state_root))
     _write_json(state_root / "queue" / "orders" / "order-1.json", {"order_id": "order-1", "session_ref": "host:monitor:%1"})
     _write_json(state_root / "lane-worktrees.json", {"monitor": str(state_root / "worktree")})
     _write_json(state_root / "handoff" / "last-old-order.json", {"order_id": "order-1", "status": "drained"})
@@ -403,7 +418,7 @@ def _write_lane_manifest(path: Path, *, state_root: Path, tmux_socket: Path) -> 
             {
                 "id": "monitor",
                 "account": "monitor",
-                "uid": os.getuid() or 1,
+                "uid": 4242,
                 "home": str(path.parent / "home"),
                 "workdir": str(path.parent / "work"),
                 "config_dir": str(path.parent / "config"),
@@ -442,6 +457,91 @@ def _stop_tmux(socket_path: Path) -> None:
     )
 
 
+def _provision_machine_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    manifest_path: Path,
+) -> dict[str, object]:
+    """Verifier-owned test setup: provision the machine anchor it will judge with."""
+    handoff_authority = _handoff_authority_module()
+    anchor_dir = tmp_path / "etc" / "chitra" / "authority"
+    anchor_path = anchor_dir / "handoff-authority.json"
+    document = cast(
+        dict[str, object],
+        handoff_authority.build_machine_anchor_document(
+            key=os.urandom(32),
+            provisioned_at="2026-08-21T00:00:00+00:00",
+            lanes_manifest_sha256=_sha256_file(manifest_path),
+        ),
+    )
+    anchor_path.parent.mkdir(parents=True, exist_ok=True)
+    anchor_path.write_text(_canonical_bytes(document).decode("utf-8"), encoding="utf-8")
+    anchor_path.chmod(0o600)
+    monkeypatch.setattr(handoff_authority, "MACHINE_ANCHOR_PATH", anchor_path)
+    return document
+
+
+def _append_signed_ledger_line(
+    state_root: Path,
+    *,
+    key: bytes,
+    order_id: str,
+    tag: str,
+    payload: dict[str, object],
+    session_ref: str,
+    sent_at: str,
+) -> dict[str, object]:
+    ledger = _ledger_module()
+    digest = _sha256_bytes(_canonical_bytes(payload))
+    entry = ledger.LedgerEntry(
+        order_id=order_id,
+        session_ref=session_ref,
+        tag=tag,
+        sig_v=4,
+        message_hash=digest,
+        sent_at=sent_at,
+        signature=ledger.sign(key, session_ref=session_ref, tag=tag, digest=digest, sent_at=sent_at),
+    )
+    line = entry.model_dump(mode="json")
+    line["enrollment"] = payload
+    with (state_root / "ledger.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(line, sort_keys=True) + "\n")
+    return {"order_id": order_id, "ledger_entry": line}
+
+
+def _enrollment_payload(
+    *,
+    instance: str,
+    bindings: dict[str, str],
+    new_process_exe_sha256: str,
+    new_process_cgroup: str | None,
+    old_tmux_session: str,
+) -> dict[str, object]:
+    import importlib.metadata
+
+    return {
+        "schema": topology.SCHEMA_AUTHORITY_ENROLLMENT,
+        "instance": instance,
+        "lane_id": instance,
+        "state_root": bindings["state_root"],
+        "goals_sha256": bindings["goals_sha256"],
+        "old_unit": bindings["old_unit"],
+        "new_unit": bindings["new_unit"],
+        "old_package": bindings["old_package"],
+        "new_package": bindings["new_package"],
+        "new_process": bindings["new_process"],
+        "new_package_distribution": "chitra-monitor",
+        "new_package_version": importlib.metadata.version("chitra-monitor"),
+        "new_process_exe_sha256": new_process_exe_sha256,
+        "new_process_cgroup": new_process_cgroup,
+        "old_tmux_socket": bindings["old_tmux_socket"],
+        "new_tmux_socket": bindings["new_tmux_socket"],
+        "old_tmux_session": old_tmux_session,
+        "enrolled_at": "2026-08-22T00:00:00+00:00",
+    }
+
+
 def _authority_proof(
     *,
     state_root: Path,
@@ -451,11 +551,13 @@ def _authority_proof(
     bindings: dict[str, str],
     lifecycle_receipts: list[dict[str, object]],
     native_client: dict[str, object],
+    signing_key: bytes,
+    enrollment_order_id: str = "authority-enrollment-1",
 ) -> dict[str, object]:
     governed_lane = {
         "id": "monitor",
         "account": "monitor",
-        "uid": os.getuid() or 1,
+        "uid": 4242,
         "state_dir": str(state_root.resolve()),
         "tmux_socket": str(Path(bindings["new_tmux_socket"]).resolve()),
         "tmux_session": "monitor-new",
@@ -481,27 +583,38 @@ def _authority_proof(
         governed_lane=governed_lane,
         tmux_sessions=tmux_sessions,
     )
-    digest = _sha256_bytes(_canonical_bytes(payload))
-    ledger = _ledger_module()
-    key = ledger.load_or_create_signing_key(state_root / "ledger.key")
-    sent_at = "2026-08-22T00:00:01+00:00"
-    entry = ledger.LedgerEntry(
-        order_id="authority-handoff-1",
-        session_ref=f"authority:{instance}",
-        tag=topology.AUTHORITY_LEDGER_TAG,
-        sig_v=4,
-        message_hash=digest,
-        sent_at=sent_at,
-        signature=ledger.sign(
-            key,
-            session_ref=f"authority:{instance}",
-            tag=topology.AUTHORITY_LEDGER_TAG,
-            digest=digest,
-            sent_at=sent_at,
+    handoff_module = _handoff_authority_module()
+    new_process_exe = topology._process_executable_sha256(new_writer.process)
+    assert new_process_exe is not None
+    enrollment = _append_signed_ledger_line(
+        state_root,
+        key=signing_key,
+        order_id=enrollment_order_id,
+        tag=handoff_module.ENROLLMENT_TAG,
+        payload=_enrollment_payload(
+            instance=instance,
+            bindings=bindings,
+            new_process_exe_sha256=new_process_exe[1],
+            new_process_cgroup=topology._process_cgroup(new_writer.process),
+            old_tmux_session=str(old_tmux["session_name"]),
         ),
+        session_ref=f"authority:{instance}",
+        sent_at="2026-08-22T00:00:00+00:00",
     )
-    (state_root / "ledger.jsonl").write_text(entry.model_dump_json() + "\n", encoding="utf-8")
-    return {"order_id": entry.order_id, "ledger_entry": entry.model_dump(mode="json")}
+    handoff = _append_signed_ledger_line(
+        state_root,
+        key=signing_key,
+        order_id="authority-handoff-1",
+        tag=handoff_module.HANDOFF_TAG,
+        payload=payload,
+        session_ref=f"authority:{instance}",
+        sent_at="2026-08-22T00:00:01+00:00",
+    )
+    return {
+        "enrollment_order_id": enrollment["order_id"],
+        "order_id": handoff["order_id"],
+        "ledger_entry": handoff["ledger_entry"],
+    }
 
 
 def _transcript_binding(state_root: Path) -> str:
@@ -521,7 +634,7 @@ def test_shadow_scan_never_writes_inside_live_state_or_dispatches(tmp_path: Path
         run_shadow_scan(state, state / "shadow")
 
 
-def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycle_bindings(
+def test_authority_handoff_binds_to_preexisting_non_caller_mintable_trust_roots(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_root = tmp_path / "state"
@@ -531,12 +644,19 @@ def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycl
     _start_tmux(new_socket_path, "monitor-new")
     manifest_path = tmp_path / "etc" / "chitra" / "lanes.yaml"
     _write_lane_manifest(manifest_path, state_root=state_root, tmux_socket=new_socket_path)
-    monkeypatch.setenv("CHITRA_LANES_FILE", str(manifest_path))
+    lane_config = import_module("chitra.lane_config")
+    monkeypatch.setattr(lane_config, "DEFAULT_LANES_FILE", manifest_path)
+    caller_manifest_path = tmp_path / "caller-selected" / "lanes.yaml"
+    _write_lane_manifest(caller_manifest_path, state_root=state_root, tmux_socket=new_socket_path)
+    monkeypatch.setenv("CHITRA_LANES_FILE", str(caller_manifest_path))
+    anchor_document = _provision_machine_authority(tmp_path, monkeypatch, manifest_path=manifest_path)
     missing_pid = os.getpid() + 100_000
     while Path(f"/proc/{missing_pid}").exists():
         missing_pid += 1
     old_process = f"pid:{missing_pid}"
-    writer_process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    writer_process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    impostor_process: subprocess.Popen[bytes] | None = None
+    rogue_socket_path = tmp_path / "caller-selected.sock"
     try:
         new_process = f"pid:{writer_process.pid}"
         bindings = _instance_bindings(state_root, old_socket_path, new_socket_path, old_process, new_process)
@@ -564,6 +684,26 @@ def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycl
             action_receipt_sha256=bindings["new_action_receipt_sha256"],
         )
         lifecycle_receipts = _lifecycle_receipts(tmp_path, bindings)
+
+        def build(**overrides: object) -> dict[str, object]:
+            return build_authority_handoff_receipt(
+                instance=str(overrides.get("instance", "monitor")),
+                old_writer=cast(WriterObservation, overrides.get("old_writer", old_writer)),
+                new_writer=cast(WriterObservation, overrides.get("new_writer", new_writer)),
+                pre_state_sha256=str(overrides.get("pre_state_sha256", bindings["pre_state_sha256"])),
+                post_state_sha256=str(overrides.get("post_state_sha256", bindings["post_state_sha256"])),
+                rollback_checkpoint_sha256=str(
+                    overrides.get("rollback_checkpoint_sha256", bindings["rollback_checkpoint_sha256"])
+                ),
+                transcript_bindings=cast(
+                    tuple[str, ...], overrides.get("transcript_bindings", (_transcript_binding(state_root),))
+                ),
+                instance_bindings=cast(dict[str, str], overrides.get("instance_bindings", bindings)),
+                lifecycle_receipts=cast(list[dict[str, object]], overrides.get("lifecycle_receipts", lifecycle_receipts)),
+                native_client=cast(dict[str, object], overrides.get("native_client", native_client)),
+                authority_proof=cast(dict[str, object], overrides.get("authority_proof", authority_proof)),
+            )
+
         authority_proof = _authority_proof(
             state_root=state_root,
             instance="monitor",
@@ -572,6 +712,7 @@ def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycl
             bindings=bindings,
             lifecycle_receipts=lifecycle_receipts,
             native_client=native_client,
+            signing_key=bytes.fromhex(str(anchor_document["key"])),
         )
         handoff = build_authority_handoff_receipt(
             instance="monitor",
@@ -591,18 +732,118 @@ def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycl
         authority_receipt = cast(dict[str, object], handoff["authority_proof"])
         assert governed_lane["id"] == "monitor"
         assert authority_receipt["payload_sha256"]
+        assert cast(dict[str, object], authority_receipt["enrollment"])["enrollment_order_id"]
+        anchor_facts = cast(dict[str, object], authority_receipt["authority_anchor"])
+        assert str(anchor_facts["sha256"])
+        assert not (state_root / "ledger.key").exists()
+
+        ledger_path = state_root / "ledger.jsonl"
+        governed_ledger_bytes = ledger_path.read_bytes()
+        caller_key_line = json.loads(governed_ledger_bytes.decode("utf-8").splitlines()[-1])
+        ledger_module = _ledger_module()
+        caller_signed_entry = dict(caller_key_line)
+        caller_signed_entry["signature"] = ledger_module.sign(
+            os.urandom(32),
+            session_ref=str(caller_key_line["session_ref"]),
+            tag=str(caller_key_line["tag"]),
+            digest=str(caller_key_line["message_hash"]),
+            sent_at=str(caller_key_line["sent_at"]),
+        )
+        with pytest.raises(ConversionError, match="signature does not verify under the machine-provisioned authority"):
+            build(authority_proof={**authority_proof, "ledger_entry": caller_signed_entry})
+
+        caller_key = os.urandom(32)
+        caller_ledger_lines: list[dict[str, object]] = []
+        for raw_line in governed_ledger_bytes.decode("utf-8").splitlines():
+            line = cast(dict[str, object], json.loads(raw_line))
+            line["signature"] = ledger_module.sign(
+                caller_key,
+                session_ref=str(line["session_ref"]),
+                tag=str(line["tag"]),
+                digest=str(line["message_hash"]),
+                sent_at=str(line["sent_at"]),
+            )
+            caller_ledger_lines.append(line)
+        ledger_path.write_text("".join(json.dumps(line, sort_keys=True) + "\n" for line in caller_ledger_lines), encoding="utf-8")
+        with pytest.raises(ConversionError, match="signature does not verify under the machine-provisioned authority"):
+            build(authority_proof={**authority_proof, "ledger_entry": caller_ledger_lines[-1]})
+        ledger_path.write_bytes(governed_ledger_bytes)
+
+        self_authored_goals = _enrolled_goals_document(state_root)
+        self_authored_goals_list = cast(list[dict[str, object]], self_authored_goals["goals"])
+        self_authored_goal = self_authored_goals_list[0]
+        self_authored_goal["goal"] = "caller-replaced enrollment"
+        _write_json(state_root / "goals.json", self_authored_goals)
+        rewritten_bindings = dict(bindings)
+        rewritten_bindings["goals_sha256"] = _sha256_file(state_root / "goals.json")
+        with pytest.raises(ConversionError, match="goals document identity|post_state_sha256"):
+            build(instance_bindings=rewritten_bindings)
+        _write_json(state_root / "goals.json", _enrolled_goals_document(state_root))
+
+        caller_selected_lane_config = import_module("chitra.lane_config")
+        monkeypatch.setattr(caller_selected_lane_config, "DEFAULT_LANES_FILE", caller_manifest_path)
+        with pytest.raises(ConversionError, match="trust-anchor declaration"):
+            build()
+        monkeypatch.setattr(caller_selected_lane_config, "DEFAULT_LANES_FILE", manifest_path)
+
+        impostor_process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        impostor_writer = WriterObservation(
+            name=new_writer.name,
+            role="new",
+            unit=new_writer.unit,
+            process=f"pid:{impostor_process.pid}",
+            package=new_writer.package,
+            stopped=False,
+            started=True,
+            can_write=True,
+            action_receipt_sha256=new_writer.action_receipt_sha256,
+        )
+        impostor_bindings = dict(bindings)
+        impostor_bindings["new_process"] = impostor_writer.process
+        with pytest.raises(ConversionError, match="process identity"):
+            build(new_writer=impostor_writer, instance_bindings=impostor_bindings)
+
+        _start_tmux(rogue_socket_path, "monitor-new")
+        rogue_bindings = dict(bindings)
+        rogue_bindings["new_tmux_socket"] = str(rogue_socket_path)
+        with pytest.raises(ConversionError, match="tmux socket|governed lane manifest"):
+            build(instance_bindings=rogue_bindings)
+
+        fake_client = tmp_path / "path-shadow" / "codex"
+        fake_client.parent.mkdir()
+        fake_client.write_text("#!/bin/sh\nprintf 'codex caller-fake\\n'\n", encoding="utf-8")
+        fake_client.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{fake_client.parent}:{os.environ.get('PATH', '')}")
+        path_shadowed_handoff = build()
+        assert cast(dict[str, object], path_shadowed_handoff["native_client"])["path"] != str(fake_client)
+
+        caller_state_root = tmp_path / "caller-selected-state"
+        shutil.copytree(state_root, caller_state_root)
+        caller_root_bindings = {
+            key: (value.replace(str(state_root), str(caller_state_root), 1) if value.startswith(str(state_root)) else value)
+            for key, value in bindings.items()
+        }
+        with pytest.raises(ConversionError, match="state root"):
+            build(
+                instance_bindings=caller_root_bindings,
+                transcript_bindings=(_transcript_binding(caller_state_root),),
+            )
+
+        unanchored_dir = tmp_path / "unanchored"
+        unanchored_dir.mkdir()
+        handoff_authority_module = _handoff_authority_module()
+        saved_anchor_path = handoff_authority_module.MACHINE_ANCHOR_PATH
+        monkeypatch.setattr(handoff_authority_module, "MACHINE_ANCHOR_PATH", unanchored_dir / "absent.json")
+        with pytest.raises(ConversionError, match="handoff-authority anchor is unavailable"):
+            build()
+        monkeypatch.setattr(handoff_authority_module, "MACHINE_ANCHOR_PATH", saved_anchor_path)
+
         blank_writer = WriterObservation(
             name="", role="old", unit="", process="", package="", stopped=True, started=False, can_write=False
         )
         with pytest.raises(ConversionError, match="missing|transcript|native|lifecycle"):
-            build_authority_handoff_receipt(
-                instance="",
-                old_writer=blank_writer,
-                new_writer=new_writer,
-                pre_state_sha256="",
-                post_state_sha256="",
-                rollback_checkpoint_sha256="",
-            )
+            build(instance="", old_writer=blank_writer, pre_state_sha256="", post_state_sha256="", rollback_checkpoint_sha256="")
+
         old_writer_still_active = WriterObservation(
             name="old-dispatchd",
             role="old",
@@ -615,90 +856,14 @@ def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycl
             last_order_sha256=bindings["last_old_order_sha256"],
         )
         with pytest.raises(ConversionError, match="old writer can still write"):
-            build_authority_handoff_receipt(
-                instance="monitor",
-                old_writer=old_writer_still_active,
-                new_writer=new_writer,
-                pre_state_sha256=bindings["pre_state_sha256"],
-                post_state_sha256=bindings["post_state_sha256"],
-                rollback_checkpoint_sha256=bindings["rollback_checkpoint_sha256"],
-                transcript_bindings=(_transcript_binding(state_root),),
-                instance_bindings=bindings,
-                lifecycle_receipts=lifecycle_receipts,
-                native_client=native_client,
-                authority_proof=authority_proof,
-            )
-        contradictory = dict(bindings)
-        contradictory["old_unit"] = "fabricated.service"
-        fake_client = dict(native_client)
-        fake_client["path"] = str(tmp_path / "missing-codex")
-        with pytest.raises(ConversionError, match="contradicts|does not exist"):
-            build_authority_handoff_receipt(
-                instance="monitor",
-                old_writer=old_writer,
-                new_writer=new_writer,
-                pre_state_sha256=bindings["pre_state_sha256"],
-                post_state_sha256=bindings["post_state_sha256"],
-                rollback_checkpoint_sha256=bindings["rollback_checkpoint_sha256"],
-                transcript_bindings=(_transcript_binding(state_root),),
-                instance_bindings=contradictory,
-                lifecycle_receipts=lifecycle_receipts,
-                native_client=fake_client,
-                authority_proof=authority_proof,
-            )
-        self_authored = dict(bindings)
-        self_authored["state_root"] = str(tmp_path / "missing-state")
-        with pytest.raises(ConversionError, match="state_root does not exist"):
-            build_authority_handoff_receipt(
-                instance="monitor",
-                old_writer=old_writer,
-                new_writer=new_writer,
-                pre_state_sha256=bindings["pre_state_sha256"],
-                post_state_sha256=bindings["post_state_sha256"],
-                rollback_checkpoint_sha256=bindings["rollback_checkpoint_sha256"],
-                transcript_bindings=(_transcript_binding(state_root),),
-                instance_bindings=self_authored,
-                lifecycle_receipts=lifecycle_receipts,
-                native_client=native_client,
-                authority_proof=authority_proof,
-            )
-        mismatching_output = dict(native_client)
-        mismatching_output["version_output"] = "codex 9.9.9"
-        with pytest.raises(ConversionError, match="version_output"):
-            build_authority_handoff_receipt(
-                instance="monitor",
-                old_writer=old_writer,
-                new_writer=new_writer,
-                pre_state_sha256=bindings["pre_state_sha256"],
-                post_state_sha256=bindings["post_state_sha256"],
-                rollback_checkpoint_sha256=bindings["rollback_checkpoint_sha256"],
-                transcript_bindings=(_transcript_binding(state_root),),
-                instance_bindings=bindings,
-                lifecycle_receipts=lifecycle_receipts,
-                native_client=mismatching_output,
-                authority_proof=authority_proof,
-            )
-        caller_authored = dict(bindings)
-        caller_authored["goals_sha256"] = _sha256_file(state_root / "goals.json")
-        (state_root / "goals.json").write_text('{"schema":"chitra.goals.v3","goals":[]}', encoding="utf-8")
-        caller_authored["goals_sha256"] = _sha256_file(state_root / "goals.json")
-        with pytest.raises(ConversionError, match="enrolled goal authority|authority ledger entry hash"):
-            build_authority_handoff_receipt(
-                instance="monitor",
-                old_writer=old_writer,
-                new_writer=new_writer,
-                pre_state_sha256=bindings["pre_state_sha256"],
-                post_state_sha256=bindings["post_state_sha256"],
-                rollback_checkpoint_sha256=bindings["rollback_checkpoint_sha256"],
-                transcript_bindings=(_transcript_binding(state_root),),
-                instance_bindings=caller_authored,
-                lifecycle_receipts=lifecycle_receipts,
-                native_client=native_client,
-                authority_proof=authority_proof,
-            )
+            build(old_writer=old_writer_still_active)
     finally:
         writer_process.terminate()
         writer_process.wait(timeout=5)
+        if impostor_process is not None:
+            impostor_process.terminate()
+            impostor_process.wait(timeout=5)
+        _stop_tmux(rogue_socket_path)
         _stop_tmux(old_socket_path)
         _stop_tmux(new_socket_path)
 
