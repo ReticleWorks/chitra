@@ -20,6 +20,71 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.14.5] - 2026-08-22
+
+### Fixed
+
+- A same-inode rotation observed while the transcript holds no completed
+  records (for example a truncate-to-zero rewrite) now also restarts the
+  journal ingestor's normalizer replay state. A record restored verbatim
+  after such an empty rotation keeps its original event ID instead of
+  being appended again as an apparent second occurrence.
+
+## [0.14.4] - 2026-08-22
+
+### Fixed
+
+- A detected same-inode rewrite now replays duplicate-free through the
+  journal ingestor: replay restarts the normalizer's per-incarnation
+  occurrence numbering, so unchanged records reproduce their original
+  event IDs and the durable journal no longer appends duplicates of
+  already-stored events. Rotation across a different inode keeps
+  continuing the stream's numbering, preserving both W11 fixture
+  projections.
+
+## [0.14.3] - 2026-08-21
+
+### Fixed
+
+- Completed whitespace-only JSONL lines are now hash-covered like every
+  other consumed byte range: their range and digest are recorded when
+  consumed, so a same-inode, same-size rewrite of a blank line into a
+  valid record can no longer be silently skipped while the final anchor
+  stays unchanged. Any such mismatch rotates the same inode and replays
+  the transcript.
+
+## [0.14.2] - 2026-08-21
+
+### Fixed
+
+- Same-inode, same-size rewrites at any record position are now always
+  detected: every poll re-verifies the stored hash of every consumed
+  record at its byte range (plus buffered partial bytes), removing the
+  16-record sampled verification that could silently skip an unsampled
+  interior record in journals longer than 16 records. Any mismatch
+  rotates the same inode and replays the whole transcript.
+
+## [0.14.1] - 2026-08-21
+
+### Fixed
+
+- Same-inode rewrites are no longer missed when file size and the final
+  64 bytes are unchanged: each poll re-verifies stored record hashes at
+  their byte ranges (first and last records always, a deterministic
+  sample of earlier records, plus buffered partial bytes) and replays
+  the transcript on any mismatch.
+
+## [0.14.0] - 2026-08-21
+
+### Added
+
+- Add fixture-gated Claude Code 2.1.229 and Codex 0.149.0 transcript
+  normalizers with stable canonical event IDs and native call/result joins.
+- Add a byte-accurate JSONL tail reader that retains partial appends, follows
+  same-inode resumes, and switches cleanly across rotation.
+- Add append-only per-lane event and progress-derivation journals under each
+  instance state root. Native records remain intact for replay.
+
 ## [0.13.0] - 2026-08-21
 
 ### Added
