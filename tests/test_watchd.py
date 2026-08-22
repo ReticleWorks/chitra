@@ -16,7 +16,7 @@ from chitra.agent_runtime import AgentStatusBroker
 from chitra.agent_status import ManifestRepository
 from chitra.dispatch import DispatchOrder
 from chitra.goal_enforcement import ReviewerVerdict, ReviewFinding
-from chitra.goals import GoalRecord, get_goal, upsert_goal
+from chitra.goals import GOALS_SCHEMA_NEWER_MESSAGE, GoalRecord, get_goal, upsert_goal
 from chitra.journal import CanonicalEvent, CanonicalType, Client, EventJournal, TranscriptIdentity
 from chitra.lane_activity import load_lane_activity
 from chitra.orders import DispatchResult, DispatchStatus
@@ -892,6 +892,43 @@ def test_delivered_order_triggers_review_of_next_turn_end(tmp_path: Path) -> Non
         assert recorded_verdicts() == ["unavailable", "accept"]
     finally:
         watcher.shutdown()
+
+
+def test_watchd_survives_a_newer_goals_store_read_only(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """The v4-outage rule for the state-writing watcher: against a goals.json
+    labeled newer than the installed package, poll_once journals the read-only
+    degradation once and keeps emitting pane events instead of letting
+    GoalsSchemaNewerError kill run_forever's loop; goal mutations are skipped,
+    so the newer writer's file is never rewritten."""
+    goal = _tracked_goal(tmp_path)
+    payload = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
+    payload["schema"] = "chitra.goals.v4"
+    (tmp_path / "goals.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    captures = iter(["Working... esc to interrupt\n", "I need the exact release target before continuing.\n❯\n"])
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures))
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"), runner=runner)
+    try:
+        watcher.poll_once()
+        emitted = watcher.poll_once()
+    finally:
+        watcher.shutdown()
+
+    assert emitted == 1
+    stored = get_goal(tmp_path, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "working"
+    document = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
+    assert document["schema"] == "chitra.goals.v4"
+    notices = [line for line in capsys.readouterr().out.splitlines() if GOALS_SCHEMA_NEWER_MESSAGE in line]
+    assert len(notices) == 1
 
 
 def test_list_panes_uses_live_tmux_enumeration_and_deduplicates_pane_id() -> None:

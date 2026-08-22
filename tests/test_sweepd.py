@@ -7,10 +7,11 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from _goal_fixtures import enrollment_fields
 
 from chitra.account_registry import update_registry
-from chitra.goals import GoalRecord, GoalStatus, close_goal, upsert_goal
+from chitra.goals import GOALS_SCHEMA_NEWER_MESSAGE, GoalRecord, GoalStatus, close_goal, upsert_goal
 from chitra.rate_limit_state import LoadHostState, Transaction, upsert_load_state, upsert_transaction
 from chitra.sweepd import SweepSnapshot, build_snapshot, compute_delta, load_latest_flags, load_snapshot, resolve_config, run_once
 from chitra.usage import AccountedVerdict
@@ -183,3 +184,30 @@ def test_digest_persistence_round_trip_collapses_unchanged_lanes(tmp_path: Path)
     digest_payload = json.loads(config.digest_path.read_text(encoding="utf-8"))
     assert digest_payload["unchanged_lane_count"] == 1
     assert digest_payload["changed_lanes"] == []
+
+
+def test_sweep_runs_read_only_against_a_newer_goals_schema(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """The v4-outage rule: sweepd starts and publishes its digest against a
+    goals.json labeled newer than the installed package, journaling the
+    read-only degradation once instead of exiting into a restart loop."""
+    record = _goal("host-a:one:0.0").to_dict()
+    record["future_v4_field"] = {"unknown": True}
+    (tmp_path / "goals.json").write_text(
+        json.dumps({"schema": "chitra.goals.v4", "updated_at": "2026-08-22T00:00:00+00:00", "goals": [record]}),
+        encoding="utf-8",
+    )
+    flags_path = tmp_path / "flags.log"
+    config = resolve_config(
+        state_dir=tmp_path,
+        digest_path=tmp_path / "sweep-digest.json",
+        snapshot_path=tmp_path / "sweep-digest-state.json",
+        flags_path=flags_path,
+        poll_seconds=30,
+    )
+
+    digest = run_once(config, now=NOW)
+
+    assert [change.lane.session_ref for change in digest.changed_lanes] == ["host-a:one:0.0"]
+    notices = [line for line in capsys.readouterr().out.splitlines() if GOALS_SCHEMA_NEWER_MESSAGE in line]
+    assert len(notices) == 1
+    assert json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))["schema"] == "chitra.goals.v4"

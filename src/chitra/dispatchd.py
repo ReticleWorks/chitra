@@ -121,7 +121,17 @@ from .dispatch import (
     nudge_confirmation_marker,
     transcript_confirms_nudge,
 )
-from .goals import LOAD_SHED_HOLD_REASON_PREFIX, RATE_LIMIT_HOLD_REASON_PREFIX, get_goal
+from .goals import (
+    GOALS_SCHEMA_NEWER_MESSAGE,
+    LOAD_SHED_HOLD_REASON_PREFIX,
+    RATE_LIMIT_HOLD_REASON_PREFIX,
+    GoalsSchemaNewerError,
+    get_goal,
+    goals_schema_newer_than_installed,
+)
+from .goals import (
+    SCHEMA as GOALS_INSTALLED_SCHEMA,
+)
 from .journal import native_session_identity
 from .orders import DispatchOrder, DispatchResult, DispatchStatus
 from .policy_config import PolicyConfig, load_policy_config
@@ -132,6 +142,33 @@ logger = structlog.get_logger(__name__)
 
 DEFAULT_POLL_SECONDS = 1.0
 DEFAULT_LANE_LOCK_RETRY_ATTEMPTS = 20
+
+# Roots whose newer-than-installed goals.json has already been journaled; a
+# long-running daemon notices once instead of writing the same warning into
+# the journal on every poll.
+_SCHEMA_NOTICED_ROOTS: set[str] = set()
+
+
+def note_goals_schema_state(goals_root: Path | None) -> None:
+    """Journal one read-only notice when this store's file schema is newer.
+
+    A newer goals.json never stops the queue: goal state is treated as
+    read-only and the daemon keeps running instead of exiting into a
+    supervisor restart loop (the chitra.goals.v4 outage class).
+    """
+    file_schema = goals_schema_newer_than_installed(goals_root)
+    if file_schema is None:
+        return
+    key = str(goals_root) if goals_root is not None else "<default-state-dir>"
+    if key in _SCHEMA_NOTICED_ROOTS:
+        return
+    _SCHEMA_NOTICED_ROOTS.add(key)
+    logger.warning(
+        GOALS_SCHEMA_NEWER_MESSAGE,
+        goals_root=key,
+        file_schema=file_schema,
+        installed_schema=GOALS_INSTALLED_SCHEMA,
+    )
 
 
 class _ConfigNotPreloaded:
@@ -979,7 +1016,15 @@ def _process_claimed_order(
         # see this module's docstring). bypass_rate_limit_freeze only takes
         # effect for dispatchd's own sealed internal task types.
         allowed_bypass = order.bypass_rate_limit_freeze and order.task_type in _RATE_LIMIT_GUARD_TASK_TYPES
-        held = None if allowed_bypass else get_goal(goals_root, order.session_ref)
+        held = None
+        if not allowed_bypass:
+            try:
+                held = get_goal(goals_root, order.session_ref)
+            except GoalsSchemaNewerError:
+                # Read-only degradation: the store refuses writes to this
+                # package, so run without goal-informed freeze decisions and
+                # keep draining the queue rather than exiting.
+                note_goals_schema_state(goals_root)
         if (
             held is not None
             and held.status == "held"
@@ -1209,6 +1254,7 @@ def run_once(
     queue_dir = queue_dir or default_queue_dir()
     orders_dir, results_dir, processed_dir = _ensure_queue_dirs(queue_dir)
     _reclaim_stale_in_flight(queue_dir)
+    note_goals_schema_state(goals_root)
     if isinstance(_preloaded_routing_config, _ConfigNotPreloaded):
         routing_config = load_routing_config(routing_config_path)
     else:
