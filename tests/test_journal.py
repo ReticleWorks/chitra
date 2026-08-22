@@ -473,3 +473,53 @@ def test_same_inode_rewrite_replay_appends_no_duplicate_events(tmp_path: Path) -
         hashlib.sha256(b"{ }\n").hexdigest(),
         hashlib.sha256(suffix).hexdigest(),
     }
+
+
+def test_same_inode_truncate_to_zero_rotation_preserves_original_event(tmp_path: Path) -> None:
+    transcript = tmp_path / "truncate-rotation-replay.jsonl"
+    record = json.dumps(
+        {"timestamp": "2026-08-21T00:00:00Z", "index": 0, "value": "x" * _REWRITE_PAD}, separators=(",", ":")
+    ).encode() + b"\n"
+    transcript.write_bytes(record)
+
+    with JournalIngestor(
+        state_root=tmp_path / "state",
+        transcript_path=transcript,
+        context=NormalizationContext(
+            instance="w11-fixture",
+            lane="codex",
+            client=Client.CODEX,
+            client_version="0.149.0",
+            observed_at="2026-08-21T00:00:00Z",
+        ),
+    ) as ingestor:
+        initial = ingestor.poll()
+        assert len(initial.appended) == 1
+        assert not initial.rotations
+        original_event_id = initial.appended[0].event_id
+        inode = transcript.stat().st_ino
+        with transcript.open("r+b") as handle:
+            handle.truncate(0)
+            handle.flush()
+            os.fsync(handle.fileno())
+        assert transcript.stat().st_ino == inode
+
+        empty_rotation = ingestor.poll()
+        assert len(empty_rotation.rotations) == 1
+        assert empty_rotation.rotations[0].previous.inode == inode
+        assert empty_rotation.rotations[0].current.inode == inode
+        assert empty_rotation.observed == ()
+        assert empty_rotation.appended == ()
+        assert len(ingestor.journal.load()) == 1
+
+        with transcript.open("r+b") as handle:
+            handle.write(record)
+            handle.flush()
+            os.fsync(handle.fileno())
+        restored = ingestor.poll()
+        stored = ingestor.journal.load()
+
+    assert len(restored.observed) == 1
+    assert restored.appended == ()
+    assert len(stored) == 1
+    assert stored[0].event_id == original_event_id

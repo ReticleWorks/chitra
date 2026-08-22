@@ -52,6 +52,16 @@ class JournalIngestor:
             == (rotation.current.device, rotation.current.inode)
         }
         observed: list[CanonicalEvent] = []
+        for rotation in batch.rotations:
+            if (rotation.previous.device, rotation.previous.inode) != (
+                rotation.current.device,
+                rotation.current.inode,
+            ):
+                continue
+            if self._normalizer_generation != rotation.previous.generation:
+                continue
+            self.normalizer.begin_replay()
+            self._normalizer_generation = rotation.current.generation
         for record in batch.records:
             if record.transcript.generation != self._normalizer_generation:
                 if (

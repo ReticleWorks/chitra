@@ -20,6 +20,16 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.14.5] - 2026-08-22
+
+### Fixed
+
+- A same-inode rotation observed while the transcript holds no completed
+  records (for example a truncate-to-zero rewrite) now also restarts the
+  journal ingestor's normalizer replay state. A record restored verbatim
+  after such an empty rotation keeps its original event ID instead of
+  being appended again as an apparent second occurrence.
+
 ## [0.14.4] - 2026-08-22
 
 ### Fixed
