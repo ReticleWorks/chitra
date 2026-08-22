@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import socket
 import tomllib
 from importlib import import_module
 from pathlib import Path
@@ -34,6 +36,37 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _canonical_bytes(payload: object) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _sha256_bytes(data: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def _file_manifest(root: Path) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        stat_result = path.stat()
+        entries.append(
+            {
+                "relative_path": path.relative_to(root).as_posix(),
+                "sha256": _sha256_file(path),
+                "size": stat_result.st_size,
+                "mode": oct(stat_result.st_mode & 0o777),
+            }
+        )
+    return entries
+
+
+def _manifest_digest(root: Path) -> str:
+    return _sha256_bytes(_canonical_bytes(_file_manifest(root)))
 
 
 def _canonical_event_model() -> type[Any]:
@@ -158,43 +191,115 @@ def test_w10_snapshot_metadata_reconciles_expected_legacy_topology(tmp_path: Pat
     }
 
 
-def _instance_bindings() -> dict[str, str]:
+def _instance_bindings(state_root: Path, old_socket: Path, new_socket: Path, old_process: str, new_process: str) -> dict[str, str]:
+    _write_json(state_root / "goals.json", {"schema": "chitra.goals.v3", "goals": []})
+    _write_json(state_root / "queue" / "orders" / "order-1.json", {"order_id": "order-1", "session_ref": "host:monitor:%1"})
+    _write_json(state_root / "lane-worktrees.json", {"monitor": str(state_root / "worktree")})
+    _write_json(state_root / "handoff" / "last-old-order.json", {"order_id": "order-1", "status": "drained"})
+    _write_json(state_root / "handoff" / "last-old-event.json", {"event": "old-write-denied"})
+    _write_json(state_root / "handoff" / "new-action-receipt.json", {"event": "new-write-proved"})
+    _write_json(state_root / "handoff" / "pre-state-manifest.json", {"manifest_sha256": "pre"})
+    _write_json(state_root / "handoff" / "rollback-checkpoint.json", {"manifest_sha256": "rollback"})
+    transcript = state_root / "transcripts" / "session.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text('{"type":"event","message":"observed"}\n', encoding="utf-8")
+
     return {
         "namespace": "monitor",
-        "state_root": "/var/lib/polyphony-chitra",
-        "goals_sha256": "1" * 64,
-        "queue_sha256": "2" * 64,
+        "state_root": str(state_root),
+        "goals_path": str(state_root / "goals.json"),
+        "goals_sha256": _sha256_file(state_root / "goals.json"),
+        "queue_root": str(state_root / "queue"),
+        "queue_sha256": _manifest_digest(state_root / "queue"),
         "old_unit": "chitra-dispatchd.service",
         "new_unit": "polyphony-chitra-dispatchd@monitor.service",
-        "old_process": "pid:100",
-        "new_process": "pid:200",
+        "old_process": old_process,
+        "new_process": new_process,
         "old_package": "chitra 0.11.0",
         "new_package": "chitra 0.14.10",
-        "old_tmux_socket": "/tmp/old.sock",
-        "new_tmux_socket": "/tmp/new.sock",
-        "lane_worktrees_sha256": "3" * 64,
-        "last_old_order_sha256": "a" * 64,
-        "last_old_event_sha256": "4" * 64,
-        "pre_state_sha256": "c" * 64,
-        "post_state_sha256": "d" * 64,
-        "rollback_checkpoint_sha256": "e" * 64,
+        "old_tmux_socket": str(old_socket),
+        "new_tmux_socket": str(new_socket),
+        "lane_worktrees_path": str(state_root / "lane-worktrees.json"),
+        "lane_worktrees_sha256": _sha256_file(state_root / "lane-worktrees.json"),
+        "last_old_order_path": str(state_root / "handoff" / "last-old-order.json"),
+        "last_old_order_sha256": _sha256_file(state_root / "handoff" / "last-old-order.json"),
+        "last_old_event_path": str(state_root / "handoff" / "last-old-event.json"),
+        "last_old_event_sha256": _sha256_file(state_root / "handoff" / "last-old-event.json"),
+        "new_action_receipt_path": str(state_root / "handoff" / "new-action-receipt.json"),
+        "new_action_receipt_sha256": _sha256_file(state_root / "handoff" / "new-action-receipt.json"),
+        "pre_state_manifest_path": str(state_root / "handoff" / "pre-state-manifest.json"),
+        "pre_state_sha256": _sha256_file(state_root / "handoff" / "pre-state-manifest.json"),
+        "rollback_checkpoint_path": str(state_root / "handoff" / "rollback-checkpoint.json"),
+        "rollback_checkpoint_sha256": _sha256_file(state_root / "handoff" / "rollback-checkpoint.json"),
+        "post_state_sha256": _manifest_digest(state_root),
     }
 
 
 def _lifecycle_receipts(tmp_path: Path, bindings: dict[str, str]) -> list[dict[str, object]]:
     receipts: list[dict[str, object]] = []
-    for kind, hex_digit, role, unit_key, process_key, package_key, booleans in (
-        ("old_drained", "5", "old", "old_unit", "old_process", "old_package", {"stopped": False, "started": False, "can_write": False}),
-        ("old_stopped", "6", "old", "old_unit", "old_process", "old_package", {"stopped": True, "started": False, "can_write": False}),
-        ("old_write_denied", "7", "old", "old_unit", "old_process", "old_package", {"stopped": True, "started": False, "can_write": False}),
-        ("new_started", "8", "new", "new_unit", "new_process", "new_package", {"stopped": False, "started": True, "can_write": True}),
-        ("new_write_proved", "9", "new", "new_unit", "new_process", "new_package", {"stopped": False, "started": True, "can_write": True}),
+    post_state_sha256 = bindings["post_state_sha256"]
+    for kind, role, unit_key, process_key, package_key, socket_key, process_alive, evidence_key, booleans in (
+        (
+            "old_drained",
+            "old",
+            "old_unit",
+            "old_process",
+            "old_package",
+            "old_tmux_socket",
+            False,
+            "last_old_order_sha256",
+            {"stopped": False, "started": False, "can_write": False},
+        ),
+        (
+            "old_stopped",
+            "old",
+            "old_unit",
+            "old_process",
+            "old_package",
+            "old_tmux_socket",
+            False,
+            "pre_state_sha256",
+            {"stopped": True, "started": False, "can_write": False},
+        ),
+        (
+            "old_write_denied",
+            "old",
+            "old_unit",
+            "old_process",
+            "old_package",
+            "old_tmux_socket",
+            False,
+            "last_old_event_sha256",
+            {"stopped": True, "started": False, "can_write": False},
+        ),
+        (
+            "new_started",
+            "new",
+            "new_unit",
+            "new_process",
+            "new_package",
+            "new_tmux_socket",
+            True,
+            "post_state_sha256",
+            {"stopped": False, "started": True, "can_write": True},
+        ),
+        (
+            "new_write_proved",
+            "new",
+            "new_unit",
+            "new_process",
+            "new_package",
+            "new_tmux_socket",
+            True,
+            "new_action_receipt_sha256",
+            {"stopped": False, "started": True, "can_write": True},
+        ),
     ):
         artifact = {
             "schema": "chitra.authority-handoff-lifecycle-proof.v1",
             "kind": kind,
-            "observer": "external-test-harness",
-            "subject": f"monitor:{kind}",
+            "observer": "chitra-authority-verifier",
+            "subject": f"monitor:{role}:{bindings[unit_key]}:{kind}",
             "observed_at": "2026-08-22T00:00:00+00:00",
             "instance": "monitor",
             "writer_role": role,
@@ -202,7 +307,10 @@ def _lifecycle_receipts(tmp_path: Path, bindings: dict[str, str]) -> list[dict[s
             "process": bindings[process_key],
             "package": bindings[package_key],
             "state_root": bindings["state_root"],
-            "artifact_nonce": hex_digit * 64,
+            "tmux_socket": bindings[socket_key],
+            "process_alive": process_alive,
+            "state_root_sha256": post_state_sha256,
+            "evidence_sha256": bindings[evidence_key],
             **booleans,
         }
         path = tmp_path / "lifecycle" / f"{kind}.json"
@@ -230,6 +338,7 @@ def _native_client(tmp_path: Path) -> dict[str, object]:
         "version": "0.149.0",
         "path": str(client_path.resolve()),
         "path_sha256": client_sha,
+        "version_output": "codex 0.149.0",
         "update_suppression": False,
     }
     proof_path = tmp_path / "native-client-proof.json"
@@ -241,11 +350,8 @@ def _native_client(tmp_path: Path) -> dict[str, object]:
     }
 
 
-def _transcript_binding(tmp_path: Path) -> str:
-    transcript = tmp_path / "transcripts" / "session.jsonl"
-    transcript.parent.mkdir(parents=True, exist_ok=True)
-    transcript.write_text('{"type":"event","message":"observed"}\n', encoding="utf-8")
-    return str(transcript)
+def _transcript_binding(state_root: Path) -> str:
+    return str(state_root / "transcripts" / "session.jsonl")
 
 
 def test_shadow_scan_never_writes_inside_live_state_or_dispatches(tmp_path: Path) -> None:
@@ -261,94 +367,146 @@ def test_shadow_scan_never_writes_inside_live_state_or_dispatches(tmp_path: Path
         run_shadow_scan(state, state / "shadow")
 
 
-def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycle_bindings(tmp_path: Path) -> None:
+def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycle_bindings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_root = tmp_path / "state"
+    old_socket_path = tmp_path / "old.sock"
+    new_socket_path = tmp_path / "new.sock"
+    old_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    new_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old_socket.bind(str(old_socket_path))
+    new_socket.bind(str(new_socket_path))
+    missing_pid = os.getpid() + 100_000
+    while Path(f"/proc/{missing_pid}").exists():
+        missing_pid += 1
+    old_process = f"pid:{missing_pid}"
+    new_process = f"pid:{os.getpid()}"
+    bindings = _instance_bindings(state_root, old_socket_path, new_socket_path, old_process, new_process)
+    native_client = _native_client(tmp_path)
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}")
     old_writer = WriterObservation(
         name="old-dispatchd",
         role="old",
         unit="chitra-dispatchd.service",
-        process="pid:100",
+        process=old_process,
         package="chitra 0.11.0",
         stopped=True,
         started=False,
         can_write=False,
-        last_order_sha256="a" * 64,
+        last_order_sha256=bindings["last_old_order_sha256"],
     )
     new_writer = WriterObservation(
         name="new-dispatchd",
         role="new",
         unit="polyphony-chitra-dispatchd@monitor.service",
-        process="pid:200",
+        process=new_process,
         package="chitra 0.14.10",
         stopped=False,
         started=True,
         can_write=True,
-        action_receipt_sha256="b" * 64,
+        action_receipt_sha256=bindings["new_action_receipt_sha256"],
     )
-    bindings = _instance_bindings()
-    handoff = build_authority_handoff_receipt(
-        instance="monitor",
-        old_writer=old_writer,
-        new_writer=new_writer,
-        pre_state_sha256="c" * 64,
-        post_state_sha256="d" * 64,
-        rollback_checkpoint_sha256="e" * 64,
-        transcript_bindings=(_transcript_binding(tmp_path),),
-        instance_bindings=bindings,
-        lifecycle_receipts=_lifecycle_receipts(tmp_path, bindings),
-        native_client=_native_client(tmp_path),
-    )
-    assert handoff["exactly_one_writer"] is True
-    blank_writer = WriterObservation(name="", role="old", unit="", process="", package="", stopped=True, started=False, can_write=False)
-    with pytest.raises(ConversionError, match="missing|transcript|native|lifecycle"):
-        build_authority_handoff_receipt(
-            instance="",
-            old_writer=blank_writer,
-            new_writer=new_writer,
-            pre_state_sha256="",
-            post_state_sha256="",
-            rollback_checkpoint_sha256="",
-        )
-    old_writer_still_active = WriterObservation(
-        name="old-dispatchd",
-        role="old",
-        unit="chitra-dispatchd.service",
-        process="pid:100",
-        package="chitra 0.11.0",
-        stopped=True,
-        started=False,
-        can_write=True,
-        last_order_sha256="a" * 64,
-    )
-    with pytest.raises(ConversionError, match="old writer can still write"):
-        build_authority_handoff_receipt(
-            instance="monitor",
-            old_writer=old_writer_still_active,
-            new_writer=new_writer,
-            pre_state_sha256="c" * 64,
-            post_state_sha256="d" * 64,
-            rollback_checkpoint_sha256="e" * 64,
-            transcript_bindings=(_transcript_binding(tmp_path),),
-            instance_bindings=bindings,
-            lifecycle_receipts=_lifecycle_receipts(tmp_path, bindings),
-            native_client=_native_client(tmp_path),
-        )
-    contradictory = dict(bindings)
-    contradictory["old_unit"] = "fabricated.service"
-    fake_client = dict(_native_client(tmp_path))
-    fake_client["path"] = str(tmp_path / "missing-codex")
-    with pytest.raises(ConversionError, match="contradicts|does not exist"):
-        build_authority_handoff_receipt(
+    try:
+        handoff = build_authority_handoff_receipt(
             instance="monitor",
             old_writer=old_writer,
             new_writer=new_writer,
-            pre_state_sha256="c" * 64,
-            post_state_sha256="d" * 64,
-            rollback_checkpoint_sha256="e" * 64,
-            transcript_bindings=(_transcript_binding(tmp_path),),
-            instance_bindings=contradictory,
+            pre_state_sha256=bindings["pre_state_sha256"],
+            post_state_sha256=bindings["post_state_sha256"],
+            rollback_checkpoint_sha256=bindings["rollback_checkpoint_sha256"],
+            transcript_bindings=(_transcript_binding(state_root),),
+            instance_bindings=bindings,
             lifecycle_receipts=_lifecycle_receipts(tmp_path, bindings),
-            native_client=fake_client,
+            native_client=native_client,
         )
+        assert handoff["exactly_one_writer"] is True
+        blank_writer = WriterObservation(
+            name="", role="old", unit="", process="", package="", stopped=True, started=False, can_write=False
+        )
+        with pytest.raises(ConversionError, match="missing|transcript|native|lifecycle"):
+            build_authority_handoff_receipt(
+                instance="",
+                old_writer=blank_writer,
+                new_writer=new_writer,
+                pre_state_sha256="",
+                post_state_sha256="",
+                rollback_checkpoint_sha256="",
+            )
+        old_writer_still_active = WriterObservation(
+            name="old-dispatchd",
+            role="old",
+            unit="chitra-dispatchd.service",
+            process=old_process,
+            package="chitra 0.11.0",
+            stopped=True,
+            started=False,
+            can_write=True,
+            last_order_sha256=bindings["last_old_order_sha256"],
+        )
+        with pytest.raises(ConversionError, match="old writer can still write"):
+            build_authority_handoff_receipt(
+                instance="monitor",
+                old_writer=old_writer_still_active,
+                new_writer=new_writer,
+                pre_state_sha256=bindings["pre_state_sha256"],
+                post_state_sha256=bindings["post_state_sha256"],
+                rollback_checkpoint_sha256=bindings["rollback_checkpoint_sha256"],
+                transcript_bindings=(_transcript_binding(state_root),),
+                instance_bindings=bindings,
+                lifecycle_receipts=_lifecycle_receipts(tmp_path, bindings),
+                native_client=native_client,
+            )
+        contradictory = dict(bindings)
+        contradictory["old_unit"] = "fabricated.service"
+        fake_client = dict(native_client)
+        fake_client["path"] = str(tmp_path / "missing-codex")
+        with pytest.raises(ConversionError, match="contradicts|does not exist"):
+            build_authority_handoff_receipt(
+                instance="monitor",
+                old_writer=old_writer,
+                new_writer=new_writer,
+                pre_state_sha256=bindings["pre_state_sha256"],
+                post_state_sha256=bindings["post_state_sha256"],
+                rollback_checkpoint_sha256=bindings["rollback_checkpoint_sha256"],
+                transcript_bindings=(_transcript_binding(state_root),),
+                instance_bindings=contradictory,
+                lifecycle_receipts=_lifecycle_receipts(tmp_path, bindings),
+                native_client=fake_client,
+            )
+        self_authored = dict(bindings)
+        self_authored["state_root"] = str(tmp_path / "missing-state")
+        with pytest.raises(ConversionError, match="state_root does not exist"):
+            build_authority_handoff_receipt(
+                instance="monitor",
+                old_writer=old_writer,
+                new_writer=new_writer,
+                pre_state_sha256=bindings["pre_state_sha256"],
+                post_state_sha256=bindings["post_state_sha256"],
+                rollback_checkpoint_sha256=bindings["rollback_checkpoint_sha256"],
+                transcript_bindings=(_transcript_binding(state_root),),
+                instance_bindings=self_authored,
+                lifecycle_receipts=_lifecycle_receipts(tmp_path, bindings),
+                native_client=native_client,
+            )
+        mismatching_output = dict(native_client)
+        mismatching_output["version_output"] = "codex 9.9.9"
+        with pytest.raises(ConversionError, match="version_output"):
+            build_authority_handoff_receipt(
+                instance="monitor",
+                old_writer=old_writer,
+                new_writer=new_writer,
+                pre_state_sha256=bindings["pre_state_sha256"],
+                post_state_sha256=bindings["post_state_sha256"],
+                rollback_checkpoint_sha256=bindings["rollback_checkpoint_sha256"],
+                transcript_bindings=(_transcript_binding(state_root),),
+                instance_bindings=bindings,
+                lifecycle_receipts=_lifecycle_receipts(tmp_path, bindings),
+                native_client=mismatching_output,
+            )
+    finally:
+        old_socket.close()
+        new_socket.close()
 
 
 def test_rollback_validates_snapshot_before_touching_destination_and_refuses_v2_evidence_loss(tmp_path: Path) -> None:

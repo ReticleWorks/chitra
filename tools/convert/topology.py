@@ -11,6 +11,8 @@ import argparse
 import json
 import os
 import shutil
+import stat
+import subprocess
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -49,12 +51,44 @@ REQUIRED_INSTANCE_BINDINGS = frozenset(
         "lane_worktrees_sha256",
         "last_old_order_sha256",
         "last_old_event_sha256",
+        "new_action_receipt_sha256",
         "pre_state_sha256",
         "post_state_sha256",
         "rollback_checkpoint_sha256",
+        "goals_path",
+        "queue_root",
+        "lane_worktrees_path",
+        "last_old_order_path",
+        "last_old_event_path",
+        "new_action_receipt_path",
+        "pre_state_manifest_path",
+        "rollback_checkpoint_path",
     )
 )
 REQUIRED_LIFECYCLE_RECEIPTS = frozenset(("old_drained", "old_stopped", "old_write_denied", "new_started", "new_write_proved"))
+APPROVED_NATIVE_CLIENTS = frozenset(("codex",))
+LIFECYCLE_ARTIFACT_FIELDS = frozenset(
+    (
+        "schema",
+        "kind",
+        "observer",
+        "subject",
+        "observed_at",
+        "instance",
+        "writer_role",
+        "unit",
+        "process",
+        "package",
+        "state_root",
+        "tmux_socket",
+        "process_alive",
+        "state_root_sha256",
+        "evidence_sha256",
+        "stopped",
+        "started",
+        "can_write",
+    )
+)
 
 
 class ConversionError(ValueError):
@@ -175,6 +209,107 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _pid_from_process(value: str) -> int | None:
+    if not value.startswith("pid:"):
+        return None
+    raw = value.removeprefix("pid:")
+    if not raw.isdigit():
+        return None
+    pid = int(raw)
+    return pid if pid > 0 else None
+
+
+def _process_exists(process: str) -> bool | None:
+    pid = _pid_from_process(process)
+    if pid is None:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _unix_socket_exists(path: Path) -> bool:
+    try:
+        return stat.S_ISSOCK(path.stat().st_mode)
+    except OSError:
+        return False
+
+
+def _jsonl_transcript_is_valid(path: Path) -> bool:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    if not lines:
+        return False
+    for line in lines:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        if not any(isinstance(payload.get(key), str) and payload.get(key) for key in ("schema", "type", "event")):
+            return False
+    return True
+
+
+def _observed_file_sha256(
+    bindings: Mapping[str, str],
+    path_key: str,
+    digest_key: str,
+    *,
+    state_root: Path,
+    issues: list[str],
+) -> str | None:
+    raw_path = bindings.get(path_key)
+    expected_sha = bindings.get(digest_key)
+    if not raw_path:
+        issues.append(f"instance binding {path_key} is missing")
+        return None
+    path = _safe_resolve(Path(raw_path))
+    if not _is_relative_to(path, state_root):
+        issues.append(f"instance binding {path_key} must be inside the observed state root")
+        return None
+    if not path.exists() or not path.is_file():
+        issues.append(f"instance binding {path_key} does not exist")
+        return None
+    actual_sha = _sha256_file(path)
+    if expected_sha != actual_sha:
+        issues.append(f"instance binding {digest_key} does not match {path_key} bytes")
+    return actual_sha
+
+
+def _observed_tree_sha256(
+    bindings: Mapping[str, str],
+    path_key: str,
+    digest_key: str,
+    *,
+    state_root: Path,
+    issues: list[str],
+) -> str | None:
+    raw_path = bindings.get(path_key)
+    expected_sha = bindings.get(digest_key)
+    if not raw_path:
+        issues.append(f"instance binding {path_key} is missing")
+        return None
+    path = _safe_resolve(Path(raw_path))
+    if not _is_relative_to(path, state_root):
+        issues.append(f"instance binding {path_key} must be inside the observed state root")
+        return None
+    if not path.exists() or not path.is_dir():
+        issues.append(f"instance binding {path_key} does not exist")
+        return None
+    actual_sha = _manifest_digest(_file_manifest(path))
+    if expected_sha != actual_sha:
+        issues.append(f"instance binding {digest_key} does not match {path_key} manifest")
+    return actual_sha
 
 
 def _goal_records(payload: Mapping[str, object], source: Path | str) -> list[dict[str, object]]:
@@ -813,6 +948,7 @@ def build_authority_handoff_receipt(
         "old_package": old_writer.package,
         "new_package": new_writer.package,
         "last_old_order_sha256": old_writer.last_order_sha256,
+        "new_action_receipt_sha256": new_writer.action_receipt_sha256,
         "pre_state_sha256": pre_state_sha256,
         "post_state_sha256": post_state_sha256,
         "rollback_checkpoint_sha256": rollback_checkpoint_sha256,
@@ -820,6 +956,66 @@ def build_authority_handoff_receipt(
     for key, expected in expected_bindings.items():
         if bindings.get(key) != expected:
             issues.append(f"instance binding {key} contradicts observed handoff fact")
+    observed_state_root: Path | None = None
+    observed_post_state_sha256: str | None = None
+    state_root_value = bindings.get("state_root")
+    if isinstance(state_root_value, str) and state_root_value:
+        state_root_path = _safe_resolve(Path(state_root_value))
+        if not state_root_path.exists() or not state_root_path.is_dir():
+            issues.append("instance binding state_root does not exist")
+        else:
+            observed_state_root = state_root_path
+            bindings["state_root"] = str(state_root_path)
+            observed_post_state_sha256 = _manifest_digest(_file_manifest(state_root_path))
+            if post_state_sha256 != observed_post_state_sha256:
+                issues.append("post_state_sha256 does not match observed state root manifest")
+    for socket_key in ("old_tmux_socket", "new_tmux_socket"):
+        socket_value = bindings.get(socket_key)
+        if isinstance(socket_value, str) and socket_value:
+            socket_path = _safe_resolve(Path(socket_value))
+            if not _unix_socket_exists(socket_path):
+                issues.append(f"instance binding {socket_key} is not an observed Unix socket")
+            else:
+                bindings[socket_key] = str(socket_path)
+    old_process_alive = _process_exists(old_writer.process)
+    new_process_alive = _process_exists(new_writer.process)
+    if old_process_alive is None:
+        issues.append("old writer process must be an observable pid:<int>")
+    elif old_process_alive:
+        issues.append("old writer process is still live")
+    if new_process_alive is None:
+        issues.append("new writer process must be an observable pid:<int>")
+    elif not new_process_alive:
+        issues.append("new writer process is not live")
+    if observed_state_root is not None:
+        _observed_file_sha256(bindings, "goals_path", "goals_sha256", state_root=observed_state_root, issues=issues)
+        _observed_tree_sha256(bindings, "queue_root", "queue_sha256", state_root=observed_state_root, issues=issues)
+        _observed_file_sha256(
+            bindings, "lane_worktrees_path", "lane_worktrees_sha256", state_root=observed_state_root, issues=issues
+        )
+        _observed_file_sha256(
+            bindings, "last_old_order_path", "last_old_order_sha256", state_root=observed_state_root, issues=issues
+        )
+        _observed_file_sha256(
+            bindings, "last_old_event_path", "last_old_event_sha256", state_root=observed_state_root, issues=issues
+        )
+        _observed_file_sha256(
+            bindings,
+            "new_action_receipt_path",
+            "new_action_receipt_sha256",
+            state_root=observed_state_root,
+            issues=issues,
+        )
+        _observed_file_sha256(
+            bindings, "pre_state_manifest_path", "pre_state_sha256", state_root=observed_state_root, issues=issues
+        )
+        _observed_file_sha256(
+            bindings,
+            "rollback_checkpoint_path",
+            "rollback_checkpoint_sha256",
+            state_root=observed_state_root,
+            issues=issues,
+        )
     verified_transcripts: list[dict[str, object]] = []
     if not transcript_bindings:
         issues.append("transcript bindings must name externally observed transcript files")
@@ -827,6 +1023,12 @@ def build_authority_handoff_receipt(
         path = _safe_resolve(Path(raw_path))
         if not path.exists() or not path.is_file():
             issues.append(f"transcript binding {raw_path} does not exist")
+            continue
+        if observed_state_root is None or not _is_relative_to(path, observed_state_root / "transcripts"):
+            issues.append(f"transcript binding {raw_path} is outside the observed transcript root")
+            continue
+        if not _jsonl_transcript_is_valid(path):
+            issues.append(f"transcript binding {raw_path} is not a valid observed JSONL transcript")
             continue
         verified_transcripts.append({"path": str(path), "sha256": _sha256_file(path)})
     lifecycle_by_kind = {str(item.get("kind")): item for item in lifecycle_receipts if isinstance(item, Mapping)}
@@ -872,6 +1074,9 @@ def build_authority_handoff_receipt(
             issues.append(str(exc))
             continue
         kind = str(lifecycle_receipt.get("kind"))
+        unknown_artifact_fields = sorted(set(artifact) - LIFECYCLE_ARTIFACT_FIELDS)
+        if unknown_artifact_fields:
+            issues.append(f"lifecycle receipt {kind} artifact has unsupported fields: {', '.join(unknown_artifact_fields)}")
         if artifact.get("schema") != SCHEMA_LIFECYCLE_PROOF:
             issues.append(f"lifecycle receipt {kind} artifact schema is invalid")
         for key in ("kind", "observer", "subject", "observed_at"):
@@ -883,18 +1088,37 @@ def build_authority_handoff_receipt(
             issues.append(str(exc))
         expected_role = lifecycle_role_by_kind.get(kind)
         writer = old_writer if expected_role == "old" else new_writer
+        writer_process_alive = old_process_alive if expected_role == "old" else new_process_alive
+        writer_socket = bindings.get("old_tmux_socket" if expected_role == "old" else "new_tmux_socket", "")
+        expected_evidence_by_kind = {
+            "old_drained": old_writer.last_order_sha256,
+            "old_stopped": pre_state_sha256,
+            "old_write_denied": bindings.get("last_old_event_sha256", ""),
+            "new_started": post_state_sha256,
+            "new_write_proved": new_writer.action_receipt_sha256,
+        }
         if artifact.get("instance") != instance:
             issues.append(f"lifecycle receipt {kind} artifact instance contradicts handoff instance")
         if artifact.get("writer_role") != expected_role:
             issues.append(f"lifecycle receipt {kind} artifact writer_role is invalid")
-        for key, expected in (
-            ("unit", writer.unit),
-            ("process", writer.process),
-            ("package", writer.package),
-            ("state_root", bindings.get("state_root", "")),
-        ):
-            if artifact.get(key) != expected:
+        expected_artifact_values: dict[str, object] = {
+            "unit": writer.unit,
+            "process": writer.process,
+            "package": writer.package,
+            "state_root": bindings.get("state_root", ""),
+            "tmux_socket": writer_socket,
+            "process_alive": writer_process_alive,
+            "state_root_sha256": observed_post_state_sha256,
+            "evidence_sha256": expected_evidence_by_kind.get(kind, ""),
+        }
+        for key, artifact_expected in expected_artifact_values.items():
+            if artifact.get(key) != artifact_expected:
                 issues.append(f"lifecycle receipt {kind} artifact {key} contradicts binding")
+        expected_subject = f"{instance}:{expected_role}:{writer.unit}:{kind}"
+        if artifact.get("subject") != expected_subject:
+            issues.append(f"lifecycle receipt {kind} artifact subject contradicts observed writer")
+        if artifact.get("observer") != "chitra-authority-verifier":
+            issues.append(f"lifecycle receipt {kind} artifact observer is not governed")
         if kind == "old_stopped" and artifact.get("stopped") is not True:
             issues.append("old_stopped lifecycle artifact must prove stopped=true")
         if kind == "old_write_denied" and artifact.get("can_write") is not False:
@@ -905,10 +1129,13 @@ def build_authority_handoff_receipt(
             issues.append("new_write_proved lifecycle artifact must prove can_write=true")
         verified_lifecycle.append({**dict(lifecycle_receipt), "artifact_path": str(path), "artifact_sha256": actual_sha})
     client = dict(native_client or {})
-    for key in ("client_name", "version", "path", "path_sha256", "version_proof_path", "version_proof_sha256"):
+    for key in ("client_name", "version", "path", "path_sha256", "version_output", "version_proof_path", "version_proof_sha256"):
         value = client.get(key)
         if not isinstance(value, str) or not value:
             issues.append(f"native client binding {key} is missing")
+    client_name = client.get("client_name")
+    if client_name not in APPROVED_NATIVE_CLIENTS:
+        issues.append("native client binding client_name is not approved")
     if not _is_sha256(client.get("path_sha256")):
         issues.append("native client path_sha256 must be a SHA-256 digest")
     if client.get("update_suppression") is not False:
@@ -916,14 +1143,40 @@ def build_authority_handoff_receipt(
     client_path_value = client.get("path")
     if isinstance(client_path_value, str) and client_path_value:
         client_path = _safe_resolve(Path(client_path_value))
+        approved_path = shutil.which(str(client_name)) if isinstance(client_name, str) else None
         if not client_path.exists() or not client_path.is_file():
             issues.append("native client path does not exist")
         elif not os.access(client_path, os.X_OK):
             issues.append("native client path is not executable")
+        elif approved_path is None or _safe_resolve(Path(approved_path)) != client_path:
+            issues.append("native client path does not match the approved executable resolved from PATH")
         else:
             actual_client_sha = _sha256_file(client_path)
             if client.get("path_sha256") != actual_client_sha:
                 issues.append("native client path_sha256 does not match executable bytes")
+            try:
+                version_result = subprocess.run(
+                    [str(client_path), "--version"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                issues.append(f"native client version output cannot be observed: {exc}")
+            else:
+                version_output = "\n".join(
+                    part.strip() for part in (version_result.stdout, version_result.stderr) if part.strip()
+                )
+                if version_result.returncode != 0:
+                    issues.append("native client version command failed")
+                if client.get("version_output") != version_output:
+                    issues.append("native client version_output does not match executable output")
+                if isinstance(client_name, str) and client_name not in version_output:
+                    issues.append("native client version output does not identify the approved client")
+                version = client.get("version")
+                if isinstance(version, str) and version not in version_output:
+                    issues.append("native client version output does not match declared version")
             client["path"] = str(client_path)
     proof_path_value = client.get("version_proof_path")
     if isinstance(proof_path_value, str) and proof_path_value:
@@ -941,7 +1194,7 @@ def build_authority_handoff_receipt(
             else:
                 if proof.get("schema") != SCHEMA_NATIVE_CLIENT_PROOF:
                     issues.append("native client version proof schema is invalid")
-                for key in ("client_name", "version", "path", "path_sha256", "update_suppression"):
+                for key in ("client_name", "version", "path", "path_sha256", "version_output", "update_suppression"):
                     if proof.get(key) != client.get(key):
                         issues.append(f"native client version proof {key} contradicts binding")
             client["version_proof_path"] = str(proof_path)
