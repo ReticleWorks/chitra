@@ -117,30 +117,25 @@ def _trusted_shaped_command(target_path: Path) -> list[str]:
     return [sys.executable, "-m", "pytest", str(target_path)]
 
 
-def test_failing_exact_target_is_rejected_at_ingest(tmp_path: Path) -> None:
+def test_failing_exact_target_is_rejected_at_ingest_completion_transition_and_close(tmp_path: Path) -> None:
     goal = _enroll(tmp_path)
-    source = _write_hash_bound_failing_target_receipt(tmp_path, [sys.executable, "-m", "pytest", "--version"])
-
-    with pytest.raises(ReceiptError):
-        ingest_receipt(tmp_path, goal.session_ref, source)
 
     presence_only_source = _write_hash_bound_failing_target_receipt(
         tmp_path,
-        _trusted_shaped_command(tmp_path / "source" / "targets" / "test_exact_target_fails.py"),
+        [sys.executable, "-m", "pytest", "--version"],
     )
     with pytest.raises(ReceiptError):
         ingest_receipt(tmp_path, goal.session_ref, presence_only_source)
-    assert list_receipts(tmp_path, goal.session_ref) == []
 
-
-def test_failing_exact_target_is_rejected_at_the_completion_transition(tmp_path: Path) -> None:
-    goal = _enroll(tmp_path)
     source = _write_hash_bound_failing_target_receipt(
         tmp_path,
         _trusted_shaped_command(tmp_path / "source" / "targets" / "test_exact_target_fails.py"),
     )
-    _place_stored_receipt(tmp_path, source)
+    with pytest.raises(ReceiptError):
+        ingest_receipt(tmp_path, goal.session_ref, source)
+    assert list_receipts(tmp_path, goal.session_ref) == []
 
+    _place_stored_receipt(tmp_path, source)
     with pytest.raises(GoalValidationError):
         mark_completion_gate_passed(
             tmp_path,
@@ -151,14 +146,6 @@ def test_failing_exact_target_is_rejected_at_the_completion_transition(tmp_path:
         )
     assert load_goals(tmp_path)[0].status == "working"
 
-
-def test_failing_exact_target_is_rejected_at_close(tmp_path: Path) -> None:
-    goal = _enroll(tmp_path)
-    source = _write_hash_bound_failing_target_receipt(
-        tmp_path,
-        _trusted_shaped_command(tmp_path / "source" / "targets" / "test_exact_target_fails.py"),
-    )
-    _place_stored_receipt(tmp_path, source)
     record = goal.to_dict()
     record["status"] = "done-pending-close"
     record["completion_proofs"] = [passing_completion_evidence(receipt_name=RECEIPT_NAME).model_dump(mode="json")]
