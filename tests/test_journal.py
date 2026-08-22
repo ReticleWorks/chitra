@@ -422,3 +422,54 @@ def test_interior_whitespace_line_rewritten_as_json_is_not_skipped(tmp_path: Pat
         {},
         json.loads(suffix),
     ]
+
+
+def test_same_inode_rewrite_replay_appends_no_duplicate_events(tmp_path: Path) -> None:
+    transcript = tmp_path / "whitespace-rewrite-replay.jsonl"
+    prefix = json.dumps(
+        {"timestamp": "2026-08-21T00:00:00Z", "index": 0, "value": "x" * _REWRITE_PAD}, separators=(",", ":")
+    ).encode() + b"\n"
+    suffix = json.dumps(
+        {"timestamp": "2026-08-21T00:02:00Z", "index": 2, "value": "stable-suffix" * 10}, separators=(",", ":")
+    ).encode() + b"\n"
+    transcript.write_bytes(prefix + b"   \n" + suffix)
+
+    with JournalIngestor(
+        state_root=tmp_path / "state",
+        transcript_path=transcript,
+        context=NormalizationContext(
+            instance="w11-fixture",
+            lane="codex",
+            client=Client.CODEX,
+            client_version="0.149.0",
+            observed_at="2026-08-21T00:00:00Z",
+        ),
+    ) as ingestor:
+        initial = ingestor.poll()
+        assert len(initial.appended) == 2
+        assert not initial.rotations
+        inode = transcript.stat().st_ino
+        anchor = transcript.read_bytes()[-64:]
+        with transcript.open("r+b") as handle:
+            handle.seek(len(prefix))
+            handle.write(b"{ }\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        assert transcript.stat().st_ino == inode
+        assert transcript.stat().st_size == len(prefix) + 4 + len(suffix)
+        assert transcript.read_bytes()[-64:] == anchor
+        replay = ingestor.poll()
+        stored = ingestor.journal.load()
+
+    assert len(replay.rotations) == 1
+    assert replay.rotations[0].previous.inode == replay.rotations[0].current.inode
+    assert len(replay.observed) == 3
+    assert len(replay.appended) == 1
+    assert replay.appended[0].raw_record == {}
+    assert len(stored) == 3
+    assert len({event.event_id for event in stored}) == 3
+    assert {event.raw_sha256 for event in stored} == {
+        hashlib.sha256(prefix).hexdigest(),
+        hashlib.sha256(b"{ }\n").hexdigest(),
+        hashlib.sha256(suffix).hexdigest(),
+    }

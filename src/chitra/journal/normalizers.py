@@ -100,6 +100,17 @@ class TranscriptNormalizer:
         self._native_occurrences: dict[str, int] = {}
         self._current_occurrence = 0
 
+    def begin_replay(self) -> None:
+        """Restart per-incarnation stream state before a full-file replay.
+
+        A detected same-inode rewrite replays the whole current transcript
+        from byte zero. Occurrence numbering must restart with it so every
+        unchanged record reproduces the event ID it already received;
+        otherwise the journal would append duplicates of durable events.
+        """
+        self._native_occurrences = {}
+        self._current_occurrence = 0
+
     def _begin_record(self, raw: RawRecord) -> None:
         key = _native_key(raw.record or {}, raw.raw_sha256)
         occurrence = self._native_occurrences.get(key, 0)
@@ -227,6 +238,11 @@ class ClaudeNormalizer(TranscriptNormalizer):
         self._pending_text: tuple[str, str | None] | None = None
         self._stop_hook_seen = False
 
+    def begin_replay(self) -> None:
+        super().begin_replay()
+        self._pending_text = None
+        self._stop_hook_seen = False
+
     def normalize(self, raw: RawRecord) -> tuple[CanonicalEvent, ...]:
         self._begin_record(raw)
         if raw.record is None:
@@ -329,6 +345,10 @@ class CodexNormalizer(TranscriptNormalizer):
             raise ValueError("CodexNormalizer requires the codex client")
         super().__init__(context)
         self._pending_text: tuple[str, str | None] | None = None
+
+    def begin_replay(self) -> None:
+        super().begin_replay()
+        self._pending_text = None
 
     def normalize(self, raw: RawRecord) -> tuple[CanonicalEvent, ...]:
         self._begin_record(raw)

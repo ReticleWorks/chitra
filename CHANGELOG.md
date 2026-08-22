@@ -20,6 +20,18 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.14.4] - 2026-08-22
+
+### Fixed
+
+- A detected same-inode rewrite now replays duplicate-free through the
+  journal ingestor: replay restarts the normalizer's per-incarnation
+  occurrence numbering, so unchanged records reproduce their original
+  event IDs and the durable journal no longer appends duplicates of
+  already-stored events. Rotation across a different inode keeps
+  continuing the stream's numbering, preserving both W11 fixture
+  projections.
+
 ## [0.14.3] - 2026-08-21
 
 ### Fixed
