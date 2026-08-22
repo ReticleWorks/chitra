@@ -20,10 +20,7 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
-<<<<<<< HEAD
-## [0.14.6] - 2026-08-22
-=======
-## [0.13.2] - 2026-08-21
+## [0.14.7] - 2026-08-22
 
 ### Fixed
 
@@ -33,8 +30,7 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   receipt when the peer consumes, instead of bypassing the governed
   session-message path.
 
-## [0.13.1] - 2026-08-21
->>>>>>> e5bcefd (fix: bind presence records to sessions and route peer messages through governed receipts)
+## [0.14.6] - 2026-08-22
 
 ### Added
 

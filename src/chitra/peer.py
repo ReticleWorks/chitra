@@ -15,6 +15,7 @@ from chitra._fsio import write_json_atomic
 from chitra.presence import shared_dir
 
 _MESSAGE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+_DELIVERY_METHOD = "governed-session-inbox"
 
 
 class PeerMessageError(ValueError):
@@ -82,6 +83,10 @@ def _normalize_time(value: datetime | str | None) -> str:
     return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
+def _message_path(root: Path, instance: str, message_id: str) -> Path:
+    return root / "inbox" / instance / f"{message_id}.json"
+
+
 def _receipt_path(root: Path, instance: str, kind: str, message_id: str) -> Path:
     return shared_dir(root) / "inbox" / instance / "receipts" / kind / f"{message_id}.json"
 
@@ -91,16 +96,36 @@ def _payload_digest(message: PeerMessage) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _write_receipt(root: Path, message: PeerMessage, kind: str, at: str) -> dict[str, str]:
-    """Write the idempotent dispatch or consumption receipt for one message."""
-    receipt = {
+def text_sha256(text: str) -> str:
+    """SHA-256 of the delivered message text, mirroring the governed path's binding."""
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _write_receipt(root: Path, message: PeerMessage, kind: str, *, at: str | None = None) -> dict[str, object]:
+    """Write the idempotent dispatch or consumption receipt for one message.
+
+    The dispatch side binds the governed session-message contract from
+    DESIGN-v3 section 1: the target session ID, the delivered text hash, the
+    delivery method and time, and the user event that landed in the peer's
+    inbox. The consumption side is written only after the pending message has
+    actually moved out of the pending inbox.
+    """
+    receipt: dict[str, object] = {
         "kind": kind,
         "message_id": message.message_id,
         "instance": message.instance,
         "sender": message.sender,
+        "session_id": message.instance,
+        "text_sha256": text_sha256(message.text),
         "payload_sha256": _payload_digest(message),
-        f"{kind}_at": at,
+        f"{kind}_at": at or _normalize_time(None),
     }
+    if kind == "dispatch":
+        receipt["method"] = _DELIVERY_METHOD
+        receipt["user_event"] = {
+            "path": str(_message_path(shared_dir(root), message.instance, message.message_id)),
+            "sha256": _payload_digest(message),
+        }
     path = _receipt_path(root, message.instance, kind, message.message_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
@@ -124,7 +149,14 @@ def say(
     sent_at: datetime | str | None = None,
     root: Path | None = None,
 ) -> PeerMessage:
-    """Atomically deliver one message; reusing its ID delivers it only once."""
+    """Deliver one question through the governed session-message path.
+
+    The target ``instance`` is the addressed monitor session. Delivery seals a
+    pre-delivery dispatch receipt bound to that session ID, the text hash, the
+    method, and the time, then writes the durable user event into the peer's
+    governed inbox; reusing an ID delivers it only once.
+    """
+    resolved_root = shared_dir(root)
     _validate_component(instance, "instance")
     actual_sender = sender or os.environ.get("CHITRA_INSTANCE", "operator")
     _validate_component(actual_sender, "sender")
@@ -132,26 +164,24 @@ def say(
         raise PeerMessageError("message text must be non-empty")
     actual_id = message_id or uuid.uuid4().hex
     _validate_component(actual_id, "message id")
-    inbox_dir = shared_dir(root) / "inbox" / instance
-    destination = inbox_dir / f"{actual_id}.json"
+    destination = _message_path(resolved_root, instance, actual_id)
     message = PeerMessage(actual_id, instance, actual_sender, text, _normalize_time(sent_at))
     if destination.exists():
         existing = _load_message(destination)
         if (existing.instance, existing.sender, existing.text) != (message.instance, message.sender, message.text):
             raise PeerMessageError(f"message id {actual_id!r} already names different content")
-        _write_receipt(shared_dir(root), existing, "dispatch", existing.sent_at)
+        _write_receipt(resolved_root, existing, "dispatch", at=existing.sent_at)
         return existing
-    inbox_dir.mkdir(parents=True, exist_ok=True)
+    _write_receipt(resolved_root, message, "dispatch", at=message.sent_at)
     write_json_atomic(destination, message.to_dict(), fsync=True)
     delivered = _load_message(destination)
     if (delivered.instance, delivered.sender, delivered.text) != (message.instance, message.sender, message.text):
         raise PeerMessageError(f"message id {actual_id!r} was replaced by different content")
-    _write_receipt(shared_dir(root), delivered, "dispatch", delivered.sent_at)
     return delivered
 
 
 def _pending_messages(instance: str, root: Path) -> list[PeerMessage]:
-    inbox_dir = shared_dir(root) / "inbox" / instance
+    inbox_dir = root / "inbox" / instance
     if not inbox_dir.is_dir():
         return []
     messages: dict[str, PeerMessage] = {}
@@ -170,16 +200,21 @@ def inbox(instance: str, *, root: Path | None = None) -> list[PeerMessage]:
 
 
 def consume(instance: str, *, root: Path | None = None) -> list[PeerMessage]:
-    """Consume every pending message in order and record consumption receipts."""
+    """Consume every pending message in order and record consumption receipts.
+
+    A consumption receipt is sealed only after the pending user event has been
+    successfully moved out of the pending inbox, so an injected move failure
+    can never leave a false consumption claim behind.
+    """
     _validate_component(instance, "instance")
     resolved_root = shared_dir(root)
     consumed_dir = resolved_root / "inbox" / instance / "consumed"
     messages = []
     for message in _pending_messages(instance, resolved_root):
-        _write_receipt(resolved_root, message, "consumption", _normalize_time(None))
-        source = resolved_root / "inbox" / instance / f"{message.message_id}.json"
+        source = _message_path(resolved_root, instance, message.message_id)
         consumed_dir.mkdir(parents=True, exist_ok=True)
         os.replace(source, consumed_dir / source.name)
+        _write_receipt(resolved_root, message, "consumption")
         messages.append(message)
     return messages
 

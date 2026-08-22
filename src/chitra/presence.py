@@ -184,11 +184,15 @@ def append_presence(
 
 
 def list_presence(*, root: Path | None = None, include_released: bool = False) -> list[PresenceRecord]:
-    """Merge every writer file and return the latest declaration per instance and resource."""
+    """Merge every writer file and return the latest declaration per instance, session, and resource.
+
+    The merged identity includes the session, so one session's release can
+    never hide another still-active session's use of the same resource.
+    """
     directory = shared_dir(root) / "presence"
     if not directory.is_dir():
         return []
-    latest: dict[tuple[str, str], PresenceRecord] = {}
+    latest: dict[tuple[str, str, str], PresenceRecord] = {}
     for path in sorted(directory.glob("*.jsonl")):
         expected_instance = path.name.removesuffix(".jsonl")
         try:
@@ -201,7 +205,7 @@ def list_presence(*, root: Path | None = None, include_released: bool = False) -
                     except (json.JSONDecodeError, PresenceError):
                         continue
                     if record.instance == expected_instance:
-                        latest[(record.instance, record.resource)] = record
+                        latest[(record.instance, record.session, record.resource)] = record
         except OSError:
             continue
     records = latest.values() if include_released else (record for record in latest.values() if record.state == "using")

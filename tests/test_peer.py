@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -93,3 +95,48 @@ def test_say_and_consume_produce_dispatch_and_consumption_receipts(tmp_path: Pat
     )
     assert receipt["kind"] == "consumption"
     assert receipt["payload_sha256"] == dispatch["payload_sha256"]
+
+
+def test_dispatch_receipt_binds_the_governed_session_message_delivery(tmp_path: Path) -> None:
+    say(
+        "monitor-b",
+        "coordinate repo:shared",
+        sender="monitor-a",
+        message_id="proof-1",
+        sent_at=datetime(2026, 8, 21, 12, 0, tzinfo=UTC),
+        root=tmp_path,
+    )
+    receipt = json.loads(
+        (tmp_path / "inbox" / "monitor-b" / "receipts" / "dispatch" / "proof-1.json").read_text(encoding="utf-8")
+    )
+    assert receipt["session_id"] == "monitor-b"
+    assert receipt["method"] == "governed-session-inbox"
+    assert receipt["dispatch_at"] == "2026-08-21T12:00:00Z"
+    assert receipt["text_sha256"] == hashlib.sha256(b"coordinate repo:shared").hexdigest()
+    event = receipt["user_event"]
+    assert event["path"] == str(tmp_path / "inbox" / "monitor-b" / "proof-1.json")
+    assert event["sha256"] == receipt["payload_sha256"]
+    assert json.loads(Path(event["path"]).read_text(encoding="utf-8"))["text"] == "coordinate repo:shared"
+
+
+def test_failed_consume_moves_no_message_and_leaves_no_consumption_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    say("monitor-b", "coordinate repo:shared", sender="monitor-a", message_id="proof-2", root=tmp_path)
+    pending = tmp_path / "inbox" / "monitor-b" / "proof-2.json"
+    real_replace = os.replace
+
+    def fail_move(source: Path, destination: Path) -> None:
+        if Path(source) == pending:
+            raise OSError(f"injected move failure: {source} -> {destination}")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_move)
+    with pytest.raises(OSError, match="injected move failure"):
+        consume("monitor-b", root=tmp_path)
+
+    assert not (tmp_path / "inbox" / "monitor-b" / "receipts" / "consumption" / "proof-2.json").exists()
+    assert pending.exists()
+    assert inbox("monitor-b", root=tmp_path) != []
+    monkeypatch.undo()
+    assert consume("monitor-b", root=tmp_path) != []

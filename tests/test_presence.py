@@ -95,3 +95,14 @@ def test_records_carry_session_goal_purpose_and_journal_bindings(tmp_path: Path)
     line = (tmp_path / "presence" / "monitor-a.jsonl").read_text(encoding="utf-8").strip()
     payload = json.loads(line)
     assert set(payload) >= {"instance", "session", "resource", "lanes", "state", "goal_refs", "purpose", "journal_ref"}
+
+
+def test_releasing_one_session_does_not_hide_another_active_session(tmp_path: Path) -> None:
+    announce_using("monitor-a", "repo:shared", session="session-a", root=tmp_path)
+    announce_using("monitor-a", "repo:shared", session="session-b", root=tmp_path)
+    announce_released("monitor-a", "repo:shared", session="session-b", root=tmp_path)
+
+    active = list_presence(root=tmp_path)
+    assert [(record.instance, record.session, record.resource) for record in active] == [
+        ("monitor-a", "session-a", "repo:shared")
+    ]
