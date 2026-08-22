@@ -3,14 +3,17 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import socket
+import subprocess
+import sys
 import tomllib
 from importlib import import_module
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
+import yaml
 
+import tools.convert.topology as topology
 from tools.convert import (
     ConversionError,
     WriterObservation,
@@ -77,10 +80,8 @@ def _goal_record_model() -> type[Any]:
     return cast(type[Any], import_module("chitra.goals").GoalRecord)
 
 
-def _write_executable(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-    path.chmod(0o755)
+def _ledger_module() -> Any:
+    return import_module("chitra.ledger")
 
 
 def _legacy_state(root: Path) -> None:
@@ -192,7 +193,36 @@ def test_w10_snapshot_metadata_reconciles_expected_legacy_topology(tmp_path: Pat
 
 
 def _instance_bindings(state_root: Path, old_socket: Path, new_socket: Path, old_process: str, new_process: str) -> dict[str, str]:
-    _write_json(state_root / "goals.json", {"schema": "chitra.goals.v3", "goals": []})
+    _write_json(
+        state_root / "goals.json",
+        {
+            "schema": "chitra.goals.v3",
+            "updated_at": "2026-08-22T00:00:00+00:00",
+            "goals": [
+                {
+                    "session_ref": "authority:monitor",
+                    "goal": "complete the governed authority handoff",
+                    "done_when": "the signed handoff proof verifies",
+                    "source": "task-file:W4f",
+                    "status": "working",
+                    "created_at": "2026-08-22T00:00:00+00:00",
+                    "updated_at": "2026-08-22T00:00:00+00:00",
+                    "now": "",
+                    "last_verified": "",
+                    "interview_receipt": {"name": "authority-enrollment", "completed_at": "2026-08-22T00:00:00+00:00"},
+                    "enrolled_at": "2026-08-22T00:00:00+00:00",
+                    "enrolled_done_when_items": [
+                        {
+                            "id": "signed-handoff",
+                            "text": "the signed handoff proof verifies",
+                            "validator": "chitra-authority-verifier",
+                            "required_receipt": "authority-ledger",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
     _write_json(state_root / "queue" / "orders" / "order-1.json", {"order_id": "order-1", "session_ref": "host:monitor:%1"})
     _write_json(state_root / "lane-worktrees.json", {"monitor": str(state_root / "worktree")})
     _write_json(state_root / "handoff" / "last-old-order.json", {"order_id": "order-1", "status": "drained"})
@@ -203,6 +233,11 @@ def _instance_bindings(state_root: Path, old_socket: Path, new_socket: Path, old
     transcript = state_root / "transcripts" / "session.jsonl"
     transcript.parent.mkdir(parents=True, exist_ok=True)
     transcript.write_text('{"type":"event","message":"observed"}\n', encoding="utf-8")
+    observed_exe = topology._process_executable_sha256(new_process)
+    new_exe_path, new_exe_sha = observed_exe or (
+        Path(sys.executable).resolve(),
+        _sha256_file(Path(sys.executable)),
+    )
 
     return {
         "namespace": "monitor",
@@ -231,7 +266,9 @@ def _instance_bindings(state_root: Path, old_socket: Path, new_socket: Path, old
         "pre_state_sha256": _sha256_file(state_root / "handoff" / "pre-state-manifest.json"),
         "rollback_checkpoint_path": str(state_root / "handoff" / "rollback-checkpoint.json"),
         "rollback_checkpoint_sha256": _sha256_file(state_root / "handoff" / "rollback-checkpoint.json"),
-        "post_state_sha256": _manifest_digest(state_root),
+        "post_state_sha256": topology._operational_state_manifest_digest(state_root),
+        "new_process_exe_path": str(new_exe_path),
+        "new_process_exe_sha256": new_exe_sha,
     }
 
 
@@ -329,16 +366,26 @@ def _lifecycle_receipts(tmp_path: Path, bindings: dict[str, str]) -> list[dict[s
 
 
 def _native_client(tmp_path: Path) -> dict[str, object]:
-    client_path = tmp_path / "bin" / "codex"
-    _write_executable(client_path, "#!/bin/sh\nprintf 'codex 0.149.0\\n'\n")
+    client_path = topology._approved_native_client_path("codex")
+    if client_path is None:
+        pytest.skip("approved codex executable is not installed")
     client_sha = _sha256_file(client_path)
+    version_result = subprocess.run(
+        [str(client_path), "--version"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    version_output = "\n".join(part.strip() for part in (version_result.stdout, version_result.stderr) if part.strip())
+    version = version_output.split()[-1]
     proof = {
         "schema": "chitra.native-client-proof.v1",
         "client_name": "codex",
-        "version": "0.149.0",
+        "version": version,
         "path": str(client_path.resolve()),
         "path_sha256": client_sha,
-        "version_output": "codex 0.149.0",
+        "version_output": version_output,
         "update_suppression": False,
     }
     proof_path = tmp_path / "native-client-proof.json"
@@ -348,6 +395,113 @@ def _native_client(tmp_path: Path) -> dict[str, object]:
         "version_proof_path": str(proof_path),
         "version_proof_sha256": _sha256_file(proof_path),
     }
+
+
+def _write_lane_manifest(path: Path, *, state_root: Path, tmux_socket: Path) -> None:
+    manifest = {
+        "lanes": [
+            {
+                "id": "monitor",
+                "account": "monitor",
+                "uid": os.getuid() or 1,
+                "home": str(path.parent / "home"),
+                "workdir": str(path.parent / "work"),
+                "config_dir": str(path.parent / "config"),
+                "state_dir": str(state_root),
+                "tmux_socket": str(tmux_socket),
+                "tmux_session": "monitor-new",
+                "credentials": {
+                    "claude_credentials": str(path.parent / "config" / ".credentials.json"),
+                    "ssh_dispatch_key": str(state_root / ".ssh" / "id_ed25519_tophand"),
+                },
+                "enabled": True,
+            }
+        ]
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+
+
+def _start_tmux(socket_path: Path, session: str) -> None:
+    subprocess.run(
+        ["tmux", "-S", str(socket_path), "new-session", "-d", "-s", session, "sleep", "60"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+
+def _stop_tmux(socket_path: Path) -> None:
+    subprocess.run(
+        ["tmux", "-S", str(socket_path), "kill-server"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+
+def _authority_proof(
+    *,
+    state_root: Path,
+    instance: str,
+    old_writer: WriterObservation,
+    new_writer: WriterObservation,
+    bindings: dict[str, str],
+    lifecycle_receipts: list[dict[str, object]],
+    native_client: dict[str, object],
+) -> dict[str, object]:
+    governed_lane = {
+        "id": "monitor",
+        "account": "monitor",
+        "uid": os.getuid() or 1,
+        "state_dir": str(state_root.resolve()),
+        "tmux_socket": str(Path(bindings["new_tmux_socket"]).resolve()),
+        "tmux_session": "monitor-new",
+    }
+    old_tmux = topology._tmux_socket_identity(Path(bindings["old_tmux_socket"]))
+    new_tmux = topology._tmux_socket_identity(Path(bindings["new_tmux_socket"]))
+    assert old_tmux is not None
+    assert new_tmux is not None
+    tmux_sessions = {"old": old_tmux, "new": new_tmux}
+    transcript_path = Path(_transcript_binding(state_root)).resolve()
+    payload = topology._authority_ledger_payload(
+        instance=instance,
+        old_writer=old_writer,
+        new_writer=new_writer,
+        pre_state_sha256=bindings["pre_state_sha256"],
+        post_state_sha256=bindings["post_state_sha256"],
+        rollback_checkpoint_sha256=bindings["rollback_checkpoint_sha256"],
+        instance_bindings=bindings,
+        transcript_bindings=[{"path": str(transcript_path), "sha256": _sha256_file(transcript_path)}],
+        lifecycle_receipts=lifecycle_receipts,
+        native_client=native_client,
+        cutover_sequence=("old-drained", "old-stopped", "old-write-denied", "new-started", "new-write-proved"),
+        governed_lane=governed_lane,
+        tmux_sessions=tmux_sessions,
+    )
+    digest = _sha256_bytes(_canonical_bytes(payload))
+    ledger = _ledger_module()
+    key = ledger.load_or_create_signing_key(state_root / "ledger.key")
+    sent_at = "2026-08-22T00:00:01+00:00"
+    entry = ledger.LedgerEntry(
+        order_id="authority-handoff-1",
+        session_ref=f"authority:{instance}",
+        tag=topology.AUTHORITY_LEDGER_TAG,
+        sig_v=4,
+        message_hash=digest,
+        sent_at=sent_at,
+        signature=ledger.sign(
+            key,
+            session_ref=f"authority:{instance}",
+            tag=topology.AUTHORITY_LEDGER_TAG,
+            digest=digest,
+            sent_at=sent_at,
+        ),
+    )
+    (state_root / "ledger.jsonl").write_text(entry.model_dump_json() + "\n", encoding="utf-8")
+    return {"order_id": entry.order_id, "ledger_entry": entry.model_dump(mode="json")}
 
 
 def _transcript_binding(state_root: Path) -> str:
@@ -373,41 +527,52 @@ def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycl
     state_root = tmp_path / "state"
     old_socket_path = tmp_path / "old.sock"
     new_socket_path = tmp_path / "new.sock"
-    old_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    new_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    old_socket.bind(str(old_socket_path))
-    new_socket.bind(str(new_socket_path))
+    _start_tmux(old_socket_path, "monitor-old")
+    _start_tmux(new_socket_path, "monitor-new")
+    manifest_path = tmp_path / "etc" / "chitra" / "lanes.yaml"
+    _write_lane_manifest(manifest_path, state_root=state_root, tmux_socket=new_socket_path)
+    monkeypatch.setenv("CHITRA_LANES_FILE", str(manifest_path))
     missing_pid = os.getpid() + 100_000
     while Path(f"/proc/{missing_pid}").exists():
         missing_pid += 1
     old_process = f"pid:{missing_pid}"
-    new_process = f"pid:{os.getpid()}"
-    bindings = _instance_bindings(state_root, old_socket_path, new_socket_path, old_process, new_process)
-    native_client = _native_client(tmp_path)
-    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}")
-    old_writer = WriterObservation(
-        name="old-dispatchd",
-        role="old",
-        unit="chitra-dispatchd.service",
-        process=old_process,
-        package="chitra 0.11.0",
-        stopped=True,
-        started=False,
-        can_write=False,
-        last_order_sha256=bindings["last_old_order_sha256"],
-    )
-    new_writer = WriterObservation(
-        name="new-dispatchd",
-        role="new",
-        unit="polyphony-chitra-dispatchd@monitor.service",
-        process=new_process,
-        package="chitra 0.14.10",
-        stopped=False,
-        started=True,
-        can_write=True,
-        action_receipt_sha256=bindings["new_action_receipt_sha256"],
-    )
+    writer_process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:
+        new_process = f"pid:{writer_process.pid}"
+        bindings = _instance_bindings(state_root, old_socket_path, new_socket_path, old_process, new_process)
+        native_client = _native_client(tmp_path)
+        old_writer = WriterObservation(
+            name="old-dispatchd",
+            role="old",
+            unit="chitra-dispatchd.service",
+            process=old_process,
+            package="chitra 0.11.0",
+            stopped=True,
+            started=False,
+            can_write=False,
+            last_order_sha256=bindings["last_old_order_sha256"],
+        )
+        new_writer = WriterObservation(
+            name="new-dispatchd",
+            role="new",
+            unit="polyphony-chitra-dispatchd@monitor.service",
+            process=new_process,
+            package="chitra 0.14.10",
+            stopped=False,
+            started=True,
+            can_write=True,
+            action_receipt_sha256=bindings["new_action_receipt_sha256"],
+        )
+        lifecycle_receipts = _lifecycle_receipts(tmp_path, bindings)
+        authority_proof = _authority_proof(
+            state_root=state_root,
+            instance="monitor",
+            old_writer=old_writer,
+            new_writer=new_writer,
+            bindings=bindings,
+            lifecycle_receipts=lifecycle_receipts,
+            native_client=native_client,
+        )
         handoff = build_authority_handoff_receipt(
             instance="monitor",
             old_writer=old_writer,
@@ -417,10 +582,15 @@ def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycl
             rollback_checkpoint_sha256=bindings["rollback_checkpoint_sha256"],
             transcript_bindings=(_transcript_binding(state_root),),
             instance_bindings=bindings,
-            lifecycle_receipts=_lifecycle_receipts(tmp_path, bindings),
+            lifecycle_receipts=lifecycle_receipts,
             native_client=native_client,
+            authority_proof=authority_proof,
         )
         assert handoff["exactly_one_writer"] is True
+        governed_lane = cast(dict[str, object], handoff["governed_lane"])
+        authority_receipt = cast(dict[str, object], handoff["authority_proof"])
+        assert governed_lane["id"] == "monitor"
+        assert authority_receipt["payload_sha256"]
         blank_writer = WriterObservation(
             name="", role="old", unit="", process="", package="", stopped=True, started=False, can_write=False
         )
@@ -454,8 +624,9 @@ def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycl
                 rollback_checkpoint_sha256=bindings["rollback_checkpoint_sha256"],
                 transcript_bindings=(_transcript_binding(state_root),),
                 instance_bindings=bindings,
-                lifecycle_receipts=_lifecycle_receipts(tmp_path, bindings),
+                lifecycle_receipts=lifecycle_receipts,
                 native_client=native_client,
+                authority_proof=authority_proof,
             )
         contradictory = dict(bindings)
         contradictory["old_unit"] = "fabricated.service"
@@ -471,8 +642,9 @@ def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycl
                 rollback_checkpoint_sha256=bindings["rollback_checkpoint_sha256"],
                 transcript_bindings=(_transcript_binding(state_root),),
                 instance_bindings=contradictory,
-                lifecycle_receipts=_lifecycle_receipts(tmp_path, bindings),
+                lifecycle_receipts=lifecycle_receipts,
                 native_client=fake_client,
+                authority_proof=authority_proof,
             )
         self_authored = dict(bindings)
         self_authored["state_root"] = str(tmp_path / "missing-state")
@@ -486,8 +658,9 @@ def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycl
                 rollback_checkpoint_sha256=bindings["rollback_checkpoint_sha256"],
                 transcript_bindings=(_transcript_binding(state_root),),
                 instance_bindings=self_authored,
-                lifecycle_receipts=_lifecycle_receipts(tmp_path, bindings),
+                lifecycle_receipts=lifecycle_receipts,
                 native_client=native_client,
+                authority_proof=authority_proof,
             )
         mismatching_output = dict(native_client)
         mismatching_output["version_output"] = "codex 9.9.9"
@@ -501,12 +674,33 @@ def test_authority_handoff_rejects_blank_caller_assertions_and_requires_lifecycl
                 rollback_checkpoint_sha256=bindings["rollback_checkpoint_sha256"],
                 transcript_bindings=(_transcript_binding(state_root),),
                 instance_bindings=bindings,
-                lifecycle_receipts=_lifecycle_receipts(tmp_path, bindings),
+                lifecycle_receipts=lifecycle_receipts,
                 native_client=mismatching_output,
+                authority_proof=authority_proof,
+            )
+        caller_authored = dict(bindings)
+        caller_authored["goals_sha256"] = _sha256_file(state_root / "goals.json")
+        (state_root / "goals.json").write_text('{"schema":"chitra.goals.v3","goals":[]}', encoding="utf-8")
+        caller_authored["goals_sha256"] = _sha256_file(state_root / "goals.json")
+        with pytest.raises(ConversionError, match="enrolled goal authority|authority ledger entry hash"):
+            build_authority_handoff_receipt(
+                instance="monitor",
+                old_writer=old_writer,
+                new_writer=new_writer,
+                pre_state_sha256=bindings["pre_state_sha256"],
+                post_state_sha256=bindings["post_state_sha256"],
+                rollback_checkpoint_sha256=bindings["rollback_checkpoint_sha256"],
+                transcript_bindings=(_transcript_binding(state_root),),
+                instance_bindings=caller_authored,
+                lifecycle_receipts=lifecycle_receipts,
+                native_client=native_client,
+                authority_proof=authority_proof,
             )
     finally:
-        old_socket.close()
-        new_socket.close()
+        writer_process.terminate()
+        writer_process.wait(timeout=5)
+        _stop_tmux(old_socket_path)
+        _stop_tmux(new_socket_path)
 
 
 def test_rollback_validates_snapshot_before_touching_destination_and_refuses_v2_evidence_loss(tmp_path: Path) -> None:

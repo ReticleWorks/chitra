@@ -63,10 +63,14 @@ REQUIRED_INSTANCE_BINDINGS = frozenset(
         "new_action_receipt_path",
         "pre_state_manifest_path",
         "rollback_checkpoint_path",
+        "new_process_exe_path",
+        "new_process_exe_sha256",
     )
 )
 REQUIRED_LIFECYCLE_RECEIPTS = frozenset(("old_drained", "old_stopped", "old_write_denied", "new_started", "new_write_proved"))
 APPROVED_NATIVE_CLIENTS = frozenset(("codex",))
+APPROVED_NATIVE_CLIENT_PATHS = {"codex": ("/usr/local/bin/codex", "/usr/bin/codex", "/opt/chitra/venv/bin/codex")}
+AUTHORITY_LEDGER_TAG = "[authority-handoff]"
 LIFECYCLE_ARTIFACT_FIELDS = frozenset(
     (
         "schema",
@@ -239,6 +243,207 @@ def _unix_socket_exists(path: Path) -> bool:
         return stat.S_ISSOCK(path.stat().st_mode)
     except OSError:
         return False
+
+
+def _tmux_socket_identity(path: Path) -> dict[str, str] | None:
+    try:
+        result = subprocess.run(
+            ["tmux", "-S", str(path), "display-message", "-p", "#{session_name}\t#{pid}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    output = result.stdout.strip()
+    if not output:
+        return None
+    parts = output.split("\t")
+    if len(parts) != 2 or not parts[0] or not parts[1].isdigit():
+        return None
+    return {"socket_path": str(path), "session_name": parts[0], "server_pid": parts[1]}
+
+
+def _process_executable_sha256(process: str) -> tuple[Path, str] | None:
+    pid = _pid_from_process(process)
+    if pid is None:
+        return None
+    exe_link = Path("/proc") / str(pid) / "exe"
+    try:
+        exe_path = exe_link.resolve(strict=True)
+    except OSError:
+        return None
+    if not exe_path.exists() or not exe_path.is_file():
+        return None
+    return exe_path, _sha256_file(exe_path)
+
+
+def _goals_have_enrolled_authority(path: Path) -> bool:
+    try:
+        payload = _load_json(path)
+    except ConversionError:
+        return False
+    if payload.get("schema") not in {"chitra.goals.v2", "chitra.goals.v3"}:
+        return False
+    goals = payload.get("goals")
+    if not isinstance(goals, list):
+        return False
+    for item in goals:
+        if not isinstance(item, Mapping):
+            continue
+        receipt = item.get("interview_receipt")
+        enrolled_items = item.get("enrolled_done_when_items")
+        enrolled_at = item.get("enrolled_at")
+        if isinstance(receipt, Mapping) and isinstance(enrolled_items, list) and enrolled_items:
+            return True
+        if isinstance(enrolled_at, str) and enrolled_at and isinstance(enrolled_items, list) and enrolled_items:
+            return True
+    return False
+
+
+def _governed_lane_binding(instance: str, state_root: Path, tmux_socket: Path, issues: list[str]) -> dict[str, object] | None:
+    try:
+        load_lanes = import_module("chitra.lane_config").load_lanes
+    except Exception as exc:  # pragma: no cover - import failure is reported as a conversion issue
+        issues.append(f"governed lane manifest cannot be imported: {exc}")
+        return None
+    try:
+        lanes = load_lanes()
+    except ValueError as exc:
+        issues.append(f"governed lane manifest cannot be loaded: {exc}")
+        return None
+    matching = [lane for lane in lanes if lane.identifier == instance]
+    if len(matching) != 1:
+        issues.append("governed lane manifest must declare exactly one matching instance")
+        return None
+    lane = matching[0]
+    if _safe_resolve(lane.state_dir) != state_root:
+        issues.append("governed lane manifest state_dir contradicts observed state root")
+    if _safe_resolve(lane.tmux_socket) != tmux_socket:
+        issues.append("governed lane manifest tmux_socket contradicts observed tmux socket")
+    return {
+        "id": lane.identifier,
+        "account": lane.account,
+        "uid": lane.uid,
+        "state_dir": str(_safe_resolve(lane.state_dir)),
+        "tmux_socket": str(_safe_resolve(lane.tmux_socket)),
+        "tmux_session": lane.tmux_session,
+    }
+
+
+def _approved_native_client_path(client_name: str) -> Path | None:
+    for raw_path in APPROVED_NATIVE_CLIENT_PATHS.get(client_name, ()):
+        path = _safe_resolve(Path(raw_path))
+        if path.exists() and path.is_file() and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def _verify_authority_ledger_proof(
+    *,
+    authority_proof: Mapping[str, object] | None,
+    state_root: Path | None,
+    instance: str,
+    expected_payload: Mapping[str, object],
+    issues: list[str],
+) -> dict[str, object]:
+    if state_root is None:
+        issues.append("authority ledger proof requires an observed governed state root")
+        return {}
+    proof = dict(authority_proof or {})
+    for key in ("order_id", "ledger_entry"):
+        if key not in proof:
+            issues.append(f"authority ledger proof {key} is missing")
+    entry_payload = proof.get("ledger_entry")
+    if not isinstance(entry_payload, Mapping):
+        issues.append("authority ledger proof ledger_entry must be an object")
+        return proof
+    ledger_path = state_root / "ledger.jsonl"
+    key_path = state_root / "ledger.key"
+    if not key_path.exists() or not key_path.is_file():
+        issues.append("authority ledger key is missing from governed state root")
+        return proof
+    if not ledger_path.exists() or not ledger_path.is_file():
+        issues.append("authority ledger is missing from governed state root")
+        return proof
+    try:
+        ledger_module = import_module("chitra.ledger")
+        LedgerEntry = ledger_module.LedgerEntry
+        verify_entry = ledger_module.verify_entry
+    except Exception as exc:  # pragma: no cover - import failure is reported as a conversion issue
+        issues.append(f"authority ledger verifier cannot be imported: {exc}")
+        return proof
+    try:
+        entry = LedgerEntry.model_validate(entry_payload)
+    except ValueError as exc:
+        issues.append(f"authority ledger entry is invalid: {exc}")
+        return proof
+    expected_digest = _sha256_bytes(_canonical_bytes(expected_payload))
+    if entry.order_id != proof.get("order_id"):
+        issues.append("authority ledger entry order_id contradicts proof")
+    if entry.session_ref != f"authority:{instance}":
+        issues.append("authority ledger entry session_ref does not bind the handoff instance")
+    if entry.tag != AUTHORITY_LEDGER_TAG:
+        issues.append("authority ledger entry tag is not the governed handoff tag")
+    if entry.message_hash != expected_digest:
+        issues.append("authority ledger entry hash does not bind the observed handoff payload")
+    try:
+        hmac_key = key_path.read_bytes()
+    except OSError as exc:
+        issues.append(f"authority ledger key cannot be read: {exc}")
+        return proof
+    if not verify_entry(entry, key=hmac_key):
+        issues.append("authority ledger entry signature is invalid")
+    entry_json = entry.model_dump_json()
+    if entry_json not in ledger_path.read_text(encoding="utf-8").splitlines():
+        issues.append("authority ledger entry is not present in the governed append-only ledger")
+    proof["ledger_path"] = str(ledger_path)
+    proof["ledger_key_path"] = str(key_path)
+    proof["payload_sha256"] = expected_digest
+    return proof
+
+
+def _authority_ledger_payload(
+    *,
+    instance: str,
+    old_writer: WriterObservation,
+    new_writer: WriterObservation,
+    pre_state_sha256: str,
+    post_state_sha256: str,
+    rollback_checkpoint_sha256: str,
+    instance_bindings: Mapping[str, object],
+    transcript_bindings: Sequence[Mapping[str, object]],
+    lifecycle_receipts: Sequence[Mapping[str, object]],
+    native_client: Mapping[str, object],
+    cutover_sequence: Sequence[str],
+    governed_lane: Mapping[str, object] | None,
+    tmux_sessions: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        "schema": "chitra.authority-handoff-ledger-payload.v1",
+        "instance": instance,
+        "writers": [old_writer.to_dict(), new_writer.to_dict()],
+        "state_hashes": {
+            "pre_handoff": pre_state_sha256,
+            "post_handoff": post_state_sha256,
+            "rollback_checkpoint": rollback_checkpoint_sha256,
+        },
+        "instance_bindings": dict(instance_bindings),
+        "transcript_bindings": [dict(item) for item in transcript_bindings],
+        "lifecycle_receipts": [dict(item) for item in lifecycle_receipts],
+        "native_client": dict(native_client),
+        "cutover_sequence": list(cutover_sequence),
+        "governed_lane": dict(governed_lane or {}),
+        "tmux_sessions": dict(tmux_sessions),
+    }
+
+
+def _operational_state_manifest_digest(root: Path) -> str:
+    authority_files = {"ledger.jsonl", "ledger.key", "ledger.jsonl.lock"}
+    return _manifest_digest([entry for entry in _file_manifest(root) if entry.get("relative_path") not in authority_files])
 
 
 def _jsonl_transcript_is_valid(path: Path) -> bool:
@@ -891,6 +1096,7 @@ def build_authority_handoff_receipt(
     instance_bindings: Mapping[str, str] | None = None,
     lifecycle_receipts: Sequence[Mapping[str, object]] = (),
     native_client: Mapping[str, object] | None = None,
+    authority_proof: Mapping[str, object] | None = None,
     cutover_sequence: Sequence[str] = ("old-drained", "old-stopped", "old-write-denied", "new-started", "new-write-proved"),
 ) -> dict[str, object]:
     """Seal an artifact-backed authority handoff proof."""
@@ -966,7 +1172,7 @@ def build_authority_handoff_receipt(
         else:
             observed_state_root = state_root_path
             bindings["state_root"] = str(state_root_path)
-            observed_post_state_sha256 = _manifest_digest(_file_manifest(state_root_path))
+            observed_post_state_sha256 = _operational_state_manifest_digest(state_root_path)
             if post_state_sha256 != observed_post_state_sha256:
                 issues.append("post_state_sha256 does not match observed state root manifest")
     for socket_key in ("old_tmux_socket", "new_tmux_socket"):
@@ -977,6 +1183,15 @@ def build_authority_handoff_receipt(
                 issues.append(f"instance binding {socket_key} is not an observed Unix socket")
             else:
                 bindings[socket_key] = str(socket_path)
+    tmux_sessions: dict[str, object] = {}
+    for role, socket_key in (("old", "old_tmux_socket"), ("new", "new_tmux_socket")):
+        socket_value = bindings.get(socket_key)
+        if isinstance(socket_value, str) and socket_value:
+            identity = _tmux_socket_identity(Path(socket_value))
+            if identity is None:
+                issues.append(f"instance binding {socket_key} is not a live tmux protocol socket")
+            else:
+                tmux_sessions[role] = identity
     old_process_alive = _process_exists(old_writer.process)
     new_process_alive = _process_exists(new_writer.process)
     if old_process_alive is None:
@@ -987,6 +1202,15 @@ def build_authority_handoff_receipt(
         issues.append("new writer process must be an observable pid:<int>")
     elif not new_process_alive:
         issues.append("new writer process is not live")
+    new_process_exe = _process_executable_sha256(new_writer.process)
+    if new_process_exe is None:
+        issues.append("new writer process executable identity cannot be observed")
+    else:
+        new_process_exe_path, new_process_exe_sha = new_process_exe
+        if bindings.get("new_process_exe_path") != str(new_process_exe_path):
+            issues.append("instance binding new_process_exe_path contradicts observed process executable")
+        if bindings.get("new_process_exe_sha256") != new_process_exe_sha:
+            issues.append("instance binding new_process_exe_sha256 contradicts observed process executable bytes")
     if observed_state_root is not None:
         _observed_file_sha256(bindings, "goals_path", "goals_sha256", state_root=observed_state_root, issues=issues)
         _observed_tree_sha256(bindings, "queue_root", "queue_sha256", state_root=observed_state_root, issues=issues)
@@ -1016,6 +1240,13 @@ def build_authority_handoff_receipt(
             state_root=observed_state_root,
             issues=issues,
         )
+        goals_path_value = bindings.get("goals_path")
+        if isinstance(goals_path_value, str) and not _goals_have_enrolled_authority(Path(goals_path_value)):
+            issues.append("governed state root lacks enrolled goal authority")
+    governed_lane: dict[str, object] | None = None
+    new_tmux_socket_value = bindings.get("new_tmux_socket")
+    if observed_state_root is not None and isinstance(new_tmux_socket_value, str) and new_tmux_socket_value:
+        governed_lane = _governed_lane_binding(instance, observed_state_root, Path(new_tmux_socket_value), issues)
     verified_transcripts: list[dict[str, object]] = []
     if not transcript_bindings:
         issues.append("transcript bindings must name externally observed transcript files")
@@ -1143,13 +1374,13 @@ def build_authority_handoff_receipt(
     client_path_value = client.get("path")
     if isinstance(client_path_value, str) and client_path_value:
         client_path = _safe_resolve(Path(client_path_value))
-        approved_path = shutil.which(str(client_name)) if isinstance(client_name, str) else None
+        approved_path = _approved_native_client_path(client_name) if isinstance(client_name, str) else None
         if not client_path.exists() or not client_path.is_file():
             issues.append("native client path does not exist")
         elif not os.access(client_path, os.X_OK):
             issues.append("native client path is not executable")
-        elif approved_path is None or _safe_resolve(Path(approved_path)) != client_path:
-            issues.append("native client path does not match the approved executable resolved from PATH")
+        elif approved_path is None or approved_path != client_path:
+            issues.append("native client path does not match the approved verifier policy executable")
         else:
             actual_client_sha = _sha256_file(client_path)
             if client.get("path_sha256") != actual_client_sha:
@@ -1198,6 +1429,28 @@ def build_authority_handoff_receipt(
                     if proof.get(key) != client.get(key):
                         issues.append(f"native client version proof {key} contradicts binding")
             client["version_proof_path"] = str(proof_path)
+    authority_payload = _authority_ledger_payload(
+        instance=instance,
+        old_writer=old_writer,
+        new_writer=new_writer,
+        pre_state_sha256=pre_state_sha256,
+        post_state_sha256=post_state_sha256,
+        rollback_checkpoint_sha256=rollback_checkpoint_sha256,
+        instance_bindings=bindings,
+        transcript_bindings=verified_transcripts,
+        lifecycle_receipts=verified_lifecycle,
+        native_client=client,
+        cutover_sequence=cutover_sequence,
+        governed_lane=governed_lane,
+        tmux_sessions=tmux_sessions,
+    )
+    verified_authority_proof = _verify_authority_ledger_proof(
+        authority_proof=authority_proof,
+        state_root=observed_state_root,
+        instance=instance,
+        expected_payload=authority_payload,
+        issues=issues,
+    )
     handoff_receipt: dict[str, object] = {
         "schema": SCHEMA_HANDOFF_RECEIPT,
         "produced_at": _utc_now(),
@@ -1212,6 +1465,9 @@ def build_authority_handoff_receipt(
         "transcript_bindings": verified_transcripts,
         "lifecycle_receipts": verified_lifecycle,
         "native_client": client,
+        "governed_lane": governed_lane or {},
+        "tmux_sessions": tmux_sessions,
+        "authority_proof": verified_authority_proof,
         "cutover_sequence": list(cutover_sequence),
         "exactly_one_writer": len(active_writers) == 1 and active_writers == [new_writer.name],
         "issues": issues,
