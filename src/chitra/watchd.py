@@ -61,7 +61,6 @@ from chitra.goals import (
     GOALS_SCHEMA_NEWER_MESSAGE,
     GoalsSchemaNewerError,
     GoalStatus,
-    SCHEMA as GOALS_INSTALLED_SCHEMA,
     add_ask,
     get_goal,
     goals_schema_newer_than_installed,
@@ -70,6 +69,9 @@ from chitra.goals import (
     mark_completion_gate_passed,
     session_host,
     update_now,
+)
+from chitra.goals import (
+    SCHEMA as GOALS_INSTALLED_SCHEMA,
 )
 from chitra.journal import CanonicalType, EventJournal
 from chitra.lane_activity import LaneActivity, LaneBackend, load_lane_activity, upsert_lane_activity

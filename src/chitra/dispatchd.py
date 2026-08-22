@@ -125,10 +125,12 @@ from .goals import (
     GOALS_SCHEMA_NEWER_MESSAGE,
     LOAD_SHED_HOLD_REASON_PREFIX,
     RATE_LIMIT_HOLD_REASON_PREFIX,
-    SCHEMA as GOALS_INSTALLED_SCHEMA,
     GoalsSchemaNewerError,
     get_goal,
     goals_schema_newer_than_installed,
+)
+from .goals import (
+    SCHEMA as GOALS_INSTALLED_SCHEMA,
 )
 from .journal import native_session_identity
 from .orders import DispatchOrder, DispatchResult, DispatchStatus
