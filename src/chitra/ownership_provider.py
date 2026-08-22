@@ -26,21 +26,22 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final
 
-from chitra.goals import GOAL_STATUSES
+from chitra.goals import GOAL_STATUSES, GOALS_SCHEMA_RE, _schema_version
 from chitra.goals import SCHEMA as CURRENT_GOALS_SCHEMA
-from chitra.goals import SUPPORTED_SCHEMAS as SUPPORTED_GOALS_SCHEMAS
 from chitra.state_paths import state_dir as default_state_dir
 
 QUERY_SCHEMA: Final = "chitra.ownership.query.v1"
 RESULT_SCHEMA: Final = "chitra.ownership.result.v1"
 ERROR_SCHEMA: Final = "chitra.protocol-error.v1"
 # The schema a freshly built marker records. Reads accept every schema
-# chitra.goals itself accepts, so a document written by a host that has not
-# upgraded yet still answers authoritatively. Pinning one literal here meant
-# the goals v2 bump silently turned every answer into a non-authoritative
-# "unknown": the provider kept working and simply stopped knowing anything.
+# chitra.goals itself accepts -- the whole chitra.goals.v<N> family, not a
+# closed tuple -- so a document written by a newer host still answers
+# authoritatively and unknown top-level or per-record fields are ignored
+# exactly like chitra.goals.load_goals_document ignores them. Pinning one
+# literal here meant the goals v2 bump silently turned every answer into a
+# non-authoritative "unknown": the provider kept working and simply stopped
+# knowing anything.
 GOALS_SCHEMA: Final = CURRENT_GOALS_SCHEMA
-GOALS_SCHEMAS: Final = SUPPORTED_GOALS_SCHEMAS
 MANAGED_MARKER_SCHEMA: Final = "chitra.ownership-managed.v1"
 PROVIDER_ID: Final = "chitra"
 MAX_MESSAGE_BYTES: Final = 64 * 1024
@@ -252,10 +253,11 @@ def _load_json_bytes(raw: bytes, *, description: str) -> object:
 
 def _validate_goals_document(raw: bytes, *, host_id: str) -> dict[str, OwnershipLane]:
     payload = _load_json_bytes(raw, description="goals state")
-    if not isinstance(payload, dict) or set(payload) != {"schema", "updated_at", "goals"}:
-        raise ValueError("goals state must contain exactly schema, updated_at, and goals")
-    if payload["schema"] not in GOALS_SCHEMAS:
-        raise ValueError(f"goals state schema is not one of: {', '.join(GOALS_SCHEMAS)}")
+    if not isinstance(payload, dict) or not {"schema", "updated_at", "goals"} <= set(payload):
+        raise ValueError("goals state must contain schema, updated_at, and goals")
+    schema = payload["schema"]
+    if not isinstance(schema, str) or _schema_version(schema) is None:
+        raise ValueError(f"goals state schema must match {GOALS_SCHEMA_RE.pattern}, got {schema!r}")
     parse_timestamp(payload["updated_at"], field="goals.updated_at")
     raw_goals = payload["goals"]
     if not isinstance(raw_goals, list) or len(raw_goals) > MAX_GOALS:
@@ -264,7 +266,7 @@ def _validate_goals_document(raw: bytes, *, host_id: str) -> dict[str, Ownership
     lanes: dict[str, OwnershipLane] = {}
     lane_ids: set[str] = set()
     for raw_goal in raw_goals:
-        if not isinstance(raw_goal, dict) or set(raw_goal) != _GOAL_FIELDS:
+        if not isinstance(raw_goal, dict) or not set(raw_goal) >= _GOAL_FIELDS:
             raise ValueError("each managed goal must be a current canonical goal record")
         if any(
             not isinstance(raw_goal[field], str) or len(raw_goal[field].encode("utf-8")) > MAX_GOAL_STRING_BYTES
@@ -444,7 +446,12 @@ def load_managed_state(
         # below is what actually binds this marker to these bytes, and the
         # schema lives inside those bytes, so pinning one literal bought no
         # safety and cost every answer during a version bump.
-        if marker["schema"] != MANAGED_MARKER_SCHEMA or marker["goals_schema"] not in GOALS_SCHEMAS:
+        marker_goals_schema = marker["goals_schema"]
+        if (
+            marker["schema"] != MANAGED_MARKER_SCHEMA
+            or not isinstance(marker_goals_schema, str)
+            or _schema_version(marker_goals_schema) is None
+        ):
             raise ValueError("managed marker schema is not canonical")
         if marker["complete"] is not True:
             return ManagedState.unknown("state_partial", generation=generation, manager_heartbeat_at=heartbeat)
