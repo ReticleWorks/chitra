@@ -50,6 +50,10 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   excessive testing, document dithering, and false completion, plus the
   consumption-bound response ladder, RESCUE bundle capture, relaunch brief
   generation, injected failure fixtures, and false-positive controls.
+- Add topology conversion tooling that preserves legacy goal and dispatch
+  queue hashes, marks legacy goals display/dispose-only, emits read-only
+  shadow findings, and records per-instance handoff and disposable rollback
+  receipts without touching live hosts.
 
 ## [0.14.8] - 2026-08-22
 
