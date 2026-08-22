@@ -20,6 +20,17 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.14.3] - 2026-08-21
+
+### Fixed
+
+- Completed whitespace-only JSONL lines are now hash-covered like every
+  other consumed byte range: their range and digest are recorded when
+  consumed, so a same-inode, same-size rewrite of a blank line into a
+  valid record can no longer be silently skipped while the final anchor
+  stays unchanged. Any such mismatch rotates the same inode and replays
+  the transcript.
+
 ## [0.14.2] - 2026-08-21
 
 ### Fixed

@@ -204,6 +204,10 @@ class JsonlTailReader:
                 self._buffer_start = line_end
                 if raw_line.strip():
                     records.append(self._decode(raw_line, line_start, line_end))
+                else:
+                    self._consumed.append(
+                        (line_start, line_end, hashlib.sha256(raw_line).hexdigest())
+                    )
         return records
 
     def _decode(self, raw_line: bytes, start: int, end: int) -> RawRecord:

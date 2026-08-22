@@ -389,3 +389,36 @@ def test_unsampled_interior_rewrite_in_long_journal_is_detected(tmp_path: Path) 
     assert rewritten.rotations[0].previous.inode == inode
     assert len(rewritten.records) == record_count
     assert rewritten.records[1].record != json.loads(lines[1])
+
+
+def test_interior_whitespace_line_rewritten_as_json_is_not_skipped(tmp_path: Path) -> None:
+    transcript = tmp_path / "whitespace-rewrite.jsonl"
+    prefix = json.dumps({"index": 0, "value": "x" * _REWRITE_PAD}, separators=(",", ":")).encode() + b"\n"
+    suffix = json.dumps({"index": 2, "value": "stable-suffix" * 10}, separators=(",", ":")).encode() + b"\n"
+    transcript.write_bytes(prefix + b"   \n" + suffix)
+
+    with JsonlTailReader(transcript) as reader:
+        initial = reader.poll()
+        assert [record.record for record in initial.records] == [
+            json.loads(prefix),
+            json.loads(suffix),
+        ]
+        inode = transcript.stat().st_ino
+        anchor = transcript.read_bytes()[-64:]
+        with transcript.open("r+b") as handle:
+            handle.seek(len(prefix))
+            handle.write(b"{ }\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        assert transcript.stat().st_ino == inode
+        assert transcript.stat().st_size == len(prefix) + 4 + len(suffix)
+        assert transcript.read_bytes()[-64:] == anchor
+        rewritten = reader.poll()
+
+    assert len(rewritten.rotations) == 1
+    assert rewritten.rotations[0].previous.inode == rewritten.rotations[0].current.inode
+    assert [record.record for record in rewritten.records] == [
+        json.loads(prefix),
+        {},
+        json.loads(suffix),
+    ]

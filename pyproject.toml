@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "chitra-monitor"
-version = "0.14.2"
+version = "0.14.3"
 description = "Deterministic tmux relay/dedup daemons for AI-agent fleet monitoring"
 readme = "README.md"
 license = "MIT"
