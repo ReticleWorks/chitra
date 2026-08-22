@@ -7,7 +7,9 @@ differently named field); ``test_peer_question_enters_the_existing_governed_disp
 pins that ``chitra.peer.say()`` enqueues a real ``DispatchOrder`` under the
 configured Chitra queue for ``dispatchd`` to consume and verify. The third
 test pins that locally recorded receipts only ever mirror dispatchd's own
-durable artifacts and can never claim delivery that did not happen.
+durable artifacts and can never claim delivery that did not happen; since the
+W6h repair it also covers the validator-derived permanent ledger-outage
+regression inside the same governed-result contract.
 """
 
 from __future__ import annotations
@@ -17,8 +19,10 @@ from pathlib import Path
 
 from pydantic import TypeAdapter
 
+from chitra.ledger import append_entry, load_or_create_signing_key
 from chitra.orders import DispatchOrder
 from chitra.peer import consume, inbox, say
+from chitra.state_paths import default_ledger_key_path, default_ledger_path
 
 _ORDER_ADAPTER = TypeAdapter(DispatchOrder)
 
@@ -85,6 +89,23 @@ def test_receipts_are_derived_from_the_governed_result(tmp_path: Path, monkeypat
     assert not (receipts / "consumption" / "q-2.json").exists()
 
     result["status"] = "sent"
+    (queue_dir / "results" / f"{message.order_id}.json").write_text(json.dumps(result), encoding="utf-8")
+    consume("monitor-b", root=tmp_path / "coordination", queue_dir=queue_dir)
+    assert not (receipts / "consumption" / "q-2.json").exists()
+
+    order = _ORDER_ADAPTER.validate_python(
+        json.loads((queue_dir / "orders" / f"{message.order_id}.json").read_text(encoding="utf-8"))
+    )
+    key = load_or_create_signing_key(default_ledger_key_path())
+    append_entry(
+        default_ledger_path(),
+        order_id=order.order_id,
+        session_ref=order.session_ref,
+        tag=order.tag,
+        nudge=message.text,
+        key=key,
+    )
+    result["delivery_ledger_verified"] = True
     (queue_dir / "results" / f"{message.order_id}.json").write_text(json.dumps(result), encoding="utf-8")
     consume("monitor-b", root=tmp_path / "coordination", queue_dir=queue_dir)
     consumption = json.loads((receipts / "consumption" / "q-2.json").read_text(encoding="utf-8"))

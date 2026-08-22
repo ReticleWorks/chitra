@@ -22,7 +22,8 @@ from pathlib import Path
 
 from chitra._fsio import write_json_atomic
 from chitra.dispatch import enqueue_dispatch_order
-from chitra.orders import DispatchOrder, DispatchStatus
+from chitra.ledger import load_or_create_signing_key, verify_delivery
+from chitra.orders import DispatchOrder, DispatchResult, DispatchStatus
 from chitra.presence import shared_dir
 from chitra.state_paths import default_queue_dir
 
@@ -140,13 +141,72 @@ def _governed_result(queue_dir: Path, order_id: str) -> dict[str, object] | None
     return payload if isinstance(payload, dict) else None
 
 
+def _state_dir(queue_dir: Path) -> Path:
+    """Return the state root holding the signed delivery ledger for a queue.
+
+    ``dispatchd`` writes the ledger and its key beside the queue it serves:
+    a queue at ``<state root>/queue`` keeps ``ledger.jsonl`` and
+    ``ledger.key`` in ``<state root>``. A queue that already sits in a
+    ``queue/`` subdirectory (the shipped ``CHITRA_STATE_DIR`` layout) resolves
+    to that subdirectory's parent, so verification reads exactly the files
+    the configured ``dispatchd`` wrote for this order.
+    """
+    return queue_dir.parent if queue_dir.name == "queue" else queue_dir
+
+
+def _completed_governed_delivery(
+    queue_dir: Path,
+    message: PeerMessage,
+) -> DispatchResult | None:
+    """Return dispatchd's durable result only when its delivery proof is complete.
+
+    A ``SENT`` result can be durable before the signed delivery ledger exists
+    (``orders.DispatchResult.delivery_ledger_verified`` documents that
+    intermediate state; a ledger outage leaves the order in flight with
+    ``delivery_ledger_verified=false``). Such a result is not consumption
+    proof. The stored JSON is re-validated against the ``DispatchResult``
+    schema, bound to this message's exact order and session, and the signed
+    ledger entry it claims is re-verified through the repository's existing
+    ledger contract rather than trusting the persisted bit alone.
+    """
+    payload = _governed_result(queue_dir, message.order_id)
+    if payload is None:
+        return None
+    try:
+        result = DispatchResult.model_validate(payload)
+    except ValueError:
+        return None
+    if result.order_id != message.order_id or result.session_ref != message.session_ref:
+        return None
+    if result.status != DispatchStatus.SENT or not result.delivery_ledger_verified:
+        return None
+    state_root = _state_dir(queue_dir)
+    try:
+        key = load_or_create_signing_key(state_root / "ledger.key")
+        entry = verify_delivery(
+            state_root / "ledger.jsonl",
+            key=key,
+            order_id=message.order_id,
+            session_ref=message.session_ref,
+            nudge=message.text,
+        )
+    except OSError:
+        return None
+    if entry is None:
+        return None
+    return result
+
+
 def _record_derived_receipts(root: Path, queue_dir: Path, message: PeerMessage) -> None:
     """Mirror only what dispatchd already proved; never assert delivery.
 
     The dispatch receipt records that the question entered the governed
     queue. The consumption receipt is written only when dispatchd's own
-    terminal result for the order exists with status ``sent`` -- a missing,
-    failed, blocked, or pending delivery leaves no receipt behind.
+    durable result for the order is schema-valid, bound to this message's
+    order and session, and carries completed signed-ledger delivery proof
+    (``delivery_ledger_verified`` plus a re-verified ledger entry). A
+    missing, failed, blocked, pending, or proof-less in-flight result leaves
+    no receipt behind.
     """
     receipt_dir = _receipt_path(root, message.instance, "dispatch", message.message_id).parent
     receipt_dir.mkdir(parents=True, exist_ok=True)
@@ -169,8 +229,8 @@ def _record_derived_receipts(root: Path, queue_dir: Path, message: PeerMessage) 
             fsync=True,
         )
 
-    result = _governed_result(queue_dir, message.order_id)
-    if isinstance(result, dict) and result.get("status") == DispatchStatus.SENT.value:
+    result = _completed_governed_delivery(queue_dir, message)
+    if result is not None:
         consumed_path = _receipt_path(root, message.instance, "consumption", message.message_id)
         if not consumed_path.exists():
             consumed_path.parent.mkdir(parents=True, exist_ok=True)
@@ -181,6 +241,7 @@ def _record_derived_receipts(root: Path, queue_dir: Path, message: PeerMessage) 
                     "message_id": message.message_id,
                     "order_id": message.order_id,
                     "result_path": str(queue_dir / "results" / f"{message.order_id}.json"),
+                    "delivery_ledger_verified": True,
                     "text_sha256": text_sha256(message.text),
                     "payload_sha256": _payload_digest(message),
                     "consumed_at": _normalize_time(None),

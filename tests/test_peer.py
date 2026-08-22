@@ -12,10 +12,24 @@ from pydantic import TypeAdapter
 
 from chitra import peer_cli
 from chitra.dispatch import enqueue_dispatch_order
+from chitra.ledger import append_entry, load_or_create_signing_key
 from chitra.orders import DispatchOrder, DispatchStatus
 from chitra.peer import PeerMessageError, consume, inbox, say
 
 _ORDER_ADAPTER = TypeAdapter(DispatchOrder)
+
+
+def _sign_governed_delivery(order: DispatchOrder, text: str, state_dir: Path) -> None:
+    """Record dispatchd's signed ledger proof for a delivered order."""
+    key = load_or_create_signing_key(state_dir / "ledger.key")
+    append_entry(
+        state_dir / "ledger.jsonl",
+        order_id=order.order_id,
+        session_ref=order.session_ref,
+        tag=order.tag,
+        nudge=text,
+        key=key,
+    )
 
 
 def _sent_result(order: DispatchOrder) -> dict[str, object]:
@@ -112,7 +126,10 @@ def test_dispatch_receipt_records_entry_into_the_governed_queue(tmp_path: Path) 
     assert not (tmp_path / "coordination" / "inbox" / "monitor-b" / "receipts" / "consumption").exists()
 
 
-def test_consumption_receipt_requires_a_sent_governed_result(tmp_path: Path) -> None:
+def test_consumption_receipt_requires_a_sent_governed_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CHITRA_STATE_DIR", str(tmp_path / "state"))
     coordination = tmp_path / "coordination"
     queue_dir = tmp_path / "queue"
     message = say(
@@ -134,6 +151,13 @@ def test_consumption_receipt_requires_a_sent_governed_result(tmp_path: Path) -> 
         json.loads((queue_dir / "orders" / f"{message.order_id}.json").read_text(encoding="utf-8"))
     )
     result_path.write_text(json.dumps(_sent_result(order)), encoding="utf-8")
+    consume("monitor-b", root=coordination, queue_dir=queue_dir)
+    assert not (receipts / "consumption" / "proof-2.json").exists()
+
+    _sign_governed_delivery(order, "coordinate repo:shared", queue_dir.parent)
+    result_path.write_text(
+        json.dumps(dict(_sent_result(order), delivery_ledger_verified=True)), encoding="utf-8"
+    )
     consume("monitor-b", root=coordination, queue_dir=queue_dir)
     consumption = json.loads((receipts / "consumption" / "proof-2.json").read_text(encoding="utf-8"))
     assert consumption["kind"] == "consumption"
