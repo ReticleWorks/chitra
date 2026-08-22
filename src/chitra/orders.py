@@ -149,6 +149,13 @@ class DispatchResult(BaseModel):
     routing_hint: str | None = None
     task_type: str | None = None
     resolved_zdr: bool = False
+    # The adapter-native session identity normalized from the confirmed lane
+    # transcript (chitra.journal.native_session_identity). Derived by
+    # dispatchd when the delivery ledger proof is signed; never taken from
+    # routing_hint, which stays opaque pass-through. Delivery-ledger rows for
+    # genuine Claude/Codex deliveries bind this value so ladder consumption
+    # can reject cross-session evidence.
+    native_session_id: str | None = None
     # A SENT result can be durable before the signed delivery ledger is
     # available so a ledger outage never causes a second paste. Such a result
     # remains in in_flight/ until dispatchd flips this proof bit and moves the
