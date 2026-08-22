@@ -20,6 +20,26 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.15.0] - 2026-08-22
+
+### Added
+
+- Review turns without completion words when they contain a question, make no
+  tool calls, or follow a delivered dispatch.
+- Resolve exhaustion evidence handles against transcripts, ledgers, and command
+  results before accepting a brief.
+- Run registered completion validators and record their observed receipts instead
+  of trusting a lane's self-reported result.
+
+### Fixed
+
+- Share one grounded, nonce-fenced reviewer contract between lane and monitor
+  review paths.
+- Read newer goals schemas without crashing and keep daemon writes gated to the
+  installed schema unless migration is explicit.
+- Apply structural, stateful stop-guard decisions across repeated turns and
+  remove the redundant word-list gates.
+
 ## [0.14.12] - 2026-08-22
 
 ### Fixed
