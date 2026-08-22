@@ -6,7 +6,7 @@ import json
 import subprocess
 import threading
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -17,6 +17,7 @@ from chitra.agent_status import ManifestRepository
 from chitra.dispatch import DispatchOrder
 from chitra.goal_enforcement import ReviewerVerdict, ReviewFinding
 from chitra.goals import GoalRecord, get_goal, upsert_goal
+from chitra.journal import CanonicalEvent, CanonicalType, Client, EventJournal, TranscriptIdentity
 from chitra.lane_activity import load_lane_activity
 from chitra.orders import DispatchResult, DispatchStatus
 from chitra.triaged import ReceivingOutputs, parse_event_line, run_once
@@ -648,6 +649,78 @@ def test_prior_turn_tool_chrome_does_not_suppress_review_of_a_no_tool_deferral_t
         ]
         verdicts = [record["review_verdict"] for record in records]
         assert verdicts == ["unavailable", "reject"]
+    finally:
+        watcher.shutdown()
+
+
+def test_current_turn_journal_tool_event_does_not_trigger_zero_tool_review(tmp_path: Path) -> None:
+    """Regression: journal filtering uses the previous watermark, not the new one.
+
+    A TOOL_CALL observed mid-turn lands before the turn-end timestamp that the
+    turn-end path writes. Filtering the journal against that new timestamp
+    discarded the event and misread the tool-active turn as zero-tool, which
+    wrongly dispatched it to isolated review. The previous reviewed turn end
+    is the only valid lower bound for current-turn journal evidence.
+    """
+    goal = _tracked_goal(tmp_path)
+    now = datetime.now(UTC)
+    started = now - timedelta(seconds=60)
+    observed_mid_turn = (now - timedelta(seconds=30)).isoformat()
+    tool_event = CanonicalEvent(
+        event_id="evt-tool-current-turn",
+        instance="watchd-regression",
+        lane="fleet",
+        client=Client.CODEX,
+        client_version="0.149.0",
+        process_id=None,
+        transcript=TranscriptIdentity(path="/tmp/fleet-transcript.jsonl", device=1, inode=1),
+        session_id=goal.session_ref,
+        resume_id=None,
+        observed_at=observed_mid_turn,
+        native_time=None,
+        native_type="exec_command_begin",
+        native_join_id="join-1",
+        raw_byte_range=None,
+        raw_sha256=None,
+        normalized_type=CanonicalType.TOOL_CALL,
+        payload_digest="0" * 64,
+        normalizer_version="test",
+        payload={},
+        raw_record=None,
+    )
+    EventJournal(tmp_path, "fleet").append([tool_event])
+    reviewer = _AcceptingReviewer()
+
+    captures = iter(["Working... esc to interrupt\n", "Holding for the operator's window.\n❯\n"])
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures, "Holding for the operator's window.\n❯\n"))
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log", journal_root=tmp_path),
+        runner=runner,
+        reviewer=reviewer,
+    )
+    watcher._started_at = started.isoformat()
+    try:
+        watcher.poll_once()
+        watcher.poll_once()
+        review_log = tmp_path / "completion_reviews.jsonl"
+        for _ in range(100):
+            if review_log.exists():
+                break
+            threading.Event().wait(0.02)
+            watcher.poll_once()
+
+        records = [json.loads(line) for line in review_log.read_text(encoding="utf-8").splitlines()]
+        assert len(records) == 1
+        assert records[0]["review_verdict"] == "unavailable"
+        assert "isolated review was not run" in records[0]["summary"]
+        assert reviewer.calls == []
     finally:
         watcher.shutdown()
 

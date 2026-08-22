@@ -675,29 +675,31 @@ class Watchd:
                 return True
         return False
 
-    def _turn_made_tool_calls(self, session_ref: str, pane: Pane) -> bool | None:
+    def _turn_made_tool_calls(self, session_ref: str, pane: Pane, *, since: str) -> bool | None:
         """Whether the CURRENT turn made an observable tool call.
 
         The structured W1 journal is the primary source when it exists for
         this lane: a TOOL_CALL event observed since the previous reviewed
-        turn end is proof the current turn called a tool, and its absence is
-        proof it did not. With no journal the pane capture's exact rendered
-        call markers are the only remaining evidence -- and because that
-        capture spans many turns, an unknown result means the capture cannot
-        attribute chrome to this turn and the caller must not treat the turn
-        as zero-tool.
+        turn end (``since``) is proof the current turn called a tool, and its
+        absence is proof it did not. The caller must pass the watermark read
+        BEFORE the current turn end was recorded: a tool event observed
+        during this turn precedes this turn's own end timestamp, so filtering
+        against that newer timestamp would discard it. With no journal the
+        pane capture's exact rendered call markers are the only remaining
+        evidence -- and because that capture spans many turns, an unknown
+        result means the capture cannot attribute chrome to this turn and
+        the caller must not treat the turn as zero-tool.
         """
         journal_root = self.config.journal_root
         if journal_root is not None:
             lane = lane_id_from_session_ref(session_ref)
             events = EventJournal(journal_root, lane).load()
             if events:
-                watermark = self.turn_end_watermarks.get(pane.pane_id)
                 recent = [
                     event
                     for event in events
                     if event.normalized_type in (CanonicalType.TOOL_CALL, CanonicalType.TOOL_RESULT, CanonicalType.TOOL_ERROR)
-                    and (watermark is None or (event.observed_at or "") > watermark)
+                    and (event.observed_at or "") > since
                 ]
                 return bool(recent)
         return None
@@ -744,7 +746,7 @@ class Watchd:
             return True
         if self._turn_followed_delivered_order(session_ref, since=since):
             return True
-        structured = self._turn_made_tool_calls(session_ref, pane)
+        structured = self._turn_made_tool_calls(session_ref, pane, since=since)
         if structured is not None:
             return not structured
         rendered = self._turn_had_rendered_tool_calls(pane.pane_id, text)
@@ -829,6 +831,9 @@ class Watchd:
         since = self.turn_end_watermarks.get(pane.pane_id, self._started_at)
         self.turn_end_watermarks[pane.pane_id] = datetime.now(UTC).isoformat()
         requires_review = self._turn_end_requires_review(session_ref, pane, text, since=since)
+        # ``since`` was read before the overwrite above and is the only
+        # watermark handed to classification: journal events observed during
+        # this turn predate this turn's own end timestamp.
         self._last_turn_end_capture[pane.pane_id] = Counter(normalize(content))
         if not requires_review:
             self.reviewed_turns.add(key)
