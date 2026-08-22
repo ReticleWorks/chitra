@@ -316,6 +316,28 @@ capabilities:
         params: []
         mutates: true
 
+  - name: review
+    kind: tool
+    purpose: >-
+      Run one isolated reviewer process against the shared rubric over a lane or
+      monitor turn envelope, enforce grounding and goal binding, and emit the verdict.
+    when_to_use: Use when a judged surface needs a single completion review verdict for one recorded session turn.
+    authority:
+      level: record
+      grants:
+        - Read one JSON turn envelope on stdin and run isolated claude reviewer processes against that turn only.
+        - Emit the bound ReviewerVerdict JSON on stdout with ungrounded rejections dropped to accept.
+      excludes:
+        - Decide whether a lane completes or merge, approve, or modify pull requests.
+        - Store, alter, or delete goals, receipts, or any local record.
+    default_enabled: true
+    commands:
+      - name: chitra-review
+        description: Review one turn envelope from stdin and emit the ReviewerVerdict JSON.
+        argv: [chitra-review]
+        params: []
+        mutates: false
+
   - name: failover
     kind: tool
     purpose: >-
