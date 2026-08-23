@@ -27,6 +27,7 @@ from chitra.ledger import LedgerEntry, append_entry
 from chitra.orders import DispatchOrder, DispatchStatus
 from chitra.provider_protocol import ProviderUpdate, UpdateKind
 from chitra.session_contract import (
+    CloseResult,
     JoinedLaneRecord,
     LaneUpdate,
     OperationReference,
@@ -537,6 +538,98 @@ def test_wake_is_idempotent_and_preserves_operation_identity(tmp_path: Path) -> 
     assert saved.pending_operation.operation_id == "op-1"
     assert saved.last_intervention is not None
     assert saved.last_intervention.operation_id == "wake-1"
+    assert saved.next_check is not None
+    assert saved.next_check.wake_condition != "wake-1"
+
+
+def test_chitra_state_update_preserves_identical_lane_authored_snapshot(tmp_path: Path) -> None:
+    store = JoinedLaneStore(tmp_path)
+    authored = lane_update(sequence=1)
+    first = record(current_update=authored)
+    store.create(first)
+    updated = first.model_copy(
+        update={"revision": 2, "recovery": first.recovery.model_copy(update={"stage": "waiting"})}
+    )
+    saved = store.save(updated)
+    assert saved.current_update == authored
+    assert saved.problems == authored.problems
+
+
+def test_store_requires_explicit_transfer_and_resume_transition_kinds(tmp_path: Path) -> None:
+    store = JoinedLaneStore(tmp_path)
+    first_provider = provider(instance_id="instance-a", generation=1)
+    first = record(provider_identity=first_provider, session_ref="tophand:lane-a:1").model_copy(
+        update={"physical_session_generation": 1}
+    )
+    store.create(first)
+    transferred_provider = provider(instance_id="instance-b", generation=2)
+    transferred = first.model_copy(
+        update={
+            "revision": 2,
+            "session_ref": "tophand:lane-a:2",
+            "provider": transferred_provider,
+            "chitra_ownership_epoch": 2,
+            "physical_session_generation": 2,
+        }
+    )
+    with pytest.raises(JoinedLaneIdentityError, match="session_ref"):
+        store.save(transferred)
+    assert store.save(transferred, transition="provider-transfer").session_ref == "tophand:lane-a:2"
+
+
+def test_steady_inactive_to_active_is_forbidden_but_store_resume_is_typed(tmp_path: Path) -> None:
+    close = CloseResult.model_validate(
+        {
+            "operation_id": "close-1",
+            "lane_id": "lane-a",
+            "provider_handle": "thread-a",
+            "provider_instance_id": "instance-a",
+            "provider_generation": 1,
+            "idempotency_key": "idem-close-1",
+            "payload_digest": "digest-close-1",
+            "state": "archived",
+            "provider_thread_ref": "thread-a",
+            "same_provider_thread": True,
+            "later_resume_supported": True,
+            "checkpoint_ref": "checkpoint-1",
+            "quiescent": True,
+            "observed_at": "2026-08-23T14:00:01+00:00",
+            "evidence": "archive",
+        },
+        strict=True,
+    )
+    resume_provider = ProviderIdentity(
+        kind="amp",
+        handle="thread-a",
+        instance_id="instance-a",
+        generation=1,
+        capabilities=ProviderCapabilities.from_supported(("create_or_resume", "close", "checkpoint", "resume_after_close")),
+    )
+    history = (
+        OperationReference(
+            operation_id="close-1",
+            idempotency_key="idem-close-1",
+            payload_digest="digest-close-1",
+            kind="close",
+            created_at="2026-08-23T14:00:00+00:00",
+        ),
+    )
+    inactive = JoinedLaneRecord(
+        lane_id="lane-a",
+        goal_id="goal-a",
+        goal_version=1,
+        session_ref="amp:lane-a:1",
+        lifecycle="inactive",
+        provider=resume_provider,
+        operation_history=history,
+        last_close_result=close,
+    )
+    store = JoinedLaneStore(tmp_path)
+    store.create(inactive)
+    active = inactive.model_copy(update={"revision": 2, "lifecycle": "active", "last_close_result": None})
+    with pytest.raises(JoinedLaneRevisionError, match="resume"):
+        store.save(active)
+    assert store.save(active, transition="resume").lifecycle == "active"
 
 
 def test_reconcile_report_blocks_dispatch_barrier_for_matching_session() -> None:

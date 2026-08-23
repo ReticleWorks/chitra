@@ -33,6 +33,7 @@ from .session_contract import (
     PendingProviderOperation,
     ProgressEvidence,
     ProviderOperationResult,
+    RecordTransitionKind,
     RecoveryState,
 )
 from .state_paths import state_dir
@@ -455,7 +456,7 @@ class RecoveryStateStore:
             raise RecoveryStateError("canonical joined-lane store returned an unexpected record type")
         return value
 
-    def save(self, record: JoinedLaneRecord) -> JoinedLaneRecord:
+    def save(self, record: JoinedLaneRecord, *, transition: RecordTransitionKind = "steady") -> JoinedLaneRecord:
         """Write one revision and retain the prior valid document."""
 
         if record.lane_id != self.lane_id:
@@ -464,7 +465,7 @@ class RecoveryStateStore:
         next_revision = max(record.revision, (current.revision + 1) if current is not None else record.revision)
         candidate = record.model_copy(update={"revision": next_revision})
         try:
-            value = self._store.save(candidate)
+            value = self._store.save(candidate, transition=transition)
         except (JoinedLaneCorruptError, TypeError, ValueError) as exc:
             raise RecoveryStateError(f"canonical joined-lane save failed: {exc}") from exc
         if not isinstance(value, JoinedLaneRecord):
@@ -699,12 +700,18 @@ class RecoveryEngine:
         store = self.store_for(lane_id)
         return None if store is None else store.load()
 
-    def _persist(self, record: JoinedLaneRecord, *, persist: bool) -> JoinedLaneRecord:
+    def _persist(
+        self,
+        record: JoinedLaneRecord,
+        *,
+        persist: bool,
+        transition: RecordTransitionKind = "steady",
+    ) -> JoinedLaneRecord:
         if not persist:
             return record
         store = self.store_for(record.lane_id)
         if store is not None:
-            return store.save(record)
+            return store.save(record, transition=transition)
         return record.model_copy(update={"revision": record.revision + 1})
 
     def schedule(
@@ -1187,9 +1194,9 @@ class RecoveryEngine:
                 "attempted_remedy": action,
                 "attempt_count": record.recovery.attempt_count + 1,
                 "next_allowed_attempt": next_check.at if next_check is not None else None,
-                "last_intervention": action,
             }
         )
+        transition: RecordTransitionKind = "steady"
         intervention = record.last_intervention
         if action in ("nudge", "correct"):
             intervention = (
@@ -1237,6 +1244,25 @@ class RecoveryEngine:
                 raise RecoveryStateError("provider relaunch changed the logical lane or goal identity")
             # A provider cannot discard a still-active roadmap merely by
             # returning a sparse resume response.
+            provider_identity_changed = (
+                record.provider.kind,
+                record.provider.handle,
+                record.provider.instance_id,
+                record.provider.generation,
+                record.provider.parent_thread_ref,
+                record.provider.project_ref,
+            ) != (
+                replacement.provider.kind,
+                replacement.provider.handle,
+                replacement.provider.instance_id,
+                replacement.provider.generation,
+                replacement.provider.parent_thread_ref,
+                replacement.provider.project_ref,
+            )
+            physical_ref_changed = replacement.session_ref != record.session_ref
+            if (provider_identity_changed or physical_ref_changed) and action == "relaunch":
+                transition = "provider-transfer"
+                updates["chitra_ownership_epoch"] = record.chitra_ownership_epoch + 1
             updates["session_ref"] = replacement.session_ref
             updates["provider"] = replacement.provider
             updates["current_update"] = replacement.current_update or record.current_update
@@ -1263,7 +1289,7 @@ class RecoveryEngine:
         # The recovery-operation sidecar is authoritative for this effect.  Do
         # not overwrite a lane-update operation result in ``last_operation_result``.
         candidate = record.model_copy(update=updates)
-        return self._persist(candidate, persist=persist)
+        return self._persist(candidate, persist=persist, transition=transition)
 
     def _next_check(self, now: datetime, *, reason: str, wake_condition: str, wait: bool = False) -> NextCheck:
         interval = self.wait_interval if wait else self.check_interval

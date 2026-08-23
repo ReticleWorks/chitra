@@ -37,6 +37,7 @@ from .session_contract import (
     ProviderCapabilities,
     ProviderIdentity,
     ProviderOperationResult,
+    RecordTransitionKind,
     validate_record_transition,
 )
 
@@ -148,16 +149,19 @@ def _owner_conflicts(candidate: JoinedLaneRecord, existing: JoinedLaneRecord) ->
     return candidate_identity[0] == existing_identity[0] or candidate_identity[1:] == existing_identity[1:]
 
 
-def _validate_transition(previous: JoinedLaneRecord, current: JoinedLaneRecord) -> None:
+def _validate_transition(
+    previous: JoinedLaneRecord,
+    current: JoinedLaneRecord,
+    *,
+    transition: RecordTransitionKind = "steady",
+) -> None:
     """Apply the canonical lane/update validators to one record transition."""
 
-    if previous.session_ref != current.session_ref:
-        raise JoinedLaneIdentityError("session_ref cannot change in a joined-lane record")
     try:
-        validate_record_transition(previous, current, active_owners=(current.owner,))
+        validate_record_transition(previous, current, active_owners=(current.owner,), transition=transition)
     except (ContractValidationError, TypeError, ValueError) as exc:
         message = str(exc)
-        if "lane_id is immutable" in message or "goal_id is immutable" in message:
+        if "lane_id is immutable" in message or "goal_id is immutable" in message or "session_ref" in message:
             raise JoinedLaneIdentityError(message) from exc
         raise JoinedLaneRevisionError(message) from exc
 
@@ -327,6 +331,7 @@ class JoinedLaneStore:
         *,
         expected_revision: int | None = None,
         expected_update_sequence: int | None = None,
+        transition: RecordTransitionKind = "steady",
     ) -> Any:
         """Write a strictly newer record and retain its valid predecessor."""
 
@@ -357,7 +362,7 @@ class JoinedLaneStore:
                     raise JoinedLaneRevisionError(
                         f"update sequence must not decrease for {lane_id}: {new_sequence} < {old_sequence}"
                     )
-                _validate_transition(current, record)
+                _validate_transition(current, record, transition=transition)
             _ownership_epoch(record)
             self._reject_duplicate_active_owner(record)
             return self._write_locked(record, current)
@@ -365,7 +370,13 @@ class JoinedLaneStore:
     def put(self, record: Any, **kwargs: Any) -> Any:
         return self.save(record, **kwargs)
 
-    def update(self, lane_id: str, mutate: Callable[[Any], Any | Mapping[str, Any]]) -> Any:
+    def update(
+        self,
+        lane_id: str,
+        mutate: Callable[[Any], Any | Mapping[str, Any]],
+        *,
+        transition: RecordTransitionKind = "steady",
+    ) -> Any:
         """Read, mutate, validate, and persist one strictly newer snapshot."""
 
         _validate_lane_id(lane_id)
@@ -381,15 +392,13 @@ class JoinedLaneStore:
                 candidate = _copy_model(candidate, {"lane_id": lane_id})
             updates: dict[str, Any] = {"revision": _revision(current) + 1}
             candidate = _copy_model(candidate, updates)
-            if _value(candidate, "session_ref", "") != _value(current, "session_ref", ""):
-                raise JoinedLaneIdentityError(f"session_ref cannot change for joined lane {lane_id}")
             old_sequence = _update_sequence(current)
             new_sequence = _update_sequence(candidate)
             if old_sequence is not None and new_sequence is not None and new_sequence < old_sequence:
                 raise JoinedLaneRevisionError(
                     f"update sequence must not decrease for {lane_id}: {new_sequence} < {old_sequence}"
                 )
-            _validate_transition(current, candidate)
+            _validate_transition(current, candidate, transition=transition)
             self._reject_duplicate_active_owner(candidate)
             return self._write_locked(candidate, current)
 
@@ -582,26 +591,18 @@ def _provider_identity(record: object) -> tuple[str, str, int | None]:
 
 
 def _wake_id(record: object) -> str:
-    direct = _text(_value(record, "wake_id", ""))
-    if direct:
-        return direct
-    direct = _text(_value(record, "wake_condition", ""))
-    if direct:
-        return direct
-    next_check = _value(record, "next_check", None)
-    next_wake = _text(_value(next_check, "wake_condition", "")) if next_check is not None else ""
-    if next_wake:
-        return next_wake
     intervention = _value(record, "last_intervention", None)
     if intervention is not None and _value(intervention, "action", "") == "Wake condition observed":
         return _text(_value(intervention, "operation_id", ""))
     return ""
 
 
-def _canonical_next_check(record: object, at: str, reason: str) -> object:
+def _canonical_next_check(record: object, at: str, reason: str, wake_condition: str | None = None) -> object:
     current = _value(record, "next_check", None)
     check_type = type(current) if current is not None else NextCheck
-    condition = _text(_value(current, "wake_condition", "")) if current is not None else ""
+    condition = _text(wake_condition or "")
+    if not condition and current is not None:
+        condition = _text(_value(current, "wake_condition", ""))
     return check_type(at=at, reason=reason or "restart reconciliation", wake_condition=condition or None)
 
 
@@ -627,7 +628,16 @@ def _apply_state(record: Any, updates: Mapping[str, Any]) -> Any:
             applied[key] = value
     if "next_check_at" in updates and "next_check" in model_fields:
         at = updates["next_check_at"]
-        applied["next_check"] = None if not at else _canonical_next_check(record, at, _text(updates.get("last_error", "")))
+        applied["next_check"] = (
+            None
+            if not at
+            else _canonical_next_check(
+                record,
+                at,
+                _text(updates.get("last_error", "")),
+                _text(updates.get("wake_condition", "")) or None,
+            )
+        )
     if "last_error" in updates and "recovery" in model_fields:
         next_at = _text(updates.get("next_check_at", ""))
         recovery = _canonical_recovery(
@@ -638,25 +648,14 @@ def _apply_state(record: Any, updates: Mapping[str, Any]) -> Any:
         )
         if recovery is not None:
             applied["recovery"] = recovery
-    if "wake_id" in updates:
-        if "wake_id" in model_fields:
-            applied["wake_id"] = updates["wake_id"]
-        elif "wake_condition" in model_fields:
-            applied["wake_condition"] = updates["wake_id"] or None
-        elif "next_check" in model_fields and (
-            applied.get("next_check") is not None or _value(record, "next_check", None) is not None
-        ):
-            current_check = applied.get("next_check") or _value(record, "next_check")
-            if hasattr(current_check, "model_copy"):
-                applied["next_check"] = current_check.model_copy(update={"wake_condition": updates["wake_id"] or None})
-        if "last_intervention" in model_fields and updates["wake_id"]:
-            applied["last_intervention"] = InterventionEvidence(
-                operation_id=updates["wake_id"],
-                action="Wake condition observed",
-                consumed=True,
-                useful_work_resumed=None,
-                observed_at=updates["wake_observed_at"],
-            )
+    if "wake_id" in updates and "last_intervention" in model_fields and updates["wake_id"]:
+        applied["last_intervention"] = InterventionEvidence(
+            operation_id=updates["wake_id"],
+            action="Wake condition observed",
+            consumed=True,
+            useful_work_resumed=None,
+            observed_at=updates["wake_observed_at"],
+        )
     return _copy_model(record, applied)
 
 
@@ -1006,7 +1005,13 @@ class JoinedLaneReconciler:
             return ReconcileReport((), (f"joined-lane load failed: {exc}",))
         return ReconcileReport(tuple(self.reconcile(record) for record in records))
 
-    def wake(self, lane_id: str, *, wake_id: str = "") -> ReconcileOutcome:
+    def wake(
+        self,
+        lane_id: str,
+        *,
+        wake_id: str = "",
+        wake_condition: str = "a new safe provider fact or material lane update",
+    ) -> ReconcileOutcome:
         """Re-run one lane without changing its operation/order identity."""
 
         record = self.store.require(lane_id)
@@ -1017,6 +1022,7 @@ class JoinedLaneReconciler:
             return self._outcome(updated, "wake_reused", True, "lane is already complete")
         updates: dict[str, Any] = {
             "next_check_at": self._now().astimezone(UTC).isoformat() if wake_id else "",
+            "wake_condition": wake_condition.strip() or "a new safe provider fact or material lane update",
         }
         if wake_id:
             updates["wake_id"] = wake_id

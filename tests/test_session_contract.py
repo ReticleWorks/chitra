@@ -810,6 +810,35 @@ def test_close_evidence_preserves_provider_state_and_same_thread_resume() -> Non
         )
 
 
+def test_later_resume_evidence_requires_the_current_resume_capability() -> None:
+    close = CloseResult.model_validate(json.loads((FIXTURES / "close-amp-later-resume.json").read_text()), strict=True)
+    with pytest.raises(ValueError, match="resume_after_close"):
+        JoinedLaneRecord(
+            lane_id="lane-a",
+            goal_id="goal-123",
+            goal_version=2,
+            session_ref="amp:lane-a-1",
+            lifecycle="inactive",
+            provider=ProviderIdentity(
+                kind="amp",
+                handle="amp-thread-a",
+                instance_id="amp-instance-1",
+                generation=1,
+                capabilities=ProviderCapabilities.from_supported(("close", "checkpoint", "create_or_resume")),
+            ),
+            operation_history=(
+                OperationReference(
+                    operation_id=close.operation_id,
+                    idempotency_key=close.idempotency_key,
+                    payload_digest=close.payload_digest,
+                    kind="close",
+                    created_at="2026-08-23T14:00:00+00:00",
+                ),
+            ),
+            last_close_result=close,
+        )
+
+
 def test_migration_rejects_legacy_shape_and_wake_intervention_have_one_home() -> None:
     with pytest.raises(ContractValidationError, match="legacy"):
         migrate_legacy_record({"lane_id": "lane-a"})

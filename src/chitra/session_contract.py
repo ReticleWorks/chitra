@@ -1224,6 +1224,8 @@ class JoinedLaneRecord(_ContractModel):
                 raise ValueError("logical close must make the joined lane inactive")
             if self.provider.kind == "amp" and close_result.state == "closed":
                 raise ValueError("Amp close must be represented as archived")
+            if close_result.later_resume_supported is True and not self.provider.capabilities.resume_after_close:
+                raise ValueError("later_resume_supported requires resume_after_close capability")
             if self.pending_operation is not None:
                 validate_close_result(self.pending_operation, close_result)
             if close_result.operation_id not in history_ids:
@@ -1333,6 +1335,8 @@ def validate_record_transition(
         errors.append("ownership epoch must not decrease")
     if current.owner != previous.owner and current.chitra_ownership_epoch <= previous.chitra_ownership_epoch:
         errors.append("owner changes require a new ownership epoch")
+    if previous.lifecycle == "inactive" and current.lifecycle == "active" and normalized_transition != "resume":
+        errors.append("inactive-to-active transition requires an explicit resume transition")
 
     provider_changed = _provider_identity_key(previous.provider) != _provider_identity_key(current.provider)
     physical_generation_advanced = (
@@ -1376,17 +1380,23 @@ def validate_record_transition(
     elif prior_close is not None and prior_close.later_resume_supported is True and current.lifecycle == "active":
         errors.append("later resume requires an explicit resume transition")
 
+    if previous.last_close_result is not None and current.last_close_result is None and normalized_transition != "resume":
+        errors.append("last_close_result evidence cannot be cleared outside an explicit resume transition")
+    if (
+        previous.last_close_result is not None
+        and current.last_close_result is not None
+        and previous.last_close_result != current.last_close_result
+    ):
+        errors.append("last_close_result evidence is immutable")
+
     if (
         previous.goal_version != current.goal_version
         and current.current_update is not None
         and current.current_update.goal_version != current.goal_version
     ):
         errors.append("current update goal_version must match joined lane")
-    if previous.lifecycle == "active" and current.lifecycle == "active":
-        if previous.current_update is not None and current.current_update is None:
-            errors.append("current_update cannot be cleared on an active unfinished lane")
-        if previous.current_update is not None and current.current_update is not None and previous.problems and not current.problems:
-            errors.append("problem history cannot be cleared on an active unfinished lane")
+    if previous.current_update is not None and current.current_update is None:
+        errors.append("current_update cannot be cleared from a joined-lane record")
 
     owner_values = tuple(active_owners) if active_owners is not None else (current.owner,)
     validate_active_owner_set(owner_values)
