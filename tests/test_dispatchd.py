@@ -564,6 +564,34 @@ def test_ledger_write_failure_leaves_order_unacknowledged_and_retries_without_re
     assert recovered_result.delivery_ledger_verified is True
 
 
+def test_result_publisher_preserves_the_first_writer_by_default(tmp_path: Path) -> None:
+    first = DispatchResult(
+        order_id="same-id",
+        session_ref="host-a:lane:0.0",
+        status=DispatchStatus.FAILED,
+        reason="first",
+    )
+    second = DispatchResult(
+        order_id="same-id",
+        session_ref="host-b:lane:0.0",
+        status=DispatchStatus.SENT,
+        reason="second",
+    )
+
+    dispatchd_mod._write_result_atomic(tmp_path, first)
+
+    with pytest.raises(FileExistsError):
+        dispatchd_mod._write_result_atomic(tmp_path, second)
+
+    stored = DispatchResult.model_validate_json((tmp_path / "same-id.json").read_text(encoding="utf-8"))
+    assert stored == first
+    # The proof-bit path remains an explicit, validated replacement.
+    first.delivery_ledger_verified = True
+    dispatchd_mod._write_result_atomic(tmp_path, first, overwrite=True)
+    stored = DispatchResult.model_validate_json((tmp_path / "same-id.json").read_text(encoding="utf-8"))
+    assert stored.delivery_ledger_verified is True
+
+
 # --- rate-limit freeze / durable deferred subqueue (SOL findings #1, #7) ---
 
 

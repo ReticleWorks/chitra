@@ -244,10 +244,26 @@ def session_scope_violation(
     return None
 
 
-def _write_result_atomic(results_dir: Path, result: DispatchResult) -> Path:
-    """Write a result JSON atomically (write to temp, rename)."""
+def _write_result_atomic(
+    results_dir: Path,
+    result: DispatchResult,
+    *,
+    overwrite: bool = False,
+) -> Path:
+    """Publish one result without clobbering a prior writer by default.
+
+    The first durable result is the queue's idempotency record. The only
+    allowed replacement is the later ``delivery_ledger_verified`` proof-bit
+    update after dispatchd has validated the existing result. Keeping those
+    operations explicit prevents the pre-ledger SENT write from undoing the
+    single-writer guarantee in ``TerminalFinalization``.
+    """
     stored = StoredResult(order_id=result.order_id, path=results_dir / f"{result.order_id}.json")
-    stored.overwrite(result.model_dump(mode="json"))
+    payload = result.model_dump(mode="json")
+    if overwrite:
+        stored.overwrite(payload)
+    elif not stored.create_once(payload):
+        raise FileExistsError(stored.path)
     return stored.path
 
 
@@ -388,7 +404,7 @@ def _complete_existing_result(
                 ledger_key_path=ledger_key_path,
             )
             stored_result.delivery_ledger_verified = True
-            _write_result_atomic(results_dir, stored_result)
+            _write_result_atomic(results_dir, stored_result, overwrite=True)
         except Exception as exc:  # noqa: BLE001 -- retry on the next daemon pass
             logger.error(
                 "dispatchd_delivery_ledger_pending",
@@ -1110,7 +1126,7 @@ def _process_claimed_order(
                 ledger_key_path=ledger_key_path,
             )
             result.delivery_ledger_verified = True
-            _write_result_atomic(results_dir, result)
+            _write_result_atomic(results_dir, result, overwrite=True)
         except Exception as exc:  # noqa: BLE001 -- keep the order pending for the next pass
             logger.error(
                 "dispatchd_delivery_ledger_pending",

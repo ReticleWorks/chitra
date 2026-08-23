@@ -335,6 +335,32 @@ class LaneLockRetryTracker:
             self.state_path(order_id).unlink()
 
 
+def _move_without_replace(source: Path, target: Path) -> bool:
+    """Move one queue file without ever replacing a peer's target.
+
+    ``Path.replace`` is atomic, but it is also destructive when another
+    worker has created ``target`` between an existence check and the rename.
+    Queue subdirectories share one filesystem, so an exclusive hard-link
+    followed by unlink gives us the needed no-clobber move. The source stays
+    intact if the link loses the target race, and a failed unlink removes the
+    link we just created before re-raising.
+
+    Return ``False`` when ``target`` already exists. Let the caller decide
+    whether that means "skip" or "already finalized".
+    """
+    try:
+        os.link(source, target)
+    except FileExistsError:
+        return False
+    try:
+        source.unlink()
+    except OSError:
+        with contextlib.suppress(OSError):
+            target.unlink()
+        raise
+    return True
+
+
 @dataclass(frozen=True)
 class StoredResult:
     """Handle on the durable terminal result JSON for one order id.
@@ -407,7 +433,6 @@ class StoredResult:
         write_json_atomic(
             self.path,
             dict(payload),
-            temporary_path=self.path.parent / f".{self.order_id}.json.tmp",
             trailing_newline=False,
             sort_keys=False,
             cleanup_on_error=False,
@@ -456,10 +481,24 @@ class TerminalFinalization:
         if self.result_payload is not None:
             wrote_result = self.stored_result().create_once(self.result_payload)
         self.destination_dir.mkdir(parents=True, exist_ok=True)
+        destination_path = self.destination_dir / self.claimed_path.name
         try:
-            self.claimed_path.replace(self.destination_dir / self.claimed_path.name)
+            moved = _move_without_replace(self.claimed_path, destination_path)
+            if not moved:
+                # A prior pass may have linked the same inode and died before
+                # unlinking its source. Treat that half-complete move as
+                # success, but never discard a different destination file.
+                if self.claimed_path.exists() and destination_path.exists() and os.path.samefile(
+                    self.claimed_path, destination_path
+                ):
+                    self.claimed_path.unlink()
+                elif self.claimed_path.exists():
+                    raise FileExistsError(destination_path)
         except FileNotFoundError:
-            pass  # moved by an earlier or repeated finalization: already done
+            if not destination_path.exists():
+                raise
+            # The source disappeared after a prior successful link/unlink.
+            # A durable destination is enough to complete an idempotent pass.
         except OSError:
             if not self.suppress_move_errors:
                 raise
@@ -519,9 +558,12 @@ def requeue_deferred_to_orders(
             outcome.skipped_existing_target.append(path)
             continue
         try:
-            path.replace(target)
+            moved = _move_without_replace(path, target)
         except OSError:
             outcome.failed.append(path)
             continue
-        outcome.requeued.append(target)
+        if moved:
+            outcome.requeued.append(target)
+        else:
+            outcome.skipped_existing_target.append(path)
     return outcome
