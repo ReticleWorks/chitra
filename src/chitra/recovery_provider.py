@@ -1086,7 +1086,12 @@ def _canonical_amp_factory(
             "child_roster": tuple(entry.model_dump(mode="json") for entry in roster),
             "child_ids": tuple(entry.child_id for entry in roster),
             "checkpoint_ref": current.checkpoint_reference,
-            "quiescent": current.checkpoint_reference is not None and current.pending_operation is None,
+            # A governed close is itself the pending operation.  It does not
+            # represent an active provider turn, so retain the Chitra
+            # checkpoint/quiescence proof while that exact close envelope is
+            # in flight.  Other pending mutations remain non-quiescent.
+            "quiescent": current.checkpoint_reference is not None
+            and (current.pending_operation is None or current.pending_operation.kind == "close"),
             "observed_at": update.observed_at if update is not None else _now(),
             "operating_facts": tuple(fact.model_dump(mode="json") for fact in current_facts),
         }
