@@ -102,7 +102,7 @@ import json
 import os
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import structlog
@@ -132,6 +132,7 @@ from .goals import (
 from .goals import (
     SCHEMA as GOALS_INSTALLED_SCHEMA,
 )
+from .joined_lane import JoinedLaneReconciler, JoinedLaneStore, ReconcileReport
 from .journal import native_session_identity
 from .orders import DispatchOrder, DispatchResult, DispatchStatus
 from .policy_config import PolicyConfig, load_policy_config
@@ -601,6 +602,7 @@ def process_one_order(
     allowed_session_prefixes: tuple[str, ...] = (),
     denied_session_prefixes: tuple[str, ...] = (),
     lane_lock_retry_attempts: int = DEFAULT_LANE_LOCK_RETRY_ATTEMPTS,
+    joined_lane_report: ReconcileReport | None = None,
 ) -> DispatchResult | None:
     """Process a single order file. Returns the result, or None if skipped
     (already processed, claimed elsewhere, or deferred by a rate-limit freeze
@@ -693,6 +695,7 @@ def process_one_order(
             allowed_session_prefixes=allowed_session_prefixes,
             denied_session_prefixes=denied_session_prefixes,
             lane_lock_retry_attempts=lane_lock_retry_attempts,
+            joined_lane_report=joined_lane_report,
         )
     finally:
         with contextlib.suppress(OSError):
@@ -722,6 +725,7 @@ def _process_claimed_order(
     allowed_session_prefixes: tuple[str, ...],
     denied_session_prefixes: tuple[str, ...],
     lane_lock_retry_attempts: int,
+    joined_lane_report: ReconcileReport | None,
 ) -> DispatchResult | None:
     """The rest of order processing, once an order file is safely claimed
     (renamed into ``in_flight/`` with a live owner marker). Split out of
@@ -747,6 +751,30 @@ def _process_claimed_order(
             result=result,
             suppress_move_errors=True,
             retry_state_dir=deferred_dir,
+        )
+
+    if joined_lane_report is not None and not joined_lane_report.allows(order.session_ref):
+        blocked = next(
+            (item for item in joined_lane_report.blocked if item.session_ref == order.session_ref),
+            None,
+        )
+        reason = blocked.reason if blocked is not None else (
+            joined_lane_report.errors[0] if joined_lane_report.errors else "joined-lane restart reconciliation blocked this session"
+        )
+        deferred_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            claimed_path.replace(deferred_dir / claimed_path.name)
+        except OSError as exc:
+            logger.error("dispatchd_joined_lane_defer_failed", order_id=order.order_id, error=str(exc))
+            return None
+        logger.info("dispatchd_joined_lane_deferred", order_id=order.order_id, session_ref=order.session_ref, reason=reason)
+        return DispatchResult(
+            order_id=order.order_id,
+            session_ref=order.session_ref,
+            status=DispatchStatus.DEFERRED,
+            reason=f"joined-lane restart barrier: {reason}",
+            routing_hint=order.routing_hint,
+            task_type=order.task_type,
         )
 
     resolved_zdr = False
@@ -1225,6 +1253,9 @@ def run_once(
     allowed_session_prefixes: tuple[str, ...] = (),
     denied_session_prefixes: tuple[str, ...] = (),
     lane_lock_retry_attempts: int = DEFAULT_LANE_LOCK_RETRY_ATTEMPTS,
+    joined_lane_root: Path | None = None,
+    joined_lane_reconciler: JoinedLaneReconciler | None = None,
+    reconciliation_gate: Callable[[], ReconcileReport] | None = None,
     _preloaded_routing_config: RoutingConfig | None | _ConfigNotPreloaded = _CONFIG_NOT_PRELOADED,
     _preloaded_policy: PolicyConfig | _ConfigNotPreloaded = _CONFIG_NOT_PRELOADED,
 ) -> list[DispatchResult]:
@@ -1251,6 +1282,29 @@ def run_once(
         raise ValueError("lane_lock_retry_attempts must be at least 1")
     queue_dir = queue_dir or default_queue_dir()
     orders_dir, results_dir, processed_dir = _ensure_queue_dirs(queue_dir)
+    # This is deliberately before the pending-order snapshot and before any
+    # claim.  A blocked unfinished lane leaves its order in the queue and
+    # therefore cannot reach provider I/O until a later wake/requeue pass.
+    if reconciliation_gate is not None:
+        joined_lane_report = reconciliation_gate()
+    elif joined_lane_reconciler is not None:
+        joined_lane_report = joined_lane_reconciler.reconcile_all()
+    elif joined_lane_root is not None:
+        joined_lane_report = ReconcileReport((), ("joined-lane reconciler is required when joined_lane_root is set",))
+    else:
+        # Even legacy queue callers pass through the barrier.  With no lane
+        # documents there is nothing to reconcile; a corrupt or unfinished
+        # document cannot silently bypass the gate.
+        try:
+            unfinished = JoinedLaneStore(queue_dir).unfinished()
+        except Exception as exc:  # noqa: BLE001 - fail closed before claim
+            joined_lane_report = ReconcileReport((), (f"joined-lane barrier load failed: {exc}",))
+        else:
+            joined_lane_report = (
+                ReconcileReport((), ("joined-lane reconciler is required for unfinished lanes",))
+                if unfinished
+                else ReconcileReport(())
+            )
     _reclaim_stale_in_flight(queue_dir)
     note_goals_schema_state(goals_root)
     if isinstance(_preloaded_routing_config, _ConfigNotPreloaded):
@@ -1296,6 +1350,7 @@ def run_once(
             allowed_session_prefixes=allowed_session_prefixes,
             denied_session_prefixes=denied_session_prefixes,
             lane_lock_retry_attempts=lane_lock_retry_attempts,
+            joined_lane_report=joined_lane_report,
         )
         if result is not None:
             out.append(result)
@@ -1319,6 +1374,9 @@ def run_forever(
     allowed_session_prefixes: tuple[str, ...] = (),
     denied_session_prefixes: tuple[str, ...] = (),
     lane_lock_retry_attempts: int = DEFAULT_LANE_LOCK_RETRY_ATTEMPTS,
+    joined_lane_root: Path | None = None,
+    joined_lane_reconciler: JoinedLaneReconciler | None = None,
+    reconciliation_gate: Callable[[], ReconcileReport] | None = None,
 ) -> None:
     """Run the daemon loop: drain the queue, sleep, repeat. Runs until killed.
 
@@ -1371,6 +1429,9 @@ def run_forever(
             allowed_session_prefixes=allowed_session_prefixes,
             denied_session_prefixes=denied_session_prefixes,
             lane_lock_retry_attempts=lane_lock_retry_attempts,
+            joined_lane_root=joined_lane_root,
+            joined_lane_reconciler=joined_lane_reconciler,
+            reconciliation_gate=reconciliation_gate,
             _preloaded_routing_config=routing_config,
             _preloaded_policy=policy,
         )
