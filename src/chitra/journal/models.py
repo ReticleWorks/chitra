@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class CanonicalType(StrEnum):
@@ -93,11 +93,22 @@ class CanonicalEvent(BaseModel):
     lifecycle_receipt: LifecycleReceipt | None = None
     normalized_type: CanonicalType
     goal_ref: str | None = None
+    # A transcript event is only recovery evidence for the goal revision that
+    # observed it.  ``None`` keeps older journal rows readable, but callers
+    # must not treat an unbound event as evidence for a current goal.
+    goal_version: int | None = Field(default=None, ge=1)
     item_ref: str | None = None
     payload_digest: str
     normalizer_version: str
     payload: dict[str, Any]
     raw_record: dict[str, Any] | None
+
+    @field_validator("goal_version")
+    @classmethod
+    def reject_bool_goal_version(cls, value: int | None) -> int | None:
+        if isinstance(value, bool):
+            raise ValueError("goal_version must be an integer")
+        return value
 
 
 class ProgressClass(StrEnum):

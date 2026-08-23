@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .ladder import IncidentRecord
 
@@ -42,6 +42,9 @@ class RecoveryCheckpointBinding(BaseModel):
     lane_id: str = Field(min_length=1)
     goal_id: str = Field(min_length=1)
     session_ref: str = Field(min_length=1)
+    # ``None`` keeps old signed receipts parseable, but recovery bindings
+    # created for a current lane must carry the exact goal revision.
+    goal_version: int | None = Field(default=None, ge=1)
     cycle_id: str = Field(min_length=1)
     operation_id: str = Field(min_length=1)
     provider_handle: str = Field(min_length=1)
@@ -54,6 +57,13 @@ class RecoveryCheckpointBinding(BaseModel):
     # distinct identities.  ``None`` keeps old signed receipts readable;
     # new recovery bindings always carry the exact session value.
     provider_session_id: str | None = None
+
+    @field_validator("goal_version")
+    @classmethod
+    def reject_bool_goal_version(cls, value: int | None) -> int | None:
+        if isinstance(value, bool):
+            raise ValueError("goal_version must be an integer")
+        return value
 
 
 class RescueBundle(BaseModel):
@@ -303,6 +313,8 @@ def write_checkpoint_receipt(
         raise ValueError("rescue bundle digest mismatch")
     if bundle.lane != record.lane or bundle.session_ref != record.consumption.session_ref:
         raise ValueError("rescue bundle does not match consumed incident")
+    if bundle.recovery_binding is not None and bundle.recovery_binding.goal_version is None:
+        raise ValueError("recovery checkpoint binding requires an exact goal_version")
     target_pid = bundle.process_identity.get("target_pid")
     if type(target_pid) is not int:
         raise ValueError("rescue bundle affected process identity is missing")
@@ -345,6 +357,8 @@ def write_checkpoint_receipt(
         "anti_replay_nonce": os.urandom(16).hex(),
         "signature": "",
     }
+    if bundle.recovery_binding is not None:
+        payload["goal_version"] = bundle.recovery_binding.goal_version
     payload["signature"] = sign_checkpoint_receipt(payload, key=load_or_create_checkpoint_key(state_root))
     directory = state_root / "checkpoints"
     directory.mkdir(parents=True, exist_ok=True)
@@ -375,6 +389,9 @@ def find_recovery_checkpoint_receipt(
 ) -> str | None:
     """Return the one signed, sealed receipt matching an exact recovery envelope."""
 
+    if binding.goal_version is None:
+        return None
+
     try:
         from .ladder import IncidentStore, consumed_checkpoint_refs
 
@@ -393,6 +410,8 @@ def find_recovery_checkpoint_receipt(
         if not isinstance(checkpoint_ref, str) or checkpoint_ref not in consumed:
             continue
         if payload.get("recovery_binding") != binding.model_dump(mode="json"):
+            continue
+        if payload.get("goal_version") != binding.goal_version:
             continue
         if payload.get("lane") != binding.lane_id or payload.get("session_ref") != binding.session_ref:
             continue

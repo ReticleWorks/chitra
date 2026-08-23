@@ -6,10 +6,12 @@ import ast
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from chitra.detect.detectors import Finding
 from chitra.detect.ladder import ConsumptionProof, IncidentStore, ResponseLadder
 from chitra.goals import GoalRecord
-from chitra.joined_lane import JoinedLaneReconciler, JoinedLaneStore
+from chitra.joined_lane import JoinedLaneIdentityError, JoinedLaneReconciler, JoinedLaneStore
 from chitra.journal.models import CanonicalEvent, CanonicalType, Client, TranscriptIdentity
 from chitra.journal.store import EventJournal
 from chitra.ledger import LedgerEntry, message_hash, sign
@@ -21,7 +23,7 @@ from chitra.provider_protocol import (
     ProviderStatus,
     SendRequest,
 )
-from chitra.recovery import RecoveryEngine
+from chitra.recovery import RecoveryEngine, confirm_useful_progress
 from chitra.session_contract import (
     MAX_INLINE_WAKE_RECEIPTS,
     JoinedLaneRecord,
@@ -32,6 +34,7 @@ from chitra.session_contract import (
     ProviderOperationResult,
     RecoveryState,
     RoadmapStep,
+    WakeReceipt,
 )
 
 NOW = datetime(2026, 8, 23, 14, tzinfo=UTC)
@@ -88,7 +91,14 @@ def lane_record(
     )
 
 
-def append_named_wake(tmp_path: Path, wake_id: str, condition: str, *, sequence: int = 1) -> None:
+def append_named_wake(
+    tmp_path: Path,
+    wake_id: str,
+    condition: str,
+    *,
+    sequence: int = 1,
+    goal_version: int | None = 1,
+) -> None:
     EventJournal(tmp_path, "lane-a").append(
         (
             CanonicalEvent(
@@ -109,6 +119,7 @@ def append_named_wake(tmp_path: Path, wake_id: str, condition: str, *, sequence:
                 raw_sha256=None,
                 normalized_type=CanonicalType.UNKNOWN,
                 goal_ref="goal-a",
+                goal_version=goal_version,
                 item_ref=None,
                 payload_digest="a" * 64,
                 normalizer_version="test",
@@ -170,6 +181,47 @@ def test_progress_evidence_from_another_lane_cannot_complete_recovery(tmp_path: 
     assert decision.action == "nudge"
     assert decision.record.recovery.stage != "complete"
     assert decision.record.last_useful_progress is None
+
+
+def test_progress_evidence_requires_the_current_goal_version(tmp_path: Path) -> None:
+    del tmp_path
+    base = lane_record()
+    record = base.model_copy(
+        update={"goal_version": 2, "current_update": base.current_update.model_copy(update={"goal_version": 2})}
+    )
+
+    def event(event_id: str, goal_version: int | None) -> CanonicalEvent:
+        return CanonicalEvent(
+            event_id=event_id,
+            instance="test",
+            lane="lane-a",
+            client=Client.CODEX,
+            client_version="test",
+            process_id="1",
+            transcript=TranscriptIdentity(path="/tmp/lane-a", device=1, inode=1),
+            session_id="tophand:lane-a:1",
+            resume_id=None,
+            observed_at=NOW.isoformat(),
+            native_time=None,
+            native_type="tool_result",
+            native_join_id=None,
+            raw_byte_range=None,
+            raw_sha256=None,
+            normalized_type=CanonicalType.TOOL_RESULT,
+            goal_ref="goal-a",
+            goal_version=goal_version,
+            item_ref=None,
+            payload_digest="a" * 64,
+            normalizer_version="test",
+            payload={"progress_evidence": {"artifact_changed": True}},
+            raw_record=None,
+        )
+
+    assert confirm_useful_progress(record, events=(event("stale-progress", 1),)) is None
+    assert confirm_useful_progress(record, events=(event("unbound-progress", None),)) is None
+    current = confirm_useful_progress(record, events=(event("current-progress", 2),))
+    assert current is not None
+    assert current.evidence_ref == "current-progress"
 
 
 def test_consumed_result_with_wrong_operation_identity_cannot_advance(tmp_path: Path) -> None:
@@ -531,6 +583,76 @@ def test_wake_receipt_survives_durable_reload(tmp_path: Path) -> None:
         event_sequence=1,
     )
     assert replay.status == "wake_reused"
+
+
+@pytest.mark.parametrize("event_goal_version", (1, None), ids=("stale", "unbound"))
+def test_wake_event_requires_the_current_goal_version(tmp_path: Path, event_goal_version: int | None) -> None:
+    base = lane_record()
+    current_update = base.current_update.model_copy(update={"goal_version": 2})
+    current = base.model_copy(update={"goal_version": 2, "current_update": current_update})
+    store = JoinedLaneStore(tmp_path)
+    store.create(current)
+    condition = "a material update is observed"
+    append_named_wake(tmp_path, "versioned-wake", condition, goal_version=event_goal_version)
+    reconciler = JoinedLaneReconciler(
+        store,
+        provider_probe=lambda _record: None,
+        journal_probe=lambda _record: None,
+        ownership_probe=lambda _record: None,
+        now=lambda: NOW,
+    )
+
+    with pytest.raises(JoinedLaneIdentityError, match="exact canonical evidence"):
+        reconciler.wake("lane-a", wake_id="versioned-wake", wake_condition=condition, event_sequence=1)
+
+
+def test_wake_receipt_version_is_checked_but_unbound_legacy_receipt_is_readable(tmp_path: Path) -> None:
+    base = lane_record()
+    legacy = WakeReceipt(
+        wake_id="legacy-wake",
+        lane_id="lane-a",
+        goal_id="goal-a",
+        session_ref="tophand:lane-a:1",
+        wake_condition="a material update is observed",
+        event_sequence=1,
+        observed_at=NOW.isoformat(),
+    )
+    readable = JoinedLaneRecord.from_dict(base.model_copy(update={"wake_receipts": (legacy,)}).to_dict())
+    assert readable.wake_receipts[0].goal_version is None
+
+    current_update = base.current_update.model_copy(update={"goal_version": 2})
+    stale = base.model_copy(
+        update={
+            "goal_version": 2,
+            "current_update": current_update,
+            "wake_receipts": (legacy.model_copy(update={"goal_version": 1}),),
+        }
+    )
+    with pytest.raises(ValueError, match="wake receipt goal_version"):
+        JoinedLaneRecord.from_dict(stale.to_dict())
+
+    condition = "a material update is observed"
+    current_update = base.current_update.model_copy(update={"goal_version": 2})
+    current = base.model_copy(
+        update={
+            "goal_version": 2,
+            "current_update": current_update,
+            "recovery": RecoveryState(stage="waiting", failure_signature="legacy-wake"),
+            "next_check": NextCheck(at=(NOW + timedelta(hours=1)).isoformat(), reason="wait", wake_condition=condition),
+            "wake_receipts": (legacy,),
+        }
+    )
+    EventJournal(tmp_path, "lane-a").append_wakes((legacy,))
+    engine = RecoveryEngine(state_root=tmp_path)
+    assert not engine._named_wake(current, "legacy-wake", condition, 1)
+
+    append_named_wake(tmp_path, "legacy-wake", condition, goal_version=2)
+    assert engine._named_wake(current, "legacy-wake", condition, 1)
+    current_receipt = legacy.model_copy(update={"goal_version": 2})
+    journal = EventJournal(tmp_path, "lane-a")
+    assert journal.append_wakes((current_receipt,)) == (current_receipt,)
+    assert [receipt.goal_version for receipt in journal.load_wakes()] == [None, 2]
+    assert journal.append_wakes((current_receipt,)) == ()
 
 
 def test_wake_receipts_compact_inline_and_remain_deduplicated_in_journal(tmp_path: Path) -> None:

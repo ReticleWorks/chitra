@@ -41,7 +41,15 @@ class NormalizationContext:
     resume_id: str | None = None
     observed_at: str | None = None
     goal_ref: str | None = None
+    # ``None`` is a read-compatibility mode for journals written before goal
+    # revisions were part of event identity.  Such events remain observable,
+    # but recovery must not accept them as current-goal evidence.
+    goal_version: int | None = None
     item_ref: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.goal_version is not None and (type(self.goal_version) is not int or self.goal_version < 1):
+            raise ValueError("goal_version must be a positive integer")
 
 
 def _canonical_digest(value: Any) -> str:
@@ -138,6 +146,11 @@ class TranscriptNormalizer:
                 "session_id": receipt.session_id,
                 "receipt_id": receipt.receipt_id,
                 "normalized_type": CanonicalType.RESUME.value,
+                **(
+                    {"goal_version": self.context.goal_version}
+                    if self.context.goal_version is not None
+                    else {}
+                ),
             }
         )
         return CanonicalEvent(
@@ -159,6 +172,7 @@ class TranscriptNormalizer:
             lifecycle_receipt=receipt,
             normalized_type=CanonicalType.RESUME,
             goal_ref=self.context.goal_ref,
+            goal_version=self.context.goal_version,
             item_ref=self.context.item_ref,
             payload_digest=payload_digest,
             normalizer_version=NORMALIZER_VERSION,
@@ -190,6 +204,11 @@ class TranscriptNormalizer:
                 "normalized_type": normalized_type.value,
                 "slot": slot,
                 "payload_digest": payload_digest,
+                **(
+                    {"goal_version": self.context.goal_version}
+                    if self.context.goal_version is not None
+                    else {}
+                ),
             }
         )
         observed_at = self.context.observed_at or native_time or datetime.now(UTC).isoformat()
@@ -211,6 +230,7 @@ class TranscriptNormalizer:
             raw_sha256=raw.raw_sha256,
             normalized_type=normalized_type,
             goal_ref=self.context.goal_ref,
+            goal_version=self.context.goal_version,
             item_ref=self.context.item_ref,
             payload_digest=payload_digest,
             normalizer_version=NORMALIZER_VERSION,

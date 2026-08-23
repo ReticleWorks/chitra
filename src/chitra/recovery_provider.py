@@ -566,6 +566,7 @@ def _canonical_recovery_bindings(
             lane_id=current.lane_id,
             goal_id=current.goal_id,
             session_ref=current.session_ref,
+            goal_version=current.goal_version,
             cycle_id=cycle_id,
             operation_id=operation.operation_id,
             provider_handle=operation.provider_handle,

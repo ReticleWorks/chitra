@@ -966,6 +966,9 @@ class WakeReceipt(_ContractModel):
     lane_id: Identifier
     goal_id: Identifier
     session_ref: Identifier
+    # ``None`` keeps pre-versioned wake archives readable.  Only a receipt
+    # carrying the joined lane's exact current version may wake recovery.
+    goal_version: int | None = Field(default=None, ge=1)
     wake_condition: Text
     event_sequence: int = Field(ge=1)
     observed_at: Timestamp
@@ -975,6 +978,13 @@ class WakeReceipt(_ContractModel):
     def reject_bool_sequence(cls, value: int) -> int:
         if isinstance(value, bool):
             raise ValueError("wake event_sequence must be an integer")
+        return value
+
+    @field_validator("goal_version")
+    @classmethod
+    def reject_bool_goal_version(cls, value: int | None) -> int | None:
+        if isinstance(value, bool):
+            raise ValueError("wake goal_version must be an integer")
         return value
 
     @field_validator("observed_at")
@@ -1321,6 +1331,8 @@ class JoinedLaneRecord(_ContractModel):
             raise ValueError("joined-lane wake receipt IDs must be unique")
         if any((receipt.lane_id, receipt.goal_id) != (self.lane_id, self.goal_id) for receipt in self.wake_receipts):
             raise ValueError("wake receipt logical identity must match joined lane")
+        if any(receipt.goal_version not in (None, self.goal_version) for receipt in self.wake_receipts):
+            raise ValueError("wake receipt goal_version must match joined lane")
         if any(receipt.session_ref != self.session_ref for receipt in self.wake_receipts):
             raise ValueError("wake receipt session identity must match joined lane")
         wake_times = [datetime.fromisoformat(receipt.observed_at.replace("Z", "+00:00")) for receipt in self.wake_receipts]

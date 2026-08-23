@@ -621,14 +621,23 @@ def _wake_id(record: object) -> str:
     receipts = _value(record, "wake_receipts", ())
     if not isinstance(receipts, tuple):
         return ""
-    return _text(_value(receipts[-1], "wake_id", "")) if receipts else ""
+    goal_version = _value(record, "goal_version", None)
+    for receipt in reversed(receipts):
+        if _value(receipt, "goal_version", None) == goal_version:
+            return _text(_value(receipt, "wake_id", ""))
+    return ""
 
 
 def _wake_ids(record: object) -> frozenset[str]:
     receipts = _value(record, "wake_receipts", ())
     if not isinstance(receipts, tuple):
         return frozenset()
-    return frozenset(_text(_value(receipt, "wake_id", "")) for receipt in receipts)
+    goal_version = _value(record, "goal_version", None)
+    return frozenset(
+        _text(_value(receipt, "wake_id", ""))
+        for receipt in receipts
+        if _value(receipt, "goal_version", None) == goal_version
+    )
 
 
 def _canonical_next_check(record: object, at: str, reason: str, wake_condition: str | None = None) -> object:
@@ -700,6 +709,7 @@ def _apply_state(record: Any, updates: Mapping[str, Any]) -> Any:
                     lane_id=_value(record, "lane_id", ""),
                     goal_id=_value(record, "goal_id", ""),
                     session_ref=_value(record, "session_ref", ""),
+                    goal_version=_value(record, "goal_version", None),
                     wake_condition=_text(updates.get("wake_condition", "")),
                     event_sequence=updates["wake_event_sequence"],
                     observed_at=updates["wake_observed_at"],
@@ -1220,7 +1230,11 @@ class JoinedLaneReconciler:
 
         record = self.store.require(lane_id)
         journal = EventJournal(self.store.root, lane_id)
-        archived_wake_ids = {receipt.wake_id for receipt in journal.load_wakes()}
+        archived_wake_ids = {
+            receipt.wake_id
+            for receipt in journal.load_wakes()
+            if receipt.goal_version == record.goal_version
+        }
         if wake_id and (wake_id in _wake_ids(record) or wake_id in archived_wake_ids):
             return self._outcome(record, "wake_reused", False, "wake already applied")
         sequence = event_sequence
@@ -1235,6 +1249,7 @@ class JoinedLaneReconciler:
                 event_sequence=sequence,
                 goal_id=record.goal_id,
                 session_ref=record.session_ref,
+                goal_version=record.goal_version,
                 wake_condition=wake_condition,
             ):
                 raise JoinedLaneIdentityError("wake receipt lacks exact canonical evidence that its named condition changed")
@@ -1260,6 +1275,7 @@ class JoinedLaneReconciler:
                             lane_id=record.lane_id,
                             goal_id=record.goal_id,
                             session_ref=record.session_ref,
+                            goal_version=record.goal_version,
                             wake_condition=wake_condition,
                             event_sequence=sequence,
                             observed_at=observed_at,
@@ -1286,6 +1302,7 @@ class JoinedLaneReconciler:
                         lane_id=record.lane_id,
                         goal_id=record.goal_id,
                         session_ref=record.session_ref,
+                        goal_version=record.goal_version,
                         wake_condition=updates["wake_condition"],
                         event_sequence=sequence,
                         observed_at=observed_at,
@@ -1410,6 +1427,7 @@ def journal_provider_probe(root: Path) -> JournalProbe:
                 event.lane != record.lane_id
                 or event.goal_ref != record.goal_id
                 or event.session_id != record.session_ref
+                or event.goal_version != record.goal_version
                 or observed_session_id != expected_session_id
             ):
                 continue

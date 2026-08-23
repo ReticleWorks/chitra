@@ -45,6 +45,9 @@ def classify_progress(
 ) -> ProgressClassification:
     """Classify only evidence the canonical stream actually establishes."""
 
+    if event.goal_version is not None and goal_version != str(event.goal_version):
+        raise ValueError("progress classification goal_version does not match its source event")
+
     evidence = event.payload.get("progress_evidence")
     if isinstance(evidence, dict) and any(evidence.get(key) is True for key in _PROGRESS_KEYS):
         classification = ProgressClass.PROGRESS
@@ -178,7 +181,7 @@ class EventJournal:
         for receipt in candidates:
             if receipt.lane_id != self.lane:
                 raise ValueError(f"wake lane {receipt.lane_id!r} does not match journal lane {self.lane!r}")
-        return self._append_unique(self.wake_path, candidates, "wake_id")
+        return self._append_unique(self.wake_path, candidates, ("wake_id", "goal_version"))
 
     def proves_named_wake(
         self,
@@ -187,6 +190,7 @@ class EventJournal:
         event_sequence: int,
         goal_id: str,
         session_ref: str,
+        goal_version: int,
         wake_condition: str,
     ) -> bool:
         """Require one exact lane event proving that a named condition changed."""
@@ -200,6 +204,7 @@ class EventJournal:
             and event.lane == self.lane
             and event.goal_ref == goal_id
             and event.session_id == session_ref
+            and event.goal_version == goal_version
             and event.payload.get("wake_condition") == wake_condition
             and event.payload.get("wake_condition_changed") is True
         )
@@ -208,7 +213,7 @@ class EventJournal:
         self,
         path: Path,
         candidates: tuple[T, ...],
-        id_field: str,
+        id_field: str | tuple[str, ...],
     ) -> tuple[T, ...]:
         if not candidates:
             return ()
@@ -218,22 +223,30 @@ class EventJournal:
             os.chmod(self.lock_path, 0o600)
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             try:
-                existing: set[str] = set()
+                def identity(value: object) -> object:
+                    if isinstance(id_field, tuple):
+                        return tuple(
+                            value.get(field) if isinstance(value, dict) else getattr(value, field)
+                            for field in id_field
+                        )
+                    return value.get(id_field) if isinstance(value, dict) else getattr(value, id_field)
+
+                existing: set[object] = set()
                 if path.exists():
                     with path.open("r", encoding="utf-8") as current:
                         for line in current:
                             if not line.strip():
                                 continue
                             value = json.loads(line)
-                            identity = value.get(id_field)
-                            if isinstance(identity, str):
-                                existing.add(identity)
+                            row_identity = identity(value)
+                            if isinstance(id_field, tuple) or isinstance(row_identity, str):
+                                existing.add(row_identity)
                 new_rows: list[T] = []
                 for candidate in candidates:
-                    identity = getattr(candidate, id_field)
-                    if identity not in existing:
+                    candidate_identity = identity(candidate)
+                    if candidate_identity not in existing:
                         new_rows.append(candidate)
-                        existing.add(identity)
+                        existing.add(candidate_identity)
                 if new_rows:
                     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
                     try:

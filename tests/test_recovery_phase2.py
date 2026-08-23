@@ -13,6 +13,7 @@ from chitra.detect.ladder import ConsumptionProof, IncidentRecord, IncidentStore
 from chitra.detect.rescue import (
     RecoveryCheckpointBinding,
     RescueBundle,
+    find_recovery_checkpoint_receipt,
     write_checkpoint_receipt,
     write_rescue_bundle,
 )
@@ -134,6 +135,7 @@ class SequenceProvider:
             lane_id=record.lane_id,
             goal_id=record.goal_id,
             session_ref=record.session_ref,
+            goal_version=record.goal_version,
             cycle_id=cycle_id,
             operation_id=request.operation_id,
             provider_handle=request.provider_handle,
@@ -264,6 +266,28 @@ def test_recovery_follows_exact_bounded_sequence_and_waits(tmp_path: Path, monke
     assert len(record.operation_history) == 5
 
 
+def test_checkpoint_proof_requires_the_current_goal_version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = SequenceProvider(tmp_path, monkeypatch)
+    engine = RecoveryEngine(provider=provider, state_root=tmp_path, check_interval=timedelta(0), wait_interval=timedelta(0))
+    record = _record()
+    for offset in range(3):
+        record = engine.run_once(
+            record,
+            now=NOW + timedelta(seconds=offset),
+            failure_signature="checkpoint-version-stall",
+            goal=_goal(),
+        ).record
+
+    checkpoint_ref = record.checkpoint_reference
+    assert checkpoint_ref == "checkpoint-a"
+    payload = json.loads((tmp_path / "checkpoints" / f"{checkpoint_ref}.json").read_text(encoding="utf-8"))
+    assert payload["goal_version"] == 1
+    binding = RecoveryCheckpointBinding.model_validate(payload["recovery_binding"])
+    assert find_recovery_checkpoint_receipt(tmp_path, binding) == checkpoint_ref
+    assert find_recovery_checkpoint_receipt(tmp_path, binding.model_copy(update={"goal_version": 2})) is None
+    assert find_recovery_checkpoint_receipt(tmp_path, binding.model_copy(update={"goal_version": None})) is None
+
+
 class AcceptedThenObservedProvider:
     provider_name = ProviderName.TOPHAND
     capabilities = ProviderCapabilities.from_supported(("send", "read_updates", "status"))
@@ -326,6 +350,7 @@ def test_restart_reuses_pending_operation_and_reconciles_normal_provider_contrac
                 raw_sha256=None,
                 normalized_type=CanonicalType.UNKNOWN,
                 goal_ref="goal-a",
+                goal_version=1,
                 item_ref=None,
                 payload_digest=pending.payload_digest,
                 normalizer_version="test",
@@ -400,6 +425,7 @@ def test_exact_bound_material_progress_clears_recovery(tmp_path: Path) -> None:
         raw_sha256=None,
         normalized_type=CanonicalType.TOOL_RESULT,
         goal_ref="goal-a",
+        goal_version=1,
         item_ref="implement",
         payload_digest="d" * 64,
         normalizer_version="test",

@@ -492,6 +492,11 @@ def _checkpoint_receipt_nonce(
         "anti_replay_nonce",
         "signature",
     }
+    bundle_binding = bundle.recovery_binding
+    if bundle_binding is not None:
+        if bundle_binding.goal_version is None:
+            return None
+        expected_fields.add("goal_version")
     if set(payload) != expected_fields:
         return None
     if payload.get("schema_name") != CHECKPOINT_SCHEMA or payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
@@ -508,10 +513,11 @@ def _checkpoint_receipt_nonce(
         return None
     if not _checkpoint_ledger_binding_matches(payload.get("ledger_binding"), record):
         return None
-    bundle_binding = bundle.recovery_binding
     if payload.get("recovery_binding") != (
         None if bundle_binding is None else bundle_binding.model_dump(mode="json")
     ):
+        return None
+    if bundle_binding is not None and payload.get("goal_version") != bundle_binding.goal_version:
         return None
     provenance = payload.get("provenance")
     if not isinstance(provenance, dict) or provenance.get("kind") != CHECKPOINT_PROVENANCE_KIND:

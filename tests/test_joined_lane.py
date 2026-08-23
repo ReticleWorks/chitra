@@ -85,6 +85,7 @@ def append_wake_event(root: Path, wake_id: str, condition: str) -> None:
                 raw_sha256=None,
                 normalized_type=CanonicalType.UNKNOWN,
                 goal_ref="goal-a",
+                goal_version=1,
                 item_ref=None,
                 payload_digest="a" * 64,
                 normalizer_version="test",

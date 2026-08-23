@@ -335,7 +335,15 @@ class RecoveryEngine:
 
     def _cycle_id(self, record: JoinedLaneRecord, signature: str, current: datetime) -> str:
         return "cycle-" + _digest(
-            (record.lane_id, record.goal_id, signature, record.revision, len(record.operation_history), current.isoformat())
+            (
+                record.lane_id,
+                record.goal_id,
+                record.goal_version,
+                signature,
+                record.revision,
+                len(record.operation_history),
+                current.isoformat(),
+            )
         )[:24]
 
     def schedule(
@@ -450,8 +458,12 @@ class RecoveryEngine:
         resolved_goal = goal or self._goal_for(working)
         if resolved_goal is None:
             return self._wait(working, current, "the enrolled goal record becomes readable", persist)
-        if (resolved_goal.lane_id, resolved_goal.goal_id) != (working.lane_id, working.goal_id):
-            return self._wait(working, current, "the exact enrolled lane and goal identity reconcile", persist)
+        if (resolved_goal.lane_id, resolved_goal.goal_id, resolved_goal.goal_version) != (
+            working.lane_id,
+            working.goal_id,
+            working.goal_version,
+        ):
+            return self._wait(working, current, "the exact enrolled lane, goal, and goal version reconcile", persist)
         refreshed_facts = tuple(facts)
         if not refreshed_facts and self.facts_reader is not None:
             try:
@@ -547,12 +559,14 @@ class RecoveryEngine:
         condition: str | None,
         sequence: int | None,
     ) -> bool:
-        known = {receipt.wake_id for receipt in record.wake_receipts}
+        known = {receipt.wake_id for receipt in record.wake_receipts if receipt.goal_version == record.goal_version}
         journal = self.journal or (EventJournal(self.state_root, record.lane_id) if self.state_root is not None else None)
         if journal is None:
             return False
         try:
-            known.update(receipt.wake_id for receipt in journal.load_wakes())
+            known.update(
+                receipt.wake_id for receipt in journal.load_wakes() if receipt.goal_version == record.goal_version
+            )
             proven = bool(
                 wake_id
                 and condition
@@ -562,6 +576,7 @@ class RecoveryEngine:
                     event_sequence=sequence,
                     goal_id=record.goal_id,
                     session_ref=record.session_ref,
+                    goal_version=record.goal_version,
                     wake_condition=condition,
                 )
             )
@@ -592,6 +607,7 @@ class RecoveryEngine:
             lane_id=record.lane_id,
             goal_id=record.goal_id,
             session_ref=record.session_ref,
+            goal_version=record.goal_version,
             wake_condition=condition,
             event_sequence=sequence,
             observed_at=current.isoformat(),
@@ -664,6 +680,8 @@ class RecoveryEngine:
                 continue
             if (event.lane, event.goal_ref, event.session_id) != (record.lane_id, record.goal_id, record.session_ref):
                 continue
+            if event.goal_version != record.goal_version:
+                continue
             marker = event.payload.get("progress_evidence")
             explicit = isinstance(marker, dict) and any(
                 marker.get(key) is True
@@ -727,6 +745,7 @@ class RecoveryEngine:
             {
                 "lane_id": record.lane_id,
                 "goal_id": record.goal_id,
+                "goal_version": record.goal_version,
                 "session_ref": record.session_ref,
                 "cycle_id": record.recovery.cycle_id,
                 "action": action,
@@ -911,6 +930,7 @@ class RecoveryEngine:
         return RecoveryCheckpointBinding(
             lane_id=record.lane_id,
             goal_id=record.goal_id,
+            goal_version=record.goal_version,
             session_ref=record.session_ref,
             cycle_id=cycle_id,
             operation_id=operation.operation_id,
@@ -1227,13 +1247,16 @@ class RecoverySupervisor:
         condition = record.wake_condition
         if not condition:
             return None
-        known = {receipt.wake_id for receipt in record.wake_receipts}
-        known.update(receipt.wake_id for receipt in journal.load_wakes())
+        known = {receipt.wake_id for receipt in record.wake_receipts if receipt.goal_version == record.goal_version}
+        known.update(
+            receipt.wake_id for receipt in journal.load_wakes() if receipt.goal_version == record.goal_version
+        )
         for sequence, event in reversed(tuple(enumerate(events, 1))):
             if (
                 event.lane == record.lane_id
                 and event.goal_ref == record.goal_id
                 and event.session_id == record.session_ref
+                and event.goal_version == record.goal_version
                 and event.event_id not in known
                 and event.payload.get("wake_condition") == condition
                 and event.payload.get("wake_condition_changed") is True

@@ -79,21 +79,29 @@ CASES = (
 )
 
 
-def context(case: FixtureCase, *, lane: str | None = None) -> NormalizationContext:
+def context(case: FixtureCase, *, lane: str | None = None, goal_version: int | None = None) -> NormalizationContext:
     return NormalizationContext(
         instance="w11-fixture",
         lane=lane or case.client.value,
         client=case.client,
         client_version=case.version,
         observed_at="2026-08-21T00:00:00Z",
+        goal_version=goal_version,
     )
 
 
-def ingest(case: FixtureCase, state_root: Path, *, path: Path | None = None, chunk_size: int = 64 * 1024) -> tuple[CanonicalEvent, ...]:
+def ingest(
+    case: FixtureCase,
+    state_root: Path,
+    *,
+    path: Path | None = None,
+    chunk_size: int = 64 * 1024,
+    goal_version: int | None = None,
+) -> tuple[CanonicalEvent, ...]:
     with JournalIngestor(
         state_root=state_root,
         transcript_path=path or case.path,
-        context=context(case),
+        context=context(case, goal_version=goal_version),
         chunk_size=chunk_size,
     ) as ingestor:
         return ingestor.poll().observed
@@ -288,6 +296,22 @@ def test_progress_classification_stays_evidence_bound(tmp_path: Path) -> None:
     assert non_progress.classification is ProgressClass.NON_PROGRESS
 
     assert os.stat(tmp_path / "journal" / "claude.jsonl").st_size > 0
+
+
+def test_goal_version_is_bound_to_current_events_and_classifications(tmp_path: Path) -> None:
+    current_events = ingest(CASES[0], tmp_path / "current", goal_version=2)
+    current = next(event for event in current_events if event.normalized_type is CanonicalType.TOOL_RESULT)
+    assert current.goal_version == 2
+    current_progress = classify_progress(current, goal_version="2")
+    assert current_progress.goal_version == "2"
+
+    with pytest.raises(ValueError, match="goal_version does not match"):
+        classify_progress(current, goal_version="1")
+
+    legacy_events = ingest(CASES[0], tmp_path / "legacy")
+    legacy = next(event for event in legacy_events if event.normalized_type is CanonicalType.TOOL_RESULT)
+    assert legacy.goal_version is None
+    assert legacy.event_id != current.event_id
 
 
 _REWRITE_PAD = 48
