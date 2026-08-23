@@ -6,11 +6,14 @@ subdirectory layout (``orders/``, ``in_flight/``, ``deferred/``,
 marker that reserves an order before it is renamed into ``in_flight/``,
 the stale-claim sweep that returns a dead worker's claim to ``orders/``
 without ever stealing a live owner's, the send-nonce marker that gates
-paste-free crash reconciliation, and the durable lane-lock retry sidecar
-parked next to a deferred order. ``dispatchd`` composes these primitives
-into its delivery policy (lane locks, freeze checks, ledger signing);
-this module owns only what the on-disk state IS -- paths, markers, and
-counters -- so queue state transitions are reviewable in one place.
+paste-free crash reconciliation, the durable lane-lock retry sidecar
+parked next to a deferred order, the single-writer terminal finalization
+that publishes a result once and moves the claimed order once, and the
+FIFO deferred-requeue sweep that returns parked orders to ``orders/``.
+``dispatchd`` composes these primitives into its delivery policy (lane
+locks, freeze checks, ledger signing); this module owns only what the
+on-disk state IS -- paths, markers, counters, and transitions -- so queue
+state transitions are reviewable in one place.
 
 On-disk compatibility: this module reproduces the exact file and directory
 names dispatchd has always used, including the dot-prefixed control files
@@ -27,9 +30,11 @@ import json
 import os
 import tempfile
 import uuid
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 import structlog
 
@@ -328,3 +333,237 @@ class LaneLockRetryTracker:
         """Best-effort cleanup after a terminal result has made retry state moot."""
         with contextlib.suppress(OSError):
             self.state_path(order_id).unlink()
+
+
+def _move_without_replace(source: Path, target: Path) -> bool:
+    """Move one queue file without ever replacing a peer's target.
+
+    ``Path.replace`` is atomic, but it is also destructive when another
+    worker has created ``target`` between an existence check and the rename.
+    Queue subdirectories share one filesystem, so an exclusive hard-link
+    followed by unlink gives us the needed no-clobber move. The source stays
+    intact if the link loses the target race, and a failed unlink removes the
+    link we just created before re-raising.
+
+    Return ``False`` when ``target`` already exists. Let the caller decide
+    whether that means "skip" or "already finalized".
+    """
+    try:
+        os.link(source, target)
+    except FileExistsError:
+        return False
+    try:
+        source.unlink()
+    except OSError:
+        with contextlib.suppress(OSError):
+            target.unlink()
+        raise
+    return True
+
+
+@dataclass(frozen=True)
+class StoredResult:
+    """Handle on the durable terminal result JSON for one order id.
+
+    The result file is the queue's single-writer record of an order's
+    outcome: whoever publishes it first wins, and no losing writer may
+    clobber it. ``create_once`` enforces that with an exclusive hard-link
+    create (the same primitive ``reserve_claim`` uses for owner markers);
+    ``overwrite`` exists only for the narrow proof-bit updates dispatchd
+    makes to a result it has already validated as its own.
+    """
+
+    order_id: str
+    path: Path
+
+    def exists(self) -> bool:
+        """Whether a terminal result has been published for this order id."""
+        return self.path.exists()
+
+    def read_payload(self) -> dict[str, Any] | None:
+        """The stored result payload, or ``None`` when absent or unreadable."""
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def create_once(self, payload: Mapping[str, Any]) -> bool:
+        """Publish this result unless one already exists; never overwrite.
+
+        The temporary file is written completely in ``results/``, fsynced,
+        then ``link`` makes the final name appear atomically -- so a crash
+        mid-publish can never leave a partial result, and two workers racing
+        to publish see exactly one winner. Returns ``True`` iff THIS call
+        created the file; on ``FileExistsError`` the existing result stands
+        and this call's payload is discarded.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.path.parent,
+                prefix=f".{self.order_id}.json.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary_path = handle.name
+                json.dump(dict(payload), handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(temporary_path, self.path)
+            return True
+        except FileExistsError:
+            return False
+        finally:
+            if temporary_path is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(temporary_path)
+
+    def overwrite(self, payload: Mapping[str, Any]) -> None:
+        """Atomically replace an already-stored result (proof-bit flips).
+
+        Only for callers that have already validated the stored result is
+        theirs (matching order id and session) -- e.g. setting
+        ``delivery_ledger_verified`` after retrying the ledger write. Byte-
+        for-byte identical serialization to the historical result writer.
+        """
+        write_json_atomic(
+            self.path,
+            dict(payload),
+            trailing_newline=False,
+            sort_keys=False,
+            cleanup_on_error=False,
+        )
+
+
+@dataclass(frozen=True)
+class TerminalFinalization:
+    """The single-writer terminal transition for one claimed order.
+
+    Binds everything one terminal outcome touches: the claimed order file
+    in ``in_flight/``, the ``results/`` directory receiving its terminal
+    result JSON, the destination directory (``processed/`` or ``invalid/``)
+    receiving the order file itself, and the stale control markers (retry
+    sidecar, send nonce) a terminal state makes moot. ``apply`` performs
+    the durable steps in crash-safe order:
+
+    1. publish the result unless one already exists -- a losing or repeated
+       finalization never overwrites the published record;
+    2. move the claimed order to its destination exactly once -- a claimed
+       path that is already gone means a previous apply finished the move,
+       which is success, not an error;
+    3. clear the now-stale control markers, each missing-safe.
+
+    Pass ``result_payload=None`` when the result JSON is already durable and
+    only the move plus cleanup remain (crash recovery finishing a previous
+    pass). Returns from ``apply`` whether THIS call published the result.
+    """
+
+    claimed_path: Path
+    order_id: str
+    results_dir: Path
+    destination_dir: Path
+    result_payload: Mapping[str, Any] | None
+    retry_state_dir: Path | None = None
+    nonce_path: Path | None = None
+    suppress_move_errors: bool = False
+
+    def stored_result(self) -> StoredResult:
+        """The result-file handle this finalization would publish."""
+        return StoredResult(order_id=self.order_id, path=self.results_dir / f"{self.order_id}.json")
+
+    def apply(self) -> bool:
+        """Execute the transition; returns True iff this call wrote the result."""
+        wrote_result = False
+        if self.result_payload is not None:
+            wrote_result = self.stored_result().create_once(self.result_payload)
+        self.destination_dir.mkdir(parents=True, exist_ok=True)
+        destination_path = self.destination_dir / self.claimed_path.name
+        try:
+            moved = _move_without_replace(self.claimed_path, destination_path)
+            if not moved:
+                # A prior pass may have linked the same inode and died before
+                # unlinking its source. Treat that half-complete move as
+                # success, but never discard a different destination file.
+                if self.claimed_path.exists() and destination_path.exists() and os.path.samefile(
+                    self.claimed_path, destination_path
+                ):
+                    self.claimed_path.unlink()
+                elif self.claimed_path.exists():
+                    raise FileExistsError(destination_path)
+        except FileNotFoundError:
+            if not destination_path.exists():
+                raise
+            # The source disappeared after a prior successful link/unlink.
+            # A durable destination is enough to complete an idempotent pass.
+        except OSError:
+            if not self.suppress_move_errors:
+                raise
+        if self.retry_state_dir is not None:
+            LaneLockRetryTracker(self.retry_state_dir).clear(self.order_id)
+        if self.nonce_path is not None:
+            with contextlib.suppress(OSError):
+                self.nonce_path.unlink()
+        return wrote_result
+
+
+@dataclass(frozen=True)
+class RequeueOutcome:
+    """What one deferred-requeue sweep did, in FIFO arrival order."""
+
+    requeued: list[Path] = field(default_factory=list)
+    """Moved order files, expressed as their new ``orders/`` paths, oldest first."""
+    skipped_existing_target: list[Path] = field(default_factory=list)
+    """Sources left parked because ``orders/`` already holds a file of that name."""
+    failed: list[Path] = field(default_factory=list)
+    """Sources whose rename failed with an unexpected OS error."""
+
+
+def requeue_deferred_to_orders(
+    deferred_dir: Path,
+    orders_dir: Path,
+    *,
+    eligible: Callable[[Path], bool] | None = None,
+) -> RequeueOutcome:
+    """Atomically return eligible deferred orders to ``orders/``, FIFO by arrival.
+
+    Eligibility (which deferred orders belong in this sweep) is the caller's
+    policy, decided by ``eligible``; everything else here is mechanics: the
+    surviving files are sorted by ``(mtime_ns, inode)`` -- a rename never
+    changes either, so original arrival order survives every prior move --
+    then renamed back to ``orders/`` oldest first. An order whose name
+    already exists under ``orders/`` is skipped rather than clobbering the
+    pending work already there. Retry sidecars are dot-prefixed control
+    records, never matched by the ``*.json`` scan, so a requeued order's
+    durable attempt count survives untouched until its next attempt resolves.
+    """
+    dated: list[tuple[int, int, Path]] = []
+    for path in deferred_dir.glob("*.json"):
+        if eligible is not None and not eligible(path):
+            continue
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        dated.append((stat.st_mtime_ns, stat.st_ino, path))
+    dated.sort(key=lambda item: item[:2])
+
+    outcome = RequeueOutcome()
+    for _, _, path in dated:
+        target = orders_dir / path.name
+        if target.exists():
+            outcome.skipped_existing_target.append(path)
+            continue
+        try:
+            moved = _move_without_replace(path, target)
+        except OSError:
+            outcome.failed.append(path)
+            continue
+        if moved:
+            outcome.requeued.append(target)
+        else:
+            outcome.skipped_existing_target.append(path)
+    return outcome
