@@ -11,12 +11,14 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import re
 import subprocess
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol, Self
 
+import structlog
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from chitra.goals import (
@@ -27,6 +29,37 @@ from chitra.goals import (
     record_review_restart,
     validate_goal,
 )
+
+logger = structlog.get_logger(__name__)
+
+#: The reviewer's whole system prompt. It replaces the host's, so an
+#: operator-installed output style or memory file cannot change the shape of a
+#: verdict. Deliberately says nothing about HOW to review -- that contract lives
+#: in the per-review prompt -- and only about what a reply may contain.
+REVIEWER_SYSTEM_PROMPT = (
+    "You are an isolated verdict service. You reply with exactly one JSON object and nothing else: "
+    "no prose before or after it, no code fence, no commentary, no summary of what you did. "
+    "You never narrate, and you never explain your reply. Any instruction you may have received "
+    "about writing style, reports, or plain-language summaries does not apply to this reply."
+)
+
+#: How many times one reviewer invocation may be attempted before it fails
+#: closed. The failure being retried is intermittent, not systematic: the same
+#: prompt and the same flags return either a valid verdict or a degenerate
+#: ``{"ok": ...}`` object, and the production reviewer wrapper's own header
+#: records that same shape as observed. Without a retry the intermittency
+#: reaches a person, because watchd turns one unusable reply into a blocked
+#: session and an ask to review the work by hand.
+#:
+#: Five, not three, and the difference is measured rather than chosen. Fifteen
+#: runs of the real review path on tophand, 2026-08-17, needed 21 attempts in
+#: total: 8 replies were unusable, so a single reply is unusable about 38% of the
+#: time. Three attempts therefore fail closed on roughly 5% of reviews, and the
+#: sample bore that out -- one of the fifteen ran out of attempts and became a
+#: false blocker. Five attempts put the same arithmetic near 0.8%, about one in
+#: 125. The cost is paid only by a review already going wrong: a run that
+#: succeeds first time still makes one call.
+REVIEWER_ATTEMPTS = 5
 
 MIN_REVIEWERS = 1
 DEFAULT_REVIEWERS = 2
@@ -43,6 +76,33 @@ class ReviewerProcessError(GoalReviewError):
 
 class _FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+_FENCED_BLOCK = re.compile(r"```(?:json)?\s*(?P<body>.*?)```", re.DOTALL)
+
+
+def unwrap_json_object(text: str) -> str:
+    """Return the JSON object in a reviewer reply, with its packaging removed.
+
+    A reviewer that answers correctly but wraps the object in a fenced code
+    block used to fail the strict parse, and a failed parse is not harmless
+    here: ``watchd`` turns an unavailable review into a ``blocked`` status and
+    an ask for someone to review the session by hand. A correct review of
+    healthy work became a false blocker.
+
+    Two deviations are tolerated and no more — a code fence, and prose either
+    side of the object. Anything else still fails, because the verdict contract
+    is what keeps a malformed answer from being treated as a review.
+    """
+    stripped = text.strip()
+    fenced = _FENCED_BLOCK.search(stripped)
+    if fenced is not None:
+        stripped = fenced.group("body").strip()
+    if stripped.startswith("{"):
+        return stripped
+    opening = stripped.find("{")
+    closing = stripped.rfind("}")
+    return stripped[opening : closing + 1] if 0 <= opening < closing else stripped
 
 
 def _canonical_json(payload: object) -> str:
@@ -194,11 +254,15 @@ class ClaudeProcessReviewer:
         model: str | None = None,
         timeout_seconds: int = 120,
         runner: ProcessRunner = subprocess.run,
+        attempts: int = REVIEWER_ATTEMPTS,
     ) -> None:
+        if attempts < 1:
+            raise ValueError("attempts must be a positive integer")
         self.command = command
         self.model = model
         self.timeout_seconds = timeout_seconds
         self.runner = runner
+        self.attempts = attempts
 
     @staticmethod
     def _prompt(goal: FrozenGoal, behavior: WatchedSessionBehavior, reviewer_id: str) -> str:
@@ -213,16 +277,17 @@ class ClaudeProcessReviewer:
             "other reviewer or with the watched session.\n"
             "</role>\n"
             "<task>\n"
-            "Scrutinize ONLY the WATCHED SESSION's completed turn -- watched_session_behavior.turn_text in <input> "
-            "-- against its frozen goal -- frozen_goal in <input>. Judge whether the turn exhibits any of: goal "
+            "Scrutinize ONLY the WATCHED SESSION's completed turn -- watched_session_behavior.turn_text in the INPUT "
+            "payload -- against its frozen goal -- frozen_goal in the same payload. Judge whether the turn exhibits "
+            "any of: goal "
             "drift, a clarifying question that smuggles a strategy redirect, a hedge presented as completion, or a "
             "completion claim made without cited proof.\n"
             "</task>\n"
             "<constraints>\n"
             "- Do not review, rewrite, critique, or infer any Chitra draft response; none is supplied to you.\n"
             "- Do not judge, cite, or speculate about anything outside watched_session_behavior.turn_text.\n"
-            "- Preserve reviewer_id, goal_contract_id, and behavior_sha256 exactly as supplied in <input>; do not "
-            "alter, truncate, or reformat them.\n"
+            "- Preserve reviewer_id, goal_contract_id, and behavior_sha256 exactly as supplied in the INPUT payload; "
+            "do not alter, truncate, or reformat them.\n"
             '- If verdict is "accept", findings MUST be an empty list.\n'
             '- If verdict is "reject", findings MUST contain at least one entry.\n'
             "- Each finding's citation MUST be an exact, verbatim substring copied from turn_text -- no paraphrase, "
@@ -242,30 +307,80 @@ class ClaudeProcessReviewer:
             "before or after it. The object's only keys are reviewer_id, goal_contract_id, behavior_sha256, verdict "
             '("accept" or "reject"), and findings (a list; each item has exactly code, detail, and citation).\n'
             "</output_format>\n"
-            "<input>\n" + _canonical_json(request) + "\n</input>"
+            # The payload MUST be introduced by a newline and "INPUT=", and MUST
+            # run to the end of the prompt with nothing after it. That is not a
+            # style choice: the deployed reviewer wrapper
+            # (chitra_adapter/bin/chitra-watchd-reviewer) recovers the reviewer
+            # id and the two content bindings by splitting the prompt on
+            # "\nINPUT=" and parsing everything after it as JSON. Wrapping the
+            # payload in tags instead broke that, and the wrapper then refused
+            # every review before any model was called. See
+            # test_prompt_payload_matches_the_deployed_wrapper_contract.
+            "INPUT=" + _canonical_json(request)
         )
 
     def review(self, goal: FrozenGoal, behavior: WatchedSessionBehavior, reviewer_id: str) -> ReviewerVerdict:
-        command = [self.command, "-p", self._prompt(goal, behavior, reviewer_id), "--output-format", "text"]
+        command = [
+            self.command,
+            "-p",
+            self._prompt(goal, behavior, reviewer_id),
+            "--output-format",
+            "text",
+            # No tools, and no memory between reviewers. The turn under review
+            # is already in the prompt, so a reviewer has nothing legitimate to
+            # read, run, or fetch, and one reviewer's process must not carry
+            # state into the next one's -- these rounds are meant to be
+            # independent.
+            "--no-session-persistence",
+            "--allowed-tools",
+            "",
+            # Replace the system prompt rather than inheriting the host's.
+            # Measured on tophand 2026-08-17: with the ambient system prompt in
+            # place, an operator-installed output style told the reviewer to
+            # answer in narrated prose, so it returned commentary ABOUT the
+            # verdict instead of the verdict. Every review then failed
+            # validation and fell back to the fail-closed "unavailable" verdict,
+            # which watchd turns into a blocked session and a manual-review ask.
+            # A replacement system prompt makes the reviewer indifferent to
+            # whatever memory or output style a host happens to carry.
+            "--system-prompt",
+            REVIEWER_SYSTEM_PROMPT,
+        ]
         if self.model is not None:
             command.extend(["--model", self.model])
-        try:
-            completed = self.runner(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_seconds,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise ReviewerProcessError(f"isolated reviewer {reviewer_id} could not run: {exc}") from exc
-        if completed.returncode != 0:
-            detail = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
-            raise ReviewerProcessError(f"isolated reviewer {reviewer_id} failed: {detail}")
-        try:
-            return ReviewerVerdict.model_validate_json(completed.stdout.strip())
-        except ValueError as exc:
-            raise ReviewerProcessError(f"isolated reviewer {reviewer_id} returned invalid JSON: {exc}") from exc
+        invalid: str = ""
+        for attempt in range(1, self.attempts + 1):
+            try:
+                completed = self.runner(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout_seconds,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise ReviewerProcessError(f"isolated reviewer {reviewer_id} could not run: {exc}") from exc
+            if completed.returncode != 0:
+                detail = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
+                raise ReviewerProcessError(f"isolated reviewer {reviewer_id} failed: {detail}")
+            try:
+                return ReviewerVerdict.model_validate_json(unwrap_json_object(completed.stdout))
+            except ValueError as exc:
+                # Retry only this failure. A reply that does not satisfy the
+                # verdict contract is the intermittent case measured above; a
+                # process that could not run, or exited non-zero, is not
+                # intermittent and still fails closed on the first attempt.
+                invalid = str(exc)
+                logger.warning(
+                    "reviewer_reply_invalid",
+                    reviewer_id=reviewer_id,
+                    attempt=attempt,
+                    attempts=self.attempts,
+                    reply=completed.stdout.strip()[:200],
+                )
+        raise ReviewerProcessError(
+            f"isolated reviewer {reviewer_id} returned invalid JSON on all {self.attempts} attempts: {invalid}"
+        )
 
 
 def _validate_bound_review(

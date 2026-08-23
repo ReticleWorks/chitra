@@ -1,0 +1,98 @@
+schema_version = 1
+agent = "codex"
+version = "2026.08.16.1"
+
+# Both rate-limit rules outrank every other rule here. A capped pane still
+# draws its input row, and can still carry the working footer of the turn that
+# hit the wall, so without them a capped lane classifies as idle or working.
+# That is not hypothetical: tophand:gct-secret-broker hit its weekly hard cap
+# around 2026-08-14 and read as an ordinary quiet lane for roughly two days.
+#
+# Every pattern below is quoted from that lane's own transcript
+# (governed-lanes/tophand/gct-secret-broker/tmux-transcript.log, banner at line
+# 10234), not guessed at.
+[[rules]]
+id = "rate_limit_hard_cap"
+state = "rate_limited_hard"
+priority = 2000
+region = "bottom"
+lines = 24
+any = [
+  # ■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage
+  # to purchase more credits or try again at Aug 19th, 2026 11:37 PM.
+  { kind = "line_regex", value = "^\\s*(?:■\\s*)?You've hit your usage limit\\b" },
+  # The statusline form, anchored on the whole phrase including its hint so an
+  # agent writing prose about a cap does not itself read as capped.
+  { kind = "line_regex", value = "\\bGoal hit usage limits \\(/goal resume\\)" },
+]
+
+[[rules]]
+id = "rate_limit_warning"
+state = "rate_limited_warn"
+priority = 1900
+region = "bottom"
+lines = 24
+any = [
+  { kind = "line_regex", value = "^\\s*(?:■\\s*)?Approaching rate limits\\b" },
+  # Switch to gpt-5.6-luna for lower credit usage?
+  { kind = "line_regex", value = "\\bSwitch to \\S+ for lower credit usage\\?" },
+]
+
+[[rules]]
+id = "permission_prompt"
+state = "blocked"
+priority = 1000
+region = "bottom"
+lines = 24
+blocker_kind = "permission"
+all = [
+  { kind = "contains", value = "Allow command?", case_sensitive = true },
+  { kind = "line_regex", value = "^\\s*(?:›\\s*)?(?:[0-9]+\\.\\s*)?(?:Yes|Allow(?: once)?)\\b", case_sensitive = true },
+]
+
+[[rules]]
+id = "trust_directory"
+state = "blocked"
+priority = 950
+region = "bottom"
+lines = 24
+blocker_kind = "approval"
+all = [
+  { kind = "contains", value = "Do you trust the contents of this directory?", case_sensitive = true },
+  { kind = "line_regex", value = "^\\s*(?:›\\s*)?(?:[0-9]+\\.\\s*)?(?:Yes|No|Continue|Cancel)\\b", case_sensitive = true },
+]
+
+[[rules]]
+id = "visible_question"
+state = "blocked"
+priority = 900
+region = "bottom"
+lines = 20
+blocker_kind = "question"
+any = [
+  { kind = "contains", value = "enter to submit answer" },
+  { kind = "contains", value = "enter to submit all" },
+]
+
+[[rules]]
+id = "working_spinner"
+state = "working"
+priority = 500
+region = "bottom"
+lines = 8
+any = [
+  { kind = "line_regex", value = "^\\s*[•◦✻✽✳✢✶*●○◐◯].*\\b(?:esc to interrupt|Working|Thinking|Running)\\b", case_sensitive = true },
+  { kind = "line_regex", value = "^\\s*(?:Working|Thinking|Running)(?:…|\\.\\.\\.|\\s*\\().*\\besc to interrupt\\b", case_sensitive = true },
+  { kind = "line_regex", value = "^\\s*esc to interrupt\\s*$", case_sensitive = true },
+]
+
+[[rules]]
+id = "input_row"
+state = "idle"
+priority = 100
+region = "bottom"
+lines = 12
+any = [
+  { kind = "line_regex", value = "^\\s*›" },
+  { kind = "line_regex", value = "^\\s*❯" },
+]

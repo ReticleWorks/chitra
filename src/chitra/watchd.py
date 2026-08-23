@@ -1,4 +1,4 @@
-"""watchd — deterministic tmux-pane change emitter for ``chitra.triaged``.
+"""watchd — deterministic semantic pane-status emitter for ``chitra.triaged``.
 
 The events log remains a small wire contract consumed by ``chitra.triaged``.
 At a detected turn-end, this watcher also forces the deterministic completion
@@ -17,6 +17,7 @@ import re
 import signal
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -26,6 +27,9 @@ from typing import Literal
 
 import structlog
 
+from chitra._fsio import parse_iso8601
+from chitra.agent_runtime import AgentStatusBroker, PaneStatus, StatusRuntimeError
+from chitra.agent_status import AgentState, ManifestRepository
 from chitra.completion_gate import (
     CompletionReviewRecord,
     TurnEndAudit,
@@ -42,12 +46,23 @@ from chitra.goal_enforcement import (
     WatchedSessionBehavior,
     review_watched_session,
 )
-from chitra.goals import GoalStatus, add_ask, get_goal, list_goals, mark_completion_gate_passed, update_now
+from chitra.goals import (
+    GoalStatus,
+    add_ask,
+    get_goal,
+    lane_id_from_session_ref,
+    list_goals,
+    mark_completion_gate_passed,
+    session_host,
+    update_now,
+)
 from chitra.lane_activity import LaneActivity, LaneBackend, load_lane_activity, upsert_lane_activity
 from chitra.lane_config import enabled_lanes
+from chitra.live_handoff import perform_live_handoff
 from chitra.policy_config import load_policy_config
 from chitra.reasoned_dispatch import abstaining_oracle, build_reasoned_dispatch
 from chitra.reasoning import Oracle, PrinciplesIndex
+from chitra.socket_api import ApiRuntime, ControlServer, default_socket_path
 from chitra.state_paths import state_dir as default_state_dir
 
 logger = structlog.get_logger(__name__)
@@ -56,13 +71,18 @@ EVENT_LOG_ENV_VAR = "CHITRA_WATCHD_EVENT_LOG"
 INTERVAL_ENV_VAR = "CHITRA_WATCHD_INTERVAL"
 PANES_ENV_VAR = "CHITRA_WATCHD_PANES"
 SESSION_PREFIXES_ENV_VAR = "CHITRA_WATCHD_SESSION_PREFIXES"
+SESSION_NAMES_ENV_VAR = "CHITRA_WATCHD_SESSION_NAMES"
 EXCLUDED_SESSION_PREFIXES_ENV_VAR = "CHITRA_WATCHD_EXCLUDE_SESSION_PREFIXES"
+TMUX_SOCKET_ENV_VAR = "CHITRA_WATCHD_TMUX_SOCKET"
+IDLE_THRESHOLD_ENV_VAR = "CHITRA_WATCHD_IDLE_THRESHOLD_SECONDS"
+MANIFEST_DIR_ENV_VAR = "CHITRA_AGENT_MANIFEST_DIR"
 MAX_LOG_BYTES_ENV_VAR = "CHITRA_WATCHD_MAX_LOG_BYTES"
 REVIEWER_COUNT_ENV_VAR = "CHITRA_WATCHD_REVIEWER_COUNT"
 REVIEWER_COMMAND_ENV_VAR = "CHITRA_WATCHD_REVIEWER_COMMAND"
 REVIEWER_MODEL_ENV_VAR = "CHITRA_WATCHD_REVIEWER_MODEL"
 REASONED_DISPATCH_ENV_VAR = "CHITRA_WATCHD_REASONED_DISPATCH_ENABLED"
 DEFAULT_INTERVAL_SECONDS = 5.0
+DEFAULT_IDLE_THRESHOLD_SECONDS = 300.0
 DEFAULT_MAX_LOG_BYTES = 5 * 1024 * 1024
 DEFAULT_REVIEWER_COUNT = 2
 DEFAULT_REVIEWER_COMMAND = "claude"
@@ -72,15 +92,20 @@ DEFAULT_REVIEWER_COMMAND = "claude"
 DEFAULT_REVIEWER_MODEL: str | None = None
 DEFAULT_REVIEW_MAX_WORKERS = 2
 DEFAULT_REASONED_DISPATCH_ENABLED = True
+TRANSCRIPT_ROOT_ENV_VAR = "CHITRA_WATCHD_TRANSCRIPT_ROOT"
+TRANSCRIPT_STALE_SECONDS_ENV_VAR = "CHITRA_WATCHD_TRANSCRIPT_STALE_SECONDS"
+# Fifteen minutes. Long enough that an ordinary thinking pause is not a fault,
+# short enough that a dead pipe surfaces within a sweep or two rather than the
+# twenty-five hours the atlas-v5 one went unnoticed.
+DEFAULT_TRANSCRIPT_STALE_SECONDS = 900
+TRANSCRIPT_NAME = "tmux-transcript.log"
+LANE_LAUNCH_NAME = "lane-launch.json"
 CAPTURE_LINES = 60
-NORMALIZED_TAIL_LINES = 25
 
 _VOLATILE_LINE_RE = re.compile(
     r"^[\s]*[·✻✽✳✢✶*●○◐◯]|tokens\b|🪟|⏵⏵|esc to interrupt|ctrl\+b|^─+$|^[\s]*$|Press up to edit|globalVersion: [0-9.]+"
 )
 _TIMING_CHROME_RE = re.compile(r"\([0-9]+m? ?[0-9]*s?[^)]*\)")
-_ACTIVE_TURN_RE = re.compile(r"esc to interrupt|thinking|working…|working\.\.\.|running…|running\.\.\.", re.I)
-
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 ReviewKey = tuple[str, str]
 
@@ -93,6 +118,10 @@ class Pane:
     target: str
     attached: bool = True
     backend: LaneBackend = "unknown"
+    # Whether tmux currently has pipe-pane running for this pane. A lane whose
+    # respawn did not re-arm the pipe reads exactly like a healthy one from the
+    # pane alone; this is the field that tells them apart.
+    pipe_armed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +132,7 @@ class WatchdConfig:
     tmux_socket: Path | None = None
     interval_seconds: float = DEFAULT_INTERVAL_SECONDS
     panes_override: tuple[str, ...] | None = None
+    session_names: tuple[str, ...] | None = None
     session_prefixes: tuple[str, ...] | None = None
     excluded_session_prefixes: tuple[str, ...] = ()
     max_log_bytes: int = DEFAULT_MAX_LOG_BYTES
@@ -113,10 +143,22 @@ class WatchdConfig:
     reviewer_model: str | None = DEFAULT_REVIEWER_MODEL
     queue_dir: Path | None = None
     reasoned_dispatch_enabled: bool = DEFAULT_REASONED_DISPATCH_ENABLED
+    manifest_dir: Path | None = None
+    socket_path: Path = field(default_factory=default_socket_path)
+    handoff_from: Path | None = None
+    idle_threshold_seconds: float = DEFAULT_IDLE_THRESHOLD_SECONDS
+    # Root of the governed-lanes tree, under which each lane's transcript lives
+    # at <host>/<lane>/tmux-transcript.log. Unset means the check is off.
+    transcript_root: Path | None = None
+    transcript_stale_seconds: int = DEFAULT_TRANSCRIPT_STALE_SECONDS
 
     def __post_init__(self) -> None:
         if self.reviewer_count < 1:
             raise ValueError("reviewer_count must be a positive integer")
+        if self.idle_threshold_seconds <= 0:
+            raise ValueError("idle_threshold_seconds must be a positive number")
+        if self.transcript_stale_seconds < 1:
+            raise ValueError("transcript_stale_seconds must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,7 +181,7 @@ def normalize(content: str) -> list[str]:
     pane cannot look like a lane state transition.
     """
     lines = content.splitlines()
-    prompt_indices = [index for index, line in enumerate(lines) if line.startswith("❯")]
+    prompt_indices = [index for index, line in enumerate(lines) if line.lstrip().startswith(("❯", "›"))]
     if prompt_indices:
         lines = lines[: prompt_indices[-1]]
 
@@ -153,19 +195,15 @@ def normalize(content: str) -> list[str]:
     return normalized
 
 
-def normalized_snapshot(content: str) -> tuple[str, list[str]]:
-    """Return the stable digest and retained normalized tail for a capture."""
-    tail = normalize(content)[-NORMALIZED_TAIL_LINES:]
-    text = "\n".join(tail)
-    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest(), tail
+def pane_turn_finished(content: str, *, previous_state: AgentState | None, current_state: AgentState) -> bool:
+    """Recognize a semantic working-to-idle boundary at a visible input row."""
+    return previous_state == "working" and current_state == "idle" and pane_at_input_row(content) and bool(normalize(content))
 
 
-def pane_turn_finished(content: str) -> bool:
-    """Recognize a stable input prompt after a completed lane turn."""
+def pane_at_input_row(content: str) -> bool:
+    """Return true when a Claude or Codex input row is visible."""
     lines = content.splitlines()
-    has_prompt = any(line.lstrip().startswith("❯") for line in lines)
-    active = any(_ACTIVE_TURN_RE.search(line) for line in lines[-12:])
-    return has_prompt and not active and bool(normalize(content))
+    return any(line.lstrip().startswith(("❯", "›")) for line in lines[-12:])
 
 
 def _run_command(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -181,12 +219,15 @@ def _tmux_command(command: Sequence[str], tmux_socket: Path | None) -> list[str]
 
 
 def _pane_backend(command: str) -> LaneBackend:
-    """Classify only explicit pane commands; unknown commands remain unknown."""
-    lowered = command.lower()
-    if "codex" in lowered:
+    """Classify only allowlisted executable names; unknown commands stay unknown."""
+    token = command.strip().split(maxsplit=1)[0] if command.strip() else ""
+    executable = Path(token).name.lower()
+    if executable == "codex":
         return "codex"
-    if "claude" in lowered:
+    if executable in ("claude", "claude-code"):
         return "claude"
+    if executable == "opencode":
+        return "opencode"
     return "unknown"
 
 
@@ -194,6 +235,7 @@ def list_panes(
     *,
     runner: CommandRunner = _run_command,
     panes_override: Sequence[str] | None = None,
+    session_names: Sequence[str] | None = None,
     session_prefixes: Sequence[str] | None = None,
     excluded_session_prefixes: Sequence[str] = (),
     tmux_socket: Path | None = None,
@@ -211,6 +253,7 @@ def list_panes(
     if panes_override is not None:
         return [Pane(pane_id=target, target=target) for target in dict.fromkeys(panes_override) if target]
 
+    allowed = frozenset(name.strip() for name in (session_names or ()) if name.strip())
     included = tuple(prefix.strip() for prefix in (session_prefixes or ()) if prefix.strip())
     excluded = tuple(prefix.strip() for prefix in excluded_session_prefixes if prefix.strip())
 
@@ -221,7 +264,7 @@ def list_panes(
             "list-panes",
             "-a",
             "-F",
-            "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{session_attached}\t#{pane_current_command}",
+            "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{session_attached}\t#{pane_current_command}\t#{pane_pipe}",
             ],
             tmux_socket,
         )
@@ -240,14 +283,17 @@ def list_panes(
         if not separator or not pane_id or not target or pane_id in seen:
             continue
         session_name, _separator, _pane = target.partition(":")
-        if included and not any(session_name.startswith(prefix) for prefix in included):
+        if (allowed or included) and session_name not in allowed and not any(
+            session_name.startswith(prefix) for prefix in included
+        ):
             continue
         if any(session_name.startswith(prefix) for prefix in excluded):
             continue
         seen.add(pane_id)
         attached = len(fields) < 3 or fields[2] != "0"
         backend = _pane_backend(fields[3]) if len(fields) >= 4 else "unknown"
-        panes.append(Pane(pane_id=pane_id, target=target, attached=attached, backend=backend))
+        pipe_armed = len(fields) >= 5 and fields[4] == "1"
+        panes.append(Pane(pane_id=pane_id, target=target, attached=attached, backend=backend, pipe_armed=pipe_armed))
     return panes
 
 
@@ -274,6 +320,106 @@ def event_line(lane_id: str, normalized_tail: Sequence[str], *, now: datetime | 
     return f"{timestamp} {lane_id} {text}\n"
 
 
+def status_event_line(status: PaneStatus, *, now: datetime | None = None) -> str:
+    """Format one semantic status transition for the legacy triaged log."""
+    timestamp = (now or datetime.now(UTC)).isoformat().replace("+00:00", "Z")
+    source = status.source or "none"
+    matched_rule = status.explain.matched_rule or "none"
+    fallback = status.explain.fallback_reason or "none"
+    attention = " needs operator input" if status.state == "blocked" else ""
+    # The resume time is the one fact the response protocol cannot reconstruct
+    # from the pane later, because the banner scrolls away. Carry it on the
+    # event or lose it.
+    resume = f" resume_at={status.explain.resume_at}" if status.explain.resume_at else ""
+    text = (
+        f"AGENT_STATUS state={status.state}{attention}{resume} pane_id={status.pane_id} target={status.target} "
+        f"agent={status.agent} authority={status.authority} source={source} rule={matched_rule} fallback={fallback}"
+    )
+    return f"{timestamp} {status.lane_id} {text}\n"
+
+
+def lane_dir(root: Path, session_ref: str) -> Path:
+    """Return the governed-lane state directory for one session reference."""
+    return root / session_host(session_ref) / lane_id_from_session_ref(session_ref)
+
+
+def transcript_path(root: Path, session_ref: str) -> Path:
+    """Return the governed-lane transcript path for one session reference."""
+    return lane_dir(root, session_ref) / TRANSCRIPT_NAME
+
+
+def transcript_pipe_fault(
+    *,
+    lane_directory: Path,
+    pipe_armed: bool,
+    last_change_at: str,
+    now: datetime,
+    stale_seconds: int = DEFAULT_TRANSCRIPT_STALE_SECONDS,
+) -> str:
+    """Return why this lane's transcript pipe is broken, or "" when it is fine.
+
+    The lane-launch record is the lane's own declaration that it is governed,
+    and a governed lane is supposed to have a growing transcript. A directory
+    with no launch record gets no opinion; nothing is inferred about whether an
+    unenrolled pane ought to be piped.
+
+    Keying on the launch record rather than on the transcript matters. Measured
+    2026-08-16, tophand:atlas-v5 has a launch record and *no transcript file at
+    all* -- so a check that treated a missing transcript as "this lane is not
+    piped" would have stayed silent on the exact lane it was written for. Its
+    respawn dropped pipe-pane on 2026-08-15 and file-based liveness monitoring
+    was blind for twenty-five hours.
+
+    An unarmed pipe is reported whether or not the lane is currently busy. An
+    idle lane with a dead pipe is not fine; it is a lane whose next output goes
+    nowhere.
+    """
+    if not (lane_directory / LANE_LAUNCH_NAME).is_file():
+        return ""
+    transcript = lane_directory / TRANSCRIPT_NAME
+    try:
+        mtime = transcript.stat().st_mtime
+    except OSError:
+        return "the lane is governed but has no transcript file, so nothing it has ever printed was recorded"
+    if not pipe_armed:
+        return "tmux has no pipe-pane running for this pane, so nothing is writing the transcript"
+    transcript_age = int(now.timestamp() - mtime)
+    if transcript_age <= stale_seconds:
+        return ""
+    if not last_change_at:
+        return ""
+    try:
+        change_age = int(
+            (now - parse_iso8601(last_change_at, require_timezone=True, normalize_utc=True)).total_seconds()
+        )
+    except ValueError:
+        return ""
+    if change_age > stale_seconds:
+        # The lane is quiet, so a quiet transcript is agreement, not a fault.
+        return ""
+    return (
+        f"the pane changed {change_age}s ago but the transcript has not grown for {transcript_age}s, "
+        "so the pipe is armed and writing nowhere useful"
+    )
+
+
+def transcript_event_line(
+    session_ref: str,
+    pane: Pane,
+    *,
+    transcript: Path,
+    reason: str,
+    now: datetime | None = None,
+) -> str:
+    """Format one transcript-pipe fault exactly as triaged consumes it."""
+    timestamp = (now or datetime.now(UTC)).isoformat().replace("+00:00", "Z")
+    text = (
+        f"TRANSCRIPT_PIPE_STALE lane={session_ref} pane_id={pane.pane_id} target={pane.target} "
+        f"pipe_armed={'1' if pane.pipe_armed else '0'} transcript={transcript}: {reason}"
+    )
+    return f"{timestamp} {pane.pane_id} {text}\n"
+
+
 def append_event(event_log: Path, line: str, *, max_log_bytes: int = DEFAULT_MAX_LOG_BYTES) -> None:
     """Append under an exclusive lock, rotating the legacy-sized log first."""
     event_log.parent.mkdir(parents=True, exist_ok=True)
@@ -298,13 +444,22 @@ class Watchd:
     reviewer: BehaviorReviewer | None = None
     principles: PrinciplesIndex = field(default_factory=PrinciplesIndex)
     reasoning_oracle: Oracle = abstaining_oracle
-    baselines: dict[str, str] = field(default_factory=dict)
+    status_broker: AgentStatusBroker | None = None
+    status_revisions: dict[str, int] = field(default_factory=dict)
+    status_states: dict[str, AgentState] = field(default_factory=dict)
+    transcript_faults: dict[str, str] = field(default_factory=dict)
+    clock: Callable[[], float] = time.monotonic
     reviewed_turns: set[ReviewKey] = field(default_factory=set)
     pending_reviews: dict[ReviewKey, PendingCompletionReview] = field(default_factory=dict)
     _review_executor: ThreadPoolExecutor = field(init=False, repr=False)
     _review_executor_shutdown: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.status_broker is None:
+            self.status_broker = AgentStatusBroker(
+                self.config.state_dir,
+                ManifestRepository(self.config.manifest_dir),
+            )
         self._review_executor = ThreadPoolExecutor(
             max_workers=DEFAULT_REVIEW_MAX_WORKERS,
             thread_name_prefix="chitra-watchd-review",
@@ -376,6 +531,16 @@ class Watchd:
                 now=summary,
                 last_verified=datetime.now(UTC).isoformat(),
             )
+            assert self.status_broker is not None
+            current = next(
+                (item for item in self.status_broker.statuses() if item.pane_id == pending.pane_id),
+                None,
+            )
+            self.status_broker.report_completion(
+                pane_id=pending.pane_id,
+                session_ref=pending.session_ref,
+                agent=current.agent if current is not None else "unknown",
+            )
         else:
             update_now(
                 root,
@@ -424,17 +589,26 @@ class Watchd:
 
     def _drain_completed_reviews(self) -> None:
         """Collect ready futures without waiting; all shared-state writes stay here."""
+        assert self.status_broker is not None
+        if self.status_broker.frozen:
+            return
         for key, pending in list(self.pending_reviews.items()):
             if not pending.future.done():
                 continue
-            del self.pending_reviews[key]
             try:
                 review_signal = pending.future.result()
             except Exception as exc:  # noqa: BLE001 - any reviewer failure must fail closed
                 review_error = str(exc) or type(exc).__name__
-                self._finalize_turn_review(pending, review_signal=None, review_error=review_error)
+                try:
+                    self._finalize_turn_review(pending, review_signal=None, review_error=review_error)
+                except StatusRuntimeError:
+                    continue
             else:
-                self._finalize_turn_review(pending, review_signal=review_signal)
+                try:
+                    self._finalize_turn_review(pending, review_signal=review_signal)
+                except StatusRuntimeError:
+                    continue
+            del self.pending_reviews[key]
 
     def _review_turn_end(self, pane: Pane, content: str) -> None:
         """Run the cheap gate inline and schedule completion review off-thread."""
@@ -524,9 +698,50 @@ class Watchd:
             status="turn-finished-unverified",
         )
 
+    def _check_transcript_pipe(self, pane: Pane, session_ref: str, *, last_change_at: str) -> int:
+        """Emit a transcript-pipe fault for one pane, once per fault.
+
+        Repeated emission is deliberately suppressed: the poll loop runs every
+        few seconds, and a fault that logs on every pass buries itself. The
+        memo clears when the pipe recovers, so a recurrence is reported again.
+        """
+        if self.config.transcript_root is None:
+            return 0
+        transcript = transcript_path(self.config.transcript_root, session_ref)
+        reason = transcript_pipe_fault(
+            lane_directory=lane_dir(self.config.transcript_root, session_ref),
+            pipe_armed=pane.pipe_armed,
+            last_change_at=last_change_at,
+            now=datetime.now(UTC),
+            stale_seconds=self.config.transcript_stale_seconds,
+        )
+        if not reason:
+            self.transcript_faults.pop(pane.pane_id, None)
+            return 0
+        if self.transcript_faults.get(pane.pane_id) == reason:
+            return 0
+        self.transcript_faults[pane.pane_id] = reason
+        append_event(
+            self.config.events_log,
+            transcript_event_line(session_ref, pane, transcript=transcript, reason=reason),
+            max_log_bytes=self.config.max_log_bytes,
+        )
+        logger.warning(
+            "watchd_transcript_pipe_stale",
+            session_ref=session_ref,
+            pane_id=pane.pane_id,
+            transcript=str(transcript),
+            pipe_armed=pane.pipe_armed,
+            reason=reason,
+        )
+        return 1
+
     def poll_once(self) -> int:
-        """Capture all current panes and emit an event for each real change."""
+        """Capture panes and emit only semantic status transitions."""
         self._drain_completed_reviews()
+        assert self.status_broker is not None
+        if self.status_broker.frozen:
+            return 0
         emitted = 0
         root = self.config.goals_root or self.config.state_dir
         existing_activity = {record.session_ref: record for record in load_lane_activity(root)}
@@ -534,6 +749,7 @@ class Watchd:
         for pane in list_panes(
             runner=self.runner,
             panes_override=self.config.panes_override,
+            session_names=self.config.session_names,
             session_prefixes=self.config.session_prefixes,
             excluded_session_prefixes=self.config.excluded_session_prefixes,
             tmux_socket=self.config.tmux_socket,
@@ -542,13 +758,26 @@ class Watchd:
             if content is None:
                 continue
             self._save_raw_capture(pane.pane_id, content)
-            digest, tail = normalized_snapshot(content)
             observed_at = datetime.now(UTC).isoformat()
             session_ref = self._session_ref(pane)
-            if pane_turn_finished(content):
+            try:
+                self.status_broker.observe(
+                    pane_id=pane.pane_id,
+                    target=pane.target,
+                    session_ref=session_ref,
+                    lane_id=self.config.lane_id or pane.target,
+                    detected_agent=pane.backend,
+                    snapshot=content,
+                    tmux_socket=self.config.tmux_socket,
+                )
+            except StatusRuntimeError:
+                break
+            status = next(item for item in self.status_broker.statuses() if item.pane_id == pane.pane_id)
+            previous_state = self.status_states.get(pane.pane_id)
+            previous_revision = self.status_revisions.get(pane.pane_id)
+            changed = previous_revision is None or previous_revision != status.revision
+            if pane_turn_finished(content, previous_state=previous_state, current_state=status.state):
                 self._review_turn_end(pane, content)
-            previous = self.baselines.get(pane.pane_id)
-            changed = previous is None or previous != digest
             if session_ref is not None:
                 prior_activity = existing_activity.get(session_ref)
                 activity_updates.append(
@@ -563,15 +792,23 @@ class Watchd:
                         else ("unknown" if prior_activity is None else prior_activity.backend),
                     )
                 )
-            if previous is None:
-                self.baselines[pane.pane_id] = digest
+            if session_ref is not None:
+                emitted += self._check_transcript_pipe(
+                    pane,
+                    session_ref,
+                    last_change_at=activity_updates[-1].last_change_at,
+                )
+            self.status_states[pane.pane_id] = status.state
+            self.status_revisions[pane.pane_id] = status.revision
+            if previous_revision is None:
                 continue
-            if previous == digest:
-                continue
-            event_id = self.config.lane_id or pane.pane_id
-            append_event(self.config.events_log, event_line(event_id, tail), max_log_bytes=self.config.max_log_bytes)
-            self.baselines[pane.pane_id] = digest
-            emitted += 1
+            if changed:
+                append_event(
+                    self.config.events_log,
+                    status_event_line(status),
+                    max_log_bytes=self.config.max_log_bytes,
+                )
+                emitted += 1
         self._drain_completed_reviews()
         upsert_lane_activity(root, activity_updates)
         return emitted
@@ -632,6 +869,8 @@ def resolve_config(
     events_log: Path | None = None,
     interval_seconds: float | None = None,
     panes_override: Sequence[str] | None = None,
+    tmux_socket: Path | None = None,
+    session_names: Sequence[str] | None = None,
     session_prefixes: Sequence[str] | None = None,
     excluded_session_prefixes: Sequence[str] | None = None,
     max_log_bytes: int | None = None,
@@ -639,6 +878,12 @@ def resolve_config(
     reviewer_command: str | None = None,
     reviewer_model: str | None = None,
     reasoned_dispatch_enabled: bool | None = None,
+    manifest_dir: Path | None = None,
+    socket_path: Path | None = None,
+    handoff_from: Path | None = None,
+    idle_threshold_seconds: float | None = None,
+    transcript_root: Path | None = None,
+    transcript_stale_seconds: int | None = None,
 ) -> WatchdConfig:
     """Resolve CLI values, then ``CHITRA_*`` overrides, then generic defaults."""
     configured_state_dir = state_dir or default_state_dir()
@@ -661,6 +906,12 @@ def resolve_config(
     if configured_panes is None:
         raw_panes = _env_value(PANES_ENV_VAR)
         configured_panes = tuple(item.strip() for item in raw_panes.split(",") if item.strip()) if raw_panes else None
+    configured_tmux_socket = tmux_socket or (Path(raw_socket) if (raw_socket := _env_value(TMUX_SOCKET_ENV_VAR)) else None)
+    configured_session_names = (
+        tuple(name.strip() for name in session_names if name.strip())
+        if session_names is not None
+        else _split_prefixes(_env_value(SESSION_NAMES_ENV_VAR))
+    )
     configured_session_prefixes = (
         tuple(prefix.strip() for prefix in session_prefixes if prefix.strip())
         if session_prefixes is not None
@@ -699,11 +950,35 @@ def resolve_config(
             if raw_reasoned_dispatch is not None
             else DEFAULT_REASONED_DISPATCH_ENABLED
         )
+    configured_idle_threshold = idle_threshold_seconds
+    if configured_idle_threshold is None:
+        raw_idle_threshold = _env_value(IDLE_THRESHOLD_ENV_VAR)
+        configured_idle_threshold = (
+            _positive_float(raw_idle_threshold, name=IDLE_THRESHOLD_ENV_VAR)
+            if raw_idle_threshold
+            else DEFAULT_IDLE_THRESHOLD_SECONDS
+        )
+    configured_manifest_dir = manifest_dir
+    if configured_manifest_dir is None and (raw_manifest_dir := _env_value(MANIFEST_DIR_ENV_VAR)) is not None:
+        configured_manifest_dir = Path(raw_manifest_dir)
+    configured_transcript_root = transcript_root
+    if configured_transcript_root is None and (raw_transcript_root := _env_value(TRANSCRIPT_ROOT_ENV_VAR)) is not None:
+        configured_transcript_root = Path(raw_transcript_root)
+    configured_transcript_stale = transcript_stale_seconds
+    if configured_transcript_stale is None:
+        raw_transcript_stale = _env_value(TRANSCRIPT_STALE_SECONDS_ENV_VAR)
+        configured_transcript_stale = (
+            _positive_int(raw_transcript_stale, name=TRANSCRIPT_STALE_SECONDS_ENV_VAR)
+            if raw_transcript_stale
+            else DEFAULT_TRANSCRIPT_STALE_SECONDS
+        )
     return WatchdConfig(
         state_dir=configured_state_dir,
         events_log=configured_events_log,
         interval_seconds=configured_interval,
         panes_override=tuple(configured_panes) if configured_panes is not None else None,
+        tmux_socket=configured_tmux_socket,
+        session_names=configured_session_names or None,
         session_prefixes=configured_session_prefixes or None,
         excluded_session_prefixes=configured_excluded_session_prefixes,
         max_log_bytes=configured_max_log_bytes,
@@ -711,12 +986,48 @@ def resolve_config(
         reviewer_command=configured_reviewer_command,
         reviewer_model=configured_reviewer_model,
         reasoned_dispatch_enabled=configured_reasoned_dispatch,
+        manifest_dir=configured_manifest_dir,
+        socket_path=socket_path or default_socket_path(),
+        handoff_from=handoff_from,
+        idle_threshold_seconds=configured_idle_threshold,
+        transcript_root=configured_transcript_root,
+        transcript_stale_seconds=configured_transcript_stale,
     )
+
+
+def _start_control_server(
+    broker: AgentStatusBroker,
+    config: WatchdConfig,
+    stop_event: threading.Event,
+) -> ControlServer:
+    runtime = ApiRuntime(broker)
+    if config.handoff_from is None:
+        server = ControlServer(config.socket_path, runtime)
+        server.start()
+    else:
+        temporary_socket = config.handoff_from.with_name(
+            f".{config.handoff_from.name}.handoff-new-{os.getpid()}"
+        )
+        server = ControlServer(temporary_socket, runtime)
+        perform_live_handoff(
+            canonical_socket=config.handoff_from,
+            replacement_server=server,
+            replacement_runtime=runtime,
+        )
+
+    def stop_replacement() -> None:
+        stop_event.set()
+        server.shutdown()
+
+    runtime.set_shutdown_callback(stop_replacement)
+    return server
 
 
 def run_forever(watchd: Watchd, *, stop_event: threading.Event | None = None) -> None:
     """Run until a SIGTERM/SIGINT handler (or caller) requests a clean stop."""
     stop_event = stop_event or threading.Event()
+    assert watchd.status_broker is not None
+    server = _start_control_server(watchd.status_broker, watchd.config, stop_event)
     logger.info("watchd_started", events_log=str(watchd.config.events_log), interval_seconds=watchd.config.interval_seconds)
     try:
         while not stop_event.is_set():
@@ -724,9 +1035,15 @@ def run_forever(watchd: Watchd, *, stop_event: threading.Event | None = None) ->
             stop_event.wait(watchd.config.interval_seconds)
     finally:
         watchd.shutdown()
+        server.shutdown()
 
 
-def build_lane_watchers(lanes_file: Path | None, base_config: WatchdConfig) -> tuple[Watchd, ...]:
+def build_lane_watchers(
+    lanes_file: Path | None,
+    base_config: WatchdConfig,
+    *,
+    status_broker: AgentStatusBroker | None = None,
+) -> tuple[Watchd, ...]:
     """Build one in-memory watcher per declared lane for one shared process."""
     watchers: list[Watchd] = []
     for lane in enabled_lanes(lanes_file):
@@ -738,12 +1055,14 @@ def build_lane_watchers(lanes_file: Path | None, base_config: WatchdConfig) -> t
                     state_dir=lane.state_dir,
                     events_log=lane.events_log,
                     tmux_socket=lane.tmux_socket,
+                    session_names=None,
                     session_prefixes=(lane.tmux_session,),
                     excluded_session_prefixes=(),
                     goals_root=lane.state_dir,
                     completion_review_log=lane.state_dir / "completion_reviews.jsonl",
                     queue_dir=lane.queue_dir,
-                )
+                ),
+                status_broker=status_broker,
             )
         )
     return tuple(watchers)
@@ -767,7 +1086,9 @@ def run_lanes_forever(
 ) -> None:
     """Run one shared watcher process over all enabled lane sockets."""
     active_stop_event = stop_event or threading.Event()
-    watchers = build_lane_watchers(lanes_file, base_config)
+    broker = AgentStatusBroker(base_config.state_dir, ManifestRepository(base_config.manifest_dir))
+    watchers = build_lane_watchers(lanes_file, base_config, status_broker=broker)
+    server = _start_control_server(broker, base_config, active_stop_event)
     logger.info("watchd_started", lanes_file=str(lanes_file), lane_count=len(watchers))
     try:
         while not active_stop_event.is_set():
@@ -777,11 +1098,21 @@ def run_lanes_forever(
     finally:
         for watcher in watchers:
             watcher.shutdown()
+        server.shutdown()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="watchd", description="Deterministic tmux-pane change emitter for triaged.")
     parser.add_argument("--state-dir", type=Path, default=None, help="Watcher state root (default: CHITRA_STATE_DIR or /var/lib/chitra).")
+    parser.add_argument(
+        "--tmux-socket", type=Path, default=None, help="Explicit tmux socket (default: CHITRA_WATCHD_TMUX_SOCKET)."
+    )
+    parser.add_argument(
+        "--session-name",
+        action="append",
+        default=None,
+        help="Observe only this exact tmux session (repeatable; default: CHITRA_WATCHD_SESSION_NAMES).",
+    )
     parser.add_argument(
         "--lanes-file",
         type=Path,
@@ -809,6 +1140,45 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--max-log-bytes", type=int, default=None, help="Rotate at this size (default: CHITRA_WATCHD_MAX_LOG_BYTES or 5 MiB)."
+    )
+    parser.add_argument(
+        "--idle-threshold-seconds",
+        type=float,
+        default=None,
+        help="Deprecated compatibility option; semantic manifests now author idle status.",
+    )
+    parser.add_argument(
+        "--transcript-root",
+        type=Path,
+        default=None,
+        help=(
+            "Governed-lanes root holding <host>/<lane>/tmux-transcript.log. Enables the transcript-pipe "
+            "liveness check (default: CHITRA_WATCHD_TRANSCRIPT_ROOT; unset disables it)."
+        ),
+    )
+    parser.add_argument(
+        "--transcript-stale-seconds",
+        type=int,
+        default=None,
+        help="Age at which a transcript counts as not growing (default: CHITRA_WATCHD_TRANSCRIPT_STALE_SECONDS or 900).",
+    )
+    parser.add_argument(
+        "--agent-manifest-dir",
+        type=Path,
+        default=None,
+        help="Local TOML manifest overrides (default: CHITRA_AGENT_MANIFEST_DIR).",
+    )
+    parser.add_argument(
+        "--socket-path",
+        type=Path,
+        default=None,
+        help="Local NDJSON control socket (default: CHITRA_SOCKET_PATH or /run/chitra/chitra.sock).",
+    )
+    parser.add_argument(
+        "--handoff-from",
+        type=Path,
+        default=None,
+        help="Replace the running watchd server at this socket after a verified live handoff.",
     )
     parser.add_argument(
         "--reviewer-count",
@@ -844,6 +1214,8 @@ def main(argv: list[str] | None = None) -> int:
         events_log=args.events_log,
         interval_seconds=args.interval_seconds,
         panes_override=panes_override,
+        tmux_socket=args.tmux_socket,
+        session_names=args.session_name,
         session_prefixes=args.session_prefix,
         excluded_session_prefixes=args.exclude_session_prefix,
         max_log_bytes=args.max_log_bytes,
@@ -851,6 +1223,12 @@ def main(argv: list[str] | None = None) -> int:
         reviewer_command=args.reviewer_command,
         reviewer_model=args.reviewer_model,
         reasoned_dispatch_enabled=args.reasoned_dispatch,
+        manifest_dir=args.agent_manifest_dir,
+        socket_path=args.socket_path,
+        handoff_from=args.handoff_from,
+        idle_threshold_seconds=args.idle_threshold_seconds,
+        transcript_root=args.transcript_root,
+        transcript_stale_seconds=args.transcript_stale_seconds,
     )
     if args.lanes_file is not None:
         if args.once:

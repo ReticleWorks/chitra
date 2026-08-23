@@ -7,7 +7,7 @@ stated goal, completion condition, and current state.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +20,7 @@ from pydantic.dataclasses import dataclass as pydantic_dataclass
 from chitra._fsio import locked_json_store, parse_iso8601, write_json_atomic
 from chitra.close_gate import RequiredItem, _recorded_descopes, require_close_inventory
 from chitra.completion_gate import CompletionEvidence
+from chitra.plain_english import require_plain_english
 from chitra.state_paths import state_dir
 
 logger = structlog.get_logger(__name__)
@@ -44,7 +45,13 @@ GOAL_STATUSES: tuple[GoalStatus, ...] = (
     "done-pending-verification",
     "done-pending-close",
 )
-SCHEMA = "chitra.goals.v1"
+SCHEMA = "chitra.goals.v2"
+# v2 is additive over v1: it adds successor_of and transferred_to and changes
+# nothing else, so a v1 document still loads and simply carries empty linkage.
+# Reading both matters because the monitor and the lane hosts do not upgrade in
+# the same instant, and a monitor that refused the older document would go
+# blind exactly while a transfer was in flight.
+SUPPORTED_SCHEMAS = ("chitra.goals.v2", "chitra.goals.v1")
 
 # Shared hold_reason convention: a hold_reason starting with this prefix
 # (e.g. "rate-limit:5h") marks a timed pause driven by provider usage
@@ -96,9 +103,15 @@ class GoalRecord:
     created_at: str = ""
     updated_at: str = ""
     open_asks: tuple[str, ...] = ()
+    retired_asks: tuple[dict[str, str], ...] = ()
     needs: str = ""
     hold_reason: str = ""
     resume_at: str = ""
+    # Backend-transfer linkage (chitra.goals.v2). ``successor_of`` names the
+    # held original this record took over from; ``transferred_to`` names the
+    # successor on the held one. Both empty on a lane that has never moved.
+    successor_of: str = ""
+    transferred_to: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return cast(dict[str, object], _GOAL_RECORD_ADAPTER.dump_python(self, mode="json"))
@@ -136,7 +149,18 @@ class GoalRecord:
             if not isinstance(value, str):
                 raise ValueError(f"goal record {field} must be a string")
             normalized[field] = value
-        for field in ("lane_id", "enrolled_done_when", "enrolled_at", "intent", "scope", "needs", "hold_reason", "resume_at"):
+        for field in (
+            "lane_id",
+            "enrolled_done_when",
+            "enrolled_at",
+            "intent",
+            "scope",
+            "needs",
+            "hold_reason",
+            "resume_at",
+            "successor_of",
+            "transferred_to",
+        ):
             value = payload.get(field, "")
             if not isinstance(value, str):
                 raise ValueError(f"goal record {field} must be a string")
@@ -154,6 +178,18 @@ class GoalRecord:
         if not isinstance(raw_open_asks, list) or not all(isinstance(ask, str) for ask in raw_open_asks):
             raise ValueError("goal record open_asks must be a list of strings")
         normalized["open_asks"] = raw_open_asks
+        raw_retired_asks = payload.get("retired_asks", [])
+        retirement_fields = {"ask", "state", "basis", "citation", "authority", "retired_at"}
+        if not isinstance(raw_retired_asks, list):
+            raise ValueError("goal record retired_asks must be a list of objects")
+        for entry in raw_retired_asks:
+            if not isinstance(entry, dict) or set(entry) != retirement_fields:
+                raise ValueError("goal record retired_asks entries must contain the complete retirement record")
+            if not all(isinstance(value, str) for value in entry.values()):
+                raise ValueError("goal record retired_asks entries must contain strings")
+            if entry["state"] not in ("resolved-by-operator", "retired-by-monitor-with-cited-basis"):
+                raise ValueError("goal record retired ask state is invalid")
+        normalized["retired_asks"] = raw_retired_asks
         goal_version = payload.get("goal_version", 1)
         if not isinstance(goal_version, int) or isinstance(goal_version, bool):
             raise ValueError("goal record goal_version must be an integer")
@@ -250,8 +286,8 @@ def load_goals(root: Path | None = None) -> list[GoalRecord]:
         payload: Any = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return []
-    if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
-        raise ValueError("goals.json is not a chitra.goals.v1 document")
+    if not isinstance(payload, dict) or payload.get("schema") not in SUPPORTED_SCHEMAS:
+        raise ValueError(f"goals.json is not one of: {', '.join(SUPPORTED_SCHEMAS)}")
     raw_goals = payload.get("goals")
     if not isinstance(raw_goals, list):
         raise ValueError("goals.json goals must be a list")
@@ -289,6 +325,7 @@ def _upsert_goal_locked(
     *,
     clear_open_asks: bool = False,
     allow_strategic_change: bool = False,
+    allow_enrollment_refresh: bool = False,
     allow_goal_metadata_change: bool = False,
     allow_done_transition: bool = False,
     mutation_time: str | None = None,
@@ -315,12 +352,16 @@ def _upsert_goal_locked(
         if rec.lane_id.strip() and rec.lane_id.strip() != existing.lane_id:
             raise GoalValidationError("lane_id is immutable once a goal is enrolled")
         lane_id = existing.lane_id
-        if rec.enrolled_done_when and rec.enrolled_done_when != existing.enrolled_done_when:
-            raise EnrolledScopeImmutableError("enrolled_done_when is immutable once a goal is enrolled")
-        if rec.enrolled_at and rec.enrolled_at != existing.enrolled_at:
-            raise EnrolledScopeImmutableError("enrolled_at is immutable once a goal is enrolled")
-        enrolled_done_when = existing.enrolled_done_when
-        enrolled_at = existing.enrolled_at
+        if allow_enrollment_refresh:
+            enrolled_done_when = rec.done_when
+            enrolled_at = now
+        else:
+            if rec.enrolled_done_when and rec.enrolled_done_when != existing.enrolled_done_when:
+                raise EnrolledScopeImmutableError("enrolled_done_when is immutable once a goal is enrolled")
+            if rec.enrolled_at and rec.enrolled_at != existing.enrolled_at:
+                raise EnrolledScopeImmutableError("enrolled_at is immutable once a goal is enrolled")
+            enrolled_done_when = existing.enrolled_done_when
+            enrolled_at = existing.enrolled_at
     else:
         if rec.lane_id.strip() and rec.lane_id.strip() != derived_lane_id:
             raise GoalValidationError("lane_id must be derived from the durable session name")
@@ -364,9 +405,17 @@ def _upsert_goal_locked(
         created_at=existing.created_at if existing is not None else now,
         updated_at=now,
         open_asks=open_asks,
+        retired_asks=rec.retired_asks,
         needs=rec.needs,
         hold_reason=hold_reason,
         resume_at=resume_at,
+        # Transfer linkage is a historical fact, so it only ever gets set, not
+        # cleared. A routine status or ``now`` write that says nothing about
+        # the link must not quietly sever it -- an original whose
+        # ``transferred_to`` vanished would look transferable a second time,
+        # and two lanes on one branch is the collision the doctrine forbids.
+        successor_of=rec.successor_of or (existing.successor_of if existing is not None else ""),
+        transferred_to=rec.transferred_to or (existing.transferred_to if existing is not None else ""),
     )
     records = [record for record in records if record.session_ref != rec.session_ref]
     records.append(stored)
@@ -434,6 +483,7 @@ def redirect_goal(
             root,
             candidate,
             allow_strategic_change=True,
+            allow_enrollment_refresh=redirected.done_when.strip() != existing.done_when.strip(),
             allow_goal_metadata_change=True,
             mutation_time=revised_at,
         )
@@ -547,6 +597,105 @@ def hold_goal(root: Path | None, session_ref: str, *, reason: str, resume_at: st
     return held
 
 
+def successor_session_ref(session_ref: str, taken: Iterable[str]) -> str:
+    """Return the next free ``<host>:<lane>-xfer[n]:<pane>`` for one lane."""
+    parts = session_ref.split(":")
+    host = parts[0] if len(parts) >= 2 else ""
+    lane = session_name(session_ref)
+    pane = parts[2] if len(parts) >= 3 else ""
+    existing = set(taken)
+    for attempt in range(1, 100):
+        suffix = "-xfer" if attempt == 1 else f"-xfer{attempt}"
+        candidate = ":".join(part for part in (host, f"{lane}{suffix}", pane) if part)
+        if candidate not in existing:
+            return candidate
+    raise GoalValidationError(f"{session_ref} has already been transferred 99 times; this needs a person")
+
+
+def transfer_goal(
+    root: Path | None,
+    session_ref: str,
+    *,
+    to_backend: str,
+    digest: str,
+    reason: str,
+    resume_at: str = "",
+) -> tuple[GoalRecord, GoalRecord]:
+    """Hold a lane and scaffold its successor on the other backend, atomically.
+
+    Returns ``(held_original, successor)``. This writes records only. It starts
+    no pane and no job: ``chitra-goals check`` remains the standing ingestion
+    gate, and launch happens after it passes.
+
+    Strategic fields transfer verbatim. A backend swap is tactical -- the lane
+    is doing the same work for the same reason -- so ``goal``, ``done_when``,
+    ``intent`` and ``scope`` are copied unchanged, and only ``source`` grows,
+    by the handoff digest appended to it.
+
+    Both writes happen under one lock. A hold that landed without its successor
+    would leave the work stopped with nothing recorded to pick it up, which is
+    the failure this verb exists to prevent.
+    """
+    if to_backend not in ("claude", "codex"):
+        raise GoalValidationError("to_backend must be claude or codex")
+    if not digest.strip():
+        raise GoalValidationError("digest must be non-empty; the successor needs its handoff context")
+    if not reason.strip():
+        raise GoalValidationError("transfer reason must be non-empty")
+    if resume_at:
+        parse_iso8601(
+            resume_at,
+            invalid_message="resume_at must be an ISO8601 datetime",
+            timezone_message="resume_at must be an ISO8601 datetime with timezone",
+            require_timezone=True,
+        )
+    with locked_json_store(goals_path(root)):
+        existing = get_goal(root, session_ref)
+        if existing is None:
+            raise GoalNotFoundError(session_ref)
+        if existing.transferred_to:
+            # Two successors driving one branch is the shared-worktree
+            # collision, arrived at by a different road. Refuse loudly.
+            raise GoalValidationError(
+                f"{session_ref} was already transferred to {existing.transferred_to}; "
+                "close or resume that successor rather than forking a second one"
+            )
+        successor_ref = successor_session_ref(session_ref, [record.session_ref for record in load_goals(root)])
+        successor = GoalRecord(
+            session_ref=successor_ref,
+            goal=existing.goal,
+            done_when=existing.done_when,
+            source=f"{existing.source}; digest:{digest.strip()}",
+            status="idle",
+            intent=existing.intent,
+            scope=existing.scope,
+            successor_of=session_ref,
+            now=f"scaffolded by transfer to {to_backend}: {reason}",
+        )
+        issues = validate_goal(successor)
+        if issues:
+            raise GoalValidationError("; ".join(issues))
+        held = _upsert_goal_locked(
+            root,
+            replace(
+                existing,
+                status="held",
+                hold_reason=reason,
+                resume_at=resume_at,
+                transferred_to=successor_ref,
+            ),
+        )
+        stored_successor = _upsert_goal_locked(root, successor)
+    logger.info(
+        "goal_mutated",
+        session_ref=session_ref,
+        action="transfer",
+        successor_ref=successor_ref,
+        to_backend=to_backend,
+    )
+    return held, stored_successor
+
+
 def resume_goal(root: Path | None, session_ref: str) -> GoalRecord:
     """Return an explicitly held lane to working state and clear hold metadata."""
     with locked_json_store(goals_path(root)):
@@ -600,8 +749,12 @@ def resolve_ask(
     ask: str | None = None,
     index: int | None = None,
     all: bool = False,
+    retired_by: Literal["operator", "monitor"] = "operator",
+    basis: str = "Operator answered the ask.",
+    citation: str = "operator-ruling",
+    authority: str = "operator",
 ) -> GoalRecord:
-    """Explicitly remove one matching ask, one indexed ask, or every ask."""
+    """Retire asks while preserving who decided and the cited basis."""
     selector_count = int(ask is not None) + int(index is not None) + int(all)
     if selector_count != 1:
         raise ValueError("select exactly one of ask, index, or all")
@@ -611,16 +764,34 @@ def resolve_ask(
             raise GoalNotFoundError(session_ref)
         if all:
             remaining: tuple[str, ...] = ()
+            removed = existing.open_asks
         elif ask is not None:
             if ask not in existing.open_asks:
                 raise ValueError("open ask was not found")
             remaining = tuple(item for item in existing.open_asks if item != ask)
+            removed = (ask,)
         else:
             assert index is not None
             if index < 0 or index >= len(existing.open_asks):
                 raise ValueError("open ask index is out of range")
             remaining = existing.open_asks[:index] + existing.open_asks[index + 1 :]
-        stored = _upsert_goal_locked(root, replace(existing, open_asks=remaining), clear_open_asks=True)
+            removed = (existing.open_asks[index],)
+        if retired_by == "monitor" and (not basis.strip() or not citation.strip() or not authority.strip()):
+            raise ValueError("monitor retirement requires a non-empty basis, citation, and authority")
+        if retired_by == "monitor":
+            require_plain_english(basis, field="ask-retirement basis")
+            require_plain_english(authority, field="ask-retirement authority")
+        state = "retired-by-monitor-with-cited-basis" if retired_by == "monitor" else "resolved-by-operator"
+        retired_at = _utc_now()
+        retirements = tuple(
+            {"ask": item, "state": state, "basis": basis, "citation": citation, "authority": authority, "retired_at": retired_at}
+            for item in removed
+        )
+        stored = _upsert_goal_locked(
+            root,
+            replace(existing, open_asks=remaining, retired_asks=(*existing.retired_asks, *retirements)),
+            clear_open_asks=True,
+        )
     logger.info("goal_mutated", session_ref=stored.session_ref, action="upsert")
     return stored
 

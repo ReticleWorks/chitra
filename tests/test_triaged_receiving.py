@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from chitra.sweepd import load_latest_flags
 from chitra.triaged import ReceivingOutputs, run_once
 
 
@@ -72,6 +73,33 @@ def test_receiving_outputs_classify_every_other_critical_rule_and_info(tmp_path:
         assert f" {lane} {rule}:" in flags
     assert "\tINFO\tlane-info\t-\troutine progress update" in queue
     assert "lane-info" not in flags
+
+
+def test_receiving_outputs_publish_parseable_idle_to_queue_and_flags(tmp_path: Path) -> None:
+    events = tmp_path / "events.log"
+    outputs = ReceivingOutputs(
+        queue_file=tmp_path / "queue.tsv",
+        flags_file=tmp_path / "flags.log",
+        stats_file=tmp_path / "stats.json",
+        alert_state_file=tmp_path / "alerts.json",
+    )
+    events.write_text(
+        "2026-08-13T12:00:00Z infra-health:0.0 IDLE target=infra-health:0.0 idle_seconds=30 threshold_seconds=30\n",
+        encoding="utf-8",
+    )
+
+    assert run_once(events, state_file=tmp_path / "state.json", triage_log=tmp_path / "triaged.log", receiving_outputs=outputs) == 1
+    assert outputs.queue_file.read_text(encoding="utf-8") == (
+        "2026-08-13T12:00:00Z\tIDLE\tinfra-health:0.0\tidle\t"
+        "IDLE target=infra-health:0.0 idle_seconds=30 threshold_seconds=30\n"
+    )
+    assert outputs.flags_file.read_text(encoding="utf-8") == (
+        "IDLE 2026-08-13T12:00:00Z infra-health:0.0 idle: "
+        "IDLE target=infra-health:0.0 idle_seconds=30 threshold_seconds=30\n"
+    )
+    parsed = load_latest_flags(outputs.flags_file)
+    idle = parsed["infra-health:0.0\x1fidle"]
+    assert idle.message == "IDLE target=infra-health:0.0 idle_seconds=30 threshold_seconds=30"
 
 
 def test_receiving_outputs_persist_alert_dedup_across_transitions(tmp_path: Path) -> None:

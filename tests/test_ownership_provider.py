@@ -66,6 +66,12 @@ def _write_state(
         complete=complete,
     )
     marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    # The reader refuses a group- or world-writable state file, so these have to
+    # carry a mode rather than inherit one. A host with umask 002 writes 0664
+    # and every test here reads back state_unsafe -- which is the reader working
+    # correctly and the fixture testing the umask it happened to run under.
+    for path in (goals_path, marker_path):
+        path.chmod(0o600)
     return goals_path, marker_path
 
 
@@ -92,7 +98,10 @@ def test_missing_state_returns_non_authoritative_unknown(tmp_path: Path) -> None
 
     assert response["authoritative"] is False
     assert response["source"] == {
-        "schema": "chitra.goals.v1",
+        # The schema this provider expects, which follows chitra.goals. The
+        # document fixture above stays on v1 on purpose, to prove a host that
+        # has not upgraded yet still reads authoritatively.
+        "schema": "chitra.goals.v2",
         "generation": 0,
         "complete": False,
         "manager_heartbeat_at": "",

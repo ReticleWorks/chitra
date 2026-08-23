@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 
 import pytest
@@ -7,6 +9,7 @@ import pytest
 from chitra.policy_config import PRReviewPolicy
 from chitra.pr_review import (
     ChangedFile,
+    ClaudeSecurityReviewer,
     PRFinding,
     PRReviewError,
     PRReviewerVerdict,
@@ -170,6 +173,32 @@ def test_append_and_load_pr_review_round_trips_and_dedupes(tmp_path: Path) -> No
 
 def test_load_latest_pr_review_returns_none_when_absent(tmp_path: Path) -> None:
     assert load_latest_pr_review(pr_review_log_path(tmp_path), "ReticleWorks/chitra#1") is None
+
+
+def test_the_security_reviewer_prompt_frames_its_payload_the_way_the_fleet_reads_it() -> None:
+    """Hold this prompt to the framing that cost the fleet its turn-end review.
+
+    The turn-end reviewer prompt named an <input> section and, later, wrapped its
+    payload in one. The wrapper that runs a reviewer in the fleet reads the
+    payload by splitting on a newline followed by INPUT=, so that prompt was
+    refused before a model was ever called, and no test noticed because each
+    side read the prompt its own way. This prompt is built the same way by the
+    same package, so it is held to the same two rules: no section named that is
+    not opened and closed, and a payload that runs to the end of the prompt
+    after the marker.
+    """
+    prompt = ClaudeSecurityReviewer._prompt(_diff(), "reviewer-1")
+
+    opened = set(re.findall(r"<([a-z_]+)>", prompt))
+    closed = set(re.findall(r"</([a-z_]+)>", prompt))
+    assert opened == closed, f"the prompt names sections it never opens or closes: {opened ^ closed}"
+
+    marker = "\nINPUT="
+    assert marker in prompt
+    payload = prompt.rsplit(marker, 1)[1]
+    request = json.loads(payload)
+    assert payload == payload.strip(), "nothing may follow the payload"
+    assert request["reviewer_id"] == "reviewer-1"
 
 
 def test_pr_review_policy_rejects_invalid_configuration() -> None:

@@ -22,11 +22,14 @@ from chitra.dispatch import (
     LaneLockError,
     _remote_transcript_grep_command,
     cancel_copy_mode,
+    capture_dispatch_pane,
     directive_voice_violation,
     dispatch_to_tmux,
     ensure_pane_not_in_mode,
     find_recent_transcript,
     find_recent_transcript_remote,
+    governed_capture_target,
+    is_local_host,
     pane_capture_confirms_nudge,
     pane_in_mode,
     pane_input_check,
@@ -40,6 +43,12 @@ from chitra.dispatch import (
 from chitra.policy_config import DispatchPolicy, PolicyConfig
 
 HAS_TMUX = shutil.which("tmux") is not None
+# A remote host has to be one this machine cannot be. Naming a real fleet host
+# means the tests pass everywhere except on that host, where they quietly take
+# the local path and stop testing the remote behaviour they are named for. That
+# is how three governed-remote tests read as failures on tophand and passes in
+# CI. `.invalid` is reserved and never resolves.
+REMOTE_HOST = "not-the-local-host.invalid"
 
 
 def fake_completed(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
@@ -426,6 +435,14 @@ def test_tmux_pane_target_leaves_a_global_pane_id_alone() -> None:
     assert tmux_pane_target("f3", "%42") == "%42"
 
 
+def test_governed_capture_target_normalizes_canonical_dot_pane() -> None:
+    assert governed_capture_target("monitor-probe:0.0") == "monitor-probe:0:0"
+
+
+def test_governed_capture_target_leaves_already_normalized_target_alone() -> None:
+    assert governed_capture_target("monitor-probe:0:0") == "monitor-probe:0:0"
+
+
 def test_dispatch_to_tmux_qualifies_pane_with_session_before_any_tmux_call() -> None:
     """Regression test: capture/paste/etc must never receive a bare pane
     spec — on a host running more than one tmux session, that resolves
@@ -477,6 +494,28 @@ def test_pane_capture_confirms_nudge_false_when_marker_absent() -> None:
     assert (
         pane_capture_confirms_nudge(
             "please check lane f3 status now",
+            host="localhost",
+            pane="f3:0.0",
+            runner=runner,
+            local_extra={"localhost"},
+        )
+        is False
+    )
+
+
+def test_pane_capture_does_not_confirm_marker_still_in_codex_composer() -> None:
+    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+        if cmd[:2] == ["tmux", "capture-pane"]:
+            return fake_completed(
+                0,
+                "older output\n› Reply with exactly STEER_0910_CONSUMED and no other text.\nstatus row\n",
+                "",
+            )
+        return fake_completed(0, "", "")
+
+    assert (
+        pane_capture_confirms_nudge(
+            "Reply with exactly STEER_0910_CONSUMED and no other text.",
             host="localhost",
             pane="f3:0.0",
             runner=runner,
@@ -696,6 +735,20 @@ def test_pane_input_check_treats_a_known_codex_hint_at_normal_intensity_as_idle(
     assert check.reason == "idle: Codex TUI input row shows only a placeholder hint"
 
 
+def test_pane_input_check_treats_codex_ghost_suggestion_as_idle() -> None:
+    """Regression: Codex paints this rotating composer placeholder at normal
+    intensity on some terminals; it is not an operator draft."""
+    check = pane_input_check(
+        [
+            "• Ready for input",
+            "\x1b[1m›\x1b[0m Ask Codex to do anything",
+            "  ? for shortcuts                                       100% context left",
+        ]
+    )
+    assert check.ok is True
+    assert check.reason == "idle: Codex TUI input row shows only a placeholder hint"
+
+
 def test_pane_input_check_blocks_an_unknown_normal_intensity_codex_draft() -> None:
     """A normal-intensity row that is not a known hint remains blocked — the
     fail-closed property for real drafts is preserved."""
@@ -764,6 +817,44 @@ def test_ssh_command_reads_the_configurable_host_key_and_timeout(monkeypatch: py
         ssh_command("example", "true")
 
 
+def test_ssh_command_can_use_the_narrow_grant_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CHITRA_SSH_RUN_AS", "chitra")
+    command = ssh_command("tophand", "chitra-tmux-capture monitor-probe:0.0")
+    assert command[:6] == ["sudo", "-n", "-u", "chitra", "--", "ssh"]
+
+    monkeypatch.setenv("CHITRA_SSH_RUN_AS", "../../root")
+    with pytest.raises(ValueError, match="valid local account"):
+        ssh_command("tophand", "true")
+
+
+def test_the_remote_host_these_tests_use_is_never_the_local_one() -> None:
+    """Keeps the governed-remote tests from testing the local path by accident.
+
+    Without this, a test that names a real host reads as a pass on every
+    machine except that one, and on that one it silently stops exercising the
+    remote branch. Whichever way it then reports, it is not measuring what its
+    name says.
+    """
+    assert not is_local_host(REMOTE_HOST)
+    assert not is_local_host(REMOTE_HOST, set())
+
+
+def test_governed_remote_capture_uses_fixed_visibility_verb(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CHITRA_REMOTE_LANE_GRANT", "codexman")
+    runner = FakeRunner(
+        default=fake_completed(
+            0,
+            json.dumps({"ok": True, "content": "old output\n› Use /skills to list available skills\n"}),
+            "",
+        )
+    )
+
+    captured = capture_dispatch_pane(REMOTE_HOST, "monitor-probe:0.0", runner=runner, local_extra=set())
+
+    assert captured[-1] == "› Use /skills to list available skills"
+    assert runner.calls[0][-1] == "chitra-tmux-capture monitor-probe:0:0"
+
+
 # --- dispatch_to_tmux end-to-end (fake runner) ----------------------------
 
 
@@ -827,8 +918,12 @@ def test_directive_voice_violation_none_for_a_clean_instruction() -> None:
 
 
 def test_dispatch_policy_can_replace_directive_voice_patterns() -> None:
+    # The host has to be one this machine is not. Named `localhost` before, and
+    # on a real lane host that took the local path, skipped the allowlist gate
+    # this test relies on to block, and dispatched for real against whatever
+    # tmux session `s` matched. On tophand that is a live lane.
     policy = PolicyConfig(dispatch=DispatchPolicy(banned_attribution_patterns=[r"forbidden"], extra_idle_input_regexes=[]))
-    order = DispatchOrder(order_id="o1", session_ref="localhost:s:0.0", nudge="The operator asked for this")
+    order = DispatchOrder(order_id="o1", session_ref=f"{REMOTE_HOST}:s:0.0", nudge="The operator asked for this")
     result = dispatch_to_tmux(order, policy=policy, allowed_hosts=set(), local_extra=set())
     assert result.status == DispatchStatus.BLOCKED
     assert not result.reason.startswith("directive-voice:")
@@ -866,6 +961,49 @@ def test_dispatch_to_tmux_sends_a_clean_order(tmp_path: Path) -> None:
         sleep=lambda _seconds: None,
     )
     assert result.status == DispatchStatus.SENT
+
+
+def test_dispatch_to_tmux_uses_governed_remote_capture_and_steer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CHITRA_REMOTE_LANE_GRANT", "codexman")
+    delivered = False
+
+    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+        if cmd[-1] == "chitra-tmux-capture monitor-probe:0:0":
+            content = (
+                "ready\nReply with the acceptance marker.\n"
+                if delivered
+                else "ready\n› Use /skills to list available skills\n"
+            )
+            capture_json = json.dumps({"ok": True, "content": content, "truncated": False})
+            return fake_completed(0, capture_json, "")
+        return fake_completed(1, "", "not available through governed grant")
+
+    input_calls: list[tuple[list[str], str]] = []
+
+    def input_runner(cmd: list[str], payload: str, *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+        nonlocal delivered
+        input_calls.append((cmd, payload))
+        delivered = True
+        return fake_completed()
+    order = DispatchOrder(
+        order_id="governed-remote",
+        session_ref=f"{REMOTE_HOST}:monitor-probe:0.0",
+        nudge="Reply with the acceptance marker.",
+    )
+
+    result = dispatch_to_tmux(
+        order,
+        runner=runner,
+        input_runner=input_runner,
+        allowed_hosts={REMOTE_HOST},
+        local_extra=set(),
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.status == DispatchStatus.SENT
+    assert "pane-capture fallback" in result.reason
+    assert input_calls[0][0][-1] == "chitra-lane-steer monitor-probe"
+    assert input_calls[0][1] == order.nudge
 
 
 def test_dispatch_to_tmux_waits_through_an_observed_slow_transcript_flush(tmp_path: Path) -> None:

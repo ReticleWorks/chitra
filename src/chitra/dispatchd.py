@@ -11,16 +11,20 @@ Queue layout (default ``queue_dir``, overridable per call/CLI):
                                      guard-held, or because a lane lock
                                      timed out (see below); no terminal
                                      result file exists for it yet
-    queue_dir/results/<id>.json  -- DispatchResult JSON, written after processing
-    queue_dir/processed/*.json   -- the order file, moved here after processing
+    queue_dir/results/<id>.json  -- DispatchResult JSON; a SENT result may be
+                                     written before ledger proof is available
+    queue_dir/processed/*.json   -- the order file, moved here only after a
+                                     terminal result, and for SENT only after
+                                     a matching signed ledger entry
 
 Crash-safety:
 
 - **Idempotent redelivery.** Once a result file exists for an order id, that
   order is never redispatched -- ``process_one_order`` checks for an
   existing result file (both before and again immediately after acquiring
-  the lane lock -- see "Lane-lock recheck" below) and, if found, moves the
-  order aside without re-dispatching.
+  the lane lock -- see "Lane-lock recheck" below). A SENT result is recovered
+  by retrying its ledger proof, not by pasting again; the order moves to
+  ``processed/`` only after that proof exists.
 - **Atomic reservation and claim.** Before moving an order file from
   ``orders/`` into ``in_flight/``, dispatchd creates its owner marker with
   exclusive-create semantics. Two workers racing the same order can each
@@ -231,6 +235,115 @@ def _finalize_claimed_order(
     if retry_state_dir is not None:
         _remove_lane_lock_retry_attempts(retry_state_dir, retry_order_id or claimed_path.stem)
     return result
+
+
+def _ensure_delivery_ledger(
+    order: DispatchOrder,
+    result: DispatchResult,
+    *,
+    ledger_path: Path | None,
+    ledger_key_path: Path | None,
+) -> ledger_mod.LedgerEntry:
+    """Return signed proof for a SENT order, appending it when needed.
+
+    The order id is part of the lookup. Matching only a session and message
+    would incorrectly accept an older identical nudge as proof for this
+    order. The post-append lookup also catches a short write or a writer that
+    returned without making the proof durable.
+    """
+    resolved_ledger_path = ledger_path or default_ledger_path()
+    resolved_key_path = ledger_key_path or (
+        ledger_path.with_name("ledger.key") if ledger_path is not None else default_ledger_key_path()
+    )
+    key = ledger_mod.load_or_create_signing_key(resolved_key_path)
+    existing = ledger_mod.verify_delivery(
+        resolved_ledger_path,
+        key=key,
+        order_id=order.order_id,
+        session_ref=order.session_ref,
+        nudge=order.nudge,
+    )
+    if existing is not None:
+        return existing
+
+    ledger_mod.append_entry(
+        resolved_ledger_path,
+        order_id=order.order_id,
+        session_ref=order.session_ref,
+        tag=order.tag,
+        routing_hint=result.routing_hint,
+        task_type=order.task_type,
+        resolved_zdr=result.resolved_zdr,
+        nudge=order.nudge,
+        key=key,
+    )
+    verified = ledger_mod.verify_delivery(
+        resolved_ledger_path,
+        key=key,
+        order_id=order.order_id,
+        session_ref=order.session_ref,
+        nudge=order.nudge,
+    )
+    if verified is None:
+        raise OSError(f"delivery ledger append did not produce proof for order {order.order_id}")
+    return verified
+
+
+def _complete_existing_result(
+    claimed_path: Path,
+    existing_result_path: Path,
+    *,
+    order: DispatchOrder,
+    results_dir: Path,
+    processed_dir: Path,
+    deferred_dir: Path,
+    ledger_path: Path | None,
+    ledger_key_path: Path | None,
+) -> None:
+    """Recover a claimed order whose result was written by an earlier pass.
+
+    A result file is not itself a queue acknowledgment. SENT results from the
+    old behavior can exist without ledger proof, so recovery retries signing
+    the already-recorded delivery and never calls the pane transport again.
+    """
+    try:
+        stored_result = DispatchResult.model_validate_json(existing_result_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.error("dispatchd_existing_result_unreadable", order_id=order.order_id, error=str(exc))
+        return
+
+    if stored_result.order_id != order.order_id or stored_result.session_ref != order.session_ref:
+        logger.error(
+            "dispatchd_existing_result_mismatch",
+            order_id=order.order_id,
+            result_order_id=stored_result.order_id,
+            result_session_ref=stored_result.session_ref,
+            order_session_ref=order.session_ref,
+        )
+        return
+
+    if stored_result.status == DispatchStatus.SENT:
+        try:
+            _ensure_delivery_ledger(
+                order,
+                stored_result,
+                ledger_path=ledger_path,
+                ledger_key_path=ledger_key_path,
+            )
+            stored_result.delivery_ledger_verified = True
+            _write_result_atomic(results_dir, stored_result)
+        except Exception as exc:  # noqa: BLE001 -- retry on the next daemon pass
+            logger.error(
+                "dispatchd_delivery_ledger_pending",
+                order_id=order.order_id,
+                session_ref=order.session_ref,
+                error=str(exc),
+            )
+            return
+
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    claimed_path.replace(processed_dir / claimed_path.name)
+    _remove_lane_lock_retry_attempts(deferred_dir, order.order_id)
 
 
 def _reserve_owner_marker(in_flight_dir: Path, order_id: str) -> Path | None:
@@ -447,8 +560,10 @@ def process_one_order(
     or lane-lock timeout).
 
     Crash-safe: if a result file already exists for this order id, the order
-    is considered already processed — it is moved to ``processed/`` without
-    re-dispatching, and None is returned (no duplicate delivery).
+    is never re-dispatched. A non-SENT result is moved to ``processed/``. A
+    SENT result is first reconciled with its signed delivery ledger; if the
+    proof is absent, dispatchd retries only the ledger write and leaves the
+    order unacknowledged until that succeeds.
 
     ``routing_config``, if given, maps ``task_type`` to a routing selection
     (see ``chitra.routing_config``). If the order's ``routing_hint`` is not
@@ -603,10 +718,16 @@ def _process_claimed_order(
     existing_result = results_dir / f"{order.order_id}.json"
     if existing_result.exists():
         logger.info("dispatchd_order_already_processed", order_id=order.order_id)
-        processed_dir.mkdir(parents=True, exist_ok=True)
-        with contextlib.suppress(OSError):
-            claimed_path.replace(processed_dir / claimed_path.name)
-        _remove_lane_lock_retry_attempts(deferred_dir, order.order_id)
+        _complete_existing_result(
+            claimed_path,
+            existing_result,
+            order=order,
+            results_dir=results_dir,
+            processed_dir=processed_dir,
+            deferred_dir=deferred_dir,
+            ledger_path=ledger_path,
+            ledger_key_path=ledger_key_path,
+        )
         return None
 
     attestation_id = order.decision_attestation.attestation_id if order.decision_attestation is not None else None
@@ -819,10 +940,16 @@ def _process_claimed_order(
         # the lock. See docs/SOL-ADVERSARIAL-REVIEW finding #5.
         if existing_result.exists():
             logger.info("dispatchd_order_already_processed_under_lock", order_id=order.order_id)
-            processed_dir.mkdir(parents=True, exist_ok=True)
-            with contextlib.suppress(OSError):
-                claimed_path.replace(processed_dir / claimed_path.name)
-            _remove_lane_lock_retry_attempts(deferred_dir, order.order_id)
+            _complete_existing_result(
+                claimed_path,
+                existing_result,
+                order=order,
+                results_dir=results_dir,
+                processed_dir=processed_dir,
+                deferred_dir=deferred_dir,
+                ledger_path=ledger_path,
+                ledger_key_path=ledger_key_path,
+            )
             return None
 
         # Rate-limit freeze/defer check, UNDER the lane lock (TOCTOU fix --
@@ -917,36 +1044,27 @@ def _process_claimed_order(
         status=result.status.value,
     )
     if result.status == DispatchStatus.SENT:
-        # Sign and log automatically on every successful delivery — no
-        # extra step for the caller, no added friction to a normal send.
-        #
-        # Crash-safety: this MUST NOT be able to cause redelivery. The
-        # dispatch already happened and the lock is already released; if
-        # the ledger write itself failed here uncaught, the order would
-        # still be sitting in in_flight/ with no result file on the next
-        # pass, so process_one_order would reconcile via the send-nonce
-        # transcript check above rather than blindly redispatching. A
-        # ledger failure therefore only costs the proof-of-delivery record
-        # for this one message.
+        # Persist the successful transport result before attempting the ledger
+        # write. If the ledger is temporarily unavailable, the next pass can
+        # retry the proof from this durable result without pasting twice.
+        _write_result_atomic(results_dir, result)
         try:
-            key = ledger_mod.load_or_create_signing_key(ledger_key_path or default_ledger_key_path())
-            ledger_mod.append_entry(
-                ledger_path or default_ledger_path(),
+            _ensure_delivery_ledger(
+                order,
+                result,
+                ledger_path=ledger_path,
+                ledger_key_path=ledger_key_path,
+            )
+            result.delivery_ledger_verified = True
+            _write_result_atomic(results_dir, result)
+        except Exception as exc:  # noqa: BLE001 -- keep the order pending for the next pass
+            logger.error(
+                "dispatchd_delivery_ledger_pending",
                 order_id=order.order_id,
                 session_ref=order.session_ref,
-                tag=order.tag,
-                routing_hint=order.routing_hint,
-                task_type=order.task_type,
-                resolved_zdr=resolved_zdr,
-                nudge=order.nudge,
-                key=key,
+                error=str(exc),
             )
-        except Exception as exc:  # noqa: BLE001 -- deliberate, narrow exception to the crash-safety
-            # contract above: any failure signing/appending the ledger is logged and swallowed
-            # here specifically because letting it propagate would break the tested guarantee
-            # that a fully-completed dispatch is never redelivered. This is the one place in the
-            # package where fail-loud is overridden, and only for this one documented reason.
-            logger.warning("dispatchd_ledger_write_failed", order_id=order.order_id, session_ref=order.session_ref, error=str(exc))
+            return None
     _finalize_claimed_order(
         claimed_path,
         results_dir=results_dir,

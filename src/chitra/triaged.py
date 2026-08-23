@@ -55,6 +55,17 @@ OPERATOR_ALIASES_ENV_VAR = "CHITRA_OPERATOR_ALIASES"
 # matches over watchd's opaque state text; triaged never decides what a worker
 # should do in response.
 _STATIC_CRITICAL_RULES = (
+    # A provider cap is the most expensive quiet failure this pipeline can
+    # miss. The lane stops producing but keeps looking like an ordinary quiet
+    # pane, and the window it waits on can be days long -- a Codex weekly cap
+    # cost roughly two days in August 2026. It leads the rule list so that when
+    # it fires it takes the queue line's summary slot.
+    ("rate_limited_hard", re.compile(r"\bAGENT_STATUS state=rate_limited_hard\b")),
+    # A lane whose transcript stopped growing is invisible to every file-based
+    # liveness check that reads it. An atlas-v5 respawn dropped its pipe on
+    # 2026-08-15 and nothing noticed for twenty-five hours, because a pane with
+    # a dead pipe looks exactly like a healthy one.
+    ("transcript_pipe_stale", re.compile(r"\bTRANSCRIPT_PIPE_STALE\b")),
     ("merge_landed", re.compile(r'^\s*REVIEW_VERDICT: (CLEAN|ISSUES)\s*$|"state":\s*"MERGED"|\bMerged #\d|\bPR #?\d+ (was )?merged', re.I)),
     ("crash", re.compile(r"Traceback \(most recent call last\)|panic:|\bfatal(:| error)", re.I)),
     ("ci_red", re.compile(r"CI .*(failure|failed|red)|required check.*fail", re.I)),
@@ -197,11 +208,14 @@ def emit_receiving_event(
     preserving Chitra's stronger transition dedup as the first filter.
     """
     epoch = time.time() if now is None else now
+    is_idle = text.startswith("IDLE ")
     hits = critical_hits(text)
-    severity = "CRIT" if hits else "INFO"
-    signature = ",".join(rule for rule, _ in hits) or "-"
+    severity = "IDLE" if is_idle else ("CRIT" if hits else "INFO")
+    signature = "idle" if is_idle else (",".join(rule for rule, _ in hits) or "-")
     summary = (hits[0][1] if hits else text).replace("\t", " ").replace("\n", " ")[:200]
     _append_line(outputs.queue_file, f"{ts}\t{severity}\t{lane_id}\t{signature}\t{summary}")
+    if is_idle:
+        _append_line(outputs.flags_file, f"IDLE {ts} {lane_id} idle: {summary[:300]}")
     stats["crit_raw"] = _counter(stats.get("crit_raw", 0)) + len(hits)
     for rule, statement in hits:
         key = f"{lane_id}\x1f{rule}"
@@ -230,8 +244,13 @@ def process_lines(
     stats: dict[str, object] | None = None,
 ) -> int:
     """Process a batch of new events.log lines against ``state`` (mutated in
-    place). Returns the count of lines that produced a real triage event
-    (i.e. an actual state transition, not a dedup'd repeat)."""
+    place). Returns the count of lines that produced a triage event.
+
+    Ordinary state text is content-deduplicated per lane. IDLE records are
+    already edge-triggered by watchd (one record per idle period), so each new
+    record must pass through even when its stable payload matches a prior idle
+    period. The events-log byte offset still prevents rereading one record.
+    """
     emitted = 0
     active_alert_state = alert_state if alert_state is not None else {}
     active_stats = stats if stats is not None else {}
@@ -242,7 +261,7 @@ def process_lines(
             continue
         ts, lane_id, text = parsed
         sig = state_signature(text)
-        if state.get(lane_id) == sig:
+        if not text.startswith("IDLE ") and state.get(lane_id) == sig:
             continue  # unchanged repeat — dedup'd, no event.
         state[lane_id] = sig
         append_triage_event(triage_log, lane_id, ts, text)
