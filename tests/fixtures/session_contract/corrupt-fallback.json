@@ -1,0 +1,5 @@
+{
+  "newest_document": "{not-json",
+  "previous_document": "update-v1.json",
+  "expected_fallback_source": "previous"
+}

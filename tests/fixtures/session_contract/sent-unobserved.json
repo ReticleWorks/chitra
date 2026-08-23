@@ -1,0 +1,15 @@
+{
+  "operation_id": "send-1",
+  "kind": "send",
+  "lane_id": "lane-a",
+  "provider_handle": "tophand-thread-a",
+  "idempotency_key": "send-idem-1",
+  "payload_digest": "sha256-send",
+  "provider_instance_id": "tophand-instance-1",
+  "provider_generation": 1,
+  "status": "accepted",
+  "accepted": true,
+  "consumed": false,
+  "observed_at": "2026-08-23T14:00:05+00:00",
+  "evidence": "provider accepted; no lane update observed"
+}

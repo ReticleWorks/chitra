@@ -19,6 +19,7 @@
   "child_roster": [],
   "operation_id": null,
   "idempotency_key": null,
+  "operation_history": [],
   "problems": [
     {
       "id": "provider-latency",
@@ -26,8 +27,7 @@
       "owner": "chitra",
       "state": "open",
       "need": "Refresh before retrying",
-      "resolution": null,
-      "reopen_event": null
+      "history": []
     }
   ]
 }

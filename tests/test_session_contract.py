@@ -9,13 +9,17 @@ from pathlib import Path
 import pytest
 
 from chitra.session_contract import (
+    ChildRosterEntry,
     CloseResult,
     ContractValidationError,
     JoinedLaneRecord,
     LaneUpdate,
     OperatingFact,
+    OperationReference,
+    OwnerIdentity,
     PendingProviderOperation,
     Problem,
+    ProblemHistoryEvent,
     ProviderCapabilities,
     ProviderIdentity,
     ProviderOperationResult,
@@ -25,7 +29,13 @@ from chitra.session_contract import (
     UsageReport,
     calculate_progress,
     is_valid_update,
+    migrate_legacy_record,
+    validate_active_owner_set,
+    validate_operation_result,
+    validate_pending_operation,
+    validate_record_transition,
     validate_update,
+    validate_usage_against_lane,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "session_contract"
@@ -162,7 +172,20 @@ def test_goal_revision_and_problem_history_need_explicit_non_destructive_changes
     first = _update(sequence=5).model_copy(
         update={
             "problems": (
-                Problem(id="p1", summary="Provider is unavailable", owner="chitra", state="resolved", resolution="retry later"),
+                Problem(
+                    id="p1",
+                    summary="Provider is unavailable",
+                    owner="chitra",
+                    state="resolved",
+                    history=(
+                        ProblemHistoryEvent(
+                            event_id="resolve-p1",
+                            kind="resolved",
+                            observed_at="2026-08-23T14:00:00+00:00",
+                            note="retry later",
+                        ),
+                    ),
+                ),
             )
         }
     )
@@ -173,7 +196,13 @@ def test_goal_revision_and_problem_history_need_explicit_non_destructive_changes
     rewritten = _update(sequence=6).model_copy(
         update={
             "problems": (
-                Problem(id="p1", summary="Different summary", owner="chitra", state="resolved", resolution="retry later"),
+                Problem(
+                    id="p1",
+                    summary="Different summary",
+                    owner="chitra",
+                    state="resolved",
+                    history=first.problems[0].history,
+                ),
             )
         }
     )
@@ -187,13 +216,22 @@ def test_goal_revision_and_problem_history_need_explicit_non_destructive_changes
                     summary="Provider is unavailable",
                     owner="chitra",
                     state="open",
-                    reopen_event="provider-observed-again",
+                    history=(
+                        *first.problems[0].history,
+                        ProblemHistoryEvent(
+                            event_id="reopen-p1",
+                            kind="reopened",
+                            observed_at="2026-08-23T14:01:00+00:00",
+                            note="provider-observed-again",
+                        ),
+                    ),
                 ),
             )
         }
     )
-    with pytest.raises(ContractValidationError, match="reopen_event"):
-        validate_update(first, reopened.model_copy(update={"problems": (reopened.problems[0].model_copy(update={"reopen_event": None}),)}))
+    with pytest.raises(ContractValidationError, match="problem history"):
+        broken_problem = reopened.problems[0].model_copy(update={"history": first.problems[0].history})
+        validate_update(first, reopened.model_copy(update={"problems": (broken_problem,)}))
 
 
 def test_progress_is_unavailable_for_untrusted_plan_states() -> None:
@@ -255,6 +293,44 @@ def test_provider_capabilities_and_operation_result_keep_acceptance_separate_fro
             observed_at="2026-08-23T14:00:01+00:00",
         )
     assert pending.operation_id == accepted.operation_id
+
+
+def test_operation_results_are_causally_after_pending_and_operation_keys_survive_gaps() -> None:
+    pending = PendingProviderOperation(
+        operation_id="send-1",
+        kind="send",
+        lane_id="lane-a",
+        provider_handle="tophand-lane-a",
+        idempotency_key="idem-send-1",
+        payload_digest="sha256-send",
+        created_at="2026-08-23T14:00:10+00:00",
+    )
+    result = ProviderOperationResult(
+        operation_id="send-1",
+        kind="send",
+        lane_id="lane-a",
+        provider_handle="tophand-lane-a",
+        idempotency_key="idem-send-1",
+        payload_digest="sha256-send",
+        status="accepted",
+        accepted=True,
+        consumed=False,
+        observed_at="2026-08-23T14:00:09+00:00",
+    )
+    with pytest.raises(ContractValidationError, match="predates"):
+        validate_operation_result(pending, result)
+    reference = OperationReference(
+        operation_id="send-1",
+        idempotency_key="idem-send-1",
+        payload_digest="sha256-send",
+        kind="send",
+        created_at="2026-08-23T14:00:00+00:00",
+    )
+    first = _update(sequence=1).model_copy(update={"operation_history": (reference,)})
+    gap = _update(sequence=3).model_copy(update={"operation_history": (reference,)})
+    reused = gap.model_copy(update={"operation_id": "send-1", "idempotency_key": "idem-send-1"})
+    with pytest.raises(ContractValidationError, match="reused"):
+        validate_update(first, reused)
 
 
 def test_operating_fact_requires_current_authority_and_freshness_for_action() -> None:
@@ -349,7 +425,19 @@ def test_joined_record_requires_consumed_update_evidence_and_terminal_close_evid
         capabilities=ProviderCapabilities.from_supported(("create_or_resume", "send", "read_updates")),
     )
     update = LaneUpdate.from_dict(json.loads((FIXTURES / "update-v1.json").read_text())).model_copy(
-        update={"operation_id": "status-1", "idempotency_key": "status-idem-1"}
+        update={
+            "operation_id": "status-1",
+            "idempotency_key": "status-idem-1",
+            "operation_history": (
+                OperationReference(
+                    operation_id="status-1",
+                    idempotency_key="status-idem-1",
+                    payload_digest="sha256-status",
+                    kind="status",
+                    created_at="2026-08-23T14:00:00+00:00",
+                ),
+            ),
+        }
     )
     accepted = ProviderOperationResult(
         operation_id="status-1",
@@ -371,6 +459,7 @@ def test_joined_record_requires_consumed_update_evidence_and_terminal_close_evid
             session_ref="tophand:lane-a-1",
             provider=provider,
             current_update=update,
+            operation_history=update.operation_history,
             last_operation_result=accepted,
         )
     consumed = accepted.model_copy(update={"status": "consumed", "consumed": True})
@@ -381,10 +470,11 @@ def test_joined_record_requires_consumed_update_evidence_and_terminal_close_evid
         session_ref="tophand:lane-a-1",
         provider=provider,
         current_update=update,
+        operation_history=update.operation_history,
         last_operation_result=consumed,
     )
     assert joined.last_operation_result == consumed
-    with pytest.raises(ValueError, match="matching close evidence"):
+    with pytest.raises(ValueError, match="logical close"):
         JoinedLaneRecord(
             lane_id="lane-a",
             goal_id="goal-123",
@@ -394,3 +484,189 @@ def test_joined_record_requires_consumed_update_evidence_and_terminal_close_evid
             provider=provider,
             current_update=update.model_copy(update={"operation_id": None, "idempotency_key": None}),
         )
+
+
+def test_plan_structure_is_frozen_but_all_blocked_plan_is_valid() -> None:
+    blocked = _update().model_copy(
+        update={
+            "steps": (
+                RoadmapStep(id="design", status="blocked", title="Design", owner="lane"),
+                RoadmapStep(id="implement", status="blocked", title="Implement", owner="lane"),
+            ),
+            "current_action": "",
+        }
+    )
+    assert blocked.steps[0].status == "blocked"
+    changed_status = blocked.model_copy(
+        update={"sequence": 2, "steps": (blocked.steps[0].model_copy(update={"status": "done"}), blocked.steps[1])}
+    )
+    assert is_valid_update(blocked, changed_status)
+    changed_title = changed_status.model_copy(
+        update={"sequence": 3, "steps": (changed_status.steps[0], changed_status.steps[1].model_copy(update={"title": "New title"}) )}
+    )
+    with pytest.raises(ContractValidationError, match="structure"):
+        validate_update(changed_status, changed_title)
+
+
+def test_record_transition_fences_owner_revision_identity_and_active_owner_set() -> None:
+    owner_a = OwnerIdentity(owner_id="chitra-a", instance_id="instance-a")
+    owner_b = OwnerIdentity(owner_id="chitra-b", instance_id="instance-b")
+    validate_active_owner_set((owner_a,))
+    with pytest.raises(ContractValidationError, match="active owner"):
+        validate_active_owner_set((owner_a, owner_b))
+    previous = JoinedLaneRecord(
+        lane_id="lane-a",
+        goal_id="goal-123",
+        goal_version=2,
+        session_ref="tophand:lane-a-1",
+        owner=owner_a,
+        provider=ProviderIdentity(kind="tophand", handle="thread-a", capabilities=ProviderCapabilities()),
+    )
+    current = previous.model_copy(update={"revision": 2, "owner": owner_b, "chitra_ownership_epoch": 2})
+    validate_record_transition(previous, current, active_owners=(owner_b,))
+    with pytest.raises(ContractValidationError, match="revision"):
+        validate_record_transition(previous, current.model_copy(update={"revision": 1}))
+    with pytest.raises(ContractValidationError, match="immutable"):
+        validate_record_transition(previous, current.model_copy(update={"revision": 3, "lane_id": "other"}))
+
+
+def test_usage_must_match_update_roster_and_parent_ancestry() -> None:
+    child = ChildRosterEntry(
+        child_id="child-a",
+        parent_id="lane-a",
+        ancestry=("lane-a", "child-a"),
+        retained_state="retained",
+        material_result=False,
+    )
+    update = _update().model_copy(update={"child_roster": (child,)})
+    report = UsageReport(
+        parent={"name": "lane-a", "amount": 1, "unit": "usd"},
+        children=({"name": "child-a", "amount": 0, "unit": "usd"},),
+        child_roster=(child,),
+        child_roster_complete=True,
+        child_roster_evidence="update-1",
+        total={"name": "total", "amount": 1, "unit": "usd"},
+        evidence_source="provider",
+        observed_at="2026-08-23T14:00:00+00:00",
+        complete=True,
+    )
+    validate_usage_against_lane(update, report)
+    with pytest.raises(ContractValidationError, match="child roster"):
+        validate_usage_against_lane(update, report.model_copy(update={"child_roster": ()}))
+
+
+def test_provider_fences_unknown_identity_and_capability_bound_operations() -> None:
+    unknown = ProviderIdentity(kind="tophand", handle="thread-a", capabilities=ProviderCapabilities())
+    assert unknown.instance_id is None and unknown.generation is None
+    operation = PendingProviderOperation(
+        operation_id="op-1",
+        kind="send",
+        lane_id="lane-a",
+        provider_handle="thread-a",
+        idempotency_key="idem-1",
+        payload_digest="digest-1",
+        created_at="2026-08-23T14:00:00+00:00",
+    )
+    with pytest.raises(ContractValidationError, match="does not support"):
+        validate_pending_operation(unknown, operation)
+    close = operation.model_copy(update={"kind": "close"})
+    provider = ProviderIdentity(
+        kind="tophand",
+        handle="thread-a",
+        instance_id="instance-a",
+        generation=1,
+        capabilities=ProviderCapabilities.from_supported(("close",)),
+    )
+    with pytest.raises(ContractValidationError, match="checkpoint"):
+        validate_pending_operation(provider, close)
+
+
+def test_close_evidence_preserves_provider_state_and_same_thread_resume() -> None:
+    close = CloseResult.model_validate(json.loads((FIXTURES / "close-amp-later-resume.json").read_text()), strict=True)
+    operation_history = (
+        OperationReference(
+            operation_id=close.operation_id,
+            idempotency_key=close.idempotency_key,
+            payload_digest=close.payload_digest,
+            kind="close",
+            created_at="2026-08-23T14:00:00+00:00",
+        ),
+    )
+    provider = ProviderIdentity(
+        kind="amp",
+        handle="amp-thread-a",
+        instance_id="amp-instance-1",
+        generation=1,
+        capabilities=ProviderCapabilities.from_supported(("close", "checkpoint", "create_or_resume")),
+    )
+    inactive = JoinedLaneRecord(
+        lane_id="lane-a",
+        goal_id="goal-123",
+        goal_version=2,
+        session_ref="amp:lane-a-1",
+        lifecycle="inactive",
+        provider=provider,
+        operation_history=operation_history,
+        last_close_result=close,
+    )
+    resumed = inactive.model_copy(update={"revision": 2, "lifecycle": "active"})
+    validate_record_transition(inactive, resumed)
+    with pytest.raises(ContractValidationError, match="close evidence"):
+        validate_record_transition(inactive, resumed.model_copy(update={"provider": provider.model_copy(update={"handle": "other"})}))
+    native = CloseResult.model_validate(json.loads((FIXTURES / "close-native.json").read_text()), strict=True)
+    assert native.closed and not native.archived
+    amp_native = native.model_copy(
+        update={
+            "provider_handle": "amp-thread-a",
+            "provider_instance_id": "amp-instance-1",
+            "provider_thread_ref": "amp-thread-a",
+        }
+    )
+    with pytest.raises(ValueError, match="archived"):
+        JoinedLaneRecord(
+            lane_id="lane-a",
+            goal_id="goal-123",
+            goal_version=2,
+            session_ref="amp:lane-a-1",
+            lifecycle="inactive",
+            provider=provider,
+            operation_history=(
+                OperationReference(
+                    operation_id=native.operation_id,
+                    idempotency_key=native.idempotency_key,
+                    payload_digest=native.payload_digest,
+                    kind="close",
+                    created_at="2026-08-23T14:00:00+00:00",
+                ),
+            ),
+            last_close_result=amp_native,
+        )
+
+
+def test_migration_rejects_legacy_shape_and_wake_intervention_have_one_home() -> None:
+    with pytest.raises(ContractValidationError, match="legacy"):
+        migrate_legacy_record({"lane_id": "lane-a"})
+    assert "wake_condition" not in JoinedLaneRecord.model_fields
+    assert "last_intervention" not in RecoveryState.model_fields
+    assert "intervention_consumed" not in RecoveryState.model_fields
+    assert "useful_work_resumed" not in RecoveryState.model_fields
+
+
+def test_failure_and_provider_parity_fixtures_are_version_neutral() -> None:
+    for name in ("lost-create.json", "sent-unobserved.json"):
+        result = ProviderOperationResult.model_validate(json.loads((FIXTURES / name).read_text()), strict=True)
+        assert result.operation_id and result.provider_instance_id and result.provider_generation == 1
+    fallback = json.loads((FIXTURES / "corrupt-fallback.json").read_text())
+    assert fallback["expected_fallback_source"] == "previous"
+    parity = json.loads((FIXTURES / "provider-parity.json").read_text())
+    assert {entry["kind"] for entry in parity["providers"]} == {"tophand", "amp"}
+    assert tuple(parity["operations"]) == (
+        "create_or_resume",
+        "status",
+        "send",
+        "read_updates",
+        "checkpoint",
+        "usage",
+        "cancel_current_turn",
+        "close",
+    )

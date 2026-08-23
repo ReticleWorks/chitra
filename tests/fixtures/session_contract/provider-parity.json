@@ -1,0 +1,7 @@
+{
+  "providers": [
+    {"kind": "tophand", "handle": "tophand-thread-a", "instance_id": "tophand-instance-1", "generation": 1},
+    {"kind": "amp", "handle": "amp-thread-a", "instance_id": "amp-instance-1", "generation": 1}
+  ],
+  "operations": ["create_or_resume", "status", "send", "read_updates", "checkpoint", "usage", "cancel_current_turn", "close"]
+}

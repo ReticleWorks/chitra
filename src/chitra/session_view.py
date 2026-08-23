@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 from chitra.session_contract import (
     InterventionEvidence,
@@ -53,6 +53,15 @@ def _json_value(value: object) -> object:
     to_dict = getattr(value, "to_dict", None)
     if callable(to_dict):
         return to_dict()
+    return value
+
+
+def _problem_value(problem: Problem) -> dict[str, object]:
+    """Return full history plus convenient current resolution fields."""
+
+    value = cast(dict[str, object], _json_value(problem))
+    value["resolution"] = problem.resolution
+    value["reopen_event"] = problem.reopen_event
     return value
 
 
@@ -158,9 +167,9 @@ class JoinedSessionView:
             "current_step": _json_value(self.current_step) if self.current_step is not None else None,
             "current_work": self.current_work,
             "owner": self.owner,
-            "problems": [_json_value(problem) for problem in self.problems],
-            "open_problems": [_json_value(problem) for problem in self.open_problems],
-            "resolved_problems": [_json_value(problem) for problem in self.resolved_problems],
+            "problems": [_problem_value(problem) for problem in self.problems],
+            "open_problems": [_problem_value(problem) for problem in self.open_problems],
+            "resolved_problems": [_problem_value(problem) for problem in self.resolved_problems],
             "chitra_action": self.chitra_action,
             "last_intervention": _json_value(self.last_intervention) if self.last_intervention is not None else None,
             "next_action": self.next_action,
@@ -228,9 +237,7 @@ def build_joined_session_view(
         last_intervention=last_intervention,
         next_action=update.next_action if update is not None else None,
         next_check=record.next_check,
-        wake_condition=record.wake_condition
-        if record.wake_condition is not None
-        else (record.next_check.wake_condition if record.next_check is not None else None),
+        wake_condition=record.next_check.wake_condition if record.next_check is not None else None,
         observed_at=update.observed_at if update is not None else None,
         update_sequence=update.sequence if update is not None else None,
         last_useful_progress=record.last_useful_progress,

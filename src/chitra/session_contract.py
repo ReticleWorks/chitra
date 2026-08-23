@@ -17,7 +17,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Annotated, Literal, Self, cast
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError, field_validator, model_validator
 
 SESSION_UPDATE_SCHEMA: Literal["chitra.session-update.v1"] = "chitra.session-update.v1"
 LANE_RECORD_SCHEMA: Literal["chitra.lanes.v1"] = "chitra.lanes.v1"
@@ -37,6 +37,8 @@ ProblemState = Literal["open", "resolved"]
 FactState = Literal["known", "missing", "stale", "conflicting", "inaccessible"]
 FactFreshness = Literal["current", "fresh", "stale", "unknown"]
 ProviderKind = Literal["tophand", "amp"]
+OwnerRole = Literal["chitra", "lane-manager", "provider"]
+ProblemHistoryKind = Literal["resolved", "reopened"]
 LaneLifecycle = Literal["active", "inactive", "closed", "archived"]
 OperationKind = Literal[
     "create_or_resume",
@@ -115,6 +117,15 @@ class _ContractModel(BaseModel):
         return cls.model_validate(_immutable_json(payload), strict=True)
 
 
+class OwnerIdentity(_ContractModel):
+    """The durable owner identity for one joined lane snapshot."""
+
+    owner_id: Identifier
+    role: OwnerRole = "chitra"
+    instance_id: Identifier | None = None
+    active: bool = True
+
+
 def _validate_payload(payload: object, *, schema: str, model: type[_ContractModel]) -> _ContractModel:
     if not isinstance(payload, Mapping):
         raise ValueError(f"{schema} document must be an object")
@@ -173,22 +184,77 @@ class NextCheck(_ContractModel):
         return _timestamp(value, "next_check.at")
 
 
+class ProblemHistoryEvent(_ContractModel):
+    """One append-only resolution or reopen event for a problem."""
+
+    event_id: Identifier
+    kind: ProblemHistoryKind
+    observed_at: Timestamp
+    note: Text
+
+    @field_validator("observed_at")
+    @classmethod
+    def validate_observed_at(cls, value: str) -> str:
+        return _timestamp(value, "problem_history.observed_at")
+
+
 class Problem(_ContractModel):
-    """One stable problem entry authored by the lane manager."""
+    """One stable problem entry with append-only resolution history."""
 
     id: Identifier
     summary: Text
     owner: Text
     state: ProblemState
     need: str = ""
-    resolution: str | None = None
-    reopen_event: str | None = None
+    history: tuple[ProblemHistoryEvent, ...] = ()
 
     @model_validator(mode="after")
-    def validate_reopen_event(self) -> Self:
-        if self.reopen_event is not None and self.state != "open":
-            raise ValueError("reopen_event is only valid on an open problem")
+    def validate_history(self) -> Self:
+        event_ids = [event.event_id for event in self.history]
+        if len(event_ids) != len(set(event_ids)):
+            raise ValueError("problem history event IDs must be unique")
+        event_times = [datetime.fromisoformat(event.observed_at.replace("Z", "+00:00")) for event in self.history]
+        if any(left > right for left, right in zip(event_times, event_times[1:], strict=False)):
+            raise ValueError("problem history timestamps must be monotonic")
+        kinds = [event.kind for event in self.history]
+        if any(left == right for left, right in zip(kinds, kinds[1:], strict=False)):
+            raise ValueError("problem resolution and reopen history must alternate")
+        if kinds and kinds[0] != "resolved":
+            raise ValueError("problem history must begin with a resolution event")
+        if self.state == "resolved" and (not self.history or self.history[-1].kind != "resolved"):
+            raise ValueError("resolved problem state requires a resolution event")
+        if self.history and self.history[-1].kind == "resolved" and self.state != "resolved":
+            raise ValueError("resolved problem history requires state=resolved")
+        if self.history and self.history[-1].kind == "reopened" and self.state != "open":
+            raise ValueError("reopened problem history requires state=open")
         return self
+
+    @property
+    def resolution(self) -> str | None:
+        """Compatibility projection; the wire contract stores history instead."""
+
+        return next((event.note for event in reversed(self.history) if event.kind == "resolved"), None)
+
+    @property
+    def reopen_event(self) -> str | None:
+        """Compatibility projection; the wire contract stores history instead."""
+
+        return next((event.note for event in reversed(self.history) if event.kind == "reopened"), None)
+
+
+class OperationReference(_ContractModel):
+    """A durable operation ID/key pair retained across update gaps."""
+
+    operation_id: Identifier
+    idempotency_key: Identifier
+    payload_digest: Text
+    kind: OperationKind
+    created_at: Timestamp
+
+    @field_validator("created_at")
+    @classmethod
+    def validate_created_at(cls, value: str) -> str:
+        return _timestamp(value, "operation_history.created_at")
 
 
 class PlanAssessment(_ContractModel):
@@ -246,6 +312,7 @@ class LaneUpdate(_ContractModel):
     child_roster: tuple[ChildRosterEntry, ...] = ()
     operation_id: Identifier | None = None
     idempotency_key: Identifier | None = None
+    operation_history: tuple[OperationReference, ...] = ()
 
     @field_validator("goal_version", "sequence", "plan_version")
     @classmethod
@@ -282,13 +349,9 @@ class LaneUpdate(_ContractModel):
         active = [step for step in steps if step.status == "active"]
         if len(active) > 1:
             raise ValueError("a lane roadmap may have at most one active step")
-        non_terminal = [step for step in steps if step.status not in ("done", "dropped")]
-        # A blocked plan is still a valid, useful snapshot.  Recovery may need
-        # to report every remaining step as blocked while Chitra owns the next
-        # intervention.  Pending work without an active step remains invalid:
-        # it would not identify where the lane is working.
-        if non_terminal and not active and not all(step.status == "blocked" for step in non_terminal):
-            raise ValueError("a roadmap with unfinished work must have one active step or all unfinished steps blocked")
+        actionable = [step for step in steps if step.status in ("pending", "active")]
+        if actionable and len(active) != 1:
+            raise ValueError("a roadmap with unfinished work must have one active step")
         if active and not self.current_action.strip():
             raise ValueError("a roadmap with an active step requires current_action")
         if (self.operation_id is None) != (self.idempotency_key is None):
@@ -296,6 +359,21 @@ class LaneUpdate(_ContractModel):
         child_ids = [entry.child_id for entry in self.child_roster]
         if len(child_ids) != len(set(child_ids)):
             raise ValueError("lane update child roster IDs must be unique")
+        if any(entry.parent_id != self.lane_id or entry.ancestry[0] != self.lane_id for entry in self.child_roster):
+            raise ValueError("lane update child roster ancestry must be rooted at lane_id")
+        history_ids = [entry.operation_id for entry in self.operation_history]
+        history_keys = [entry.idempotency_key for entry in self.operation_history]
+        if len(history_ids) != len(set(history_ids)) or len(history_keys) != len(set(history_keys)):
+            raise ValueError("operation history IDs and idempotency keys must be unique")
+        history_times = [datetime.fromisoformat(entry.created_at.replace("Z", "+00:00")) for entry in self.operation_history]
+        if any(left > right for left, right in zip(history_times, history_times[1:], strict=False)):
+            raise ValueError("operation history timestamps must be monotonic")
+        if self.operation_id is not None:
+            if not self.operation_history:
+                raise ValueError("an operation-bound update requires operation history")
+            latest = self.operation_history[-1]
+            if (latest.operation_id, latest.idempotency_key) != (self.operation_id, self.idempotency_key):
+                raise ValueError("operation-bound update must identify the latest operation history entry")
         return self
 
     @property
@@ -381,6 +459,15 @@ def _roadmap_structure(update: LaneUpdate) -> tuple[tuple[tuple[str, str, str, s
     return steps, milestones
 
 
+def _revalidate_update(update: LaneUpdate) -> LaneUpdate:
+    """Re-run nested validators on values produced by unchecked model copies."""
+
+    try:
+        return LaneUpdate.model_validate(_immutable_json(update.to_dict()), strict=True)
+    except ValidationError as exc:
+        raise ContractValidationError(f"lane update failed strict round-trip validation: {exc}") from exc
+
+
 def validate_update(previous: LaneUpdate, current: LaneUpdate) -> None:
     """Raise when ``current`` cannot follow ``previous`` in one lane stream.
 
@@ -390,6 +477,8 @@ def validate_update(previous: LaneUpdate, current: LaneUpdate) -> None:
     ``dropped``).  Updates within one plan version keep the exact step IDs.
     """
 
+    previous = _revalidate_update(previous)
+    current = _revalidate_update(current)
     errors: list[str] = []
     if previous.lane_id != current.lane_id:
         errors.append("lane_id changed")
@@ -424,25 +513,43 @@ def validate_update(previous: LaneUpdate, current: LaneUpdate) -> None:
         new_problem = current_problems.get(problem_id)
         if new_problem is None:
             continue
-        if old_problem.state == "resolved" and new_problem.state == "open" and not new_problem.reopen_event:
-            errors.append(f"resolved problem {problem_id} requires an explicit reopen_event")
-        if old_problem.state == "resolved" and new_problem.state == "resolved" and new_problem != old_problem:
-            errors.append(f"resolved problem {problem_id} history cannot be rewritten")
-        if old_problem.state == "open" and new_problem.state == "open":
-            if old_problem.reopen_event != new_problem.reopen_event:
-                errors.append(f"open problem {problem_id} reopen history cannot be rewritten")
-            if old_problem.resolution != new_problem.resolution:
-                errors.append(f"open problem {problem_id} resolution history cannot be rewritten")
         if new_problem.summary != old_problem.summary or new_problem.owner != old_problem.owner:
             errors.append(f"problem {problem_id} summary and owner are immutable")
+        old_history = old_problem.history
+        new_history = new_problem.history
+        if len(new_history) < len(old_history) or new_history[: len(old_history)] != old_history:
+            errors.append(f"problem {problem_id} history must preserve its append-only prefix")
+        if (
+            old_problem.state == "resolved"
+            and new_problem.state == "open"
+            and (len(new_history) <= len(old_history) or new_history[-1].kind != "reopened")
+        ):
+            errors.append(f"resolved problem {problem_id} requires an appended reopen event")
+        if (
+            old_problem.state == "open"
+            and new_problem.state == "resolved"
+            and (len(new_history) <= len(old_history) or new_history[-1].kind != "resolved")
+        ):
+            errors.append(f"resolved problem {problem_id} requires an appended resolution event")
     if (
         current.operation_id is not None
         and current.operation_id == previous.operation_id
         and current.idempotency_key != previous.idempotency_key
     ):
         errors.append("operation idempotency key changed")
+    if (
+        current.operation_id is not None
+        and current.operation_id in {entry.operation_id for entry in previous.operation_history}
+        and current.operation_id != previous.operation_id
+    ):
+        errors.append("operation ID cannot be reused after an update gap")
     if current.plan_version > previous.plan_version and not _step_id_set(previous).issubset(_step_id_set(current)):
         errors.append("plan revisions must retain prior step IDs")
+    if (
+        len(current.operation_history) < len(previous.operation_history)
+        or current.operation_history[: len(previous.operation_history)] != previous.operation_history
+    ):
+        errors.append("operation history must preserve its append-only prefix")
     if errors:
         raise ContractValidationError("invalid lane update: " + "; ".join(errors))
 
@@ -511,20 +618,46 @@ class ProviderIdentity(_ContractModel):
     kind: ProviderKind
     handle: Identifier
     capabilities: ProviderCapabilities
-    # The instance and generation fence restart reconciliation.  A default is
-    # retained for old provider records that only had one durable handle.
-    instance_id: Identifier = "default"
-    generation: int = Field(default=1, ge=1)
+    # Unknown restart-fence values stay null.  The contract never invents a
+    # provider instance or generation from a durable handle alone.
+    instance_id: Identifier | None = None
+    generation: int | None = Field(default=None, ge=1)
     parent_thread_ref: str | None = None
     project_ref: str | None = None
     provider_version: str = ""
 
     @field_validator("generation")
     @classmethod
-    def reject_bool_generation(cls, value: int) -> int:
+    def reject_bool_generation(cls, value: int | None) -> int | None:
         if isinstance(value, bool):
             raise ValueError("provider generation must be an integer")
         return value
+
+    def supports(self, capability: CapabilityName | OperationKind) -> bool:
+        return bool(getattr(self.capabilities, capability))
+
+
+def validate_pending_operation(provider: ProviderIdentity, operation: PendingProviderOperation) -> None:
+    """Reject operations the observed provider cannot perform safely."""
+
+    if operation.provider_handle != provider.handle:
+        raise ContractValidationError("pending operation provider handle does not match provider identity")
+    if (
+        provider.instance_id is not None
+        and operation.provider_instance_id is not None
+        and provider.instance_id != operation.provider_instance_id
+    ):
+        raise ContractValidationError("pending operation provider instance does not match provider identity")
+    if (
+        provider.generation is not None
+        and operation.provider_generation is not None
+        and provider.generation != operation.provider_generation
+    ):
+        raise ContractValidationError("pending operation provider generation does not match provider identity")
+    if not provider.supports(operation.kind):
+        raise ContractValidationError(f"provider does not support operation {operation.kind}")
+    if operation.kind == "close" and not provider.capabilities.checkpoint:
+        raise ContractValidationError("close requires checkpoint capability")
 
 
 class PendingProviderOperation(_ContractModel):
@@ -536,8 +669,8 @@ class PendingProviderOperation(_ContractModel):
     provider_handle: Identifier
     idempotency_key: Identifier
     payload_digest: Text
-    provider_instance_id: Identifier = "default"
-    provider_generation: int = Field(default=1, ge=1)
+    provider_instance_id: Identifier | None = None
+    provider_generation: int | None = Field(default=None, ge=1)
     created_at: Timestamp
     attempt: int = Field(default=1, ge=1)
 
@@ -555,7 +688,7 @@ class PendingProviderOperation(_ContractModel):
 
     @field_validator("provider_generation")
     @classmethod
-    def reject_bool_generation(cls, value: int) -> int:
+    def reject_bool_generation(cls, value: int | None) -> int | None:
         if isinstance(value, bool):
             raise ValueError("provider generation must be an integer")
         return value
@@ -575,8 +708,8 @@ class ProviderOperationResult(_ContractModel):
     provider_handle: Identifier
     idempotency_key: Identifier
     payload_digest: Text
-    provider_instance_id: Identifier = "default"
-    provider_generation: int = Field(default=1, ge=1)
+    provider_instance_id: Identifier | None = None
+    provider_generation: int | None = Field(default=None, ge=1)
     status: OperationStatus
     accepted: bool | None = None
     consumed: bool | None = None
@@ -590,7 +723,7 @@ class ProviderOperationResult(_ContractModel):
 
     @field_validator("provider_generation")
     @classmethod
-    def reject_bool_generation(cls, value: int) -> int:
+    def reject_bool_generation(cls, value: int | None) -> int | None:
         if isinstance(value, bool):
             raise ValueError("provider generation must be an integer")
         return value
@@ -634,6 +767,10 @@ def validate_operation_result(pending: PendingProviderOperation, result: Provide
         errors.append("provider instance changed")
     if pending.provider_generation != result.provider_generation:
         errors.append("provider generation changed")
+    pending_time = datetime.fromisoformat(pending.created_at.replace("Z", "+00:00"))
+    result_time = datetime.fromisoformat(result.observed_at.replace("Z", "+00:00"))
+    if result_time < pending_time:
+        errors.append("operation result predates pending operation")
     if errors:
         raise ContractValidationError("operation result does not match pending operation: " + "; ".join(errors))
 
@@ -656,6 +793,10 @@ def validate_close_result(pending: PendingProviderOperation, result: CloseArchiv
     for field in fields:
         if getattr(pending, field) != getattr(result, field):
             errors.append(f"{field} changed")
+    pending_time = datetime.fromisoformat(pending.created_at.replace("Z", "+00:00"))
+    result_time = datetime.fromisoformat(result.observed_at.replace("Z", "+00:00"))
+    if result_time < pending_time:
+        errors.append("close result predates pending operation")
     if errors:
         raise ContractValidationError("close result does not match pending operation: " + "; ".join(errors))
 
@@ -715,9 +856,6 @@ class RecoveryState(_ContractModel):
     attempted_remedy: str = ""
     attempt_count: int = Field(default=0, ge=0)
     next_allowed_attempt: str | None = None
-    last_intervention: str = ""
-    intervention_consumed: bool | None = None
-    useful_work_resumed: bool | None = None
 
     @field_validator("attempt_count")
     @classmethod
@@ -820,6 +958,8 @@ class UsageReport(_ContractModel):
         child_names = set(child.name for child in self.children)
         if set(roster_ids) != child_names:
             raise ValueError("child roster must identify every reported child exactly once")
+        if any(entry.parent_id != self.parent.name for entry in self.child_roster):
+            raise ValueError("child roster parent_id must match the usage parent name")
         if self.complete and (not self.child_roster_complete or self.child_roster_evidence is None):
             raise ValueError("complete usage requires an observed child roster and evidence")
         units = {self.parent.unit, *(child.unit for child in self.children), self.total.unit}
@@ -844,6 +984,41 @@ class UsageReport(_ContractModel):
         return cls.model_validate(_immutable_json(payload), strict=True)
 
 
+def validate_usage_against_lane(update: LaneUpdate, report: UsageReport) -> None:
+    """Require usage evidence to cover exactly the lane's observed children."""
+
+    update = _revalidate_update(update)
+    try:
+        report = UsageReport.model_validate(_immutable_json(report.to_dict()), strict=True)
+    except ValidationError as exc:
+        raise ContractValidationError(f"usage report failed strict round-trip validation: {exc}") from exc
+    expected = {entry.child_id: entry for entry in update.child_roster}
+    observed = {entry.child_id: entry for entry in report.child_roster}
+    if set(expected) != set(observed):
+        raise ContractValidationError("usage child roster does not exactly cover the lane update roster")
+    for child_id, expected_entry in expected.items():
+        if observed[child_id] != expected_entry:
+            raise ContractValidationError(f"usage child roster evidence changed for {child_id}")
+        if expected_entry.parent_id != update.lane_id or expected_entry.ancestry[0] != update.lane_id:
+            raise ContractValidationError(f"child {child_id} ancestry is not rooted at the lane")
+    if report.complete and not report.child_roster_complete:
+        raise ContractValidationError("complete usage requires a complete observed lane roster")
+
+
+def validate_active_owner_set(owners: Iterable[OwnerIdentity]) -> None:
+    """Validate the input owner claims before choosing a single active owner."""
+
+    values = tuple(owners)
+    owner_ids = [owner.owner_id for owner in values]
+    if len(owner_ids) != len(set(owner_ids)):
+        raise ContractValidationError("owner identity set contains duplicate owner IDs")
+    if sum(owner.active for owner in values) > 1:
+        raise ContractValidationError("a lane may have at most one active owner")
+
+
+validate_owner_set = validate_active_owner_set
+
+
 class CloseArchiveResult(_ContractModel):
     """Observed close/archive state for the same provider thread."""
 
@@ -856,7 +1031,7 @@ class CloseArchiveResult(_ContractModel):
     payload_digest: Text
     state: CloseState
     provider_thread_ref: Identifier
-    same_provider_thread: bool | None = True
+    same_provider_thread: bool | None = None
     later_resume_supported: bool | None = None
     checkpoint_ref: Identifier | None = None
     quiescent: bool | None = None
@@ -882,6 +1057,8 @@ class CloseArchiveResult(_ContractModel):
                 raise ValueError("a closed or archived result must identify the same provider thread")
             if self.checkpoint_ref is None or self.quiescent is not True:
                 raise ValueError("a closed or archived result requires a checkpoint and provider quiescence")
+            if self.provider_thread_ref != self.provider_handle:
+                raise ValueError("close evidence provider_thread_ref must equal provider_handle")
         return self
 
     @property
@@ -931,8 +1108,9 @@ class JoinedLaneRecord(_ContractModel):
     goal_version: int = Field(ge=1)
     session_ref: Identifier
     lifecycle: LaneLifecycle = "active"
-    physical_session_generation: int = Field(default=1, ge=1)
+    physical_session_generation: int | None = Field(default=None, ge=1)
     chitra_ownership_epoch: int = Field(default=1, ge=1)
+    owner: OwnerIdentity = Field(default_factory=lambda: OwnerIdentity(owner_id="chitra"))
     provider: ProviderIdentity
     update_cursor: str = ""
     send_deduplication_key: str = ""
@@ -942,27 +1120,35 @@ class JoinedLaneRecord(_ContractModel):
     last_intervention: InterventionEvidence | None = None
     recovery: RecoveryState = RecoveryState()
     next_check: NextCheck | None = None
-    wake_condition: str | None = None
     pending_operation: PendingProviderOperation | None = None
     last_operation_result: ProviderOperationResult | None = None
     last_close_result: CloseArchiveResult | None = None
+    operation_history: tuple[OperationReference, ...] = ()
     checkpoint_reference: str | None = None
     worktree_path: str | None = None
     repository_commit: str | None = None
     preserved_work_manifest: tuple[str, ...] = ()
     revision: int = Field(default=1, ge=1)
 
-    @field_validator("goal_version", "physical_session_generation", "chitra_ownership_epoch", "revision")
+    @field_validator("goal_version", "chitra_ownership_epoch", "revision")
     @classmethod
     def reject_bool_counts(cls, value: int) -> int:
         if isinstance(value, bool):
             raise ValueError("lane record counters must be integers")
         return value
 
+    @field_validator("physical_session_generation")
+    @classmethod
+    def reject_bool_physical_generation(cls, value: int | None) -> int | None:
+        if isinstance(value, bool):
+            raise ValueError("physical session generation must be an integer")
+        return value
+
     @model_validator(mode="after")
     def validate_references(self) -> Self:
+        validate_active_owner_set((self.owner,))
         if self.current_update is not None:
-            update = self.current_update
+            update = _revalidate_update(self.current_update)
             if (update.lane_id, update.goal_id, update.goal_version, update.session_ref) != (
                 self.lane_id,
                 self.goal_id,
@@ -970,6 +1156,15 @@ class JoinedLaneRecord(_ContractModel):
                 self.session_ref,
             ):
                 raise ValueError("current_update identity and goal reference must match joined lane record")
+            if update != self.current_update:
+                raise ValueError("current_update must pass strict round-trip validation")
+        history_ids = [entry.operation_id for entry in self.operation_history]
+        history_keys = [entry.idempotency_key for entry in self.operation_history]
+        if len(history_ids) != len(set(history_ids)) or len(history_keys) != len(set(history_keys)):
+            raise ValueError("joined-lane operation history IDs and keys must be unique")
+        history_times = [datetime.fromisoformat(entry.created_at.replace("Z", "+00:00")) for entry in self.operation_history]
+        if any(left > right for left, right in zip(history_times, history_times[1:], strict=False)):
+            raise ValueError("joined-lane operation history timestamps must be monotonic")
         for operation in (self.pending_operation, self.last_operation_result):
             if operation is not None and (
                 operation.lane_id != self.lane_id
@@ -978,6 +1173,24 @@ class JoinedLaneRecord(_ContractModel):
                 or operation.provider_generation != self.provider.generation
             ):
                 raise ValueError("provider operation does not belong to joined lane")
+        if self.pending_operation is not None:
+            validate_pending_operation(self.provider, self.pending_operation)
+            if self.pending_operation.operation_id not in history_ids:
+                raise ValueError("pending operation must be retained in operation history")
+        if self.last_operation_result is not None and self.last_operation_result.operation_id not in history_ids:
+            raise ValueError("operation result must be retained in operation history")
+        if self.last_operation_result is not None:
+            reference = next(item for item in self.operation_history if item.operation_id == self.last_operation_result.operation_id)
+            if (
+                reference.kind != self.last_operation_result.kind
+                or reference.idempotency_key != self.last_operation_result.idempotency_key
+                or reference.payload_digest != self.last_operation_result.payload_digest
+            ):
+                raise ValueError("operation result does not match its operation history entry")
+            if datetime.fromisoformat(self.last_operation_result.observed_at.replace("Z", "+00:00")) < datetime.fromisoformat(
+                reference.created_at.replace("Z", "+00:00")
+            ):
+                raise ValueError("operation result predates its operation history entry")
         if self.last_operation_result is not None and self.pending_operation is not None:
             validate_operation_result(self.pending_operation, self.last_operation_result)
         if self.last_close_result is not None:
@@ -989,16 +1202,38 @@ class JoinedLaneRecord(_ContractModel):
                 or close_result.provider_generation != self.provider.generation
             ):
                 raise ValueError("close evidence does not belong to joined lane provider generation")
-            if close_result.lane_lifecycle is not None and close_result.lane_lifecycle != self.lifecycle:
-                raise ValueError("close evidence lifecycle does not match joined lane lifecycle")
+            if (
+                close_result.state in ("closed", "archived")
+                and self.lifecycle != "inactive"
+                and not (self.lifecycle == "active" and close_result.later_resume_supported is True)
+            ):
+                raise ValueError("logical close must make the joined lane inactive")
+            if self.provider.kind == "amp" and close_result.state == "closed":
+                raise ValueError("Amp close must be represented as archived")
             if self.pending_operation is not None:
                 validate_close_result(self.pending_operation, close_result)
+            if close_result.operation_id not in history_ids:
+                raise ValueError("close operation must be retained in operation history")
+            close_reference = next(item for item in self.operation_history if item.operation_id == close_result.operation_id)
+            if (
+                close_reference.kind != "close"
+                or close_reference.idempotency_key != close_result.idempotency_key
+                or close_reference.payload_digest != close_result.payload_digest
+            ):
+                raise ValueError("close evidence does not match its operation history entry")
+            if datetime.fromisoformat(close_result.observed_at.replace("Z", "+00:00")) < datetime.fromisoformat(
+                close_reference.created_at.replace("Z", "+00:00")
+            ):
+                raise ValueError("close result predates its operation history entry")
         if self.lifecycle in ("closed", "archived"):
-            terminal_close = self.last_close_result
-            if terminal_close is None or terminal_close.lane_lifecycle != self.lifecycle:
-                raise ValueError("closed or archived lane requires matching close evidence")
-        elif self.last_close_result is not None and self.last_close_result.lane_lifecycle is not None:
-            raise ValueError("active or inactive lane cannot carry terminal close evidence")
+            raise ValueError("logical close lifecycle must be inactive; provider state stays in close evidence")
+        if (
+            self.lifecycle == "active"
+            and self.last_close_result is not None
+            and self.last_close_result.state in ("closed", "archived")
+            and self.last_close_result.later_resume_supported is not True
+        ):
+            raise ValueError("active lane cannot carry terminal close evidence")
         if self.current_update is not None and self.current_update.operation_id is not None:
             result = self.last_operation_result
             if result is None or (
@@ -1008,10 +1243,16 @@ class JoinedLaneRecord(_ContractModel):
                 raise ValueError("lane update operation evidence must bind to the observed provider result")
             if result.status != "consumed" or result.accepted is not True or result.consumed is not True:
                 raise ValueError("lane update operation evidence must be consumed")
+            if result.operation_id not in history_ids:
+                raise ValueError("lane update operation must be retained in operation history")
         return self
 
     @classmethod
     def from_dict(cls, payload: object) -> JoinedLaneRecord:
+        if isinstance(payload, Mapping) and "owner" not in payload:
+            raise ContractValidationError(
+                "joined-lane document lacks explicit owner identity; migrate the legacy record before loading"
+            )
         return cast(JoinedLaneRecord, _validate_payload(payload, schema=LANE_RECORD_SCHEMA, model=cls))
 
     @property
@@ -1029,8 +1270,82 @@ class JoinedLaneRecord(_ContractModel):
 
         return () if self.current_update is None else self.current_update.problems
 
+    @property
+    def wake_condition(self) -> str | None:
+        """Read the sole durable wake condition from ``next_check``."""
+
+        return None if self.next_check is None else self.next_check.wake_condition
+
     def progress(self) -> Progress | None:
         return None if self.current_update is None else calculate_progress(self.current_update, plan_state=self.plan_assessment.state)
+
+
+def validate_record_transition(
+    previous: JoinedLaneRecord,
+    current: JoinedLaneRecord,
+    *,
+    active_owners: Iterable[OwnerIdentity] | None = None,
+) -> None:
+    """Validate one atomic joined-lane record transition under ownership fencing."""
+
+    try:
+        previous = JoinedLaneRecord.model_validate(_immutable_json(previous.to_dict()), strict=True)
+        current = JoinedLaneRecord.model_validate(_immutable_json(current.to_dict()), strict=True)
+    except ValidationError as exc:
+        raise ContractValidationError(f"joined-lane record failed strict round-trip validation: {exc}") from exc
+    errors: list[str] = []
+    if previous.lane_id != current.lane_id:
+        errors.append("lane_id is immutable")
+    if previous.goal_id != current.goal_id:
+        errors.append("goal_id is immutable")
+    if current.revision <= previous.revision:
+        errors.append("revision must increase")
+    if current.chitra_ownership_epoch < previous.chitra_ownership_epoch:
+        errors.append("ownership epoch must not decrease")
+    if current.owner != previous.owner and current.chitra_ownership_epoch <= previous.chitra_ownership_epoch:
+        errors.append("owner changes require a new ownership epoch")
+    prior_close = previous.last_close_result
+    if (
+        prior_close is not None
+        and prior_close.later_resume_supported is True
+        and (
+            current.provider.handle != prior_close.provider_thread_ref
+            or current.provider.instance_id != prior_close.provider_instance_id
+            or current.provider.generation != prior_close.provider_generation
+        )
+    ):
+        errors.append("later resume must restore the same provider thread identity")
+    owner_values = tuple(active_owners) if active_owners is not None else (current.owner,)
+    validate_active_owner_set(owner_values)
+    if active_owners is not None and current.owner not in owner_values:
+        errors.append("current owner is absent from the active owner input set")
+    if (
+        len(current.operation_history) < len(previous.operation_history)
+        or current.operation_history[: len(previous.operation_history)] != previous.operation_history
+    ):
+        errors.append("operation history must preserve its append-only prefix")
+    if previous.current_update is not None and current.current_update is not None:
+        try:
+            validate_update(previous.current_update, current.current_update)
+        except ContractValidationError as exc:
+            errors.append(str(exc))
+    if errors:
+        raise ContractValidationError("invalid joined-lane transition: " + "; ".join(errors))
+
+
+def migrate_legacy_record(payload: object) -> JoinedLaneRecord:
+    """Provide an explicit, deterministic migration boundary for old records.
+
+    No legacy shape is guessed here.  The store must supply a reviewed
+    migration that emits the current versioned document before this entrypoint
+    accepts it.
+    """
+
+    if isinstance(payload, Mapping) and payload.get("schema") == LANE_RECORD_SCHEMA:
+        return JoinedLaneRecord.from_dict(payload)
+    raise ContractValidationError(
+        "legacy joined-lane records are rejected; migrate to chitra.lanes.v1 with an explicit reviewed transform"
+    )
 
 
 LaneRecord = JoinedLaneRecord
@@ -1058,6 +1373,7 @@ __all__ = [
     "NextCheck",
     "NextWake",
     "OperationKind",
+    "OperationReference",
     "OperationResult",
     "OperationStatus",
     "PendingProviderOperation",
@@ -1075,6 +1391,10 @@ __all__ = [
     "ProviderKind",
     "ProviderOperationResult",
     "ProviderResult",
+    "OwnerIdentity",
+    "OwnerRole",
+    "ProblemHistoryEvent",
+    "ProblemHistoryKind",
     "RecoveryStage",
     "RecoveryState",
     "Recovery",
@@ -1091,8 +1411,14 @@ __all__ = [
     "Usage",
     "calculate_progress",
     "is_valid_update",
+    "migrate_legacy_record",
+    "validate_active_owner_set",
     "validate_lane_update",
     "validate_close_result",
     "validate_operation_result",
+    "validate_owner_set",
+    "validate_pending_operation",
+    "validate_record_transition",
+    "validate_usage_against_lane",
     "validate_update",
 ]

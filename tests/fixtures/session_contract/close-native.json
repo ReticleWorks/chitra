@@ -1,0 +1,17 @@
+{
+  "operation_id": "close-tophand-1",
+  "lane_id": "lane-a",
+  "provider_handle": "tophand-thread-a",
+  "provider_instance_id": "tophand-instance-1",
+  "provider_generation": 1,
+  "idempotency_key": "close-tophand-idem-1",
+  "payload_digest": "sha256-close-tophand",
+  "state": "closed",
+  "provider_thread_ref": "tophand-thread-a",
+  "same_provider_thread": true,
+  "later_resume_supported": false,
+  "checkpoint_ref": "checkpoint-tophand-1",
+  "quiescent": true,
+  "observed_at": "2026-08-23T14:00:05+00:00",
+  "evidence": "native close receipt"
+}

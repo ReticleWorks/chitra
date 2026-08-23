@@ -10,6 +10,7 @@ from chitra.session_contract import (
     LaneUpdate,
     PlanAssessment,
     Problem,
+    ProblemHistoryEvent,
     ProviderCapabilities,
     ProviderIdentity,
     RoadmapStep,
@@ -59,7 +60,14 @@ def _update(*, sequence: int = 3, plan_version: int = 2) -> LaneUpdate:
                 summary="The previous update used an old schema",
                 owner="lane",
                 state="resolved",
-                resolution="Published a versioned update",
+                history=(
+                    ProblemHistoryEvent(
+                        event_id="old-schema-resolved",
+                        kind="resolved",
+                        observed_at="2026-08-23T13:59:00+00:00",
+                        note="Published a versioned update",
+                    ),
+                ),
             ),
         ),
     )
@@ -90,7 +98,6 @@ def _record(*, update: LaneUpdate | None = None) -> JoinedLaneRecord:
             "reason": "Check for a material update",
             "wake_condition": "A newer lane update is observed",
         },
-        wake_condition="A newer lane update is observed",
     )
 
 

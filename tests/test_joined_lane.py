@@ -22,6 +22,7 @@ from chitra.orders import DispatchOrder, DispatchStatus
 from chitra.session_contract import (
     JoinedLaneRecord,
     LaneUpdate,
+    OperationReference,
     PendingProviderOperation,
     ProviderCapabilities,
     ProviderIdentity,
@@ -102,6 +103,27 @@ def record(
     provider_identity: ProviderIdentity | None = None,
     wake_condition: str | None = None,
 ) -> JoinedLaneRecord:
+    operation = pending
+    if operation is None and result is not None:
+        operation = pending_operation(operation_id=result.operation_id)
+    history = (
+        OperationReference(
+            operation_id=operation.operation_id,
+            idempotency_key=operation.idempotency_key,
+            payload_digest=operation.payload_digest,
+            kind=operation.kind,
+            created_at=operation.created_at,
+        ),
+    ) if operation is not None else ()
+    next_check = (
+        {
+            "at": "2026-08-23T14:00:00+00:00",
+            "reason": "Wait for wake condition",
+            "wake_condition": wake_condition,
+        }
+        if wake_condition is not None
+        else None
+    )
     return JoinedLaneRecord(
         lane_id=lane_id,
         goal_id=goal_id,
@@ -112,7 +134,8 @@ def record(
         current_update=current_update,
         pending_operation=pending,
         last_operation_result=result,
-        wake_condition=wake_condition,
+        operation_history=history,
+        next_check=next_check,
     ).model_copy(update={"revision": revision})
 
 
@@ -341,7 +364,8 @@ def test_wake_is_idempotent_and_preserves_operation_identity(tmp_path: Path) -> 
     assert first.status == "sent_unobserved"
     assert second.status == "wake_reused"
     saved = store.require("lane-a")
-    assert (saved.pending_operation.operation_id, saved.wake_condition) == ("op-1", "wake-1")
+    assert saved.pending_operation.operation_id == "op-1"
+    assert saved.recovery.attempted_remedy == "wake:wake-1"
 
 
 def test_reconcile_report_blocks_dispatch_barrier_for_matching_session() -> None:

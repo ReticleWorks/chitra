@@ -558,7 +558,12 @@ def _wake_id(record: object) -> str:
     if direct:
         return direct
     next_check = _value(record, "next_check", None)
-    return _text(_value(next_check, "wake_condition", "")) if next_check is not None else ""
+    next_wake = _text(_value(next_check, "wake_condition", "")) if next_check is not None else ""
+    if next_wake:
+        return next_wake
+    recovery = _value(record, "recovery", None)
+    attempted = _text(_value(recovery, "attempted_remedy", "")) if recovery is not None else ""
+    return attempted.removeprefix("wake:") if attempted.startswith("wake:") else ""
 
 
 def _canonical_next_check(record: object, at: str, reason: str) -> object:
@@ -605,10 +610,18 @@ def _apply_state(record: Any, updates: Mapping[str, Any]) -> Any:
             applied["wake_id"] = updates["wake_id"]
         elif "wake_condition" in model_fields:
             applied["wake_condition"] = updates["wake_id"] or None
-        elif "next_check" in model_fields and _value(record, "next_check", None) is not None:
-            current_check = _value(record, "next_check")
+        elif "next_check" in model_fields and (
+            applied.get("next_check") is not None or _value(record, "next_check", None) is not None
+        ):
+            current_check = applied.get("next_check") or _value(record, "next_check")
             if hasattr(current_check, "model_copy"):
                 applied["next_check"] = current_check.model_copy(update={"wake_condition": updates["wake_id"] or None})
+        if "recovery" in model_fields and _value(record, "recovery", None) is not None:
+            recovery = applied.get("recovery") or _value(record, "recovery")
+            if hasattr(recovery, "model_copy"):
+                applied["recovery"] = recovery.model_copy(
+                    update={"attempted_remedy": f"wake:{updates['wake_id']}" if updates["wake_id"] else ""}
+                )
     return _copy_model(record, applied)
 
 
@@ -935,7 +948,9 @@ class JoinedLaneReconciler:
         if not _record_pending(record):
             updated = self._save(record, wake_id=wake_id) if wake_id else record
             return self._outcome(updated, "wake_reused", True, "lane is already complete")
-        updates: dict[str, Any] = {"next_check_at": ""}
+        updates: dict[str, Any] = {
+            "next_check_at": self._now().astimezone(UTC).isoformat() if wake_id else "",
+        }
         if wake_id:
             updates["wake_id"] = wake_id
         updated = self._save(record, **updates)
