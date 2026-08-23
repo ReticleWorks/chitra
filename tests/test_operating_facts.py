@@ -82,7 +82,10 @@ def test_reads_named_records_for_all_operating_categories(tmp_path: Path) -> Non
     assert snapshot.get("fleet.credential-readiness.tophand").value == {"ready": True}  # type: ignore[union-attr]
     assert snapshot.get("fleet.access.tophand").value == {"read_only": True}  # type: ignore[union-attr]
     assert snapshot.get("fleet.capacity.tophand").value == {"slots": 2}  # type: ignore[union-attr]
-    assert all(fact.state == "known" for fact in snapshot.facts)
+    assert all(snapshot.get(name).state == "known" for name in (
+        "fleet.placement.tophand", "fleet.routing.build", "fleet.credential-readiness.tophand",
+        "fleet.access.tophand", "fleet.capacity.tophand",
+    ))
 
 
 def test_arbitrary_fleet_shape_is_not_parsed_or_inferred(tmp_path: Path) -> None:

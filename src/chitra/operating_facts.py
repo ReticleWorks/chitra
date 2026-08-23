@@ -25,7 +25,7 @@ from chitra.session_contract import FactState, OperatingFact
 OPERATING_FACTS_SCHEMA: Literal["chitra.operating-facts.v1"] = "chitra.operating-facts.v1"
 PRODUCTION_OPERATING_FACTS_PATH = Path("/var/lib/polyphony-chitra/operating-facts.json")
 
-FactCategory = Literal["placement", "routing", "credential-readiness", "access", "capacity"]
+FactCategory = Literal["placement", "routing", "credential-readiness", "access", "capacity", "versions", "provider-capabilities"]
 
 _CATEGORY_PREFIX: dict[FactCategory, str] = {
     "placement": "fleet.placement",
@@ -33,6 +33,8 @@ _CATEGORY_PREFIX: dict[FactCategory, str] = {
     "credential-readiness": "fleet.credential-readiness",
     "access": "fleet.access",
     "capacity": "fleet.capacity",
+    "versions": "fleet.versions",
+    "provider-capabilities": "fleet.provider-capabilities",
 }
 _CATEGORIES: tuple[FactCategory, ...] = tuple(_CATEGORY_PREFIX)
 _SNAPSHOT_KEYS = frozenset(("schema", "observed_at", "facts"))
@@ -60,6 +62,8 @@ class OperatingFactsSources:
     credential_readiness: Path | Sequence[Path] = ()
     access: Path | Sequence[Path] = ()
     capacity: Path | Sequence[Path] = ()
+    versions: Path | Sequence[Path] = ()
+    provider_capabilities: Path | Sequence[Path] = ()
 
     def paths(self, category: FactCategory) -> tuple[Path, ...]:
         if category == "placement":
@@ -70,7 +74,11 @@ class OperatingFactsSources:
             return _as_paths(self.credential_readiness)
         if category == "access":
             return _as_paths(self.access)
-        return _as_paths(self.capacity)
+        if category == "capacity":
+            return _as_paths(self.capacity)
+        if category == "versions":
+            return _as_paths(self.versions)
+        return _as_paths(self.provider_capabilities)
 
 
 def production_operating_facts_sources() -> OperatingFactsSources:
@@ -83,6 +91,8 @@ def production_operating_facts_sources() -> OperatingFactsSources:
         credential_readiness=path,
         access=path,
         capacity=path,
+        versions=path,
+        provider_capabilities=path,
     )
 
 
