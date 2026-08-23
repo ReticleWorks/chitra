@@ -1,0 +1,33 @@
+{
+  "schema": "chitra.session-update.v1",
+  "lane_id": "lane-a",
+  "goal_id": "goal-123",
+  "session_ref": "tophand:lane-a-1",
+  "goal_version": 2,
+  "sequence": 3,
+  "observed_at": "2026-08-23T14:00:00+00:00",
+  "plan_version": 1,
+  "revision_note": "",
+  "steps": [
+    {"id": "design", "status": "done", "title": "Design the contract", "owner": "lane", "milestone_id": null},
+    {"id": "implement", "status": "active", "title": "Implement the contract", "owner": "lane", "milestone_id": null},
+    {"id": "prove", "status": "pending", "title": "Prove the contract", "owner": "lane", "milestone_id": null}
+  ],
+  "milestones": [],
+  "current_action": "Implementing typed contract models",
+  "next_action": "Run the focused contract tests",
+  "child_roster": [],
+  "operation_id": null,
+  "idempotency_key": null,
+  "problems": [
+    {
+      "id": "provider-latency",
+      "summary": "Provider status is slower than the normal check interval",
+      "owner": "chitra",
+      "state": "open",
+      "need": "Refresh before retrying",
+      "resolution": null,
+      "reopen_event": null
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "operation_id": "close-1",
+  "lane_id": "lane-a",
+  "provider_handle": "amp-thread-1",
+  "provider_instance_id": "amp-instance-1",
+  "provider_generation": 2,
+  "idempotency_key": "close-idem-1",
+  "payload_digest": "sha256-close",
+  "state": "archived",
+  "provider_thread_ref": "amp-thread-1",
+  "same_provider_thread": true,
+  "later_resume_supported": true,
+  "checkpoint_ref": "checkpoint-1",
+  "quiescent": true,
+  "observed_at": "2026-08-23T14:00:00+00:00",
+  "evidence": "fake provider archive receipt"
+}

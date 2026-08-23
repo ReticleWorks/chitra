@@ -1,0 +1,12 @@
+{
+  "parent": {"name": "parent", "amount": 8, "unit": "usd"},
+  "children": [],
+  "child_roster": [],
+  "child_roster_complete": false,
+  "child_roster_evidence": null,
+  "total": {"name": "total", "amount": 8, "unit": "usd"},
+  "evidence_source": "provider-summary-without-children",
+  "observed_at": "2026-08-23T14:00:00+00:00",
+  "complete": false,
+  "ceiling": 10
+}

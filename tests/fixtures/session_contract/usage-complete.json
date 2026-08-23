@@ -1,0 +1,32 @@
+{
+  "parent": {"name": "parent", "amount": 8, "unit": "usd"},
+  "children": [
+    {"name": "child-a", "amount": 2, "unit": "usd"},
+    {"name": "child-b", "amount": 1.5, "unit": "usd"}
+  ],
+  "child_roster": [
+    {
+      "child_id": "child-a",
+      "parent_id": "parent",
+      "ancestry": ["parent", "child-a"],
+      "retained_state": "retained",
+      "material_result": true,
+      "material_result_ref": "update-child-a"
+    },
+    {
+      "child_id": "child-b",
+      "parent_id": "parent",
+      "ancestry": ["parent", "child-b"],
+      "retained_state": "retained",
+      "material_result": true,
+      "material_result_ref": "update-child-b"
+    }
+  ],
+  "child_roster_complete": true,
+  "child_roster_evidence": "parent-update-1",
+  "total": {"name": "total", "amount": 11.5, "unit": "usd"},
+  "evidence_source": "fake-provider-usage",
+  "observed_at": "2026-08-23T14:00:00+00:00",
+  "complete": true,
+  "ceiling": null
+}
