@@ -132,12 +132,12 @@ from .goals import (
 from .goals import (
     SCHEMA as GOALS_INSTALLED_SCHEMA,
 )
-from .joined_lane import JoinedLaneReconciler, JoinedLaneStore, ReconcileReport, build_production_reconciler
+from .joined_lane import JoinedLaneReconciler, JoinedLaneStore, ReconcileReport, build_filesystem_reconciler
 from .journal import native_session_identity
 from .orders import DispatchOrder, DispatchResult, DispatchStatus
 from .policy_config import PolicyConfig, load_policy_config
 from .routing_config import RoutingConfig, load_routing_config, resolve_route, resolve_routing_hint
-from .state_paths import default_attestation_ledger_path, default_ledger_key_path, default_ledger_path, default_queue_dir
+from .state_paths import default_attestation_ledger_path, default_ledger_key_path, default_ledger_path, default_queue_dir, state_dir
 
 logger = structlog.get_logger(__name__)
 
@@ -1600,6 +1600,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--poll-seconds", type=float, default=DEFAULT_POLL_SECONDS)
     parser.add_argument("--joined-lane-root", type=Path, default=None)
+    parser.add_argument("--ownership-socket-path", type=Path, default=None)
     parser.add_argument("--once", action="store_true", help="Drain the queue once and exit (for tests/cron), instead of looping forever.")
     return parser
 
@@ -1607,16 +1608,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     queue_dir = args.queue_dir or default_queue_dir()
-    joined_lane_root = args.joined_lane_root or queue_dir
-    # Startup always installs a concrete barrier.  Until the daemon's live
-    # provider adapters are configured, these probes report missing evidence;
-    # unfinished lanes therefore remain durably blocked instead of bypassing
-    # reconciliation.
-    joined_lane_reconciler = build_production_reconciler(
+    joined_lane_root = args.joined_lane_root or state_dir()
+    joined_lane_reconciler = build_filesystem_reconciler(
         joined_lane_root,
-        provider_probe=lambda _record: None,
-        journal_probe=lambda _record: None,
-        ownership_probe=lambda _record: None,
+        ledger_path=args.ledger_path or default_ledger_path(),
+        ledger_key_path=args.ledger_key_path or default_ledger_key_path(),
+        ownership_socket_path=args.ownership_socket_path or Path("/run/chitra-ownership/provider.sock"),
     )
     allowed_session_prefixes = resolve_session_prefixes(args.allow_session_prefix, env_var=SESSION_ALLOW_PREFIXES_ENV_VAR)
     denied_session_prefixes = resolve_session_prefixes(args.deny_session_prefix, env_var=SESSION_DENY_PREFIXES_ENV_VAR)

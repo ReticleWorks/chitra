@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -21,8 +22,10 @@ from typing import Any, Final, Literal, cast
 from pydantic import ValidationError
 
 from ._fsio import locked_json_store, write_json_atomic
-from .ledger import LedgerEntry
-from .provider_protocol import ProviderUpdate
+from .journal import EventJournal
+from .ledger import LedgerEntry, verify_entry
+from .ownership_provider import DEFAULT_SOCKET_PATH, QUERY_SCHEMA, request_json_line
+from .provider_protocol import ProviderUpdate, UpdateKind
 from .session_contract import (
     ContractValidationError,
     InterventionEvidence,
@@ -1078,6 +1081,147 @@ def build_production_reconciler(
     )
 
 
+def _provider_result_path(root: Path, lane_id: str) -> Path:
+    _validate_lane_id(lane_id)
+    return root / "provider-results" / f"{lane_id}.jsonl"
+
+
+def filesystem_provider_probe(root: Path) -> ProviderProbe:
+    """Read the latest typed provider result for a lane from durable state."""
+
+    def probe(record: JoinedLaneRecord) -> ProviderOperationResult | None:
+        path = _provider_result_path(root, record.lane_id)
+        if not path.exists():
+            return None
+        pending = record.pending_operation
+        found: ProviderOperationResult | None = None
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                result = ProviderOperationResult.model_validate_json(line)
+                if result.lane_id != record.lane_id:
+                    continue
+                if pending is not None and result.operation_id != pending.operation_id:
+                    continue
+                if result.provider_instance_id != record.provider.instance_id or result.provider_generation != record.provider.generation:
+                    continue
+                found = result
+        return found
+
+    return probe
+
+
+def journal_provider_probe(root: Path) -> JournalProbe:
+    """Return exact full-envelope provider evidence from the canonical journal."""
+
+    def probe(record: JoinedLaneRecord) -> ProviderUpdate | None:
+        pending = record.pending_operation
+        if pending is None:
+            return None
+        provider_instance_id = record.provider.instance_id
+        provider_generation = record.provider.generation
+        if provider_instance_id is None or provider_generation is None:
+            return None
+        for event in reversed(EventJournal(root, record.lane_id).load()):
+            payload = event.payload
+            if payload.get("operation_id") != pending.operation_id:
+                continue
+            if payload.get("lane_id") != record.lane_id:
+                continue
+            if payload.get("provider_instance_id") != provider_instance_id:
+                continue
+            if payload.get("provider_generation") != provider_generation:
+                continue
+            evidence = payload.get("result_evidence")
+            if not isinstance(evidence, Mapping):
+                continue
+            consumed = evidence.get("consumed")
+            if consumed is not True and consumed is not False and consumed is not None:
+                continue
+            kind = UpdateKind.STEER_CONSUMED if consumed is True else UpdateKind.STEER_ACCEPTED
+            return ProviderUpdate(
+                event_id=event.event_id,
+                cursor=event.event_id,
+                kind=kind,
+                provider_session_id=event.session_id,
+                observed_at=event.observed_at,
+                operation_id=pending.operation_id,
+                lane_id=record.lane_id,
+                idempotency_key=pending.idempotency_key,
+                payload_digest=pending.payload_digest,
+                provider_instance_id=provider_instance_id,
+                provider_generation=provider_generation,
+                payload={"result_evidence": dict(evidence)},
+            )
+        return None
+
+    return probe
+
+
+def ledger_provider_probe(ledger_path: Path, ledger_key_path: Path) -> LedgerProbe:
+    """Read only verified delivery entries with exact operation/session IDs."""
+
+    def probe(record: JoinedLaneRecord) -> LedgerEntry | None:
+        pending = record.pending_operation
+        if pending is None or not ledger_path.exists() or not ledger_key_path.exists():
+            return None
+        key = ledger_key_path.read_bytes()
+        with ledger_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                entry = LedgerEntry.model_validate_json(line)
+                if entry.order_id != pending.operation_id or entry.session_ref != record.session_ref:
+                    continue
+                if verify_entry(entry, key=key):
+                    return entry
+        return None
+
+    return probe
+
+
+def ownership_provider_probe(*, socket_path: Path = DEFAULT_SOCKET_PATH) -> OwnershipProbe:
+    """Query the live ownership authority with host and boot identity fences."""
+
+    def probe(record: JoinedLaneRecord) -> object | None:
+        host_id = record.session_ref.split(":", 1)[0]
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+        if not host_id or not boot_id:
+            return None
+        query = {
+            "schema": QUERY_SCHEMA,
+            "request_id": str(uuid.uuid4()),
+            "host_id": host_id,
+            "boot_id": boot_id,
+            "session_ref": record.session_ref,
+        }
+        try:
+            return request_json_line(socket_path, query)
+        except (OSError, ValueError):
+            return None
+
+    return probe
+
+
+def build_filesystem_reconciler(
+    root: Path,
+    *,
+    ledger_path: Path,
+    ledger_key_path: Path,
+    ownership_socket_path: Path = DEFAULT_SOCKET_PATH,
+) -> JoinedLaneReconciler:
+    """Build the daemon barrier from durable provider, journal, ledger, and ownership adapters."""
+
+    return build_production_reconciler(
+        root,
+        provider_probe=filesystem_provider_probe(root),
+        journal_probe=journal_provider_probe(root),
+        ledger_probe=ledger_provider_probe(ledger_path, ledger_key_path),
+        ownership_probe=ownership_provider_probe(socket_path=ownership_socket_path),
+    )
+
+
 __all__ = [
     "JoinedLaneError",
     "JoinedLaneCorruptError",
@@ -1102,4 +1246,9 @@ __all__ = [
     "save_lane_record",
     "reconcile_before_send",
     "build_production_reconciler",
+    "build_filesystem_reconciler",
+    "filesystem_provider_probe",
+    "journal_provider_probe",
+    "ledger_provider_probe",
+    "ownership_provider_probe",
 ]

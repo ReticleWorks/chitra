@@ -18,8 +18,10 @@ from chitra.joined_lane import (
     JoinedLaneStore,
     ReconcileOutcome,
     ReconcileReport,
+    filesystem_provider_probe,
+    ledger_provider_probe,
 )
-from chitra.ledger import LedgerEntry
+from chitra.ledger import LedgerEntry, append_entry
 from chitra.orders import DispatchOrder, DispatchStatus
 from chitra.provider_protocol import ProviderUpdate, UpdateKind
 from chitra.session_contract import (
@@ -289,6 +291,33 @@ def test_lost_reply_retries_same_pending_operation_without_duplicate(tmp_path: P
     assert store.require("lane-a").pending_operation.operation_id == "op-1"
 
 
+def test_filesystem_provider_and_verified_ledger_adapters_fence_exact_operation(tmp_path: Path) -> None:
+    pending = pending_operation()
+    current = record(pending=pending)
+    result = accepted_observation("op-1")
+    provider_path = tmp_path / "provider-results" / "lane-a.jsonl"
+    provider_path.parent.mkdir(parents=True)
+    provider_path.write_text(result.model_dump_json() + "\n", encoding="utf-8")
+    provider_probe = filesystem_provider_probe(tmp_path)
+    assert provider_probe(current) == result
+
+    key = b"adapter-test-key"
+    ledger_path = tmp_path / "ledger.jsonl"
+    key_path = tmp_path / "ledger.key"
+    key_path.write_bytes(key)
+    append_entry(
+        ledger_path,
+        order_id="op-1",
+        session_ref=current.session_ref,
+        tag="[C]",
+        nudge="continue",
+        key=key,
+        sent_at="2026-08-23T14:00:02+00:00",
+    )
+    entry = ledger_provider_probe(ledger_path, key_path)(current)
+    assert entry is not None and entry.order_id == pending.operation_id
+
+
 def test_legacy_wire_schema_is_rejected_without_migration(tmp_path: Path) -> None:
     store = JoinedLaneStore(tmp_path)
     store.path("lane-a").parent.mkdir(parents=True)
@@ -513,7 +542,7 @@ def test_dispatchd_requeues_matching_joined_lane_defer_when_barrier_clears(tmp_p
 def test_main_wires_startup_reconciler_before_run_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
     sentinel = object()
-    monkeypatch.setattr(dispatchd, "build_production_reconciler", lambda root, **kwargs: sentinel)
+    monkeypatch.setattr(dispatchd, "build_filesystem_reconciler", lambda root, **kwargs: sentinel)
 
     def fake_run_once(queue_dir: Path, **kwargs: object) -> list[object]:
         captured.update(kwargs)
