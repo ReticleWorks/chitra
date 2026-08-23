@@ -1,0 +1,92 @@
+schema_version = 1
+agent = "claude"
+version = "2026.08.16.1"
+
+# The Claude-side analogs of the Codex cap banner, at the same top priority
+# and for the same reason: a capped pane keeps its input row and would
+# otherwise classify as idle.
+#
+# Unlike the Codex rules in codex.toml, these patterns are NOT quoted from a
+# captured Claude cap banner -- no lane on this fleet has hit a Claude cap with
+# its pane recorded. They are the wordings named in the 2026-08-16 rate-limit
+# design. Replace them with the measured strings the first time a Claude lane
+# does cap, and treat a miss until then as expected rather than surprising.
+[[rules]]
+id = "rate_limit_hard_cap"
+state = "rate_limited_hard"
+priority = 2000
+region = "bottom"
+lines = 24
+any = [
+  { kind = "line_regex", value = "^\\s*(?:■\\s*)?(?:You(?:'ve| have) )?(?:reached|hit) your (?:usage|rate) limit\\b" },
+  { kind = "line_regex", value = "^\\s*(?:■\\s*)?(?:\\d+-hour |weekly |usage )?limit reached\\b" },
+]
+
+[[rules]]
+id = "rate_limit_warning"
+state = "rate_limited_warn"
+priority = 1900
+region = "bottom"
+lines = 24
+any = [
+  { kind = "line_regex", value = "^\\s*(?:■\\s*)?Approaching (?:rate|usage) limits?\\b" },
+]
+
+[[rules]]
+id = "permission_prompt"
+state = "blocked"
+priority = 1000
+region = "bottom"
+lines = 24
+blocker_kind = "permission"
+all = [
+  { kind = "regex", value = "Do you want to (?:proceed|allow|approve)" },
+  { kind = "line_regex", value = "^\\s*(?:❯\\s*)?1\\. Yes\\b(?:$|,)", case_sensitive = true },
+]
+
+[[rules]]
+id = "tool_approval_choices"
+state = "blocked"
+priority = 950
+region = "bottom"
+lines = 24
+blocker_kind = "approval"
+all = [
+  { kind = "line_regex", value = "^\\s*(?:❯\\s*)?1\\. (?:Allow|Approve)\\b", case_sensitive = true },
+  { kind = "line_regex", value = "^\\s*[23]\\. (?:Deny|Reject|Cancel|No)\\b", case_sensitive = true },
+]
+
+[[rules]]
+id = "visible_question"
+state = "blocked"
+priority = 900
+region = "bottom"
+lines = 20
+blocker_kind = "question"
+all = [
+  { kind = "regex", value = "(?:Enter to select|Type your answer)" },
+  { kind = "regex", value = "(?:Esc to cancel|↑/↓ to navigate)" },
+]
+
+[[rules]]
+id = "working_spinner"
+state = "working"
+priority = 500
+region = "bottom"
+lines = 8
+any = [
+  { kind = "line_regex", value = "^\\s*[•◦✻✽✳✢✶*●○◐◯].*\\b(?:esc to interrupt|Working|Thinking|Running)\\b", case_sensitive = true },
+  { kind = "line_regex", value = "^\\s*(?:Working|Thinking|Running)(?:…|\\.\\.\\.|\\s*\\().*\\besc to interrupt\\b", case_sensitive = true },
+  { kind = "line_regex", value = "^\\s*esc to interrupt\\s*$", case_sensitive = true },
+]
+
+[[rules]]
+id = "input_row"
+state = "idle"
+priority = 100
+region = "bottom"
+lines = 12
+any = [
+  { kind = "line_regex", value = "^\\s*❯" },
+  { kind = "line_regex", value = "^\\s*›" },
+]

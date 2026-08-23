@@ -1,0 +1,29 @@
+[Unit]
+Description=chitra auto-merge-on-green daemon
+Documentation=https://github.com/ReticleWorks/chitra
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace with the user/group this service should run as. Do not run as root.
+User=chitra
+Group=chitra
+# systemd creates and owns this directory (mode 0750) for the unit's lifetime.
+# The merge ledger and the per-repository merge locks live here.
+StateDirectory=chitra
+# The GitHub App installation token this daemon merges as. No token, no merge:
+# the daemon refuses rather than falling back to whatever identity gh happens
+# to hold. Note there is no "-" prefix, so a missing file fails the unit
+# instead of silently starting it with the wrong credentials.
+EnvironmentFile=/etc/polyphony/chitra-merge/merge.env
+# Fill in the venv and policy paths.
+ExecStart=/path/to/venv/bin/polyphony-chitra-merged --state-dir /var/lib/chitra --queue-dir /var/lib/chitra/queue --policy-config /path/to/chitra-policy.yaml
+Restart=on-failure
+RestartSec=60
+# The daemon exits 0 immediately when merge policy is disabled, which is the
+# shipped default. That is a correct no-op, not a failure to restart from.
+SuccessExitStatus=0
+
+[Install]
+WantedBy=multi-user.target

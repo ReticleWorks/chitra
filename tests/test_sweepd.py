@@ -10,10 +10,24 @@ from pathlib import Path
 from chitra.account_registry import update_registry
 from chitra.goals import GoalRecord, GoalStatus, close_goal, upsert_goal
 from chitra.rate_limit_state import LoadHostState, Transaction, upsert_load_state, upsert_transaction
-from chitra.sweepd import SweepSnapshot, build_snapshot, compute_delta, load_snapshot, resolve_config, run_once
+from chitra.sweepd import SweepSnapshot, build_snapshot, compute_delta, load_latest_flags, load_snapshot, resolve_config, run_once
 from chitra.usage import AccountedVerdict
 
 NOW = datetime(2026, 7, 13, 18, 0, tzinfo=UTC)
+
+
+def test_load_latest_flags_accepts_mixed_documented_severities(tmp_path: Path) -> None:
+    flags_path = tmp_path / "flags.log"
+    flags_path.write_text(
+        "CRIT 2026-08-13T15:32:00Z lane-a:0.0 crash: traceback detected\n"
+        "IDLE 2026-08-13T15:33:37Z lane-b:0.0 idle: unchanged input row\n",
+        encoding="utf-8",
+    )
+
+    flags = load_latest_flags(flags_path)
+
+    assert flags["lane-a:0.0\x1fcrash"].message == "traceback detected"
+    assert flags["lane-b:0.0\x1fidle"].message == "unchanged input row"
 
 
 def _goal(

@@ -12,6 +12,7 @@ from chitra.policy_config import (
     POLICY_CONFIG_ENV_VAR,
     GuidancePolicy,
     LoadPolicy,
+    MergePolicyConfig,
     PolicyConfig,
     PRReviewPolicy,
     UsagePolicy,
@@ -40,8 +41,13 @@ def test_unconfigured_policy_is_the_current_shipped_behavior(monkeypatch: pytest
         "pause_7d_pct": 95.0,
         "warn_5h_pct": 80.0,
         "warn_7d_pct": 90.0,
+        "codex_pause_5h_pct": 92.0,
+        "codex_pause_weekly_pct": 90.0,
+        "codex_warn_5h_pct": 80.0,
+        "codex_warn_weekly_pct": 85.0,
         "max_running": None,
         "auto_resume": True,
+        "auto_transfer": True,
     }
     assert policy.load == LoadPolicy()
     assert policy.pr_review == PRReviewPolicy()
@@ -223,3 +229,61 @@ def test_resolve_guidance_uses_longest_component_boundary_prefix_and_default(tmp
 def test_guidance_policy_rejects_empty_document_values() -> None:
     with pytest.raises(ValueError, match="canonical_decisions values"):
         GuidancePolicy(canonical_decisions={"default": ""})
+
+
+def test_merge_is_off_and_allows_nothing_until_an_operator_configures_it() -> None:
+    policy = PolicyConfig().merge
+    assert policy.enabled is False
+    assert policy.allowed_repos == []
+    assert policy.lane_authors == []
+    # Both conventions ship on. A brake wired only to a label the repository
+    # never applies would not stop anything there.
+    assert policy.hold_labels == ["chitra-hold", "hold"]
+
+
+def test_merge_policy_rejects_a_repository_that_is_not_owner_slash_name() -> None:
+    with pytest.raises(ValueError, match="owner/name"):
+        MergePolicyConfig(allowed_repos=["chitra"])
+
+
+def test_merge_policy_rejects_padded_or_empty_entries() -> None:
+    with pytest.raises(ValueError, match="non-empty and unpadded"):
+        MergePolicyConfig(lane_authors=[" lane-bot"])
+
+
+def test_merge_policy_rejects_being_enabled_with_nothing_allowlisted() -> None:
+    with pytest.raises(ValueError, match="no repository is allowlisted"):
+        MergePolicyConfig(enabled=True)
+
+
+def test_merge_policy_rejects_an_unnamed_hold_label() -> None:
+    with pytest.raises(ValueError, match="non-empty and unpadded"):
+        MergePolicyConfig(hold_labels=["  "])
+
+
+def test_merge_policy_refuses_to_leave_a_merge_with_no_brake_at_all() -> None:
+    with pytest.raises(ValueError, match="at least one label"):
+        MergePolicyConfig(hold_labels=[])
+
+
+def test_merge_policy_reads_from_policy_yaml(tmp_path: Path) -> None:
+    path = tmp_path / "policy.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "merge": {
+                    "enabled": True,
+                    "allowed_repos": ["ReticleWorks/chitra"],
+                    "lane_authors": ["lane-bot"],
+                    "app_login": "polyphony-automation[bot]",
+                    "poll_seconds": 300,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    merge = load_policy_config(path).merge
+    assert merge.enabled is True
+    assert merge.allowed_repos == ["ReticleWorks/chitra"]
+    assert merge.app_login == "polyphony-automation[bot]"
+    assert merge.poll_seconds == 300

@@ -13,6 +13,7 @@ from chitra.convlog import (
     OperatorBrief,
     append_directive,
     append_entry,
+    append_resolution,
     append_ruling,
     append_session_message,
     entries_for_thread,
@@ -267,3 +268,35 @@ def test_direct_helpers_complete_four_rungs(tmp_path: Path) -> None:
     append_ruling(path, thread_id=thread_id, text="yes")
     append_directive(path, thread_id=thread_id, text="do it", order_id=None)
     assert list_threads(path)[0].pending is False
+
+
+@pytest.mark.parametrize("state", ["moot", "superseded"])
+def test_event_resolution_retires_thread_with_truthful_basis(tmp_path: Path, state: str) -> None:
+    path = tmp_path / "conversation.jsonl"
+    thread_id = open_thread(path, brief=_brief(), raw_text="raw")
+    append_resolution(
+        path,
+        thread_id=thread_id,
+        state=state,  # type: ignore[arg-type]
+        basis="The incident ended before an operator ruling was needed.",
+        citation="evidence/incident-health.json#healthy",
+        authority="The monitor applied the incident-resolution rule.",
+    )
+
+    thread = list_threads(path)[0]
+    assert thread.pending is False
+    assert thread.state == state
+    assert pending_threads(path) == []
+    assert thread.entries[-1].payload["citation"] == "evidence/incident-health.json#healthy"
+
+
+def test_cli_can_mark_multiple_threads_moot(tmp_path: Path) -> None:
+    path = tmp_path / "conversation.jsonl"
+    first = open_thread(path, brief=_brief(), raw_text="first")
+    second = open_thread(path, brief=_brief(session_ref="host-b:other:0.0", program="Other program (F3)"), raw_text="second")
+    assert main([
+        "retire", "--convlog-path", str(path), "--thread", first, "--thread", second,
+        "--state", "moot", "--basis", "Events resolved both questions.",
+        "--citation", "evidence/current-state.md", "--authority", "The monitor applied the operator's standing guidance.",
+    ]) == 0
+    assert [thread.state for thread in list_threads(path)] == ["moot", "moot"]

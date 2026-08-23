@@ -99,7 +99,7 @@ def test_store_round_trip_and_atomic_write(tmp_path: Path) -> None:
     assert load_goals(tmp_path) == [stored]
     assert not list(tmp_path.glob("*.tmp"))
     payload = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
-    assert payload["schema"] == "chitra.goals.v1"
+    assert payload["schema"] == "chitra.goals.v2"
     assert payload["goals"][0]["needs"] == "you: run the interview"
     assert payload["goals"][0]["goal_version"] == 1
     assert payload["goals"][0]["goal_history"] == []
@@ -155,6 +155,45 @@ def test_resolve_ask_rejects_ambiguous_missing_and_out_of_range_selectors(tmp_pa
         resolve_ask(tmp_path, stored.session_ref, index=0)
     with pytest.raises(GoalNotFoundError):
         add_ask(tmp_path, "missing:lane", "1. Decide?")
+
+
+def test_monitor_ask_retirement_keeps_cited_history(tmp_path: Path) -> None:
+    stored = upsert_goal(tmp_path, _record())
+    ask = "Approve the old deployment route?"
+    add_ask(tmp_path, stored.session_ref, ask)
+    retired = resolve_ask(
+        tmp_path,
+        stored.session_ref,
+        ask=ask,
+        retired_by="monitor",
+        basis="The governed deployment route has already succeeded.",
+        citation="evidence/deploy-probe.json#success",
+        authority="The monitor applied the operator's act-in-place guidance.",
+    )
+
+    assert retired.open_asks == ()
+    assert retired.retired_asks[-1] == {
+        "ask": ask,
+        "state": "retired-by-monitor-with-cited-basis",
+        "basis": "The governed deployment route has already succeeded.",
+        "citation": "evidence/deploy-probe.json#success",
+        "authority": "The monitor applied the operator's act-in-place guidance.",
+        "retired_at": retired.retired_asks[-1]["retired_at"],
+    }
+    assert load_goals(tmp_path)[0].retired_asks == retired.retired_asks
+
+
+def test_monitor_ask_retirement_requires_cited_basis(tmp_path: Path) -> None:
+    stored = upsert_goal(tmp_path, _record())
+    add_ask(tmp_path, stored.session_ref, "Approve the old route?")
+    with pytest.raises(ValueError, match="basis, citation, and authority"):
+        resolve_ask(tmp_path, stored.session_ref, all=True, retired_by="monitor", basis="", citation="", authority="")
+
+
+def test_lane_authored_ask_is_preserved_without_plain_english_gate(tmp_path: Path) -> None:
+    stored = upsert_goal(tmp_path, _record())
+    verbatim = "F2 lane blocked pls?"
+    assert add_ask(tmp_path, stored.session_ref, verbatim).open_asks == (verbatim,)
 
 
 def test_load_old_record_without_optional_fields_is_backward_compatible(tmp_path: Path) -> None:
@@ -258,7 +297,7 @@ def test_enrolled_scope_is_write_once_and_carried_through_later_writes(tmp_path:
     )
 
 
-def test_redirect_now_hold_resume_and_close_preserve_enrollment_anchor(tmp_path: Path) -> None:
+def test_done_when_redirect_refreshes_enrollment_and_later_writes_preserve_it(tmp_path: Path) -> None:
     enrolled = upsert_goal(tmp_path, _record(done_when="both the X client and the Y client pass live validation"))
     redirected = redirect_goal(
         tmp_path,
@@ -271,9 +310,26 @@ def test_redirect_now_hold_resume_and_close_preserve_enrollment_anchor(tmp_path:
     resumed = resume_goal(tmp_path, held.session_ref)
     closed = close_goal(tmp_path, resumed.session_ref, delivered_items=("X client",))
 
-    for record in (redirected, updated, held, resumed, closed):
-        assert record.enrolled_done_when == enrolled.done_when
-        assert record.enrolled_at == enrolled.enrolled_at
+    assert redirected.enrolled_done_when == redirected.done_when
+    assert redirected.enrolled_at == redirected.updated_at
+    assert redirected.enrolled_at != enrolled.enrolled_at
+    for record in (updated, held, resumed, closed):
+        assert record.enrolled_done_when == redirected.done_when
+        assert record.enrolled_at == redirected.enrolled_at
+
+
+def test_redirect_without_done_when_change_preserves_enrollment_anchor(tmp_path: Path) -> None:
+    enrolled = upsert_goal(tmp_path, _record())
+
+    redirected = redirect_goal(
+        tmp_path,
+        enrolled.session_ref,
+        reason="operator narrowed implementation scope",
+        scope="Goal storage and redirect tests only.",
+    )
+
+    assert redirected.enrolled_done_when == enrolled.enrolled_done_when
+    assert redirected.enrolled_at == enrolled.enrolled_at
 
 
 @pytest.mark.parametrize(

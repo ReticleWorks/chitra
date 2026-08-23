@@ -9,15 +9,18 @@ Dispatchd is chitra's always-on delivery engine. It drains a JSON order queue, d
 1. Reclaim stale in-flight orders (if an order failed halfway through, restart it).
 2. Read orders from the queue in FIFO order (sorted by file modification time).
 3. For each order:
-   - Check if a result file already exists. If yes, skip (idempotent).
+   - Check if a result file already exists. A non-`SENT` result is terminal;
+     a `SENT` result is recovered by retrying its ledger proof, never by
+     dispatching again.
    - Verify the target session exists and is in scope.
    - Acquire an exclusive file lock (LaneLock) for that session.
    - Check the rate-limit freeze status. If the session is paused, defer the order.
    - Paste the message text into the tmux session via `tmux load-buffer` and `tmux paste-buffer`.
    - Verify delivery by grepping the session's transcript for the exact text.
-   - Write a result file and sign a ledger entry.
+   - Write a result file, sign a matching ledger entry, and move the order to
+     `processed/` only after the signed proof verifies.
 
-Dispatchd is **single-threaded per session.** The LaneLock prevents two writers from racing. It is **idempotent:** once a result file exists, the order is never redelivered, even across a restart. It is **crash-safe:** if a crash happens between paste and ledger write, the send-nonce marker plus transcript-grep check reconcile the state on the next run.
+Dispatchd is **single-threaded per session.** The LaneLock prevents two writers from racing. It is **idempotent:** once a result file exists, the order is never redelivered, even across a restart. A `SENT` result may temporarily have `delivery_ledger_verified=false`; that record lets a restart retry only the ledger write. The order is not acknowledged in `processed/` until the signed proof exists. If a crash happens before the result is written, the send-nonce marker plus transcript-grep check reconcile the state on the next run.
 
 ## CLI usage
 
@@ -81,6 +84,7 @@ Run with `--once` for a single pass (used in cron/systemd timer). Omit it to run
   "order_id": "task-123",
   "lane_id": "session-name",
   "status": "sent",
+  "delivery_ledger_verified": true,
   "delivery_timestamp": "2025-01-15T12:34:56Z",
   "nonce": "send-nonce-value"
 }
@@ -123,4 +127,8 @@ python -c "from chitra.ledger import verify_delivery; verify_delivery(ledger_pat
 - **Atomicity:** Each delivery acquires a lock, completes, and releases it. No partial deliveries.
 - **Durability:** Ledger entries are HMAC-signed and appended. Crash-safe.
 - **Idempotency:** Once a result file exists, the order is never redelivered.
+- **Ledger-gated acknowledgment:** A `SENT` order is not moved to
+  `processed/` until its order-specific HMAC proof is present and valid in the
+  delivery ledger. A `SENT` result with a false proof flag is pending recovery,
+  not a completed queue acknowledgment.
 - **Single-writer:** LaneLock prevents concurrent writes to the same session.

@@ -7,11 +7,14 @@ from pathlib import Path
 
 import pytest
 
+from chitra.account_registry import RegistryEntry
 from chitra.goals import GoalRecord
+from chitra.lane_activity import LaneActivity
 from chitra.load_shed import (
     PressureSample,
     ShedCandidate,
     advance_load_state,
+    build_shed_candidates,
     effective_max_running,
     pause_policy_for_load,
     pressure_is_clear,
@@ -108,6 +111,23 @@ def test_shed_priority_is_blocked_idle_detached_then_active() -> None:
 
     assert ranked[:2] == ["h:blocked:0.0", "h:no-goal:0.0"]
     assert ranked[2:] == ["h:idle:0.0", "h:detached-old:0.0", "h:detached-new:0.0", "h:active:0.0"]
+
+
+def test_load_shed_does_not_treat_opencode_as_a_claude_pause_target() -> None:
+    goal = _goal("h:opencode:0.0")
+    activity = LaneActivity(
+        session_ref=goal.session_ref,
+        pane_id="%1",
+        last_change_at="2026-07-14T12:00:00+00:00",
+        last_seen_at="2026-07-14T12:00:00+00:00",
+        attached=True,
+        backend="opencode",
+    )
+
+    assert build_shed_candidates([goal], activities=[activity], registry=[], host="h") == []
+
+    registry = [RegistryEntry(tmux_session="opencode", session_id="s1", kind="opencode", account="", updated_at="")]
+    assert build_shed_candidates([goal], activities=[], registry=registry, host="h") == []
 
 
 def test_load_caps_override_usage_baseline_and_l3_uses_tighter_graceful_deadlines() -> None:

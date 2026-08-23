@@ -63,6 +63,53 @@ Reads usage snapshots and policy thresholds, then outputs:
 - pause_threshold_pct: 92.0
 - account: account name
 
+### export — Publish this host's usage to the shared fleet tree
+
+```bash
+chitra-usage export \
+  --fleet-dir /opt/opshome/scratch/temp-twinridge/fleet-monitor/usage \
+  --dir /var/lib/chitra/usage \
+  --codex-bin codex
+```
+
+Reads both backends locally, evaluates them against local policy, and writes
+one file per backend into `<fleet-dir>/<host>/`:
+
+- `<fleet-dir>/<host>/claude.json`
+- `<fleet-dir>/<host>/codex.json`
+- `<fleet-dir>/<host>/history/<backend>-<YYYYMMDDHH>.json` (pruned to 7 days)
+
+Each file is a `chitra.usage-export.v1` document carrying percentages, reset
+times, an account identity, and a verdict. It never carries a provider token,
+so it is safe to publish onto a shared filesystem the monitor can read.
+
+A backend that cannot be read still gets a file, with `verdict: unknown` and
+the reason in `error`. That is deliberate: a broken read must stay
+distinguishable from a host that runs no lane on that backend.
+
+Run it from a systemd timer every 15 minutes.
+
+### evaluate --fleet-dir — Read every host's usage
+
+```bash
+chitra-usage evaluate \
+  --fleet-dir /opt/opshome/scratch/temp-twinridge/fleet-monitor/usage \
+  --stale-after-seconds 1800
+```
+
+Prints one JSON line per host and backend. Verdicts:
+
+| Verdict | Meaning |
+|---------|---------|
+| `ok` / `approaching` / `pause` | The host's own evaluation of a fresh reading. |
+| `unknown` | The host wrote a file but could not read that backend; see `error`. |
+| `stale-export` | The file is older than the ceiling. The export timer on that host is an incident. |
+| `missing-export` | The host directory exists but that backend was never exported. |
+| `invalid-export` | The file is unreadable or off-contract. |
+
+The last three are faults to raise, not gaps to ignore. Silence about a host's
+usage is what let a Codex lane sit dead on a weekly cap for two days.
+
 ### policy — Show policy thresholds
 
 ```bash

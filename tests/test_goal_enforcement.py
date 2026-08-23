@@ -1,21 +1,42 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from chitra.goal_enforcement import (
+    REVIEWER_ATTEMPTS,
+    REVIEWER_SYSTEM_PROMPT,
     ClaudeProcessReviewer,
+    FrozenGoal,
     GoalReviewError,
+    ReviewerProcessError,
     ReviewerVerdict,
     ReviewFinding,
     WatchedSessionBehavior,
     freeze_goal,
     review_watched_session,
+    unwrap_json_object,
 )
 from chitra.goals import GoalRecord, get_goal, redirect_goal, upsert_goal
+
+
+def _request_from_prompt(prompt: str) -> dict[str, object]:
+    """Read the payload back exactly the way the deployed wrapper reads it.
+
+    `chitra_adapter/bin/chitra-watchd-reviewer` recovers the payload with
+    `prompt.rsplit("\\nINPUT=", 1)[1]` and parses that as JSON. Every test here
+    parses it the same way on purpose. When the tests used their own marker
+    instead, the prompt drifted away from the wrapper and no test noticed.
+    """
+    marker = "\nINPUT="
+    assert marker in prompt
+    request = json.loads(prompt.rsplit(marker, 1)[1])
+    assert isinstance(request, dict)
+    return request
 
 
 def _goal(root: Path) -> GoalRecord:
@@ -70,7 +91,7 @@ def test_initial_round_requires_unanimous_isolated_acceptance(tmp_path: Path) ->
     assert (tmp_path / "goal_reviews.jsonl").exists()
 
 
-def test_frozen_goal_uses_immutable_enrollment_condition_after_redirect(tmp_path: Path) -> None:
+def test_frozen_goal_uses_redirect_refreshed_enrollment_condition(tmp_path: Path) -> None:
     enrolled = _goal(tmp_path)
     redirected = redirect_goal(
         tmp_path,
@@ -81,7 +102,8 @@ def test_frozen_goal_uses_immutable_enrollment_condition_after_redirect(tmp_path
 
     frozen = freeze_goal(redirected)
 
-    assert frozen.done_when == enrolled.done_when
+    assert frozen.done_when == redirected.done_when
+    assert frozen.done_when != enrolled.done_when
 
 
 def test_initial_round_can_be_configured_to_one_reviewer(tmp_path: Path) -> None:
@@ -156,6 +178,225 @@ def test_tampered_reviewer_binding_fails_closed(tmp_path: Path) -> None:
         review_watched_session(tmp_path, goal.session_ref, behavior, reviewer=TamperedReviewer())
 
 
+@pytest.mark.parametrize(
+    ("packaged", "expected"),
+    [
+        ('{"a": 1}', '{"a": 1}'),
+        ('```json\n{"a": 1}\n```', '{"a": 1}'),
+        ('```\n{"a": 1}\n```', '{"a": 1}'),
+        ('Here is the verdict:\n{"a": 1}\n', '{"a": 1}'),
+        ("not json at all", "not json at all"),
+    ],
+)
+def test_reviewer_reply_packaging_is_removed_before_the_verdict_is_read(packaged: str, expected: str) -> None:
+    assert unwrap_json_object(packaged) == expected
+
+
+def test_a_fenced_reviewer_verdict_is_accepted(tmp_path: Path) -> None:
+    """A correct verdict must not be lost to a code fence.
+
+    A lost verdict is not harmless: watchd turns an unavailable review into a
+    blocked status and an ask to review the session by hand, so a correct review
+    of healthy work became a false blocker.
+    """
+    goal = freeze_goal(_goal(tmp_path))
+    behavior = WatchedSessionBehavior.from_turn(goal.session_ref, "Continuing against the recorded goal.")
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        request = _request_from_prompt(command[2])
+        verdict = ReviewerVerdict(
+            reviewer_id=request["reviewer_id"],
+            goal_contract_id=request["frozen_goal"]["contract_id"],
+            behavior_sha256=request["watched_session_behavior"]["behavior_sha256"],
+            verdict="accept",
+        ).model_dump_json()
+        return subprocess.CompletedProcess(command, 0, f"```json\n{verdict}\n```", "")
+
+    assert ClaudeProcessReviewer(runner=runner).review(goal, behavior, "reviewer-a").verdict == "accept"
+
+
+def test_unwrapping_never_rescues_a_verdict_that_breaks_its_contract(tmp_path: Path) -> None:
+    """Tolerating packaging must not tolerate a wrong verdict."""
+    goal = freeze_goal(_goal(tmp_path))
+    behavior = WatchedSessionBehavior.from_turn(goal.session_ref, "Continuing against the recorded goal.")
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, '```json\n{"reviewer_id": "reviewer-a", "verdict": "accept"}\n```', "")
+
+    with pytest.raises(ReviewerProcessError, match="invalid JSON"):
+        ClaudeProcessReviewer(runner=runner).review(goal, behavior, "reviewer-a")
+
+
+def test_the_reviewer_process_is_granted_no_tools_and_no_memory(tmp_path: Path) -> None:
+    goal = freeze_goal(_goal(tmp_path))
+    behavior = WatchedSessionBehavior.from_turn(goal.session_ref, "Continuing against the recorded goal.")
+    commands: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        request = _request_from_prompt(command[2])
+        output = ReviewerVerdict(
+            reviewer_id=request["reviewer_id"],
+            goal_contract_id=request["frozen_goal"]["contract_id"],
+            behavior_sha256=request["watched_session_behavior"]["behavior_sha256"],
+            verdict="accept",
+        ).model_dump_json()
+        return subprocess.CompletedProcess(command, 0, output, "")
+
+    ClaudeProcessReviewer(runner=runner).review(goal, behavior, "reviewer-a")
+    command = commands[0]
+    assert "--no-session-persistence" in command
+    assert command[command.index("--allowed-tools") + 1] == ""
+
+
+def _verdict_json(command: list[str]) -> str:
+    request = _request_from_prompt(command[2])
+    return ReviewerVerdict(
+        reviewer_id=request["reviewer_id"],
+        goal_contract_id=request["frozen_goal"]["contract_id"],
+        behavior_sha256=request["watched_session_behavior"]["behavior_sha256"],
+        verdict="accept",
+    ).model_dump_json()
+
+
+def _behavior(goal: FrozenGoal) -> WatchedSessionBehavior:
+    return WatchedSessionBehavior.from_turn(goal.session_ref, "Continuing against the recorded goal.")
+
+
+def test_the_reviewer_replaces_the_host_system_prompt(tmp_path: Path) -> None:
+    """An operator-installed output style must not change the shape of a verdict.
+
+    Measured on tophand: with the ambient system prompt in place the reviewer
+    answered in narrated prose, which fails validation and becomes a false
+    blocker. Replacing the system prompt is what stops that.
+    """
+    goal = freeze_goal(_goal(tmp_path))
+    captured: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(command)
+        return subprocess.CompletedProcess(command, 0, _verdict_json(command), "")
+
+    ClaudeProcessReviewer(runner=runner).review(goal, _behavior(goal), "reviewer-a")
+    command = captured[0]
+    assert command[command.index("--system-prompt") + 1] == REVIEWER_SYSTEM_PROMPT
+
+
+def test_prompt_payload_matches_the_deployed_wrapper_contract(tmp_path: Path) -> None:
+    """The prompt must stay readable by the wrapper that runs the reviewer.
+
+    In the fleet the reviewer is not run directly. `chitra-watchd-reviewer`
+    runs it, and that wrapper recovers the reviewer id and the two content
+    bindings by splitting the prompt on "\\nINPUT=" and parsing the rest as
+    JSON. The prompt once wrapped the payload in tags instead, so the wrapper
+    refused every review with "reviewer prompt does not contain INPUT" before
+    any model was called. The only production review record the fleet has ever
+    written carries exactly that error, and it marked a clean completion as
+    blocked. No test held the prompt to the reader's shape, so nothing caught
+    it. This test is that hold.
+    """
+    goal = freeze_goal(_goal(tmp_path))
+    behavior = _behavior(goal)
+    captured: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(command)
+        return subprocess.CompletedProcess(command, 0, _verdict_json(command), "")
+
+    ClaudeProcessReviewer(runner=runner).review(goal, behavior, "reviewer-a")
+    prompt = captured[0][2]
+
+    marker = "\nINPUT="
+    assert marker in prompt, "the wrapper fails outright when the marker is absent"
+    payload = prompt.rsplit(marker, 1)[1]
+    request = json.loads(payload)
+    assert payload == payload.strip(), "nothing may follow the payload"
+    assert request["reviewer_id"] == "reviewer-a"
+    assert request["frozen_goal"]["contract_id"] == goal.contract_id
+    assert request["watched_session_behavior"]["behavior_sha256"] == behavior.behavior_sha256
+
+
+def test_the_prompt_never_points_at_a_section_it_does_not_contain(tmp_path: Path) -> None:
+    """Directing the reviewer to a section that is not there invites a bad reply.
+
+    Moving the payload out of an <input> section left three instructions still
+    telling the reviewer to read fields "in <input>", a section the prompt no
+    longer had. This holds every section the prompt names to one it opens and
+    closes.
+    """
+    goal = freeze_goal(_goal(tmp_path))
+    captured: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(command)
+        return subprocess.CompletedProcess(command, 0, _verdict_json(command), "")
+
+    ClaudeProcessReviewer(runner=runner).review(goal, _behavior(goal), "reviewer-a")
+    prompt = captured[0][2]
+
+    named = set(re.findall(r"<([a-z_]+)>", prompt))
+    closed = set(re.findall(r"</([a-z_]+)>", prompt))
+    assert named == closed, f"the prompt names sections it never opens or closes: {named ^ closed}"
+
+
+def test_an_unusable_reply_is_retried_because_the_failure_is_intermittent(tmp_path: Path) -> None:
+    """Measured three valid replies in seven attempts on identical input."""
+    goal = freeze_goal(_goal(tmp_path))
+    calls: list[int] = []
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(1)
+        if len(calls) < 3:
+            return subprocess.CompletedProcess(command, 0, '{"ok":true}', "")
+        return subprocess.CompletedProcess(command, 0, _verdict_json(command), "")
+
+    assert ClaudeProcessReviewer(runner=runner).review(goal, _behavior(goal), "reviewer-a").verdict == "accept"
+    assert len(calls) == 3
+
+
+def test_an_unusable_reply_still_fails_closed_once_the_attempts_run_out(tmp_path: Path) -> None:
+    goal = freeze_goal(_goal(tmp_path))
+    calls: list[int] = []
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(1)
+        return subprocess.CompletedProcess(command, 0, '{"ok":true}', "")
+
+    with pytest.raises(ReviewerProcessError, match=f"all {REVIEWER_ATTEMPTS} attempts"):
+        ClaudeProcessReviewer(runner=runner).review(goal, _behavior(goal), "reviewer-a")
+    assert len(calls) == REVIEWER_ATTEMPTS
+
+
+def test_the_attempt_budget_is_the_one_the_measurement_supports() -> None:
+    """Measured on tophand 2026-08-17 over 15 runs of the real review path.
+
+    Those runs needed 21 attempts, of which 8 replies were unusable, so a single
+    reply is unusable about 38% of the time. At three attempts that leaves about
+    5% of reviews failing closed, and one of the 15 did exactly that and became a
+    false blocker. Five attempts put the same arithmetic near one in 125.
+    """
+    assert REVIEWER_ATTEMPTS == 5
+
+
+def test_a_process_that_exits_non_zero_is_not_retried(tmp_path: Path) -> None:
+    """Only the intermittent failure is retried; a broken process fails at once."""
+    goal = freeze_goal(_goal(tmp_path))
+    calls: list[int] = []
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(1)
+        return subprocess.CompletedProcess(command, 1, "", "the model was unavailable")
+
+    with pytest.raises(ReviewerProcessError, match="the model was unavailable"):
+        ClaudeProcessReviewer(runner=runner).review(goal, _behavior(goal), "reviewer-a")
+    assert len(calls) == 1
+
+
+def test_a_non_positive_attempt_count_is_refused() -> None:
+    with pytest.raises(ValueError, match="attempts must be a positive integer"):
+        ClaudeProcessReviewer(attempts=0)
+
+
 def test_claude_reviewer_uses_a_fresh_process_and_only_watched_behavior_context(tmp_path: Path) -> None:
     goal = freeze_goal(_goal(tmp_path))
     behavior = WatchedSessionBehavior.from_turn(goal.session_ref, "Can I redirect this work to an unrelated deploy?")
@@ -164,7 +405,7 @@ def test_claude_reviewer_uses_a_fresh_process_and_only_watched_behavior_context(
     def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         commands.append(command)
         prompt = command[2]
-        request = json.loads(prompt.split("<input>\n", 1)[1].rsplit("\n</input>", 1)[0])
+        request = _request_from_prompt(prompt)
         output = ReviewerVerdict(
             reviewer_id=request["reviewer_id"],
             goal_contract_id=request["frozen_goal"]["contract_id"],

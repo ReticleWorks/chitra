@@ -1,8 +1,6 @@
-"""The single rendered declaration shared by every Chitra daemon.
+"""The single rendered identity declaration shared by every Chitra daemon.
 
-The manifest describes lane identity and ownership only.  It deliberately has
-no model or prompt-selection field: the operator chooses the model when the
-interactive session starts.
+Models remain launch-time choices, never mutable manifest identity.
 """
 
 from __future__ import annotations

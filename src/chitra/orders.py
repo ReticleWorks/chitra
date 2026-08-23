@@ -136,5 +136,10 @@ class DispatchResult(BaseModel):
     routing_hint: str | None = None
     task_type: str | None = None
     resolved_zdr: bool = False
+    # A SENT result can be durable before the signed delivery ledger is
+    # available so a ledger outage never causes a second paste. Such a result
+    # remains in in_flight/ until dispatchd flips this proof bit and moves the
+    # order to processed/.
+    delivery_ledger_verified: bool = False
     decision_attestation_id: str | None = None
     at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())

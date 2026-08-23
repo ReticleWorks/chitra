@@ -1,8 +1,285 @@
 # Changelog
 
+## 0.9.11
+
+- Normalize canonical remote pane targets at the governed grant boundary and
+  fail closed when pane fallback sees the steer text still in an agent's
+  composer instead of consumed into the transcript.
+
+## 0.9.10
+
+- Preserve watchd's per-idle-period edge semantics through triaged: each new
+  `IDLE` event reaches `queue.tsv` and `flags.log` even when its stable payload
+  is byte-identical to an earlier idle period.
+
+## 0.9.9
+
+- Route remote governed-lane capture and steering through the fixed codexman
+  SSH grant verbs, allowing the draft guard to recognize the Codex 0.147 empty
+  composer without granting raw remote tmux execution.
+
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
-## [Unreleased]
+## [0.12.2] - 2026-08-17
+
+The merge daemon is being turned on for the first time, on one host. This
+carries what it needs to be safe there.
+
+### Fixed
+
+- A token command the merge daemon cannot use now fails the unit instead of
+  being logged and slept off. It would otherwise loop for days merging nothing
+  while every reading systemd can take said it was running. The unit takes its
+  environment file with no dash for exactly this reason, and minting the token
+  per merge had moved the credential out of that file, leaving the guard
+  checking an empty room.
+- The reviewer's second model prompt is held to the framing that broke the
+  first, so the same regression cannot come back through the other path.
+
+## [0.12.1] - 2026-08-17
+
+Turn-end review has never completed a single review anywhere in the fleet. The
+last reason is fixed here, and it does not reach the monitor until this ships.
+
+### Fixed
+
+- The reviewer prompt could not be read by the wrapper that runs it. In the
+  fleet the reviewer is not run directly: `chitra-watchd-reviewer` runs it, and
+  that wrapper recovers the reviewer identifier and the two content bindings by
+  splitting the prompt on a newline followed by `INPUT=`. The prompt wrapped its
+  payload in tags instead, so the wrapper refused before a model was ever
+  called, and watchd turned the refusal into a blocked session. The only
+  turn-end review record the fleet has ever written says exactly that, and it
+  marked a clean completion as blocked. Every reviewer test read the payload
+  back with its own marker rather than the wrapper's, which is why the suite
+  stayed green while the gate could not run once.
+- Three instructions in that same prompt still told the reviewer to read its
+  fields "in `<input>`" after the payload moved out of that section, so they
+  pointed at nothing. A test now holds every section the prompt names to one it
+  opens and closes.
+
+## [0.12.0] - 2026-08-17
+
+Every automatic behaviour gets a manual verb, and a daemon that merges a lane's
+green work without waiting for a person. Five lanes stalled at once on
+2026-08-16, each waiting on someone to merge its own passing pull request.
+
+### Added
+
+- `chitra-failover evaluate`, `chitra-failover run --lane`, and
+  `chitra-failover resume` — the pause and resume decisions as commands anyone
+  can run. Auto mode is the daemon calling the same verbs, so what you watch it
+  do you can do yourself, and what it refuses stays refused when you type it.
+- `chitra-merge <owner/repo> <number> [--dry-run]` merges one pull request
+  through the same decision the daemon uses. `--dry-run` prints the decision and
+  writes a ledger line without merging.
+- `polyphony-chitra-merged`, a daemon that merges verifiably green
+  lane-authored pull requests under a GitHub App identity, one at a time per
+  repository. It never reads or writes branch protection: a pull request
+  protection would refuse is one this refuses.
+- `chitra-usage evaluate --dir` now reads a host's export directory as well as a
+  local snapshot directory.
+
+### Changed
+
+- The merge decision refuses on more than gate state. A bot author is refused,
+  and so is a pull request nobody has touched in 24 hours. Both come from real
+  merges an interim auto-merger made overnight: five dependency-bot pull
+  requests including a 1.28.1 to 2.0.0 major bump, and one that had been open
+  about five days. Green says a change is mechanically safe to land. It cannot
+  say whose work it is or whether anyone still wants it.
+- The hold brake honours `hold` as well as `chitra-hold`. It was wired only to a
+  label ReticleWorks repositories do not apply, so it stopped nothing.
+
+### Fixed
+
+- `chitra-usage evaluate` could not read the exports `chitra-usage export`
+  writes. It demanded `chitra.usage.v1` and the exporter publishes
+  `chitra.usage-export.v1`, so a correct pause verdict was thrown away
+  overnight while the monitor reported nothing wrong.
+- The merge identity check called `/user`, which an installation token cannot
+  call. The daemon could never have merged anything. Every test passed, because
+  every fixture agreed with the wrong assumption.
+- The ledger recorded the verified head as the merge commit, naming a sha that
+  is not on the base branch. A squash merge creates a new commit, and both are
+  now read back after the merge.
+- The merge token is minted per call and passed by environment rather than
+  stored, so it cannot expire mid-run or land in a process listing.
+- Ten tests measured the host they ran on rather than the code. Three named a
+  real fleet host as the *remote* host, so on that machine they took the local
+  path and stopped testing what they were named for. One of those reached a
+  live tmux pane belonging to another lane. Six wrote state files without a
+  mode and failed wherever the umask is 002.
+
+## [0.11.0] - 2026-08-16
+
+Rate-limit visibility and failover. A Codex lane hit its weekly hard cap around
+2026-08-14 and sat dead for roughly two days: the monitor had no reading for
+that host, and a capped pane classified as idle.
+
+### Added
+
+- `chitra-usage export` writes a token-free `chitra.usage-export.v1` file per
+  host and backend into a shared directory, so a host publishes its own usage
+  rather than being reached into. The file carries percentages, reset times, an
+  account identity and a verdict, never a provider token.
+- `chitra-usage evaluate --fleet-dir` reads every host's exports and returns one
+  verdict per host and backend. A reading that is missing, old, or unreadable
+  becomes its own named verdict — `missing-export`, `stale-export`,
+  `invalid-export` — instead of silence.
+- Two agent states, `rate_limited_hard` and `rate_limited_warn`, with banner
+  signatures for Codex quoted from a real capped lane's transcript. A matched
+  rate-limit rule is never overridden, because a capped pane still draws its
+  input row and would otherwise read as idle. The resume time is parsed onto the
+  event, since the banner scrolls away.
+- Separate Codex thresholds (`codex_pause_5h_pct`, `codex_pause_weekly_pct`,
+  `codex_warn_5h_pct`, `codex_warn_weekly_pct`) and an `auto_transfer` policy
+  knob. The Codex weekly pause sits at 90 against Claude's 95: that window is a
+  hard cap with a multi-day reset, so margin is cheaper than dead time.
+- `chitra-goals transfer` holds a capped lane and scaffolds its successor on the
+  other backend under one lock, copying the strategic fields verbatim. It starts
+  nothing; `chitra-goals check` still gates launch.
+- Transcript-pipe liveness in watchd: a governed lane whose pipe is unarmed,
+  whose transcript is absent, or whose transcript has stopped growing while the
+  pane changes is reported, and `triaged` raises it as CRIT.
+
+### Changed
+
+- Goals documents are written as `chitra.goals.v2`, adding `successor_of` and
+  `transferred_to`. The bump is additive and v1 documents still load, so a host
+  that has not upgraded keeps working.
+- Codex usage windows are identified by their reset horizon rather than by the
+  slot the provider used. Measured 2026-08-16, a capped account reported its
+  weekly cap in the `primary` slot with `secondary` null, so a weekly threshold
+  keyed on the slot name would never have fired.
+
+### Fixed
+
+- `lane_anchor.start_lane` arms `tmux pipe-pane` on both the create and the
+  already-running paths. It previously armed it nowhere, and its early return
+  for an existing session did nothing at all — which is the respawn path that
+  left a lane unrecorded for twenty-five hours.
+- The ownership provider follows the goals schema instead of pinning one
+  version, and carries the new record fields. Pinned to `chitra.goals.v1` it
+  would have refused every v2 document and answered non-authoritative
+  `unknown`, continuing to run while knowing nothing.
+
+## [0.10.2] - 2026-08-14
+
+### Fixed
+
+- Delay governed launch receipts until the new tmux session survives its
+  startup window. An agent that exits during startup now returns temporary
+  failure code 75 without writing a false-success receipt, so callers can
+  retry that one failure class safely.
+- Recognize tmux's `can't find session` response as an inactive lane during
+  status and stop operations.
+
+## [0.10.1] - 2026-08-14
+
+### Fixed
+
+- Pass Chitra's resolved package root into each governed tmux pane, so the
+  supervised agent starts from an immutable target install without a host-wide
+  Python path shim.
+
+## [0.10.0] - 2026-08-14
+
+### Added
+
+- A deterministic semantic agent-status broker with authoritative integration
+  reports, local and bundled TOML screen manifests, strict blocked rules, and
+  evidence-rich explain output.
+- A mode-`0600` newline-delimited JSON socket with correlated request IDs,
+  typed status subscriptions, bounded event predicates, blocking semantic
+  waits, and a self-describing JSON Schema document.
+- Governed lanes now inject `CHITRA_LANE_ID`, `CHITRA_SESSION_REF`,
+  `CHITRA_PANE_ID`, `CHITRA_PANE_TARGET`, and `CHITRA_SOCKET_PATH` into the
+  agent process.
+- A validate, switch, and commit live-handoff protocol transfers Watchd's
+  status state and socket ownership while tmux keeps pane processes running.
+
+### Changed
+
+- **Breaking:** Watchd no longer treats pane-content hashes, a fixed active
+  regular expression, or an unchanged input row as semantic status. It emits
+  `AGENT_STATUS` transitions from lifecycle reports or manifests instead.
+  Operators must ship compatible manifest provisioning and lifecycle hooks
+  with the package update; see `docs/watchd-status-migration.md`.
+
+### Fixed
+
+- Anchor screen-derived blockers to live bottom controls, use exact answer
+  tokens, and let a live working footer suppress stale prompt text.
+- Bound `agent.wait` by default, align the CLI timeout, and reap wait and
+  subscription handlers when clients disconnect.
+- Recover verified stale crash sockets while continuing to refuse a socket
+  held by a live server.
+- Validate handoff state before broker mutation, keep the replacement alive
+  after commit, and inject supervised identity with `tmux new-session -e`.
+
+## [0.9.8] - 2026-08-13
+
+### Fixed
+- Sweepd accepts every severity documented for `flags.log` (`CRIT` and
+  `IDLE`), preventing an idle event emitted by triaged from crashing the
+  sweep daemon. Mixed-severity and triaged-to-sweepd regression coverage keeps
+  the producer and consumer wire formats compatible.
+
+## [0.9.7] - 2026-08-13
+
+### Fixed
+- Watchd clears its per-pane IDLE guard when raw pane content changes or the
+  pane leaves the input row, so each new idle period emits one IDLE event.
+
+## [0.9.6] - 2026-08-13
+
+### Changed
+- Reserved the next package version for the fleet dispatchd unit correction
+  that preserves the shared worker tmux runtime directory across restarts.
+
+## [0.9.5] - 2026-08-13
+
+### Added
+- Watchd accepts an explicit tmux socket from `--tmux-socket` or
+  `CHITRA_WATCHD_TMUX_SOCKET`, plus exact session-name and prefix filters.
+- An unchanged Claude or Codex input row emits one configurable `IDLE` event.
+  Triaged writes it to `queue.tsv` with severity `IDLE` and to `flags.log`
+  with an `IDLE` prefix for bounded monitor consumption.
+
+## [0.9.4] - 2026-08-13
+
+### Changed
+- Governed Claude and Codex lane launches now carry an explicit effort into
+  the agent command and the `chitra.lane-launch.v1` receipt.
+- A gateway already running as the declared lane account launches directly,
+  without an unnecessary privileged `runuser` hop.
+- Trinity is accepted as the second sanctioned governed lane host, with the
+  same host-qualified goal gate used by Tophand.
+
+## [0.9.3] - 2026-08-13
+
+### Added
+- An append-only `chitra-decisions` log for consequential monitor decisions. Every entry records the time, decision, basis, citation, and authority.
+- Explicit `moot` and `superseded` outcomes for operator conversation threads, with a required basis, citation, and authority.
+- Durable ask-retirement history, including the `retired-by-monitor-with-cited-basis` state.
+
+### Changed
+- Monitor-authored operator briefs, decisions, and retirement reasons now apply deterministic plain-English checks at write time. The checks reject unexplained internal jargon, bare codenames, and sentence fragments. They never gate or rewrite spawned work-session reports, evidence files, transcripts, pull-request text, citations, or verbatim asks.
+
+## [0.9.2] - 2026-08-13
+
+### Added
+- A governed Tophand tmux-lane launcher with complete goal-ingestion gating,
+  frozen lane/goal receipts, Claude Sonnet/Opus and Codex model selection,
+  usage-pause refusal, and lifecycle-parity documentation.
+
+### Fixed
+- Codex's `Ask Codex to do anything` composer ghost suggestion is recognized
+  as an idle placeholder instead of an unsubmitted operator draft.
+- Lane status read failures report UNKNOWN instead of false inactivity.
+
+## [0.9.1] - 2026-08-10
 
 ### Added
 - A PR security review gate, `chitra.pr_review` / `chitra.pr_reviewd` (new `chitra-pr-review`
