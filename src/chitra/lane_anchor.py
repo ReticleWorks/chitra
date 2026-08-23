@@ -14,7 +14,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from chitra._fsio import write_json_atomic
-from chitra.goals import RATE_LIMIT_HOLD_REASON_PREFIX, GoalRecord, check_specification, get_goal
+from chitra.goals import RATE_LIMIT_HOLD_REASON_PREFIX, GoalRecord, check_specification, get_goal, render_done_when_items
 from chitra.lane_config import LaneSpec, load_lanes
 from chitra.lane_selftest import (
     SELFTEST_ENV_SSH_TARGET,
@@ -88,8 +88,15 @@ def ingestion_gate(lane: LaneSpec, *, host: str = SANCTIONED_HOST) -> GoalRecord
     issues = check_specification(goal)
     if issues:
         raise LaneLaunchRefused("lane launch refused: ingestion gate failed: " + "; ".join(issues))
-    if goal.lane_id != lane.tmux_session or goal.enrolled_done_when != goal.done_when:
-        raise LaneLaunchRefused("lane launch refused: lane identity or frozen done_when snapshot does not match")
+    rendered_done_when = render_done_when_items(goal.enrolled_done_when_items)
+    if (
+        goal.interview_receipt is None
+        or not goal.enrolled_done_when_items
+        or goal.lane_id != lane.tmux_session
+        or goal.enrolled_done_when != rendered_done_when
+        or goal.done_when != rendered_done_when
+    ):
+        raise LaneLaunchRefused("lane launch refused: interview receipt, frozen done items, or lane identity does not match")
     if goal.status == "held" or goal.hold_reason.startswith(RATE_LIMIT_HOLD_REASON_PREFIX):
         raise LaneLaunchRefused("lane launch refused: usage-pause hold is active")
     try:

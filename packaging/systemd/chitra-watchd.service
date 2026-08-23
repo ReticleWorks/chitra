@@ -7,7 +7,11 @@ StartLimitIntervalSec=10min
 StartLimitBurst=5
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+# Default poll interval is 5s (CHITRA_WATCHD_INTERVAL); 3x cadence gives one
+# missed cycle of slack before systemd concludes the loop is hung and restarts it.
+WatchdogSec=15
 User=chitra
 Group=chitra
 ExecStart=/opt/chitra/venv/bin/python -m chitra.watchd --lanes-file /etc/chitra/lanes.yaml

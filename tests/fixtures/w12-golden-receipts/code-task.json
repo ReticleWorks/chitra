@@ -1,0 +1,65 @@
+{
+  "artifacts": [
+    {
+      "kind": "pvr-validation-report",
+      "path": "evidence/code-pvr-report-golden.json",
+      "sha256": "741b865ac4a0a6379f102e8dbd6b3c823fd68ec87efe4b31b02044b120a42ff9"
+    },
+    {
+      "kind": "pvr-audit-log",
+      "path": "evidence/code-pvr-audit-golden.jsonl",
+      "sha256": "a66d0098067404e9270085c2adae59411104377e135c7d963d3e50b4c92190ab"
+    }
+  ],
+  "exercise": {
+    "command": [
+      "/bin/true"
+    ]
+  },
+  "integrity": {
+    "algorithm": "sha256",
+    "canonicalization": "UTF-8 JSON; keys sorted; separators comma and colon; ensure_ascii false",
+    "digest": "e05df732ac44e690f65786964d511e73ab6febf958938cb32be4f2161eb2b4d0",
+    "hand_authored_fields": [
+      {
+        "pointer": "/receipt_name",
+        "reason": "stable item-facing name chosen for the golden example"
+      },
+      {
+        "pointer": "/integrity/canonicalization",
+        "reason": "proposed common-envelope rule, not emitted by PVR today"
+      },
+      {
+        "pointer": "/integrity/scope",
+        "reason": "proposed common-envelope rule, not emitted by PVR today"
+      }
+    ],
+    "scope": "entire receipt with /integrity/digest omitted"
+  },
+  "not_exercised": [],
+  "produced_at": "2026-08-21T14:51:49Z",
+  "receipt_name": "code-task-cli-true.pvr.v1",
+  "result": {
+    "must_gates_passed": 6,
+    "must_gates_total": 6,
+    "should_gates_met": 3,
+    "should_gates_total": 3,
+    "status": "PASS",
+    "surfaces_exercised": 3,
+    "surfaces_total": 3,
+    "validator_acceptance": true
+  },
+  "target": {
+    "artifact": {
+      "path": "/bin/true",
+      "sha256": "69851c424c4519cd11af710b69d52ddf44b929b74470a02e62e0aab227c07543"
+    }
+  },
+  "validator": {
+    "family_id": "F04",
+    "name": "Polyvalidation Rig",
+    "report_path": "evidence/code-pvr-report-golden.json",
+    "report_schema": "pvr-v2",
+    "version": "0.2.0"
+  }
+}

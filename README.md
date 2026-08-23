@@ -48,8 +48,8 @@ always-on shared daemons; the rest are periodic or ad-hoc tools.
 - `chitra.pr_review` / `chitra.pr_reviewd` (`chitra-pr-review`) — deterministic blast-radius/diff-size pre-checks plus an isolated multi-reviewer security pass over one pull request's diff, logged to a signed ledger and reported as a plain PR comment. Never merges, approves, requests changes, or fails a required check by default; see the `pr_reviewd` module docstring and `PRReviewPolicy.block_on_findings`. Stock trigger: `.github/workflows/pr-security-review.yml`.
 
 **Goals and completion**
-- `chitra.goals` — a per-lane goal store with a write-once enrolled done-condition, guarded by `flock`.
-- `chitra.goal_enforcement` / `chitra.completion_gate` / `chitra.close_gate` — review a session's completion claim against its frozen goal and cited evidence; spend, credentials, and irreversible actions stay operator-gated.
+- `chitra.goals` — a per-lane goal store with atomic interview enrollment and frozen structured done items, guarded by `flock`.
+- `chitra.goal_enforcement` / `chitra.completion_gate` / `chitra.close_gate` — require exact named, validator-bearing receipts for every frozen done item; spend, credentials, and irreversible actions stay operator-gated.
 
 **Rate limiting**
 - `chitra.usage` / `chitra.rate_limit_guard` / `chitra.account_registry` — read account usage and pause/resume lanes on provider limits or host load pressure, over a durable, crash-safe transaction. See [`docs/pause-recovery.md`](docs/pause-recovery.md).
@@ -141,8 +141,18 @@ Each entrypoint is configured with CLI flags (`--help` on any command lists them
 | `CHITRA_CLAUDE_PROJECTS` | `~/.claude/projects` | Root, or `os.pathsep`-separated list of roots, searched locally for transcript-grep delivery verification. List more than one root when a local session runs under a non-default `CLAUDE_CONFIG_DIR` (e.g. a dedicated persona/harness identity) — its transcripts live under that root's `projects/`, not the default |
 | `CHITRA_ROUTING_CONFIG` | *(unset)* | Optional `task_type` → routing-hint config; see [`docs/routing.yaml.example`](docs/routing.yaml.example) |
 | `CHITRA_POLICY_CONFIG` | *(unset)* | Optional completion-gate and dispatch policy; see [`docs/policy.yaml.example`](docs/policy.yaml.example) |
+| `CHITRA_SHARED_DIR` | `/var/lib/polyphony-chitra-coordination` | Shared advisory presence and peer inbox root. |
 
 The full set — ssh options, triage log paths, transcript globs — is documented per-command via `--help`.
+
+`chitra-presence using <instance> <resource>` appends to that instance's own
+presence file and prints peers already using the same resource. It never waits,
+claims, expires, steals, or grants authority. Use `released` to append an
+explicit release and `list` to merge all instance files. `chitra-peer say
+<instance> <text>` enqueues a real dispatch order for the named peer's session
+so `dispatchd` delivers it with its own verification receipts; `chitra-peer
+inbox` reads a non-authoritative mirror of what was asked, never proof that it
+arrived.
 
 **Routing.** A caller can tag a `DispatchOrder` with an opaque `task_type`. If a routing config is set, `dispatchd` maps that to a `routing_hint` (a model/harness preference the caller's system uses); an explicit `routing_hint` always wins. chitra carries both fields through `DispatchResult` and, for a successful delivery, the signed ledger; it does not make routing decisions beyond the configured lookup.
 

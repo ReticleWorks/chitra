@@ -128,6 +128,19 @@ _CODEX_TUI_PLACEHOLDER_HINTS: frozenset[str] = frozenset(
 # apart from a normal-intensity operator draft on a TUI input row.
 _SGR_RE = re.compile(r"\x1b\[([0-9;]*)m")
 
+# Active-turn chrome: the same "esc to interrupt" spinner text
+# ``chitra.agent_detection``'s codex.toml/claude.toml rules and
+# ``chitra.watchd``'s idle-line filter already key off. Its presence means a
+# turn is currently running; a submit fallback must never fire an ESC-shaped
+# byte sequence into a pane in that state, or it risks cancelling live work
+# instead of submitting a stale, unrelated composer row.
+_ACTIVE_TURN_CHROME_RE = re.compile(r"esc to interrupt")
+
+# The kitty keyboard protocol's CSI-u encoding of a plain Enter keypress.
+# Codex's TUI composer (kitty protocol enabled) does not treat a bare
+# ``tmux send-keys Enter`` as a submit -- see ``_send_submit_fallback``.
+_CODEX_KITTY_ENTER_SEQUENCE = "\x1b[13u"
+
 # Directive-voice guard: chitra relays instructions, it never speaks AS the
 # operator or claims the operator's authority. A nudge that attributes itself
 # to "the operator" or "the monitor", or has chitra claim to want/say/need/
@@ -432,6 +445,26 @@ def _input_row_draft_is_all_dim(raw_line: str, *, prompt_marker: str) -> bool:
     return saw_visible
 
 
+def _detect_tui_backend(captured_lines: list[str]) -> str:
+    """Return ``"codex"``, ``"claude"``, or ``"unknown"`` for one pane capture.
+
+    Reuses the same composer-row parsers ``pane_input_check`` already relies
+    on to distinguish the two TUI shapes, so backend detection never drifts
+    from idle/draft detection.
+    """
+    if _codex_tui_input_row(captured_lines) is not None:
+        return "codex"
+    if _claude_code_input_row(captured_lines) is not None:
+        return "claude"
+    return "unknown"
+
+
+def _active_turn_chrome_visible(captured_lines: list[str]) -> bool:
+    """Return True iff the pane shows a running turn ("esc to interrupt")."""
+    text = strip_terminal_controls("\n".join(str(line) for line in captured_lines))
+    return bool(_ACTIVE_TURN_CHROME_RE.search(text))
+
+
 def normalized_dispatch_text(text: str) -> str:
     """Collapse whitespace and strip terminal controls for comparison."""
     return re.sub(r"\s+", " ", strip_terminal_controls(text)).strip()
@@ -448,6 +481,25 @@ def nudge_confirmation_marker(nudge: str) -> str:
         if len(marker) >= 8:
             return marker[:160]
     return normalized_dispatch_text(nudge)[:160]
+
+
+def _composer_holds_marker(captured_lines: list[str], marker: str) -> bool:
+    """Return True iff ``marker`` is still sitting, unsubmitted, in the pane's
+    active TUI composer row.
+
+    Shared by the post-Enter submit check (fix for Codex's kitty-keyboard
+    composer not submitting on a bare ``send-keys Enter``) and
+    ``pane_capture_confirms_nudge``'s existing composer-vs-scrollback split.
+    """
+    if not marker:
+        return False
+    for row_parser in (_codex_tui_input_row, _claude_code_input_row):
+        input_row = row_parser(captured_lines)
+        if input_row is not None:
+            _input_line, draft, _raw_line = input_row
+            if marker in normalized_dispatch_text(draft):
+                return True
+    return False
 
 
 def tmux_buffer_name(nudge: str) -> str:
@@ -529,9 +581,7 @@ def capture(
     """Capture a local or remote tmux pane through ``run_on_host``."""
     if host and not is_local_host(host, local_extra) and _env("CHITRA_REMOTE_LANE_GRANT") == "codexman":
         grant_target = governed_capture_target(pane_id)
-        proc = (runner or run_cmd)(
-            ssh_command(host, f"chitra-tmux-capture {shlex.quote(grant_target)}"), timeout=8
-        )
+        proc = (runner or run_cmd)(ssh_command(host, f"chitra-tmux-capture {shlex.quote(grant_target)}"), timeout=8)
         if proc.returncode != 0:
             return []
         try:
@@ -801,6 +851,123 @@ def remote_tmux_paste_command(pane: str, nudge: str, tmux_socket: Path | None = 
 
 
 # ---------------------------------------------------------------------------
+# Verified submit (bug fix (c)): a bare ``send-keys Enter`` does not commit
+# Codex's kitty-keyboard-protocol composer -- the pasted text can sit there
+# looking delivered while no turn ever starts. After the initial Enter,
+# re-capture the pane; if the nudge is still visible in the active composer
+# row, fire one backend-appropriate submit fallback (unless a turn is
+# already running, in which case the composer text is stale/unrelated and
+# must not be touched), then re-verify the composer actually cleared.
+# ---------------------------------------------------------------------------
+
+
+def _send_submit_fallback(
+    host: str,
+    pane: str,
+    session: str,
+    backend: str,
+    *,
+    governed_remote: bool,
+    runner: TmuxRunner,
+    input_runner: TmuxInputRunner,
+    local_extra: set[str] | None,
+    tmux_socket: Path | None,
+) -> bool:
+    """Send one backend-appropriate submit fallback. Returns True iff the
+    fallback command(s) ran without error (not proof of a cleared composer --
+    the caller re-captures to verify that separately).
+    """
+    if governed_remote:
+        # The governed grant's forced-command surface exposes only
+        # ``chitra-tmux-capture`` (read) and ``chitra-lane-steer`` (write) --
+        # no raw ``tmux send-keys`` verb. Reuse the same steer transport the
+        # original paste went through to deliver the kitty-Enter bytes; every
+        # governed lane is a Codex job (codexman), so the codex fallback
+        # always applies here.
+        proc = input_runner(ssh_command(host, f"chitra-lane-steer {shlex.quote(session)}"), _CODEX_KITTY_ENTER_SEQUENCE, timeout=10)
+        return proc.returncode == 0
+    if backend == "codex":
+        proc = run_on_host(
+            host,
+            ["tmux", "send-keys", "-t", pane, "-l", _CODEX_KITTY_ENTER_SEQUENCE],
+            runner=runner,
+            local_extra=local_extra,
+            tmux_socket=tmux_socket,
+            timeout=5,
+        )
+        return proc.returncode == 0
+    # Claude Code (or an unrecognized composer shape): a bare second Enter
+    # can be swallowed for the same reason the first one was, so send a
+    # minimal non-empty payload before the follow-up Enter.
+    space = run_on_host(
+        host,
+        ["tmux", "send-keys", "-t", pane, "-l", " "],
+        runner=runner,
+        local_extra=local_extra,
+        tmux_socket=tmux_socket,
+        timeout=5,
+    )
+    if space.returncode != 0:
+        return False
+    enter = run_on_host(
+        host,
+        ["tmux", "send-keys", "-t", pane, "Enter"],
+        runner=runner,
+        local_extra=local_extra,
+        tmux_socket=tmux_socket,
+        timeout=5,
+    )
+    return enter.returncode == 0
+
+
+def ensure_nudge_submitted(
+    host: str,
+    pane: str,
+    session: str,
+    marker: str,
+    *,
+    governed_remote: bool,
+    runner: TmuxRunner,
+    input_runner: TmuxInputRunner,
+    local_extra: set[str] | None,
+    tmux_socket: Path | None,
+    lines: int = DISPATCH_CAPTURE_LINES,
+) -> tuple[bool, str]:
+    """Verify a just-pasted nudge actually submitted; fall back once if not.
+
+    Returns ``(ok, detail)``. ``ok=False`` means the composer still holds the
+    nudge after the fallback attempt -- the caller must report FAILED with
+    ``detail`` as the reason, never SENT.
+    """
+    captured = capture_dispatch_pane(host, pane, lines=lines, runner=runner, local_extra=local_extra, tmux_socket=tmux_socket)
+    if not captured or not _composer_holds_marker(captured, marker):
+        return True, "submitted: composer cleared after Enter"
+    if _active_turn_chrome_visible(captured):
+        # A turn is already running: whatever text is sitting in the
+        # composer is not this delivery waiting to be submitted (or it is a
+        # genuine race), and an ESC-shaped fallback byte into a live turn
+        # cancels it rather than submitting stale text. Never send it.
+        return True, "submitted: active-turn chrome visible, skipped fallback to avoid interrupting a running turn"
+    backend = _detect_tui_backend(captured)
+    if not _send_submit_fallback(
+        host,
+        pane,
+        session,
+        backend,
+        governed_remote=governed_remote,
+        runner=runner,
+        input_runner=input_runner,
+        local_extra=local_extra,
+        tmux_socket=tmux_socket,
+    ):
+        return False, "submit-failed-composer-still-holds-text (fallback command failed)"
+    recaptured = capture_dispatch_pane(host, pane, lines=lines, runner=runner, local_extra=local_extra, tmux_socket=tmux_socket)
+    if recaptured and _composer_holds_marker(recaptured, marker):
+        return False, "submit-failed-composer-still-holds-text"
+    return True, f"submitted: composer cleared after {backend} submit fallback"
+
+
+# ---------------------------------------------------------------------------
 # Transcript-grep verification (replaces pane-capture confirmation)
 # ---------------------------------------------------------------------------
 
@@ -884,6 +1051,91 @@ def _resolve_local_projects_roots(projects_root: Path | None) -> list[Path]:
     return [Path(part) for part in raw.split(os.pathsep) if part.strip()]
 
 
+_CONSUMPTION_EVENT_ROLES = frozenset(
+    {"assistant", "agent", "agent_message", "tool", "tool_use", "tool_result", "function_call", "function_call_output"}
+)
+_TRANSCRIPT_RECORD_ROLES = _CONSUMPTION_EVENT_ROLES | {"user", "system", "progress"}
+
+
+def _record_role(payload: object) -> str | None:
+    """Return one parsed JSONL transcript record's semantic role.
+
+    Claude Code uses top-level user/assistant types. Codex wraps messages and
+    tool events in ``payload`` under generic ``response_item``/``event_msg``
+    envelope types, so inner explicit roles and event kinds take precedence.
+    Generic envelope names never count as activity.
+    """
+    if not isinstance(payload, dict):
+        return None
+    message = payload.get("message")
+    message_role = message.get("role") if isinstance(message, dict) else None
+    nested = payload.get("payload")
+    nested_message = nested.get("message") if isinstance(nested, dict) else None
+    nested_message_role = nested_message.get("role") if isinstance(nested_message, dict) else None
+    for candidate in (
+        payload.get("role"),
+        message_role,
+        nested.get("role") if isinstance(nested, dict) else None,
+        nested_message_role,
+        nested.get("type") if isinstance(nested, dict) else None,
+        payload.get("type"),
+    ):
+        if isinstance(candidate, str) and candidate in _TRANSCRIPT_RECORD_ROLES:
+            return candidate
+    return None
+
+
+def _parse_transcript_records(text: str) -> list[tuple[str | None, str]]:
+    """Parse JSONL text into ``(role, normalized_text)`` pairs.
+
+    Lines that are not valid JSON (a torn write mid-flush, or non-JSONL
+    scrollback noise) are skipped rather than raising -- matching
+    ``chitra.lane_read.read_last_assistant_message``'s tolerance for a
+    partially-flushed transcript tail.
+    """
+    records: list[tuple[str | None, str]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload: object = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        role = _record_role(payload)
+        normalized = normalized_dispatch_text("\n".join(_json_string_values(payload)))
+        records.append((role, normalized))
+    return records
+
+
+def _structural_transcript_confirms(text: str, marker_norm: str) -> bool:
+    """Return True iff ``text`` (a JSONL transcript tail) structurally
+    confirms delivery of ``marker_norm`` in one lane transcript.
+
+    A plain substring match over raw JSONL bytes is fooled by an assistant
+    reply that merely echoes the nudge text back, or by the marker sitting
+    in scrollback with no turn ever having started. Confirmation instead
+    requires: (1) the normalized marker appears in a record whose role is
+    ``"user"`` -- chitra's tmux paste is persisted by Claude Code/Codex
+    exactly like real operator input, as a user-role record -- AND (2) at
+    least one later agent or tool record showing the turn actually started
+    (see ``_CONSUMPTION_EVENT_ROLES``). A user record with the marker but no
+    follow-up, or only a generic system/progress record, is not confirmation.
+    Both records must occur in the same transcript, so activity from another
+    lane cannot satisfy this lane's delivery proof.
+    """
+    if not marker_norm:
+        return False
+    records = _parse_transcript_records(text)
+    last_user_index: int | None = None
+    for index, (role, normalized) in enumerate(records):
+        if role == "user" and marker_norm in normalized:
+            last_user_index = index
+    if last_user_index is None:
+        return False
+    return any(role in _CONSUMPTION_EVENT_ROLES for role, _normalized in records[last_user_index + 1 :])
+
+
 def find_recent_transcript(
     marker: str,
     *,
@@ -916,7 +1168,7 @@ def find_recent_transcript(
             if now - mtime > recency_seconds:
                 continue
             tail = _read_transcript_tail(jsonl)
-            if marker_norm in normalized_dispatch_text(tail):
+            if _structural_transcript_confirms(tail, marker_norm):
                 candidates.append((mtime, jsonl))
     if not candidates:
         return None
@@ -952,7 +1204,7 @@ def _remote_transcript_grep_command(marker: str, root: str, recency_seconds: flo
     stat_command = "for f do stat -c '%Y %n' \"$f\" 2>/dev/null || stat -f '%m %N' \"$f\" 2>/dev/null; done"
     return (
         f"root={_remote_root_shell_value(root)}; "
-        f"find \"$root\" -mindepth {depth} -maxdepth {depth} -path \"$root\"/{shlex.quote(pattern)} "
+        f'find "$root" -mindepth {depth} -maxdepth {depth} -path "$root"/{shlex.quote(pattern)} '
         f"-mmin -{minutes} 2>/dev/null -exec sh -c {shlex.quote(stat_command)} sh {{}} \\;"
     )
 
@@ -963,17 +1215,10 @@ def _remote_transcript_tail_command(path: str, max_bytes: int = 262144) -> str:
 
 
 def _remote_tail_confirms_marker(tail: str, marker_norm: str) -> bool:
-    """Compare a remote JSONL tail using the local normalization semantics."""
-    if marker_norm in normalized_dispatch_text(tail):
-        return True
-    for line in tail.splitlines():
-        try:
-            record: object = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if marker_norm in normalized_dispatch_text("\n".join(_json_string_values(record))):
-            return True
-    return False
+    """Structurally confirm a remote JSONL tail (see
+    ``_structural_transcript_confirms``) using the same semantics as the
+    local implementation."""
+    return _structural_transcript_confirms(tail, marker_norm)
 
 
 def _json_string_values(value: object) -> list[str]:
@@ -1107,19 +1352,13 @@ def pane_capture_confirms_nudge(
     marker = nudge_confirmation_marker(nudge)
     if not marker:
         return False
-    captured = capture_dispatch_pane(
-        host, pane, lines=lines, runner=runner, local_extra=local_extra, tmux_socket=tmux_socket
-    )
+    captured = capture_dispatch_pane(host, pane, lines=lines, runner=runner, local_extra=local_extra, tmux_socket=tmux_socket)
     if not captured:
         return False
     # A marker visible in the active composer is an unsubmitted draft, not
     # delivery evidence.  Fail closed before considering older scrollback.
-    for row_parser in (_codex_tui_input_row, _claude_code_input_row):
-        input_row = row_parser(captured)
-        if input_row is not None:
-            _input_line, draft, _raw_line = input_row
-            if marker in normalized_dispatch_text(draft):
-                return False
+    if _composer_holds_marker(captured, marker):
+        return False
     text = normalized_dispatch_text(strip_terminal_controls("\n".join(captured)))
     return marker in text
 
@@ -1339,23 +1578,18 @@ def dispatch_to_tmux(
         )
         return _result(DispatchStatus.BLOCKED, pre_check.reason, tail_hash=pre_check.tail_hash)
 
+    governed_remote = bool(host and not is_local_host(host, local_extra) and _env("CHITRA_REMOTE_LANE_GRANT") == "codexman")
+
     # Bug fix (b): copy-mode detection + cancel, run against the actual
     # target host (local or ssh-wrapped) — checking the local tmux server
     # for a remote target's copy-mode state would report on the wrong tmux
     # server entirely.
-    governed_remote = bool(
-        host and not is_local_host(host, local_extra) and _env("CHITRA_REMOTE_LANE_GRANT") == "codexman"
-    )
-    if not governed_remote and not ensure_pane_not_in_mode(
-        pane, host=host, runner=run, local_extra=local_extra, tmux_socket=tmux_socket
-    ):
+    if not governed_remote and not ensure_pane_not_in_mode(pane, host=host, runner=run, local_extra=local_extra, tmux_socket=tmux_socket):
         return _result(DispatchStatus.BLOCKED, "blocked: pane in copy-mode and cancel failed")
 
     # Bug fix (a): paste-buffer -p.
     if is_local_host(host, local_extra):
-        proc = paste_nudge_to_local_tmux(
-            pane, order.nudge, runner=run, input_runner=run_in, tmux_socket=tmux_socket
-        )
+        proc = paste_nudge_to_local_tmux(pane, order.nudge, runner=run, input_runner=run_in, tmux_socket=tmux_socket)
         if proc.returncode != 0:
             return _result(
                 DispatchStatus.FAILED,
@@ -1372,6 +1606,32 @@ def dispatch_to_tmux(
                 DispatchStatus.FAILED,
                 proc.stderr.strip() or proc.stdout.strip() or f"remote tmux paste-buffer failed rc={proc.returncode}",
             )
+
+    # Verified submit: a bare send-keys Enter does not commit Codex's
+    # kitty-keyboard-protocol composer, so re-capture and, only if the nudge
+    # is still sitting in the active composer row, fire one
+    # backend-appropriate fallback before ever waiting on the transcript.
+    submit_marker = nudge_confirmation_marker(order.nudge)
+    submitted, submit_detail = ensure_nudge_submitted(
+        host,
+        pane,
+        session,
+        submit_marker,
+        governed_remote=governed_remote,
+        runner=run,
+        input_runner=run_in,
+        local_extra=local_extra,
+        tmux_socket=tmux_socket,
+        lines=tuning.capture_lines,
+    )
+    if not submitted:
+        logger.warning(
+            "tmux_dispatch_submit_failed",
+            session_ref=order.session_ref,
+            marker=submit_marker,
+            reason=submit_detail,
+        )
+        return _result(DispatchStatus.FAILED, submit_detail, marker=submit_marker)
 
     sleep(tuning.post_paste_wait_seconds)
 
@@ -1398,7 +1658,7 @@ def dispatch_to_tmux(
         )
         return _result(
             DispatchStatus.SENT,
-            "sent: confirmed via transcript-grep",
+            "sent: confirmed via lane transcript (user marker + subsequent agent/tool activity)",
             marker=marker,
             transcript_path=str(transcript_path) if transcript_path is not None else None,
         )
@@ -1406,7 +1666,11 @@ def dispatch_to_tmux(
     # transcript even when the send succeeded (unresolvable cwd-slug,
     # not-yet-flushed write, transcript outside the searched roots). Before
     # declaring FAILED (a false negative that erodes queue-path trust and
-    # risks a resend), fall back to the weaker-but-real pane signal.
+    # risks a resend), fall back to the weaker-but-real pane signal. Pane
+    # capture cannot tell a genuinely-started turn from a scrollback echo or
+    # an unsubmitted composer row, so it is never authoritative on its own:
+    # this reports DELIVERY_UNCONFIRMED, not SENT. dispatchd keeps the send
+    # nonce and retries transcript verification without pasting again.
     if pane_capture_confirms_nudge(
         order.nudge,
         host=host,
@@ -1417,13 +1681,13 @@ def dispatch_to_tmux(
         tmux_socket=tmux_socket,
     ):
         logger.info(
-            "tmux_dispatch_sent_pane_fallback",
+            "tmux_dispatch_delivery_unconfirmed_pane_fallback",
             session_ref=order.session_ref,
             marker=marker,
         )
         return _result(
-            DispatchStatus.SENT,
-            "sent: confirmed via pane-capture fallback (transcript unavailable)",
+            DispatchStatus.DELIVERY_UNCONFIRMED,
+            "delivery-unconfirmed: confirmed only via pane-capture fallback (transcript-grep found no marker)",
             marker=marker,
         )
     logger.info(

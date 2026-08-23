@@ -3,18 +3,222 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import secrets
+import shlex
 import sys
+from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from chitra import board
 from chitra import goals as goal_store
-from chitra._fsio import parse_iso8601
+from chitra._fsio import locked_json_store, parse_iso8601, write_json_atomic
 from chitra.artifacts import list_unreviewed_artifacts
-from chitra.close_gate import lint_done_when
+from chitra.completion_gate import CompletionEvidence
 from chitra.lane_read import extract_open_asks, read_last_assistant_message
 from chitra.policy_config import load_policy_config, resolve_guidance
 from chitra.state_paths import state_dir
+
+_DONE_ITEM_KEYS = ("id", "text", "validator", "receipt")
+
+
+def _parse_done_item_specs(specs: Sequence[str]) -> tuple[goal_store.EnrolledDoneWhenItem, ...]:
+    """Parse repeated ``--done-item`` specs into frozen done items."""
+    items: list[goal_store.EnrolledDoneWhenItem] = []
+    for position, spec in enumerate(specs, start=1):
+        fields: dict[str, str] = {}
+        try:
+            tokens = shlex.split(spec)
+        except ValueError as exc:
+            raise ValueError(f"--done-item {position} is not parsable: {exc}") from exc
+        for token in tokens:
+            key, separator, value = token.partition("=")
+            if not separator or key not in _DONE_ITEM_KEYS or key in fields:
+                raise ValueError(
+                    f"--done-item {position} has malformed token {token!r}; "
+                    f"expected one key=value per token with keys {' '.join(_DONE_ITEM_KEYS)}"
+                )
+            fields[key] = value
+        missing = [key for key in _DONE_ITEM_KEYS if key not in fields]
+        if missing:
+            raise ValueError(f"--done-item {position} is missing {', '.join(missing)}")
+        items.append(
+            goal_store.EnrolledDoneWhenItem(
+                id=fields["id"],
+                text=fields["text"],
+                validator=fields["validator"],
+                required_receipt=fields["receipt"],
+            )
+        )
+    return tuple(items)
+
+
+def _interview_nonce_path(root: Path, session_ref: str) -> Path:
+    token = hashlib.sha256(session_ref.encode("utf-8")).hexdigest()
+    return root / "goal-interviews" / f"{token}.json"
+
+
+def _set_request_sha256(args: argparse.Namespace) -> str:
+    payload = {
+        "session_ref": args.session_ref,
+        "goal": args.goal,
+        "done_when": args.done_when,
+        "done_items": list(getattr(args, "done_item", ()) or ()),
+        "source": args.source,
+        "intent": args.intent,
+        "scope": args.scope,
+        "status": args.status,
+        "now": args.now,
+        "last_verified": args.last_verified,
+        "needs": args.needs,
+        "open_asks": args.open_ask,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _interview_required(root: Path, args: argparse.Namespace) -> dict[str, object]:
+    nonce_path = _interview_nonce_path(root, args.session_ref)
+    request_sha256 = _set_request_sha256(args)
+    with locked_json_store(nonce_path):
+        persisted: dict[str, Any] = {}
+        try:
+            loaded = json.loads(nonce_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                persisted = loaded
+        except FileNotFoundError:
+            pass
+        if persisted.get("request_sha256") != request_sha256 or not isinstance(persisted.get("nonce"), str):
+            receipt_name = "interview:" + hashlib.sha256(args.session_ref.encode("utf-8")).hexdigest()[:16]
+            persisted = {
+                "type": "INTERVIEW_NONCE",
+                "session_ref": args.session_ref,
+                "nonce": secrets.token_urlsafe(24),
+                "receipt_name": receipt_name,
+                "request_sha256": request_sha256,
+                "created_at": datetime.now(UTC).isoformat(),
+                "consumed_at": "",
+            }
+            write_json_atomic(nonce_path, persisted)
+    return {
+        "type": "INTERVIEW_REQUIRED",
+        "session_ref": args.session_ref,
+        "nonce": persisted["nonce"],
+        "receipt_name": persisted["receipt_name"],
+        "questions": [
+            {"id": question_id, "text": goal_store.INTERVIEW_QUESTIONS[question_id]}
+            for question_id in goal_store.INTERVIEW_QUESTION_IDS
+        ],
+    }
+
+
+def _read_nonce_record(nonce_path: Path) -> dict[str, Any] | None:
+    """Read the persisted nonce record under an already-held nonce lock."""
+    try:
+        loaded: Any = json.loads(nonce_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _parse_interview_result(root: Path, args: argparse.Namespace) -> tuple[
+    goal_store.InterviewReceipt,
+    tuple[goal_store.EnrolledDoneWhenItem, ...],
+    dict[str, str],
+    Path,
+    dict[str, Any],
+]:
+    payload = json.loads(args.interview_result.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("type") not in (None, "INTERVIEW_RESULT"):
+        raise ValueError("--interview-result must contain an INTERVIEW_RESULT JSON object")
+    nonce_path = _interview_nonce_path(root, args.session_ref)
+    nonce_record = json.loads(nonce_path.read_text(encoding="utf-8"))
+    if not isinstance(nonce_record, dict) or nonce_record.get("session_ref") != args.session_ref:
+        raise ValueError("interview nonce does not belong to this session")
+    if nonce_record.get("request_sha256") != _set_request_sha256(args):
+        raise ValueError("interview nonce does not match this set request")
+    if nonce_record.get("consumed_at"):
+        raise ValueError("interview nonce was already consumed")
+    if not secrets.compare_digest(str(payload.get("nonce", "")), str(nonce_record.get("nonce", ""))):
+        raise ValueError("interview nonce does not match")
+    supplied_receipt_name = payload.get("receipt_name")
+    if supplied_receipt_name is not None and supplied_receipt_name != nonce_record.get("receipt_name"):
+        raise ValueError("interview receipt name does not match the issued name")
+
+    raw_answers = payload.get("answers")
+    normalized_answers: dict[str, dict[str, str]] = {}
+    if isinstance(raw_answers, list):
+        for entry in raw_answers:
+            if not isinstance(entry, dict):
+                raise ValueError("interview answers must be objects")
+            question = entry.get("question", entry.get("id"))
+            if not isinstance(question, str):
+                raise ValueError("interview answer question must be a string")
+            normalized_answers[question] = {
+                "answer": str(entry.get("answer", "")),
+                "provenance": str(entry.get("provenance", "")),
+            }
+    elif isinstance(raw_answers, dict):
+        for question, entry in raw_answers.items():
+            if not isinstance(question, str) or not isinstance(entry, dict):
+                raise ValueError("interview answers must map question ids to objects")
+            normalized_answers[question] = {
+                "answer": str(entry.get("answer", "")),
+                "provenance": str(entry.get("provenance", "")),
+            }
+    else:
+        raise ValueError("interview result answers must contain all four typed answers")
+
+    if set(normalized_answers) != set(goal_store.INTERVIEW_QUESTION_IDS):
+        raise ValueError("interview result must answer exactly intent, done_when, out_of_scope, and constraints")
+    ordered_answers: list[dict[str, str]] = []
+    for question in goal_store.INTERVIEW_QUESTION_IDS:
+        entry = normalized_answers[question]
+        if not entry["answer"].strip():
+            raise ValueError(f"interview answer for {question!r} must be non-empty")
+        provenance = entry["provenance"].strip()
+        if not provenance.startswith(("operator:", "source:")) or not provenance.partition(":")[2].strip():
+            raise ValueError(f"interview answer for {question!r} requires operator: or source: provenance")
+        ordered_answers.append({"question": question, "answer": entry["answer"].strip(), "provenance": provenance})
+
+    raw_items = payload.get("enrolled_done_when_items", payload.get("done_when_items"))
+    done_item_specs = _parse_done_item_specs(args.done_item)
+    if done_item_specs:
+        items = done_item_specs
+    else:
+        if not isinstance(raw_items, list):
+            raise ValueError("interview result enrolled_done_when_items must be a list")
+        try:
+            items = tuple(goal_store.EnrolledDoneWhenItem(**item) for item in raw_items if isinstance(item, dict))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid enrolled done item: {exc}") from exc
+        if len(items) != len(raw_items):
+            raise ValueError("interview result done items must be objects")
+        if not items:
+            raise ValueError("interview result enrolled_done_when_items must contain at least one item")
+    answers_sha256 = hashlib.sha256(
+        json.dumps(ordered_answers, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    receipt = goal_store.InterviewReceipt(
+        name=str(nonce_record["receipt_name"]),
+        completed_at=datetime.now(UTC).isoformat(),
+        answers_sha256=answers_sha256,
+        provenance=tuple(entry["provenance"] for entry in ordered_answers),
+    )
+    answer_values = {entry["question"]: entry["answer"] for entry in ordered_answers}
+    return receipt, items, answer_values, nonce_path, nonce_record
+
+
+def _load_completion_evidence(path: Path | None) -> tuple[CompletionEvidence, ...]:
+    if path is None:
+        return ()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError("--completion-evidence must contain a JSON list")
+    return tuple(CompletionEvidence.model_validate(item) for item in payload)
 
 
 def _print_record(record: goal_store.GoalRecord) -> None:
@@ -33,13 +237,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add_root(set_command)
     set_command.add_argument("--session-ref", required=True)
     set_command.add_argument("--goal", required=True)
-    set_command.add_argument("--done-when", required=True)
+    set_command.add_argument("--done-when", default="", help="Display-only proposal; interviewed done items become the stored value.")
+    set_command.add_argument(
+        "--done-item",
+        action="append",
+        default=[],
+        metavar="ID=<id> TEXT=<...> VALIDATOR=<registry-name> RECEIPT=<name>",
+        help=(
+            "Structured frozen done condition for a new enrollment; repeat once per item. "
+            "Quote values containing spaces. Free-text --done-when is refused on a new record."
+        ),
+    )
     set_command.add_argument("--source", required=True)
     set_command.add_argument("--intent", default=None)
     set_command.add_argument("--scope", default=None)
     set_command.add_argument("--status", choices=goal_store.GOAL_STATUSES, default="working")
     set_command.add_argument("--now", default="")
     set_command.add_argument("--last-verified", default="")
+    set_command.add_argument("--interview-result", type=Path)
+    set_command.add_argument(
+        "--migrate",
+        action="store_true",
+        help="Rewrite goals.json at this package's schema when its file schema is newer.",
+    )
     set_command.add_argument("--needs", default=None, help="Specific human action required to unblock this lane.")
     asks_group = set_command.add_mutually_exclusive_group()
     asks_group.add_argument("--open-ask", action="append", default=[])
@@ -60,7 +280,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--delivered-item",
         action="append",
         default=[],
-        help="Caller-verified delivered item; repeat once per delivered item.",
+        help="Legacy input retained for a typed refusal; it cannot satisfy completion close.",
     )
     close_command.add_argument(
         "--close-note",
@@ -72,8 +292,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--operator-acknowledged-item",
         action="append",
         default=[],
-        help="Required item the operator explicitly acknowledged may close without delivery; repeat as needed.",
+        help="Legacy input retained for a typed refusal; it cannot satisfy completion close.",
     )
+    close_command.add_argument(
+        "--completion-evidence",
+        type=Path,
+        help="JSON list of structured completion receipts. Stored Watchd receipts are used when omitted.",
+    )
+    close_command.add_argument(
+        "--administrative",
+        action="store_true",
+        help="Discard the record without claiming the work is done.",
+    )
+    close_command.add_argument("--reason", default="", help="Required reason for --administrative discard.")
 
     hold_command = commands.add_parser("hold", help="Hold an existing lane without discarding its goal.")
     add_root(hold_command)
@@ -155,28 +386,124 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _enroll_from_interview_result(root: Path, args: argparse.Namespace) -> goal_store.GoalRecord:
+    """Verify the interview nonce and enroll the goal as one lock-governed transaction.
+
+    The goals lock is held across nonce re-verification, provenance/item
+    construction, the goal commit, and the nonce consumption write, so a
+    replacement nonce issued concurrently by a changed ``set`` request can
+    neither be accepted by this stale parsed result nor overwritten by its
+    consumption marker.  The caller has already established that no enrolled
+    goal exists, and that fact is re-checked under the lock.
+
+    ``allow_strategic_change`` only widens the pre-existing-goal guard inside
+    ``_upsert_goal_locked``; with no existing record there is nothing to
+    compare strategic fields against, and a genuine stale second enrollment
+    still fails because the re-checked ``existing`` guard above raises first.
+    The final nonce comparison and the consumption write are one critical
+    section under the nonce lock itself (nested inside the fixed
+    goals→nonce order, the same order issuance uses), so a replacement nonce
+    cannot slip in between that comparison and consumption: either the
+    verified nonce is still current when it is consumed, or the just-written
+    goal document is rolled back to its exact pre-commit bytes under the same
+    goals lock and the enrollment fails closed.  Crash safety (atomic file
+    replacement throughout) is unchanged.
+    """
+    with locked_json_store(goal_store.goals_path(root)):
+        existing = goal_store.get_goal(args.root, args.session_ref)
+        if existing is not None:
+            raise goal_store.GoalValidationError("goal is already enrolled; its interview receipt and done items are frozen")
+        receipt, done_items, answers, nonce_path, nonce_record = _parse_interview_result(args.root, args)
+        done_when = goal_store.render_done_when_items(done_items)
+        intent = answers["intent"]
+        scope = f"Out of scope: {answers['out_of_scope']} Constraints: {answers['constraints']}"
+        requested_record = goal_store.GoalRecord(
+            session_ref=args.session_ref,
+            goal=args.goal,
+            done_when=done_when,
+            source=args.source,
+            status=args.status,
+            intent=intent,
+            scope=scope,
+            now=args.now,
+            last_verified=args.last_verified,
+            open_asks=tuple(args.open_ask),
+            needs=args.needs if args.needs is not None else "",
+            interview_receipt=receipt,
+            enrolled_done_when_items=done_items,
+            completion_proofs=(),
+        )
+        pre_commit_payload: dict[str, Any] | None
+        try:
+            loaded_document: Any = json.loads(goal_store.goals_path(root).read_text(encoding="utf-8"))
+            pre_commit_payload = loaded_document if isinstance(loaded_document, dict) else None
+        except FileNotFoundError:
+            pre_commit_payload = None
+        stored = goal_store._upsert_goal_locked(args.root, requested_record, allow_strategic_change=True, migrate=args.migrate)
+        try:
+            with locked_json_store(nonce_path):
+                persisted_nonce_record = _read_nonce_record(nonce_path)
+                if (
+                    persisted_nonce_record is None
+                    or persisted_nonce_record.get("nonce") != nonce_record["nonce"]
+                ):
+                    raise ValueError("interview nonce was replaced before enrollment committed")
+                nonce_record["consumed_at"] = stored.enrolled_at
+                write_json_atomic(nonce_path, nonce_record)
+        except ValueError:
+            if pre_commit_payload is None:
+                (goal_store.goals_path(root)).unlink(missing_ok=True)
+            else:
+                write_json_atomic(goal_store.goals_path(root), pre_commit_payload)
+            raise
+    return stored
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     try:
         if args.command == "set":
             existing = goal_store.get_goal(args.root, args.session_ref)
-            requested_record = goal_store.GoalRecord(
-                session_ref=args.session_ref,
-                goal=args.goal,
-                done_when=args.done_when,
-                source=args.source,
-                status=args.status,
-                intent=args.intent if args.intent is not None else (existing.intent if existing is not None else ""),
-                scope=args.scope if args.scope is not None else (existing.scope if existing is not None else ""),
-                now=args.now,
-                last_verified=args.last_verified,
-                open_asks=tuple(args.open_ask),
-                needs=args.needs if args.needs is not None else (existing.needs if existing is not None else ""),
-            )
-            stored = goal_store.upsert_goal(args.root, requested_record, clear_open_asks=args.clear_asks)
-            done_when_flag = lint_done_when(stored.done_when)
-            if done_when_flag is not None:
-                stored = goal_store.add_ask(args.root, stored.session_ref, done_when_flag.message)
+            if existing is None and args.done_when.strip():
+                raise goal_store.GoalValidationError(
+                    "free-text --done-when is refused on a new record; enroll structured --done-item conditions"
+                )
+            if existing is not None and args.done_item:
+                raise goal_store.GoalValidationError("--done-item applies only to a new enrollment")
+            if existing is None and args.interview_result is None:
+                print(json.dumps(_interview_required(args.root, args), indent=2, sort_keys=True))
+                return 2
+            if existing is not None and existing.interview_receipt is None:
+                raise goal_store.GoalValidationError(
+                    "legacy goals are display-only; use a reasoned administrative redirect or discard"
+                )
+            if existing is not None and args.interview_result is not None:
+                raise goal_store.GoalValidationError("goal is already enrolled; its interview receipt and done items are frozen")
+
+            if existing is not None:
+                stored = goal_store.upsert_goal(
+                    args.root,
+                    goal_store.GoalRecord(
+                        session_ref=args.session_ref,
+                        goal=args.goal,
+                        done_when=args.done_when or existing.done_when,
+                        source=args.source,
+                        status=args.status,
+                        intent=args.intent if args.intent is not None else existing.intent,
+                        scope=args.scope if args.scope is not None else existing.scope,
+                        now=args.now,
+                        last_verified=args.last_verified,
+                        open_asks=tuple(args.open_ask),
+                        needs=args.needs if args.needs is not None else existing.needs,
+                        interview_receipt=existing.interview_receipt,
+                        enrolled_done_when_items=existing.enrolled_done_when_items,
+                        completion_proofs=existing.completion_proofs,
+                    ),
+                    clear_open_asks=args.clear_asks,
+                    migrate=args.migrate,
+                )
+            else:
+                stored = _enroll_from_interview_result(args.root, args)
             _print_record(stored)
         elif args.command == "get":
             found_record = goal_store.get_goal(args.root, args.session_ref)
@@ -191,13 +518,18 @@ def main(argv: list[str] | None = None) -> int:
                 for record in records:
                     print(f"{record.session_ref}\t{record.status}\t{record.goal}\t{json.dumps(list(record.open_asks))}")
         elif args.command == "close":
+            if args.administrative and not args.reason.strip():
+                raise ValueError("--administrative requires a non-empty --reason")
             _print_record(
                 goal_store.close_goal(
                     args.root,
                     args.session_ref,
                     delivered_items=tuple(args.delivered_item),
+                    completion_evidence=_load_completion_evidence(args.completion_evidence),
                     close_notes=tuple(args.close_note),
                     operator_acknowledged_items=tuple(args.operator_acknowledged_item),
+                    administrative=args.administrative,
+                    administrative_reason=args.reason,
                 )
             )
         elif args.command == "hold":
@@ -305,6 +637,10 @@ def main(argv: list[str] | None = None) -> int:
     except goal_store.GoalRedirectRequiredError as exc:
         print(f"chitra-goals: {exc}; use chitra-goals redirect --reason ...", file=sys.stderr)
         return 1
+    except goal_store.GoalsSchemaNewerError as exc:
+        print(f"chitra-goals: {exc}", file=sys.stderr)
+        print("chitra-goals: re-run chitra-goals set with --migrate to rewrite goals.json at the installed schema", file=sys.stderr)
+        return 3
     except (goal_store.GoalValidationError, goal_store.GoalNotFoundError, OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"chitra-goals: {exc}", file=sys.stderr)
         return 1

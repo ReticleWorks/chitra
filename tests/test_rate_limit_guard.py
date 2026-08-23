@@ -10,11 +10,20 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _goal_fixtures import enrollment_fields
 
 import chitra.dispatchd as dispatchd_mod
 from chitra.account_registry import RegistryEntry, get_entry
 from chitra.dispatch import DispatchOrder, DispatchResult, DispatchStatus
-from chitra.goals import LOAD_SHED_HOLD_REASON_PREFIX, RATE_LIMIT_HOLD_REASON_PREFIX, GoalRecord, get_goal, hold_goal, upsert_goal
+from chitra.goals import (
+    GOALS_SCHEMA_NEWER_MESSAGE,
+    LOAD_SHED_HOLD_REASON_PREFIX,
+    RATE_LIMIT_HOLD_REASON_PREFIX,
+    GoalRecord,
+    get_goal,
+    hold_goal,
+    upsert_goal,
+)
 from chitra.lane_activity import LaneActivity, upsert_lane_activity
 from chitra.load_shed import PressureSample
 from chitra.policy_config import PausePolicy, PolicyConfig, UsagePolicy
@@ -44,6 +53,20 @@ FAST_POLICY = PolicyConfig(
 CLEAR_PRESSURE = PressureSample(80, 0, 0, 0)
 
 
+@pytest.fixture(autouse=True)
+def _clear_host_pressure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep unit sweeps independent of Linux procfs on developer hosts."""
+    monkeypatch.setattr("chitra.rate_limit_guard.sample_pressure", lambda: CLEAR_PRESSURE)
+
+    def local_transcript_mtime(transcript_path: str, **_: object) -> float | None:
+        try:
+            return Path(transcript_path).stat().st_mtime
+        except OSError:
+            return None
+
+    monkeypatch.setattr("chitra.rate_limit_guard.transcript_mtime", local_transcript_mtime)
+
+
 def _snapshot(*, session_id: str, tmux_session: str, account: str = "acct@example.com", five_hour_pct: float, ts: str) -> UsageSnapshot:
     return UsageSnapshot(
         kind="claude",
@@ -68,6 +91,7 @@ def _goal(session_ref: str = "host-b:lane1:0.0") -> GoalRecord:
         done_when="Tests pass and the full suite is green.",
         source="task",
         status="working",
+        **enrollment_fields("Tests pass and the full suite is green."),
     )
 
 
@@ -825,6 +849,38 @@ def test_registry_entry_records_the_observed_account(tmp_path: Path) -> None:
     entry = get_entry(tmp_path, "lane1")
     assert isinstance(entry, RegistryEntry)
     assert entry.account == "a@x.com"
+
+
+def test_sweep_survives_a_newer_goals_store_read_only(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """The v4-outage rule for the guard: a goals.json labeled newer than the
+    installed package must not fail the sweep. The sweep journals one
+    read-only notice, skips every goal mutation and hold/resume planning,
+    and still advances its own non-goals state (transactions) so an operator
+    sees a report instead of an exit code."""
+    upsert_goal(tmp_path, _goal())
+    payload = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
+    payload["schema"] = "chitra.goals.v4"
+    (tmp_path / "goals.json").write_text(json.dumps(payload), encoding="utf-8")
+    usage_dir = tmp_path / "usage"
+    _write_snapshot(usage_dir, _snapshot(session_id="s1", tmux_session="lane1", five_hour_pct=93, ts=_iso()))
+
+    report = sweep(
+        usage_dir=usage_dir,
+        host="host-b",
+        goals_root=tmp_path,
+        queue_dir=tmp_path / "queue",
+        policy=FAST_POLICY,
+        now=_now(),
+        pressure_sample=CLEAR_PRESSURE,
+    )
+
+    assert get_goal(tmp_path, "host-b:lane1:0.0").status == "working"
+    assert get_transaction(tmp_path, "host-b:lane1:0.0") is None
+    assert report.paused == [] and report.resumed == []
+    document = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
+    assert document["schema"] == "chitra.goals.v4"
+    notices = [line for line in capsys.readouterr().out.splitlines() if GOALS_SCHEMA_NEWER_MESSAGE in line]
+    assert len(notices) == 1
 
 
 # --- Codex fan-out: explicitly excluded, fails closed (SOL finding #6) ------

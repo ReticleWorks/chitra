@@ -1,5 +1,8 @@
 # sweepd — Fleet State Digest
 
+> **Deprecated.** Superseded by the composed [`monitord`](../monitord.md)
+> per-pass digest; kept for existing declarations only.
+
 Sweepd reads canonical fleet state and publishes a delta-only digest of what changed since the last sweep. Downstream dashboards and monitors consume this digest instead of polling multiple sources.
 
 ## What it does

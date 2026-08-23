@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -13,8 +14,10 @@ from chitra.completion_gate import (
     CompletionEvidence,
     TodoItem,
     check_todo_residue,
+    completion_receipt_issues,
     evaluate_completion_claim,
     evaluate_turn_end,
+    extract_completion_evidence,
     is_completion_claim,
     scan_deferral_language,
 )
@@ -415,3 +418,89 @@ def test_dispatchd_leaves_a_non_completion_nudge_unaffected(tmp_path: Path, monk
 
     assert result is not None
     assert result.status == DispatchStatus.SENT
+
+
+# ---------------------------------------------------------------------------
+# registered validators: Chitra's stored disk result replaces the claimed one
+# ---------------------------------------------------------------------------
+
+
+def _structured_claim_line(**overrides: object) -> str:
+    payload: dict[str, object] = {
+        "kind": "artifact",
+        "done_when_item_id": "done-1",
+        "receipt_name": "tests-green",
+        "validator": "pytest",
+        "validator_result": "pass",
+        "citation": "proof /tmp/test-results.json",
+    }
+    payload.update(overrides)
+    return "CHITRA-COMPLETION: " + json.dumps(payload, separators=(",", ":"))
+
+
+def test_structured_completion_line_is_only_a_trigger_and_drops_the_claimed_result() -> None:
+    evidence = extract_completion_evidence(_structured_claim_line())
+
+    assert len(evidence) == 1
+    assert evidence[0].validator_result is None
+    assert evidence[0].receipt_name == "tests-green"
+
+
+def test_has_structured_completion_line_detects_the_trigger_and_ignores_plain_text() -> None:
+    from chitra.completion_gate import has_structured_completion_line
+
+    assert has_structured_completion_line(_structured_claim_line())
+    assert not has_structured_completion_line("the validator passed, trust me")
+    assert not has_structured_completion_line("CHITRA-COMPLETION: {not json")
+
+
+def _enrolled_item(validator: str = "pytest", receipt: str = "tests-green") -> Any:
+    from chitra.goals import EnrolledDoneWhenItem
+
+    return EnrolledDoneWhenItem(id="done-1", text="The suite passes.", validator=validator, required_receipt=receipt)
+
+
+def test_disk_fail_result_disputes_a_claimed_pass() -> None:
+    item = _enrolled_item()
+    proof = CompletionEvidence(
+        kind="artifact",
+        done_when_item_id="done-1",
+        receipt_name="tests-green",
+        validator="pytest",
+        validator_result=None,
+        citation="proof /tmp/test-results.json",
+    )
+
+    issues = completion_receipt_issues([item], [proof], verified_results={"tests-green": "fail"})
+
+    assert issues == ["done item 'done-1' has no passing validator result with a concrete citation"]
+
+
+def test_disk_pass_result_closes_even_when_the_lane_claimed_failure() -> None:
+    item = _enrolled_item()
+    proof = CompletionEvidence(
+        kind="artifact",
+        done_when_item_id="done-1",
+        receipt_name="tests-green",
+        validator="pytest",
+        validator_result="fail",
+        citation="receipt validation-receipts/tests-green.json",
+    )
+
+    issues = completion_receipt_issues([item], [proof], verified_results={"tests-green": "pass"})
+
+    assert issues == []
+
+
+def test_missing_disk_result_for_a_required_receipt_stays_disputed() -> None:
+    item = _enrolled_item()
+    proof = CompletionEvidence(
+        kind="artifact",
+        done_when_item_id="done-1",
+        receipt_name="tests-green",
+        validator="pytest",
+        validator_result="pass",
+        citation="proof /tmp/test-results.json",
+    )
+
+    assert completion_receipt_issues([item], [proof], verified_results={})
