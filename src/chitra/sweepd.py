@@ -14,6 +14,7 @@ import json
 import os
 import signal
 import threading
+import warnings
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -544,6 +545,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    warnings.warn(
+        "sweepd is deprecated by chitra-monitord and will be removed "
+        "in a future release; declare one monitord instance instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     """Run the daemon; malformed persisted input deliberately terminates it."""
     args = build_arg_parser().parse_args(argv)
     if args.lanes_file is not None:

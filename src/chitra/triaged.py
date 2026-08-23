@@ -34,6 +34,7 @@ import hashlib
 import json
 import re
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -425,6 +426,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    warnings.warn(
+        "triaged is deprecated by chitra-monitord and will be removed "
+        "in a future release; declare one monitord instance instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     args = build_arg_parser().parse_args(argv)
     if args.lanes_file is not None:
         if args.once:

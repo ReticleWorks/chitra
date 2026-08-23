@@ -1,5 +1,8 @@
 # triaged — State Deduplication
 
+> **Deprecated.** Superseded by the composed [`monitord`](../monitord.md)
+> entrypoint and its canonical journal; kept for existing declarations only.
+
 Triaged tails an events log and emits triage events only on real state transitions. It deduplicates noisy pane changes, detects critical conditions (crash, merge landed, rate limit), and flags them.
 
 ## What it does
