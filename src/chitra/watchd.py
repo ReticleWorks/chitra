@@ -2,9 +2,16 @@
 
 The events log remains a small wire contract consumed by ``chitra.triaged``.
 At a detected turn-end, this watcher also forces the deterministic completion
-boundary. Completion claims launch isolated watched-session reviewers against
-the lane's frozen goal; ordinary turns do not. Review metadata is written only
-to Chitra-owned ledgers and never to pane text.
+boundary. Isolated watched-session reviewers see a turn end that carries a
+completion claim, asks a question, made zero observable tool calls in the
+turn itself, or followed a delivered dispatch order -- the turn shapes that
+carry deferral, idle, and false-blocker defections, not just completion
+claims. Zero-tool activity is decided at the current turn boundary from the
+structured journal record when one exists, else exact rendered tool-call
+markers among only the pane lines added since the previous reviewed turn
+end -- or, when no boundary exists yet, over a marker-free capture;
+scrollback chrome from earlier turns never suppresses review.
+Review metadata is written only to Chitra-owned ledgers and never to pane text.
 """
 
 from __future__ import annotations
@@ -18,6 +25,8 @@ import signal
 import subprocess
 import threading
 import time
+import warnings
+from collections import Counter
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -31,11 +40,14 @@ from chitra._fsio import parse_iso8601
 from chitra.agent_runtime import AgentStatusBroker, PaneStatus, StatusRuntimeError
 from chitra.agent_status import AgentState, ManifestRepository
 from chitra.completion_gate import (
+    CompletionEvidence,
     CompletionReviewRecord,
+    TodoItem,
     TurnEndAudit,
     append_completion_review,
     evaluate_turn_end,
     extract_completion_evidence,
+    has_structured_completion_line,
     is_completion_claim,
 )
 from chitra.dispatch import enqueue_dispatch_order
@@ -47,25 +59,61 @@ from chitra.goal_enforcement import (
     review_watched_session,
 )
 from chitra.goals import (
+    GOALS_SCHEMA_NEWER_MESSAGE,
+    GoalsSchemaNewerError,
     GoalStatus,
     add_ask,
     get_goal,
+    goals_schema_newer_than_installed,
     lane_id_from_session_ref,
     list_goals,
     mark_completion_gate_passed,
     session_host,
     update_now,
 )
+from chitra.goals import (
+    SCHEMA as GOALS_INSTALLED_SCHEMA,
+)
+from chitra.journal import CanonicalType, EventJournal
 from chitra.lane_activity import LaneActivity, LaneBackend, load_lane_activity, upsert_lane_activity
 from chitra.lane_config import enabled_lanes
 from chitra.live_handoff import perform_live_handoff
+from chitra.orders import DispatchResult, DispatchStatus
 from chitra.policy_config import load_policy_config
 from chitra.reasoned_dispatch import abstaining_oracle, build_reasoned_dispatch
 from chitra.reasoning import Oracle, PrinciplesIndex
 from chitra.socket_api import ApiRuntime, ControlServer, default_socket_path
 from chitra.state_paths import state_dir as default_state_dir
+from chitra.systemd_notify import notify_ready, notify_watchdog
+from chitra.validation_receipts import record_enrolled_validator_runs, verified_disk_results
 
 logger = structlog.get_logger(__name__)
+
+# Roots whose newer-than-installed goals.json has already been journaled; a
+# long-running daemon notices once instead of writing the same warning into
+# the journal on every poll.
+_SCHEMA_NOTICED_ROOTS: set[str] = set()
+
+
+def note_goals_schema_state(goals_root: Path | None) -> None:
+    """Journal one read-only notice when this store's file schema is newer.
+
+    A newer goals.json never stops the watcher: goal state is treated as
+    read-only and the daemon keeps polling instead of exiting into a
+    supervisor restart loop (the chitra.goals.v4 outage class).
+    """
+    file_schema = goals_schema_newer_than_installed(goals_root)
+    if file_schema is None:
+        return
+    key = str(goals_root) if goals_root is not None else "<default-state-dir>"
+    if key in _SCHEMA_NOTICED_ROOTS:
+        return
+    _SCHEMA_NOTICED_ROOTS.add(key)
+    print(
+        f"{GOALS_SCHEMA_NEWER_MESSAGE} goals_root={key} file_schema={file_schema} "
+        f"installed_schema={GOALS_INSTALLED_SCHEMA}"
+    )
+
 
 EVENT_LOG_ENV_VAR = "CHITRA_WATCHD_EVENT_LOG"
 INTERVAL_ENV_VAR = "CHITRA_WATCHD_INTERVAL"
@@ -100,12 +148,24 @@ TRANSCRIPT_STALE_SECONDS_ENV_VAR = "CHITRA_WATCHD_TRANSCRIPT_STALE_SECONDS"
 DEFAULT_TRANSCRIPT_STALE_SECONDS = 900
 TRANSCRIPT_NAME = "tmux-transcript.log"
 LANE_LAUNCH_NAME = "lane-launch.json"
+JOURNAL_ROOT_ENV_VAR = "CHITRA_WATCHD_JOURNAL_ROOT"
 CAPTURE_LINES = 60
+DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 10.0
 
 _VOLATILE_LINE_RE = re.compile(
     r"^[\s]*[·✻✽✳✢✶*●○◐◯]|tokens\b|🪟|⏵⏵|esc to interrupt|ctrl\+b|^─+$|^[\s]*$|Press up to edit|globalVersion: [0-9.]+"
 )
 _TIMING_CHROME_RE = re.compile(r"\([0-9]+m? ?[0-9]*s?[^)]*\)")
+# Exact rendered tool-call lines. Claude Code draws each tool call as
+# "⏺ Tool(...)" with its result under "⎿  Tool(...)"; Codex draws each action
+# as "• verb ...". The glyph must be followed by a non-space character so a
+# bare rule line never counts as a call, and the generic "•" prose bullet is
+# excluded entirely -- Codex answers legitimately begin prose lines with "•",
+# so only its verb-shaped action line is tool activity. A Unicode-bullet list
+# ("• first item") is answer prose, not tool activity. These markers decide
+# only lines added since the previous reviewed turn end; the structured
+# journal record takes precedence when the lane has one.
+_RENDERED_TOOL_CALL_RE = re.compile(r"^\s*(?:⏺\s*\S|⎿\s*\S|•\s*(?:ran|read|edited|search|bash|shell|exec|patch)\b)")
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 ReviewKey = tuple[str, str]
 
@@ -151,6 +211,10 @@ class WatchdConfig:
     # at <host>/<lane>/tmux-transcript.log. Unset means the check is off.
     transcript_root: Path | None = None
     transcript_stale_seconds: int = DEFAULT_TRANSCRIPT_STALE_SECONDS
+    # Root of the W1 canonical event journals, one per lane at
+    # <root>/journal/<lane>.jsonl. Unset (or a lane with no journal) means
+    # tool-call evidence falls back to the pane capture's rendered markers.
+    journal_root: Path | None = None
 
     def __post_init__(self) -> None:
         if self.reviewer_count < 1:
@@ -169,6 +233,7 @@ class PendingCompletionReview:
     session_ref: str
     behavior_sha256: str
     turn_audit: TurnEndAudit
+    completion_evidence: tuple[CompletionEvidence, ...]
     last_verified: str
     future: Future[SessionReviewSignal]
 
@@ -206,8 +271,13 @@ def pane_at_input_row(content: str) -> bool:
     return any(line.lstrip().startswith(("❯", "›")) for line in lines[-12:])
 
 
-def _run_command(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, check=False, capture_output=True, text=True)
+def _run_command(command: Sequence[str], *, timeout: float = DEFAULT_SUBPROCESS_TIMEOUT_SECONDS) -> subprocess.CompletedProcess[str]:
+    """Run one tmux subprocess without allowing it to wedge the poll loop."""
+    try:
+        return subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        logger.warning("watchd_subprocess_timeout", command=list(command), timeout_seconds=timeout)
+        return subprocess.CompletedProcess(args=list(command), returncode=124, stdout="", stderr=f"timed out after {timeout}s")
 
 
 def _tmux_command(command: Sequence[str], tmux_socket: Path | None) -> list[str]:
@@ -451,6 +521,15 @@ class Watchd:
     clock: Callable[[], float] = time.monotonic
     reviewed_turns: set[ReviewKey] = field(default_factory=set)
     pending_reviews: dict[ReviewKey, PendingCompletionReview] = field(default_factory=dict)
+    # pane_id -> ISO timestamp of that pane's previous reviewed turn end. A
+    # dispatch order sent after this watermark preceded the current turn.
+    turn_end_watermarks: dict[str, str] = field(default_factory=dict)
+    # pane_id -> multiset of normalized lines on screen at that pane's
+    # previous reviewed turn end. Lines on screen now that were not there
+    # then belong to the current turn; that difference is the only turn
+    # boundary a pane capture carries.
+    _last_turn_end_capture: dict[str, Counter[str]] = field(default_factory=dict)
+    _started_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat(), init=False, repr=False)
     _review_executor: ThreadPoolExecutor = field(init=False, repr=False)
     _review_executor_shutdown: bool = field(default=False, init=False, repr=False)
 
@@ -500,9 +579,10 @@ class Watchd:
         review_log = self.config.completion_review_log or self.config.state_dir / "completion_reviews.jsonl"
         completion_verdict = pending.turn_audit.completion.verdict if pending.turn_audit.completion is not None else None
         ask = ""
-        if pending.turn_audit.condition == "turn_end_without_completion_claim":
+        if review_signal is None and not review_error:
+            # The turn-end gate decided this shape needs no isolated review.
             status: GoalStatus = "turn-finished-unverified"
-            summary = f"{pending.turn_audit.summary}; no completion claim, so isolated review was not run"
+            summary = f"{pending.turn_audit.summary}; isolated review was not run for this turn end"
             review_verdict: Literal["accept", "reject", "unavailable"] = "unavailable"
         elif review_signal is None:
             status = "blocked"
@@ -518,10 +598,14 @@ class Watchd:
             status = "done-pending-close"
             summary = pending.turn_audit.summary
             review_verdict = "accept"
-        else:
+        elif pending.turn_audit.condition == "completion_claim":
             status = "completion-disputed"
             summary = pending.turn_audit.summary
             ask = "Resolve the cited completion-gate gaps before treating this lane as complete."
+            review_verdict = "accept"
+        else:
+            status = "turn-finished-unverified"
+            summary = f"{pending.turn_audit.summary}; isolated review accepted the turn end with no completion claim"
             review_verdict = "accept"
 
         if status == "done-pending-close":
@@ -530,6 +614,7 @@ class Watchd:
                 pending.session_ref,
                 now=summary,
                 last_verified=datetime.now(UTC).isoformat(),
+                completion_evidence=pending.completion_evidence,
             )
             assert self.status_broker is not None
             current = next(
@@ -592,6 +677,12 @@ class Watchd:
         assert self.status_broker is not None
         if self.status_broker.frozen:
             return
+        root = self.config.goals_root or self.config.state_dir
+        if goals_schema_newer_than_installed(root) is not None:
+            # Review finalization writes goals. Keep ready reviews queued until
+            # a package that understands the newer store can apply them.
+            note_goals_schema_state(root)
+            return
         for key, pending in list(self.pending_reviews.items()):
             if not pending.future.done():
                 continue
@@ -609,6 +700,100 @@ class Watchd:
                 except StatusRuntimeError:
                     continue
             del self.pending_reviews[key]
+
+    def _turn_followed_delivered_order(self, session_ref: str, *, since: str) -> bool:
+        """Whether dispatchd recorded a sent order for this session after ``since``."""
+        queue_dir = self.config.queue_dir or self.config.state_dir / "queue"
+        results = queue_dir / "results"
+        if not results.is_dir():
+            return False
+        for path in sorted(results.glob("*.json")):
+            try:
+                result = DispatchResult.model_validate_json(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if result.session_ref == session_ref and result.status == DispatchStatus.SENT and result.at > since:
+                return True
+        return False
+
+    def _turn_made_tool_calls(self, session_ref: str, pane: Pane, *, since: str) -> bool | None:
+        """Whether the CURRENT turn made an observable tool call.
+
+        The structured W1 journal is the primary source when it exists for
+        this lane: a TOOL_CALL event observed since the previous reviewed
+        turn end (``since``) is proof the current turn called a tool, and its
+        absence is proof it did not. The caller must pass the watermark read
+        BEFORE the current turn end was recorded: a tool event observed
+        during this turn precedes this turn's own end timestamp, so filtering
+        against that newer timestamp would discard it. With no journal the
+        pane capture's exact rendered call markers are the only remaining
+        evidence -- and because that capture spans many turns, an unknown
+        result means the capture cannot attribute chrome to this turn and
+        the caller must not treat the turn as zero-tool.
+        """
+        journal_root = self.config.journal_root
+        if journal_root is not None:
+            lane = lane_id_from_session_ref(session_ref)
+            events = EventJournal(journal_root, lane).load()
+            if events:
+                recent = [
+                    event
+                    for event in events
+                    if event.normalized_type in (CanonicalType.TOOL_CALL, CanonicalType.TOOL_RESULT, CanonicalType.TOOL_ERROR)
+                    and (event.observed_at or "") > since
+                ]
+                return bool(recent)
+        return None
+
+    def _turn_had_rendered_tool_calls(self, pane_id: str, text: str) -> bool | None:
+        """Whether the current turn's own lines contain rendered tool calls.
+
+        A capture with no rendered call markers anywhere proves the current
+        turn made none, whatever older scrollback sits above it. When markers
+        are on screen, the previous reviewed turn end is the only boundary a
+        pane capture carries: lines added since then belong to the current
+        turn and only they may count as activity. With markers on screen but
+        no such boundary the chrome cannot be attributed to any one turn and
+        the result is unknown.
+        """
+        if not any(_RENDERED_TOOL_CALL_RE.match(line) for line in text.splitlines()):
+            return False
+        boundary = self._last_turn_end_capture.get(pane_id)
+        if boundary is None:
+            return None
+        fresh_lines = Counter(text.splitlines()) - boundary
+        return any(_RENDERED_TOOL_CALL_RE.match(line) for line in fresh_lines)
+
+    def _turn_end_requires_review(self, session_ref: str, pane: Pane, text: str, *, since: str) -> bool:
+        """Structural triggers that send one enrolled lane's turn end to review.
+
+        A completion claim always reviews. So does a turn that asks a question
+        and a turn that answers a delivered dispatch order -- the shapes that
+        carry deferral, idle, and false-blocker defections a completion-claim
+        regex never sees.
+
+        The zero-tool trigger reads only the CURRENT turn: structured tool-call
+        records since the previous reviewed turn end when the journal has
+        them, else exact rendered tool-call markers attributed to only the
+        pane lines added since that turn end. Scrollback chrome from earlier
+        turns never counts as activity in this one, so prior tool chrome does
+        not suppress review of a quiet deferral turn; and when on-screen
+        chrome cannot be attributed to any turn, the trigger abstains rather
+        than classifying the turn as zero-tool.
+        """
+        if is_completion_claim(text):
+            return True
+        if "?" in text:
+            return True
+        if self._turn_followed_delivered_order(session_ref, since=since):
+            return True
+        structured = self._turn_made_tool_calls(session_ref, pane, since=since)
+        if structured is not None:
+            return not structured
+        rendered = self._turn_had_rendered_tool_calls(pane.pane_id, text)
+        if rendered is None:
+            return False
+        return not rendered
 
     def _review_turn_end(self, pane: Pane, content: str) -> None:
         """Run the cheap gate inline and schedule completion review off-thread."""
@@ -637,24 +822,71 @@ class Watchd:
             return
 
         goal = next(record for record in list_goals(root) if record.session_ref == session_ref)
+        if goal.interview_receipt is None or not goal.enrolled_done_when_items:
+            self.reviewed_turns.add(key)
+            append_completion_review(
+                review_log,
+                CompletionReviewRecord(
+                    session_ref=session_ref,
+                    pane_id=pane.pane_id,
+                    behavior_sha256=behavior_sha256,
+                    condition="completion_claim" if is_completion_claim(text) else "turn_end_without_completion_claim",
+                    completion_verdict="COMPLETION_DISPUTE" if is_completion_claim(text) else None,
+                    review_verdict="unavailable",
+                    status="unenrolled",
+                    summary="turn-end review failed closed: the goal has no interview receipt or frozen done items",
+                ),
+            )
+            return
         policy = load_policy_config().completion_gate
+        completion_evidence = tuple(extract_completion_evidence(text))
+        verified_results: dict[str, str] | None = None
+        if is_completion_claim(text) and has_structured_completion_line(text):
+            # The structured line is only a trigger: Chitra executes the
+            # enrolled validators itself and stores the receipts whose disk
+            # results the gate reads. The lane's claimed result is ignored.
+            run_proofs = record_enrolled_validator_runs(root, session_ref, goal.enrolled_done_when_items)
+            if run_proofs:
+                completion_evidence = completion_evidence + run_proofs
+                verified_results = verified_disk_results(root, session_ref, goal.enrolled_done_when_items)
+        enrolled_todos = [
+            TodoItem(
+                id=item.id,
+                text=item.text,
+                status="done",
+                validator=item.validator,
+                required_receipt=item.required_receipt,
+            )
+            for item in goal.enrolled_done_when_items
+        ]
+        if not enrolled_todos:
+            enrolled_todos = [TodoItem(text="interview enrollment receipt and frozen done items", status="missing")]
         turn_audit = evaluate_turn_end(
             text,
-            todo_items=[],
-            evidence=extract_completion_evidence(text),
+            todo_items=enrolled_todos,
+            evidence=completion_evidence,
             policy=policy,
             open_asks=goal.open_asks,
             blockers=(goal.needs,) if goal.needs else (),
+            verified_results=verified_results,
         )
         pending = PendingCompletionReview(
             pane_id=pane.pane_id,
             session_ref=session_ref,
             behavior_sha256=behavior_sha256,
             turn_audit=turn_audit,
+            completion_evidence=completion_evidence,
             last_verified=goal.last_verified,
             future=Future(),
         )
-        if not is_completion_claim(text):
+        since = self.turn_end_watermarks.get(pane.pane_id, self._started_at)
+        self.turn_end_watermarks[pane.pane_id] = datetime.now(UTC).isoformat()
+        requires_review = self._turn_end_requires_review(session_ref, pane, text, since=since)
+        # ``since`` was read before the overwrite above and is the only
+        # watermark handed to classification: journal events observed during
+        # this turn predate this turn's own end timestamp.
+        self._last_turn_end_capture[pane.pane_id] = Counter(normalize(content))
+        if not requires_review:
             self.reviewed_turns.add(key)
             self._finalize_turn_review(pending, review_signal=None)
             return
@@ -686,6 +918,7 @@ class Watchd:
             session_ref=session_ref,
             behavior_sha256=behavior_sha256,
             turn_audit=turn_audit,
+            completion_evidence=completion_evidence,
             last_verified=goal.last_verified,
             future=future,
         )
@@ -738,12 +971,77 @@ class Watchd:
 
     def poll_once(self) -> int:
         """Capture panes and emit only semantic status transitions."""
-        self._drain_completed_reviews()
         assert self.status_broker is not None
         if self.status_broker.frozen:
             return 0
-        emitted = 0
         root = self.config.goals_root or self.config.state_dir
+        if goals_schema_newer_than_installed(root) is not None:
+            # Read-only degradation (the chitra.goals.v4 outage class): a
+            # store newer than this package refuses our writes, so skip goal
+            # mutations and keep polling instead of killing run_forever.
+            note_goals_schema_state(root)
+            return self._poll_panes_only()
+        try:
+            self._drain_completed_reviews()
+            return self._poll_once_locked(root)
+        except GoalsSchemaNewerError:
+            # A newer store appeared mid-poll; degrade exactly as above.
+            note_goals_schema_state(root)
+            return 0
+
+    def _poll_panes_only(self) -> int:
+        """One sensing pass with goal state treated as read-only: pane events,
+        activity facts, and transcript-pipe faults still emit; every goal
+        mutation (turn-end review finalization, status writes, asks) is
+        skipped so the newer writer's file is never rewritten here."""
+        assert self.status_broker is not None
+        emitted = 0
+        for pane in list_panes(
+            runner=self.runner,
+            panes_override=self.config.panes_override,
+            session_names=self.config.session_names,
+            session_prefixes=self.config.session_prefixes,
+            excluded_session_prefixes=self.config.excluded_session_prefixes,
+            tmux_socket=self.config.tmux_socket,
+        ):
+            content = capture_pane(pane, runner=self.runner, tmux_socket=self.config.tmux_socket)
+            if content is None:
+                continue
+            self._save_raw_capture(pane.pane_id, content)
+            session_ref = self._session_ref(pane)
+            try:
+                self.status_broker.observe(
+                    pane_id=pane.pane_id,
+                    target=pane.target,
+                    session_ref=session_ref,
+                    lane_id=self.config.lane_id or pane.target,
+                    detected_agent=pane.backend,
+                    snapshot=content,
+                    tmux_socket=self.config.tmux_socket,
+                )
+            except StatusRuntimeError:
+                break
+            status = next(item for item in self.status_broker.statuses() if item.pane_id == pane.pane_id)
+            previous_revision = self.status_revisions.get(pane.pane_id)
+            changed = previous_revision is None or previous_revision != status.revision
+            if session_ref is not None:
+                emitted += self._check_transcript_pipe(pane, session_ref, last_change_at=datetime.now(UTC).isoformat())
+            self.status_states[pane.pane_id] = status.state
+            self.status_revisions[pane.pane_id] = status.revision
+            if previous_revision is None:
+                continue
+            if changed:
+                append_event(
+                    self.config.events_log,
+                    status_event_line(status),
+                    max_log_bytes=self.config.max_log_bytes,
+                )
+                emitted += 1
+        return emitted
+
+    def _poll_once_locked(self, root: Path) -> int:
+        assert self.status_broker is not None
+        emitted = 0
         existing_activity = {record.session_ref: record for record in load_lane_activity(root)}
         activity_updates: list[LaneActivity] = []
         for pane in list_panes(
@@ -884,6 +1182,7 @@ def resolve_config(
     idle_threshold_seconds: float | None = None,
     transcript_root: Path | None = None,
     transcript_stale_seconds: int | None = None,
+    journal_root: Path | None = None,
 ) -> WatchdConfig:
     """Resolve CLI values, then ``CHITRA_*`` overrides, then generic defaults."""
     configured_state_dir = state_dir or default_state_dir()
@@ -972,6 +1271,9 @@ def resolve_config(
             if raw_transcript_stale
             else DEFAULT_TRANSCRIPT_STALE_SECONDS
         )
+    configured_journal_root = journal_root
+    if configured_journal_root is None and (raw_journal_root := _env_value(JOURNAL_ROOT_ENV_VAR)) is not None:
+        configured_journal_root = Path(raw_journal_root)
     return WatchdConfig(
         state_dir=configured_state_dir,
         events_log=configured_events_log,
@@ -992,6 +1294,7 @@ def resolve_config(
         idle_threshold_seconds=configured_idle_threshold,
         transcript_root=configured_transcript_root,
         transcript_stale_seconds=configured_transcript_stale,
+        journal_root=configured_journal_root,
     )
 
 
@@ -1029,9 +1332,11 @@ def run_forever(watchd: Watchd, *, stop_event: threading.Event | None = None) ->
     assert watchd.status_broker is not None
     server = _start_control_server(watchd.status_broker, watchd.config, stop_event)
     logger.info("watchd_started", events_log=str(watchd.config.events_log), interval_seconds=watchd.config.interval_seconds)
+    notify_ready()
     try:
         while not stop_event.is_set():
             watchd.poll_once()
+            notify_watchdog()
             stop_event.wait(watchd.config.interval_seconds)
     finally:
         watchd.shutdown()
@@ -1090,10 +1395,12 @@ def run_lanes_forever(
     watchers = build_lane_watchers(lanes_file, base_config, status_broker=broker)
     server = _start_control_server(broker, base_config, active_stop_event)
     logger.info("watchd_started", lanes_file=str(lanes_file), lane_count=len(watchers))
+    notify_ready()
     try:
         while not active_stop_event.is_set():
             for watcher in watchers:
                 watcher.poll_once()
+            notify_watchdog()
             active_stop_event.wait(base_config.interval_seconds)
     finally:
         for watcher in watchers:
@@ -1163,6 +1470,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Age at which a transcript counts as not growing (default: CHITRA_WATCHD_TRANSCRIPT_STALE_SECONDS or 900).",
     )
     parser.add_argument(
+        "--journal-root",
+        type=Path,
+        default=None,
+        help=(
+            "Canonical event journal root holding <root>/journal/<lane>.jsonl. Gives the zero-tool review trigger "
+            "structured tool-call evidence for the current turn (default: CHITRA_WATCHD_JOURNAL_ROOT; unset falls "
+            "back to exact rendered pane markers)."
+        ),
+    )
+    parser.add_argument(
         "--agent-manifest-dir",
         type=Path,
         default=None,
@@ -1207,6 +1524,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    warnings.warn(
+        "watchd is deprecated by chitra-monitord and will be removed "
+        "in a future release; declare one monitord instance instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     args = build_arg_parser().parse_args(argv)
     panes_override = tuple(item.strip() for item in args.panes.split(",") if item.strip()) if args.panes is not None else None
     config = resolve_config(
@@ -1229,6 +1552,7 @@ def main(argv: list[str] | None = None) -> int:
         idle_threshold_seconds=args.idle_threshold_seconds,
         transcript_root=args.transcript_root,
         transcript_stale_seconds=args.transcript_stale_seconds,
+        journal_root=args.journal_root,
     )
     if args.lanes_file is not None:
         if args.once:

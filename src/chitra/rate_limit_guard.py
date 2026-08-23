@@ -113,16 +113,22 @@ from .account_registry import load_registry, update_registry
 from .dispatch import transcript_mtime
 from .dispatchd import requeue_deferred_for_session
 from .goals import (
+    GOALS_SCHEMA_NEWER_MESSAGE,
     LOAD_SHED_HOLD_REASON_PREFIX,
     RATE_LIMIT_HOLD_REASON_PREFIX,
     GoalRecord,
+    GoalsSchemaNewerError,
     close_goal,
     done_when_with_delta,
     due_goals,
     get_goal,
+    goals_schema_newer_than_installed,
     hold_goal,
     list_goals,
     resume_goal,
+)
+from .goals import (
+    SCHEMA as GOALS_INSTALLED_SCHEMA,
 )
 from .lane_activity import load_lane_activity
 from .load_shed import (
@@ -153,6 +159,33 @@ from .state_paths import default_queue_dir
 from .usage import AccountedVerdict, CodexSnapshotError, codex_snapshot, evaluate_grouped, read_snapshots
 
 logger = structlog.get_logger(__name__)
+
+# Roots whose newer-than-installed goals.json has already been journaled; a
+# long-running process notices once instead of writing the same warning into
+# the journal on every sweep.
+_SCHEMA_NOTICED_ROOTS: set[str] = set()
+
+
+def note_goals_schema_state(goals_root: Path | None) -> None:
+    """Journal one read-only notice when this store's file schema is newer.
+
+    A newer goals.json never fails the guard: goal holds and resumes are
+    paused for the pass while the transaction ledger keeps advancing, so the
+    process degrades read-only instead of exiting into a supervisor restart
+    loop (the chitra.goals.v4 outage class).
+    """
+    file_schema = goals_schema_newer_than_installed(goals_root)
+    if file_schema is None:
+        return
+    key = str(goals_root) if goals_root is not None else "<default-state-dir>"
+    if key in _SCHEMA_NOTICED_ROOTS:
+        return
+    _SCHEMA_NOTICED_ROOTS.add(key)
+    print(
+        f"{GOALS_SCHEMA_NEWER_MESSAGE} goals_root={key} file_schema={file_schema} "
+        f"installed_schema={GOALS_INSTALLED_SCHEMA}"
+    )
+
 
 # Fixed, non-operator-voice checkpoint instruction (see chitra.dispatch's
 # directive-voice guard -- this text is checked against that same banned-
@@ -880,7 +913,12 @@ def clear_superseded_holds(*, goals_root: Path | None) -> list[str]:
     for record in list_goals(goals_root):
         if record.status != "held" or not record.hold_reason.startswith("superseded-by:"):
             continue
-        close_goal(goals_root, record.session_ref, administrative=True)
+        close_goal(
+            goals_root,
+            record.session_ref,
+            administrative=True,
+            administrative_reason=f"discard superseded hold {record.hold_reason} without claiming completion",
+        )
         remove_transaction(goals_root, record.session_ref)
         cleared.append(record.session_ref)
         logger.info("rate_limit_guard_superseded_hold_cleared", session_ref=record.session_ref)
@@ -974,6 +1012,18 @@ def sweep(
     load_state = upsert_load_state(goals_root, load_state)
     report.load_level = load_state.load_level
     report.shed_lanes = list(load_state.shed_lanes)
+
+    if goals_schema_newer_than_installed(goals_root) is not None:
+        # Read-only degradation (the chitra.goals.v4 outage class): a store
+        # newer than this package refuses every goal write, so hold/resume
+        # planning is paused for this pass and the sweep returns a report
+        # instead of failing. Non-goals state (transactions, registry,
+        # load state) still advances so in-flight evidence stays visible.
+        note_goals_schema_state(goals_root)
+        report.skipped.append(
+            f"{GOALS_SCHEMA_NEWER_MESSAGE}: goal holds and resumes are paused; the installed package treats this store as read-only"
+        )
+        return report
 
     registry_update = update_registry(goals_root, verdicts, now=current)
     for entry in registry_update.disappeared:
@@ -1180,7 +1230,14 @@ def main(argv: list[str] | None = None) -> int:
             queue_dir=args.queue_dir,
             policy=policy,
         )
-    except (CodexSnapshotError, OSError, ValueError, json.JSONDecodeError) as exc:
+    except (CodexSnapshotError, OSError, GoalsSchemaNewerError, ValueError, json.JSONDecodeError) as exc:
+        if isinstance(exc, GoalsSchemaNewerError):
+            # Read-only degradation, not an ordinary fatal value error: the
+            # store is newer than this package. Journal once and exit 0 with
+            # the report path documented in note_goals_schema_state.
+            note_goals_schema_state(args.goals_root)
+            print(json.dumps({"skipped": [GOALS_SCHEMA_NEWER_MESSAGE]}, indent=2, sort_keys=True))
+            return 0
         print(f"chitra-rate-limit-guard: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(report.to_dict(), indent=2, sort_keys=True))

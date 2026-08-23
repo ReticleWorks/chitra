@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -23,7 +23,11 @@ from chitra.merge import (
     resolve_identity,
 )
 
-NOW = datetime(2026, 8, 16, 22, 30, tzinfo=UTC)
+NOW = datetime.now(UTC)
+
+
+def timestamp_ago(delta: timedelta) -> str:
+    return (NOW - delta).isoformat().replace("+00:00", "Z")
 
 APP = GitHubIdentity(login="polyphony-automation[bot]", kind="app", source="test")
 PAT = GitHubIdentity(login="lean-wintermute", kind="user", source="test")
@@ -53,7 +57,7 @@ def make_state(**overrides: object):
         "head_oid": "a" * 40,
         "labels": (),
         # Fresh by default so every other test exercises what it means to.
-        "updated_at": "2026-08-16T22:00:00Z",
+        "updated_at": timestamp_ago(timedelta(minutes=30)),
     }
     base.update(overrides)
     return PullRequestState(**base)  # type: ignore[arg-type]
@@ -190,19 +194,19 @@ def test_a_pull_request_nobody_has_touched_for_days_is_refused() -> None:
     """From a real overnight merge: one open about five days landed on green.
     Green and mergeable describe the branch, not whether anyone still wants it.
     """
-    stale = make_state(updated_at="2026-08-11T00:00:00Z")
+    stale = make_state(updated_at=timestamp_ago(timedelta(days=5)))
     decision = decide(stale, POLICY, APP, now=NOW)
     assert decision.reason == "stale_pull_request"
     assert "still wanted" in decision.detail
 
 
 def test_a_pull_request_touched_today_passes_the_freshness_bound() -> None:
-    assert decide(make_state(updated_at="2026-08-16T20:00:00Z"), POLICY, APP, now=NOW).allowed
+    assert decide(make_state(updated_at=timestamp_ago(timedelta(hours=2))), POLICY, APP, now=NOW).allowed
 
 
 def test_an_unreadable_last_updated_time_is_refused_rather_than_assumed_fresh() -> None:
     """Unknown is not zero. A freshness gate must not pass on missing data."""
-    for value in ("", "not a timestamp", "2026-08-16T20:00:00"):
+    for value in ("", "not a timestamp", (NOW - timedelta(hours=2)).replace(tzinfo=None).isoformat()):
         assert decide(make_state(updated_at=value), POLICY, APP, now=NOW).reason == "stale_pull_request"
 
 
@@ -216,7 +220,7 @@ def test_the_freshness_bound_is_configurable_and_defaults_to_a_day() -> None:
         app_login=APP.login,
         max_age_hours=24 * 7,
     )
-    assert decide(make_state(updated_at="2026-08-11T00:00:00Z"), wide, APP, now=NOW).allowed
+    assert decide(make_state(updated_at=timestamp_ago(timedelta(days=5))), wide, APP, now=NOW).allowed
 
 
 def test_an_empty_lane_allowlist_qualifies_nobody() -> None:
@@ -239,7 +243,7 @@ def graphql_payload(**pr: object) -> str:
         "state": "OPEN",
         "mergeable": "MERGEABLE",
         "mergeStateStatus": "CLEAN",
-        "updatedAt": "2026-08-16T22:00:00Z",
+        "updatedAt": timestamp_ago(timedelta(minutes=30)),
         "author": {"login": "lane-bot"},
         "labels": {"nodes": [{"name": "enhancement"}]},
         "commits": {"nodes": [{"commit": {"oid": "b" * 40, "statusCheckRollup": {"state": "SUCCESS"}}}]},

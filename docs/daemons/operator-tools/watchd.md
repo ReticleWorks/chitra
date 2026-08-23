@@ -1,5 +1,8 @@
 # watchd — Semantic Status and Completion Review
 
+> **Deprecated.** Superseded by the composed [`monitord`](../monitord.md)
+> entrypoint; kept for existing declarations only.
+
 Watchd classifies supervised tmux panes, publishes semantic status, and runs
 isolated completion reviewers. Status classification is deterministic. The
 completion reviewer is the only part of this path that calls an LLM.

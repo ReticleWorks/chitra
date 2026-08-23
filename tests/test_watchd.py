@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import threading
 from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _goal_fixtures import enrollment_fields, ingest_passing_receipt
 
 from chitra.agent_runtime import AgentStatusBroker
 from chitra.agent_status import ManifestRepository
 from chitra.dispatch import DispatchOrder
 from chitra.goal_enforcement import ReviewerVerdict, ReviewFinding
-from chitra.goals import GoalRecord, get_goal, upsert_goal
+from chitra.goals import GOALS_SCHEMA_NEWER_MESSAGE, GoalRecord, get_goal, upsert_goal
+from chitra.journal import CanonicalEvent, CanonicalType, Client, EventJournal, TranscriptIdentity
 from chitra.lane_activity import load_lane_activity
+from chitra.orders import DispatchResult, DispatchStatus
 from chitra.triaged import ReceivingOutputs, parse_event_line, run_once
 from chitra.watchd import (
     Pane,
@@ -168,12 +173,15 @@ def test_watchd_semantic_idle_periods_land_twice_in_triaged_queue(tmp_path: Path
         stats_file=tmp_path / "stats.json",
         alert_state_file=tmp_path / "alerts.json",
     )
-    assert run_once(
-        tmp_path / "events.log",
-        state_file=tmp_path / "triaged-state.json",
-        triage_log=tmp_path / "triaged.log",
-        receiving_outputs=outputs,
-    ) == 3
+    assert (
+        run_once(
+            tmp_path / "events.log",
+            state_file=tmp_path / "triaged-state.json",
+            triage_log=tmp_path / "triaged.log",
+            receiving_outputs=outputs,
+        )
+        == 3
+    )
     assert [line.split("\t")[1] for line in outputs.queue_file.read_text(encoding="utf-8").splitlines()] == [
         "INFO",
         "INFO",
@@ -238,8 +246,31 @@ class _RejectingReviewer:
         )
 
 
+class _DeferringReviewer:
+    """Rejects a question turn as deferred_to_operator, citing it verbatim."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def review(self, goal, behavior, reviewer_id: str) -> ReviewerVerdict:
+        self.calls.append(reviewer_id)
+        return ReviewerVerdict(
+            reviewer_id=reviewer_id,
+            goal_contract_id=goal.contract_id,
+            behavior_sha256=behavior.behavior_sha256,
+            verdict="reject",
+            findings=(
+                ReviewFinding(
+                    code="deferred_to_operator",
+                    detail="The turn hands a command the session can run itself to the operator.",
+                    citation="Can you run npm install on tophand for me?",
+                ),
+            ),
+        )
+
+
 def _tracked_goal(root: Path) -> GoalRecord:
-    return upsert_goal(
+    goal = upsert_goal(
         root,
         GoalRecord(
             session_ref="localhost:fleet:0.0",
@@ -249,8 +280,11 @@ def _tracked_goal(root: Path) -> GoalRecord:
             scope="WS1 source tests and documentation only.",
             source="task-file:/tmp/ws1.md",
             status="working",
+            **enrollment_fields("The live completion probe passes with cited evidence."),
         ),
     )
+    ingest_passing_receipt(root, goal.session_ref)
+    return goal
 
 
 class _BlockingReviewer:
@@ -277,11 +311,48 @@ class _BlockingReviewer:
         )
 
 
-_CITED_CLAIM_CAPTURE = """The forced completion review was completed and deployed at SHA abc1234.
+_DEPLOY_PROOF_LINE = "CHITRA-COMPLETION: " + json.dumps(
+    {
+        "kind": "deploy",
+        "done_when_item_id": "done-1",
+        "receipt_name": "tests-green",
+        "validator": "pytest",
+        "validator_result": "pass",
+        "citation": "deployed SHA abc1234",
+    },
+    separators=(",", ":"),
+)
+_LIVE_PROOF_LINE = "CHITRA-COMPLETION: " + json.dumps(
+    {
+        "kind": "live_verify",
+        "done_when_item_id": "done-1",
+        "receipt_name": "tests-green",
+        "validator": "pytest",
+        "validator_result": "pass",
+        "citation": "live health probe status=200 with 24 requests; /tmp/live-review.log",
+    },
+    separators=(",", ":"),
+)
+_CITED_CLAIM_CAPTURE = f"""The forced completion review was completed and deployed at SHA abc1234.
 It reviews every finished lane turn before any done state is trusted.
-Live health probe status=200 with 24 requests; /tmp/live-review.log.
+{_DEPLOY_PROOF_LINE}
+{_LIVE_PROOF_LINE}
 \u276f
 """
+_DEFERRAL_QUESTION_TURN = "Can you run npm install on tophand for me?\nI will pick it up once it is there.\n\u276f\n"
+_TOOL_ACTIVE_TURN = "\u23fa Bash(pytest -q)\n  \u23bf  1 passed in 0.02s\nSuite output above.\n\u276f\n"
+_TOOL_ACTIVE_TURN_AFTER_ORDER = "\u23fa Bash(chitra-goals now)\n  \u23bf  recorded\nStill on it.\n\u276f\n"
+# A first turn that ends with rendered tool chrome, then a second turn whose
+# scrollback still shows that same chrome above a quiet answer. The chrome
+# belongs to the earlier turn; the second turn itself made no tool call and
+# must still reach review.
+_TOOL_TURN_LEAVING_CHROME = "\u23fa Bash(early setup)\n  \u23bf  recorded\nSuite output above.\n\u276f\n"
+_NO_TOOL_TURN_BELOW_OLD_CHROME = (
+    "\u23fa Bash(early setup)\n  \u23bf  recorded\nHolding for the operator's call on the rollout window.\n\u276f\n"
+)
+# An answer that uses Unicode bullets as ordinary list prose. No tool ran in
+# this turn; a generic bullet glyph must not read as tool activity.
+_UNICODE_BULLET_ANSWER_TURN = "\u2022 first item stays open\n\u2022 second item is scheduled\nI will hold here.\n\u276f\n"
 
 
 def test_poll_once_does_not_block_on_a_slow_reviewer_and_later_drains_it(tmp_path: Path) -> None:
@@ -343,11 +414,7 @@ def test_turn_end_automatically_runs_review_and_marks_cited_completion_pending_c
     captures = iter(
         [
             "working on the implementation\nesc to interrupt\n❯\n",
-            """The forced completion review was completed and deployed at SHA abc1234.
-It reviews every finished lane turn before any done state is trusted.
-Live health probe status=200 with 24 requests; /tmp/live-review.log.
-❯
-""",
+            _CITED_CLAIM_CAPTURE,
         ]
     )
 
@@ -379,6 +446,40 @@ Live health probe status=200 with 24 requests; /tmp/live-review.log.
     review = json.loads((tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8"))
     assert review["condition"] == "completion_claim"
     assert review["completion_verdict"] == "CLEAN"
+
+
+def test_legacy_goal_cannot_reach_done_through_watchd(tmp_path: Path) -> None:
+    enrolled = _tracked_goal(tmp_path)
+    payload = enrolled.to_dict()
+    payload["interview_receipt"] = None
+    payload["enrolled_done_when_items"] = []
+    payload["completion_proofs"] = []
+    (tmp_path / "goals.json").write_text(
+        json.dumps({"schema": "chitra.goals.v2", "updated_at": enrolled.updated_at, "goals": [payload]}),
+        encoding="utf-8",
+    )
+    captures = iter(["working\nesc to interrupt\n❯\n", _CITED_CLAIM_CAPTURE])
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures, _CITED_CLAIM_CAPTURE))
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"), runner=runner)
+    try:
+        watcher.poll_once()
+        watcher.poll_once()
+    finally:
+        watcher.shutdown()
+
+    stored = get_goal(tmp_path, enrolled.session_ref)
+    assert stored is not None
+    assert stored.status == "working"
+    review = json.loads((tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8"))
+    assert review["status"] == "unenrolled"
+    assert review["completion_verdict"] == "COMPLETION_DISPUTE"
 
 
 def test_rejected_turn_review_enqueues_reasoned_dispatch(tmp_path: Path) -> None:
@@ -432,7 +533,44 @@ def test_turn_end_without_claim_is_finished_unverified_not_idle_green(tmp_path: 
         if command[1] == "list-panes":
             return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
         if command[1] == "capture-pane":
-            return _completed(command, next(captures))
+            return _completed(command, next(captures, "I need the exact release target before continuing.\n❯\n"))
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"),
+        runner=runner,
+        reviewer=reviewer,
+    )
+    watcher.poll_once()
+    watcher.poll_once()
+    review_log = tmp_path / "completion_reviews.jsonl"
+    for _ in range(100):
+        if len(reviewer.calls) == 2 and review_log.exists():
+            break
+        threading.Event().wait(0.01)
+        watcher.poll_once()
+    stored = get_goal(tmp_path, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "turn-finished-unverified"
+    assert "without a completion claim" in stored.now
+    assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
+    review = json.loads(review_log.read_text(encoding="utf-8"))
+    assert review["condition"] == "turn_end_without_completion_claim"
+    assert review["review_verdict"] == "accept"
+    assert "accepted the turn end" in review["summary"]
+
+
+def test_tool_active_turn_without_trigger_skips_isolated_review(tmp_path: Path) -> None:
+    goal = _tracked_goal(tmp_path)
+    reviewer = _AcceptingReviewer()
+
+    captures = iter(["Working... esc to interrupt\n", _TOOL_ACTIVE_TURN])
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures, _TOOL_ACTIVE_TURN))
         raise AssertionError(f"unexpected command: {command}")
 
     watcher = Watchd(
@@ -446,11 +584,386 @@ def test_turn_end_without_claim_is_finished_unverified_not_idle_green(tmp_path: 
     stored = get_goal(tmp_path, goal.session_ref)
     assert stored is not None
     assert stored.status == "turn-finished-unverified"
-    assert "without a completion claim" in stored.now
+    assert "isolated review was not run" in stored.now
     assert reviewer.calls == []
     review = json.loads((tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8"))
+    assert review["condition"] == "turn_end_without_completion_claim"
     assert review["review_verdict"] == "unavailable"
     assert "isolated review was not run" in review["summary"]
+
+
+def test_prior_turn_tool_chrome_does_not_suppress_review_of_a_no_tool_deferral_turn(tmp_path: Path) -> None:
+    """Regression: the zero-tool trigger reads the current turn, not scrollback.
+
+    The pane still shows the previous turn's rendered tool chrome above this
+    turn's answer. The earlier turn ended at its own reviewed boundary, so
+    its chrome is not part of THIS turn and must not classify this no-tool
+    deferral turn as tool-active.
+    """
+    _tracked_goal(tmp_path)
+    reviewer = _DeferringReviewer()
+
+    captures = iter(
+        [
+            "working\nesc to interrupt\n❯\n",
+            _TOOL_TURN_LEAVING_CHROME,
+            "working\nesc to interrupt\n❯\n",
+            _NO_TOOL_TURN_BELOW_OLD_CHROME,
+        ]
+    )
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures, _NO_TOOL_TURN_BELOW_OLD_CHROME))
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"),
+        runner=runner,
+        reviewer=reviewer,
+    )
+    try:
+        watcher.poll_once()
+        watcher.poll_once()
+        first_records = [
+            json.loads(line)
+            for line in (tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        assert [record["review_verdict"] for record in first_records] == ["unavailable"]
+        assert reviewer.calls == []
+        watcher.poll_once()
+        for _ in range(100):
+            orders = list((tmp_path / "queue" / "orders").glob("*.json"))
+            if orders:
+                break
+            threading.Event().wait(0.02)
+            watcher.poll_once()
+
+        assert len(orders) == 1
+        order = DispatchOrder.model_validate_json(orders[0].read_text(encoding="utf-8"))
+        assert order.message_kind == "reasoned_nudge"
+        assert order.decision_attestation is not None
+        assert order.decision_attestation.review_verdict == "reject"
+        assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
+        records = [
+            json.loads(line)
+            for line in (tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        verdicts = [record["review_verdict"] for record in records]
+        assert verdicts == ["unavailable", "reject"]
+    finally:
+        watcher.shutdown()
+
+
+def test_current_turn_journal_tool_event_does_not_trigger_zero_tool_review(tmp_path: Path) -> None:
+    """Regression: journal filtering uses the previous watermark, not the new one.
+
+    A TOOL_CALL observed mid-turn lands before the turn-end timestamp that the
+    turn-end path writes. Filtering the journal against that new timestamp
+    discarded the event and misread the tool-active turn as zero-tool, which
+    wrongly dispatched it to isolated review. The previous reviewed turn end
+    is the only valid lower bound for current-turn journal evidence.
+    """
+    goal = _tracked_goal(tmp_path)
+    now = datetime.now(UTC)
+    started = now - timedelta(seconds=60)
+    observed_mid_turn = (now - timedelta(seconds=30)).isoformat()
+    tool_event = CanonicalEvent(
+        event_id="evt-tool-current-turn",
+        instance="watchd-regression",
+        lane="fleet",
+        client=Client.CODEX,
+        client_version="0.149.0",
+        process_id=None,
+        transcript=TranscriptIdentity(path="/tmp/fleet-transcript.jsonl", device=1, inode=1),
+        session_id=goal.session_ref,
+        resume_id=None,
+        observed_at=observed_mid_turn,
+        native_time=None,
+        native_type="exec_command_begin",
+        native_join_id="join-1",
+        raw_byte_range=None,
+        raw_sha256=None,
+        normalized_type=CanonicalType.TOOL_CALL,
+        payload_digest="0" * 64,
+        normalizer_version="test",
+        payload={},
+        raw_record=None,
+    )
+    EventJournal(tmp_path, "fleet").append([tool_event])
+    reviewer = _AcceptingReviewer()
+
+    captures = iter(["Working... esc to interrupt\n", "Holding for the operator's window.\n❯\n"])
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures, "Holding for the operator's window.\n❯\n"))
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log", journal_root=tmp_path),
+        runner=runner,
+        reviewer=reviewer,
+    )
+    watcher._started_at = started.isoformat()
+    try:
+        watcher.poll_once()
+        watcher.poll_once()
+        review_log = tmp_path / "completion_reviews.jsonl"
+        for _ in range(100):
+            if review_log.exists():
+                break
+            threading.Event().wait(0.02)
+            watcher.poll_once()
+
+        records = [json.loads(line) for line in review_log.read_text(encoding="utf-8").splitlines()]
+        assert len(records) == 1
+        assert records[0]["review_verdict"] == "unavailable"
+        assert "isolated review was not run" in records[0]["summary"]
+        assert reviewer.calls == []
+    finally:
+        watcher.shutdown()
+
+
+def test_unicode_bullet_answer_without_tool_calls_gets_reviewed(tmp_path: Path) -> None:
+    """Regression: a generic Unicode bullet is prose, not a tool marker.
+
+    Codex answers legitimately begin lines with "•". A turn whose text uses
+    them as list prose made zero observable tool calls and must reach the
+    isolated reviewer instead of being waved through as tool-active.
+    """
+    _tracked_goal(tmp_path)
+    reviewer = _AcceptingReviewer()
+
+    captures = iter(
+        [
+            "Working... esc to interrupt\n",
+            _TOOL_ACTIVE_TURN,
+            "Working... esc to interrupt\n",
+            _UNICODE_BULLET_ANSWER_TURN,
+        ]
+    )
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures, _UNICODE_BULLET_ANSWER_TURN))
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"),
+        runner=runner,
+        reviewer=reviewer,
+    )
+    try:
+        watcher.poll_once()
+        watcher.poll_once()
+        first_records = [
+            json.loads(line)
+            for line in (tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        assert [record["review_verdict"] for record in first_records] == ["unavailable"]
+        for _ in range(100):
+            records = [
+                json.loads(line)
+                for line in (tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            if len(records) == 2:
+                break
+            threading.Event().wait(0.02)
+            watcher.poll_once()
+
+        assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
+        records = [
+            json.loads(line)
+            for line in (tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        assert [record["review_verdict"] for record in records] == ["unavailable", "accept"]
+    finally:
+        watcher.shutdown()
+
+
+def test_question_turn_without_completion_word_gets_deferral_review_and_nudge(tmp_path: Path) -> None:
+    goal = _tracked_goal(tmp_path)
+    reviewer = _DeferringReviewer()
+    state = {"finished": False}
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            content = _DEFERRAL_QUESTION_TURN if state["finished"] else "working on the implementation\nesc to interrupt\n❯\n"
+            return _completed(command, content)
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"),
+        runner=runner,
+        reviewer=reviewer,
+    )
+    try:
+        watcher.poll_once()
+        state["finished"] = True
+        watcher.poll_once()
+        orders: list[Path] = []
+        for _ in range(50):
+            orders = list((tmp_path / "queue" / "orders").glob("*.json"))
+            if orders:
+                break
+            threading.Event().wait(0.05)
+            watcher.poll_once()
+
+        assert len(orders) == 1
+        order = DispatchOrder.model_validate_json(orders[0].read_text(encoding="utf-8"))
+        assert order.session_ref == goal.session_ref
+        assert order.message_kind == "reasoned_nudge"
+        assert "in-authority" in order.nudge
+        assert order.decision_attestation is not None
+        assert order.decision_attestation.review_verdict == "reject"
+        assert order.decision_attestation.operator_confirmed is True
+        assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
+        stored = get_goal(tmp_path, goal.session_ref)
+        assert stored is not None
+        assert stored.status == "blocked"
+        review = json.loads((tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8"))
+        assert review["condition"] == "turn_end_without_completion_claim"
+        assert review["review_verdict"] == "reject"
+    finally:
+        watcher.shutdown()
+
+
+def test_delivered_order_triggers_review_of_next_turn_end(tmp_path: Path) -> None:
+    goal = _tracked_goal(tmp_path)
+    reviewer = _AcceptingReviewer()
+    captures = iter(
+        [
+            "working\nesc to interrupt\n❯\n",
+            _TOOL_ACTIVE_TURN,
+            "working the delivered order\nesc to interrupt\n❯\n",
+            _TOOL_ACTIVE_TURN_AFTER_ORDER,
+        ]
+    )
+    settled_capture = {"value": _TOOL_ACTIVE_TURN}
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures, settled_capture["value"]))
+        raise AssertionError(f"unexpected command: {command}")
+
+    def recorded_verdicts() -> list[str]:
+        return [
+            json.loads(line)["review_verdict"]
+            for line in (tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+
+    watcher = Watchd(
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"),
+        runner=runner,
+        reviewer=reviewer,
+    )
+    try:
+        watcher.poll_once()
+        watcher.poll_once()
+        assert reviewer.calls == []
+        assert recorded_verdicts() == ["unavailable"]
+
+        result = DispatchResult(
+            order_id="order-1",
+            session_ref=goal.session_ref,
+            status=DispatchStatus.SENT,
+            at=datetime.now(UTC).isoformat(),
+        )
+        results_dir = tmp_path / "queue" / "results"
+        results_dir.mkdir(parents=True)
+        (results_dir / "order-1.json").write_text(result.model_dump_json(), encoding="utf-8")
+
+        settled_capture["value"] = _TOOL_ACTIVE_TURN_AFTER_ORDER
+        watcher.poll_once()
+        for _ in range(100):
+            if recorded_verdicts() == ["unavailable", "accept"]:
+                break
+            threading.Event().wait(0.02)
+            watcher.poll_once()
+
+        assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
+        assert recorded_verdicts() == ["unavailable", "accept"]
+    finally:
+        watcher.shutdown()
+
+
+def test_watchd_survives_a_newer_goals_store_read_only(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """The v4-outage rule for the state-writing watcher: against a goals.json
+    labeled newer than the installed package, poll_once journals the read-only
+    degradation once and keeps emitting pane events instead of letting
+    GoalsSchemaNewerError kill run_forever's loop; goal mutations are skipped,
+    so the newer writer's file is never rewritten."""
+    goal = _tracked_goal(tmp_path)
+    payload = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
+    payload["schema"] = "chitra.goals.v4"
+    (tmp_path / "goals.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    captures = iter(["Working... esc to interrupt\n", "I need the exact release target before continuing.\n❯\n"])
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures))
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"), runner=runner)
+    try:
+        watcher.poll_once()
+        emitted = watcher.poll_once()
+    finally:
+        watcher.shutdown()
+
+    assert emitted == 1
+    stored = get_goal(tmp_path, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "working"
+    document = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
+    assert document["schema"] == "chitra.goals.v4"
+    notices = [line for line in capsys.readouterr().out.splitlines() if GOALS_SCHEMA_NEWER_MESSAGE in line]
+    assert len(notices) == 1
+
+
+def test_watchd_does_not_drain_completed_reviews_before_newer_schema_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ready review must not get a goal-write attempt against a newer store.
+
+    ``poll_once`` drains ready review futures before capturing panes. That
+    drain is itself a goal-writing path, so the newer-schema guard must run
+    before it.
+    """
+    goal = _tracked_goal(tmp_path)
+    payload = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
+    payload["schema"] = "chitra.goals.v4"
+    (tmp_path / "goals.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    watcher = Watchd(WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"), runner=lambda _: _completed([], ""))
+
+    def drain(_watcher: Watchd) -> None:
+        from chitra.goals import update_now
+
+        update_now(tmp_path, goal.session_ref, now="must remain read-only")
+
+    monkeypatch.setattr(Watchd, "_drain_completed_reviews", drain)
+    try:
+        assert watcher.poll_once() == 0
+    finally:
+        monkeypatch.undo()
+        watcher.shutdown()
+
+    assert json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))["schema"] == "chitra.goals.v4"
 
 
 def test_list_panes_uses_live_tmux_enumeration_and_deduplicates_pane_id() -> None:
@@ -629,3 +1142,192 @@ def test_reviewer_config_precedence_is_cli_then_env_then_pinned_defaults(monkeyp
 def test_resolve_config_rejects_non_positive_reviewer_count(tmp_path: Path, reviewer_count: int) -> None:
     with pytest.raises(ValueError, match="reviewer_count must be a positive integer"):
         resolve_config(state_dir=tmp_path, reviewer_count=reviewer_count)
+
+
+def test_claimed_pass_with_failing_registered_validator_stays_completion_disputed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """P4: the lane's CHITRA-COMPLETION result is ignored; Chitra runs the
+    registered validator itself, stores its exit code, and a failing stored
+    result keeps the completion claim disputed."""
+    import sys
+
+    from chitra.validator_registry import VALIDATORS_ENV_VAR
+
+    registry = tmp_path / "validators.json"
+    registry.write_text(
+        json.dumps({"fail-always": {"argv": [sys.executable, "-c", "import sys; sys.exit(1)"]}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(VALIDATORS_ENV_VAR, str(registry))
+
+    goal = upsert_goal(
+        tmp_path,
+        GoalRecord(
+            session_ref="localhost:fleet:0.0",
+            intent="Deliver the requested gate while preserving every explicit operator boundary.",
+            goal="Build and verify the requested forced completion review.",
+            done_when="The live completion probe passes with cited evidence.",
+            scope="WS1 source tests and documentation only.",
+            source="task-file:/tmp/ws1.md",
+            status="working",
+            **enrollment_fields(
+                "The live completion probe passes with cited evidence.",
+                validator="fail-always",
+                required_receipt="failing-check",
+            ),
+        ),
+    )
+    assert get_goal(tmp_path, goal.session_ref) is not None
+
+    proof_line = "CHITRA-COMPLETION: " + json.dumps(
+        {
+            "kind": "live_verify",
+            "done_when_item_id": "done-1",
+            "receipt_name": "failing-check",
+            "validator": "fail-always",
+            "validator_result": "pass",
+            "citation": "live health probe status=200 with 24 requests; /tmp/live-review.log",
+        },
+        separators=(",", ":"),
+    )
+    capture = f"""The forced completion review was completed and deployed at SHA abc1234.
+It reviews every finished lane turn before any done state is trusted.
+{proof_line}
+❯
+"""
+    captures = iter(["working on the implementation\nesc to interrupt\n❯\n", capture])
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures, capture))
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"),
+        runner=runner,
+        reviewer=_AcceptingReviewer(),
+    )
+    try:
+        watcher.poll_once()
+        watcher.poll_once()
+        for _ in range(50):
+            stored = get_goal(tmp_path, goal.session_ref)
+            assert stored is not None
+            if stored.status in {"completion-disputed", "done-pending-close"}:
+                break
+            threading.Event().wait(0.01)
+            watcher.poll_once()
+    finally:
+        watcher.shutdown()
+
+    stored = get_goal(tmp_path, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "completion-disputed"
+    receipt = json.loads((tmp_path / "validation-receipts" / "failing-check.json").read_text(encoding="utf-8"))
+    assert receipt["result"]["status"] == "FAIL"
+    review = json.loads((tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8"))
+    assert review["condition"] == "completion_claim"
+    assert review["completion_verdict"] == "COMPLETION_DISPUTE"
+
+
+@pytest.mark.parametrize("mode", ["forged_pass", "missing"])
+def test_tampered_disk_receipt_cannot_produce_a_clean_completion_audit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    """P4: the turn-end gate reads the hash-bound disk receipt, not the
+    runner's in-memory result; a missing or falsified receipt stays dirty."""
+    import sys
+
+    import chitra.watchd as watchd_module
+    from chitra.validator_registry import VALIDATORS_ENV_VAR
+
+    registry = tmp_path / "validators.json"
+    registry.write_text(json.dumps({"flaky-check": {"argv": [sys.executable, "-c", "pass"]}}), encoding="utf-8")
+    monkeypatch.setenv(VALIDATORS_ENV_VAR, str(registry))
+
+    goal = upsert_goal(
+        tmp_path,
+        GoalRecord(
+            session_ref="localhost:fleet:0.0",
+            intent="Deliver the requested gate while preserving every explicit operator boundary.",
+            goal="Build and verify the requested forced completion review.",
+            done_when="The live completion probe passes with cited evidence.",
+            scope="WS1 source tests and documentation only.",
+            source="task-file:/tmp/ws1.md",
+            status="working",
+            **enrollment_fields(
+                "The live completion probe passes with cited evidence.",
+                validator="flaky-check",
+                required_receipt="tampered-check",
+            ),
+        ),
+    )
+    assert get_goal(tmp_path, goal.session_ref) is not None
+
+    proof_line = "CHITRA-COMPLETION: " + json.dumps(
+        {
+            "kind": "live_verify",
+            "done_when_item_id": "done-1",
+            "receipt_name": "tampered-check",
+            "validator": "flaky-check",
+            "validator_result": "pass",
+            "citation": "live health probe status=200 with 24 requests; /tmp/live-review.log",
+        },
+        separators=(",", ":"),
+    )
+    capture = f"""The forced completion review was completed and deployed at SHA abc1234.
+It reviews every finished lane turn before any done state is trusted.
+{proof_line}
+❯
+"""
+    captures = iter(["working on the implementation\nesc to interrupt\n❯\n", capture])
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures, capture))
+        raise AssertionError(f"unexpected command: {command}")
+
+    original_record = watchd_module.record_enrolled_validator_runs
+    receipt_file = tmp_path / "validation-receipts" / "tampered-check.json"
+
+    def record_then_damage(root, session_ref, items):
+        proofs = original_record(root, session_ref, items)
+        if mode == "forged_pass":
+            forged = json.loads(receipt_file.read_text(encoding="utf-8"))
+            forged["target"]["artifact"]["sha256"] = "0" * 64
+            unsigned = dict(forged)
+            unsigned["integrity"] = {k: v for k, v in forged["integrity"].items() if k != "digest"}
+            canonical = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            forged["integrity"]["digest"] = hashlib.sha256(canonical).hexdigest()
+            receipt_file.write_text(json.dumps(forged), encoding="utf-8")
+        else:
+            receipt_file.unlink()
+        return proofs
+
+    monkeypatch.setattr(watchd_module, "record_enrolled_validator_runs", record_then_damage)
+
+    watcher = Watchd(
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"),
+        runner=runner,
+        reviewer=_AcceptingReviewer(),
+    )
+    try:
+        watcher.poll_once()
+        watcher.poll_once()
+        for _ in range(50):
+            stored = get_goal(tmp_path, goal.session_ref)
+            assert stored is not None
+            if stored.status in {"completion-disputed", "done-pending-close"}:
+                break
+            threading.Event().wait(0.01)
+            watcher.poll_once()
+    finally:
+        watcher.shutdown()
+
+    stored = get_goal(tmp_path, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "completion-disputed"
+    review = json.loads((tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8"))
+    assert review["condition"] == "completion_claim"
+    assert review["completion_verdict"] == "COMPLETION_DISPUTE"

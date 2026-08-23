@@ -1,0 +1,27 @@
+[Unit]
+Description=chitra monitord for lane %i (composed journal/detector/ladder/enrollment/presence monitor)
+Documentation=https://github.com/ReticleWorks/chitra
+After=network-online.target
+
+[Service]
+Type=simple
+# Replace with the user/group this service should run as. Do not run as root.
+User=chitra
+Group=chitra
+# Each %i instance gets an isolated state root so one lane namespace's
+# journals, findings, and presence records never touch another's.
+StateDirectory=polyphony-chitra-%i
+StateDirectoryMode=0750
+Environment=CHITRA_STATE_DIR=/var/lib/polyphony-chitra-%i
+# Shadow mode (the default) records findings and ladder decisions without any
+# action path. An operator opts a unit out explicitly by overriding this to 0;
+# leave it on until that review has happened per instance.
+Environment=CHITRA_MONITORD_SHADOW_MODE=1
+# Fill in the venv path where chitra >= 0.16.0 was installed.
+ExecStart=/opt/chitra/venv/bin/chitra-monitord --state-dir ${CHITRA_STATE_DIR}
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

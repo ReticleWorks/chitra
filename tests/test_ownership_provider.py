@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _goal_fixtures import enrollment_fields
 
 from chitra import ownership_provider as provider
 from chitra.goals import GoalRecord
@@ -37,6 +38,7 @@ def _goal(session_ref: str, lane_id: str) -> dict[str, object]:
         enrolled_at="2026-07-15T15:00:00Z",
         created_at="2026-07-15T15:00:00Z",
         updated_at="2026-07-15T15:00:00Z",
+        **enrollment_fields("All focused ownership authority tests pass cleanly"),
     ).to_dict()
 
 
@@ -101,7 +103,7 @@ def test_missing_state_returns_non_authoritative_unknown(tmp_path: Path) -> None
         # The schema this provider expects, which follows chitra.goals. The
         # document fixture above stays on v1 on purpose, to prove a host that
         # has not upgraded yet still reads authoritatively.
-        "schema": "chitra.goals.v2",
+        "schema": "chitra.goals.v3",
         "generation": 0,
         "complete": False,
         "manager_heartbeat_at": "",
@@ -277,6 +279,84 @@ def test_generation_fence_rejects_rollback_or_same_generation_rewrite(tmp_path: 
         generation_fence_path=fence_path,
     )
     assert rewritten.authoritative is False and rewritten.reason == "state_generation_rollback"
+
+
+def _read_args(goals_path: Path, marker_path: Path) -> dict[str, object]:
+    return {
+        "provider_instance_id": "provider-instance",
+        "goals_path": goals_path,
+        "marker_path": marker_path,
+        "expected_host_id": HOST,
+        "expected_boot_id": BOOT,
+        "now": NOW,
+    }
+
+
+def test_newer_goals_schema_and_future_fields_stay_authoritative(tmp_path: Path) -> None:
+    """P6 forward compatibility: the provider accepts every schema
+    chitra.goals accepts -- including chitra.goals.v4 from a newer writer --
+    and ignores unknown top-level or per-record fields instead of turning
+    managed state into unknown/malformed during the exact version-skew
+    incident P6 exists to handle. Duplicate keys, sizes, digests, required
+    fields, and status checks are unchanged."""
+    goals_path, marker_path = _write_state(tmp_path)
+    payload = json.loads(goals_path.read_bytes())
+    payload["schema"] = "chitra.goals.v4"
+    payload["future_v4_envelope"] = {"unknown": True}
+    record = payload["goals"][0]
+    record["future_v4_field"] = {"nested": [1, 2, 3]}
+    raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    goals_path.write_bytes(raw)
+    goals_path.chmod(0o600)
+    marker_path.write_text(
+        json.dumps(managed_marker_for_state(raw, host_id=HOST, boot_id=BOOT, generation=17, manager_heartbeat_at=NOW)),
+        encoding="utf-8",
+    )
+    marker_path.chmod(0o600)
+
+    owned = ownership_result(_query("host-a:lane-one:0.0"), **_read_args(goals_path, marker_path))
+    unowned = ownership_result(_query("host-a:absent:0.0"), **_read_args(goals_path, marker_path))
+
+    assert owned["authoritative"] is True
+    assert owned["result"] == {
+        "session_ref": "host-a:lane-one:0.0",
+        "status": "owned",
+        "lane_id": "lane-one",
+        "lane_generation": 1,
+    }
+    assert unowned["authoritative"] is True
+    assert unowned["result"] == {"session_ref": "host-a:absent:0.0", "status": "unowned"}
+
+
+def test_non_family_label_and_missing_required_field_stay_malformed(tmp_path: Path) -> None:
+    """Tolerance is for newer versions of the same schema family only: an
+    arbitrary label, or a record missing a required canonical field, still
+    fails closed to non-authoritative unknown."""
+    goals_path, marker_path = _write_state(tmp_path)
+
+    def _rewrite(payload: dict[str, object]) -> None:
+        raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+        goals_path.write_bytes(raw)
+        goals_path.chmod(0o600)
+        marker_path.write_text(
+            json.dumps(managed_marker_for_state(raw, host_id=HOST, boot_id=BOOT, generation=17, manager_heartbeat_at=NOW)),
+            encoding="utf-8",
+        )
+        marker_path.chmod(0o600)
+
+    payload = json.loads(goals_path.read_bytes())
+    payload["schema"] = "some.other.thing.v9"
+    _rewrite(payload)
+    response = ownership_result(_query("host-a:lane-one:0.0"), **_read_args(goals_path, marker_path))
+    assert response["authoritative"] is False
+    assert response["result"]["reason"] == "state_malformed"
+
+    payload["schema"] = "chitra.goals.v3"
+    del payload["goals"][0]["source"]
+    _rewrite(payload)
+    missing_required = ownership_result(_query("host-a:lane-one:0.0"), **_read_args(goals_path, marker_path))
+    assert missing_required["authoritative"] is False
+    assert missing_required["result"]["reason"] == "state_malformed"
 
 
 def test_query_requires_exact_fields_and_canonical_session_ref(tmp_path: Path) -> None:

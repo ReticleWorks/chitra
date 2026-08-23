@@ -20,6 +20,259 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.16.0] - 2026-08-23
+
+### Added
+
+- Compose journal ingestion, detectors and ladder, enrollment receipts, and
+  presence into one `monitord` entrypoint with shadow-mode findings on by
+  default.
+- Register `monitord` in the capability manifest so its command surface is
+  declared like every other daemon.
+- Ship a single chitra-monitord@ .service.example instance-template unit
+  alongside the kept dispatchd units.
+
+### Deprecated
+
+- Mark `watchd`, `triaged`, and `sweepd` as deprecated by the composed
+  `monitord` entrypoint. They remain installed for existing declarations; no
+  new daemon beyond `monitord` and `dispatchd` will be added.
+
+## [0.15.0] - 2026-08-22
+
+### Added
+
+- Review turns without completion words when they contain a question, make no
+  tool calls, or follow a delivered dispatch.
+- Resolve exhaustion evidence handles against transcripts, ledgers, and command
+  results before accepting a brief.
+- Run registered completion validators and record their observed receipts instead
+  of trusting a lane's self-reported result.
+
+### Fixed
+
+- Share one grounded, nonce-fenced reviewer contract between lane and monitor
+  review paths.
+- Read newer goals schemas without crashing and keep daemon writes gated to the
+  installed schema unless migration is explicit.
+- Apply structural, stateful stop-guard decisions across repeated turns and
+  remove the redundant word-list gates.
+
+## [0.14.12] - 2026-08-22
+
+### Fixed
+
+- Bind dispatch delivery-ledger rows to the adapter-native session identity
+  normalized from the confirmed lane transcript (signature version 5,
+  never derived from routing_hint), so genuine deliveries advance the W3
+  ladder while cross-session evidence fails closed.
+- Make rescue checkpoint receipts single-create and their consumption
+  atomic: a seal now durably spends the receipt's reference and anti-replay
+  nonce under the incident lock before appending, rejecting duplicate or
+  replayed receipts exactly once ever, including after restart.
+
+## [0.14.11] - 2026-08-22
+
+### Fixed
+
+- Tighten W3 detector and ladder semantics: canonical event-ID progress resets,
+  real worktree containment, claim-aware false completion, signed immediate
+  consumption boundaries, sealed RESCUE/checkpoint relaunch gating, and
+  fail-closed rescue evidence capture.
+
+## [0.14.10] - 2026-08-22
+
+### Added
+
+- Add W3 canonical-journal detectors for drift, unnecessary steps,
+  excessive testing, document dithering, and false completion, plus the
+  consumption-bound response ladder, RESCUE bundle capture, relaunch brief
+  generation, injected failure fixtures, and false-positive controls.
+- Add topology conversion tooling that preserves legacy goal and dispatch
+  queue hashes, marks legacy goals display/dispose-only, emits read-only
+  shadow findings, and records per-instance handoff and disposable rollback
+  receipts without touching live hosts.
+
+## [0.14.8] - 2026-08-22
+
+### Fixed
+
+- Presence records now serialize the contractual `mode` field with value
+  `using` or `released`, as DESIGN-v3 section 5 requires, instead of a
+  differently named `state` field; every other record binding and the
+  append/merge behavior are unchanged.
+- Direct peer questions now enter the existing governed session-message path:
+  `chitra-peer say` enqueues a real dispatch order bound to the target session
+  and text for `dispatchd` to deliver and verify. The shared-dir mirror is
+  non-authoritative, and locally recorded receipts only ever mirror
+  dispatchd's own durable results, so they can no longer claim delivery that
+  did not happen.
+
+## [0.14.7] - 2026-08-22
+
+### Fixed
+
+- Presence records now bind each declaration to its session, goal references,
+  purpose, and journal event reference, as DESIGN-v3 section 5 requires.
+- Peer messages now record a dispatch receipt on delivery and a consumption
+  receipt when the peer consumes, instead of bypassing the governed
+  session-message path.
+
+## [0.14.6] - 2026-08-22
+
+### Added
+
+- Add per-instance, append-only advisory presence for shared resources. Readers
+  merge every writer file and report peers without locks, expiry, stealing, or
+  exclusive claims.
+- Add atomic file-per-message peer inboxes with stable ordering and idempotent
+  retry IDs. The `chitra-presence` and `chitra-peer` commands expose both
+  library surfaces without adding a daemon or socket.
+
+### Fixed
+
+- Preserve nanosecond modification times with an inode tie-breaker when
+  ordering dispatch queues, so same-tick writes retain FIFO order on Linux.
+
+## [0.14.5] - 2026-08-22
+
+### Fixed
+
+- A same-inode rotation observed while the transcript holds no completed
+  records (for example a truncate-to-zero rewrite) now also restarts the
+  journal ingestor's normalizer replay state. A record restored verbatim
+  after such an empty rotation keeps its original event ID instead of
+  being appended again as an apparent second occurrence.
+
+## [0.14.4] - 2026-08-22
+
+### Fixed
+
+- A detected same-inode rewrite now replays duplicate-free through the
+  journal ingestor: replay restarts the normalizer's per-incarnation
+  occurrence numbering, so unchanged records reproduce their original
+  event IDs and the durable journal no longer appends duplicates of
+  already-stored events. Rotation across a different inode keeps
+  continuing the stream's numbering, preserving both W11 fixture
+  projections.
+
+## [0.14.3] - 2026-08-21
+
+### Fixed
+
+- Completed whitespace-only JSONL lines are now hash-covered like every
+  other consumed byte range: their range and digest are recorded when
+  consumed, so a same-inode, same-size rewrite of a blank line into a
+  valid record can no longer be silently skipped while the final anchor
+  stays unchanged. Any such mismatch rotates the same inode and replays
+  the transcript.
+
+## [0.14.2] - 2026-08-21
+
+### Fixed
+
+- Same-inode, same-size rewrites at any record position are now always
+  detected: every poll re-verifies the stored hash of every consumed
+  record at its byte range (plus buffered partial bytes), removing the
+  16-record sampled verification that could silently skip an unsampled
+  interior record in journals longer than 16 records. Any mismatch
+  rotates the same inode and replays the whole transcript.
+
+## [0.14.1] - 2026-08-21
+
+### Fixed
+
+- Same-inode rewrites are no longer missed when file size and the final
+  64 bytes are unchanged: each poll re-verifies stored record hashes at
+  their byte ranges (first and last records always, a deterministic
+  sample of earlier records, plus buffered partial bytes) and replays
+  the transcript on any mismatch.
+- Receipt verification now fails closed on every validator, not only the
+  Polyvalidation Rig: a `PASS` receipt must bind a hash-bound
+  `chitra-validator-report-v1` report whose command and exit code support the
+  claim, checked at ingest and again at close. A self-asserted `PASS` over a
+  failing report can no longer close an item.
+- The generic verifier no longer takes a PASS result from caller-authored
+  report text alone. A claimed exit code must be re-established by an
+  independent trusted execution of the declared exercise command in a
+  verifier-controlled environment, so a hash-consistent report that lies about
+  a failing command can no longer close an item.
+- Receipts are stored at `<state-root>/validation-receipts/<receipt_name>.json`
+  as DESIGN-v3 section 2 requires, without the undocumented session-hash
+  directory.
+
+## [0.14.0] - 2026-08-21
+
+### Added
+
+- Add fixture-gated Claude Code 2.1.229 and Codex 0.149.0 transcript
+  normalizers with stable canonical event IDs and native call/result joins.
+- Add a byte-accurate JSONL tail reader that retains partial appends, follows
+  same-inode resumes, and switches cleanly across rotation.
+- Add append-only per-lane event and progress-derivation journals under each
+  instance state root. Native records remain intact for replay.
+- `chitra-receipts ingest`, `list`, and `verify` manage immutable per-lane
+  validation receipts under the instance state root. Ingest verifies the W12
+  nine-field envelope, its canonical digest, and every copied evidence hash.
+- Receipt verification checks current artifact or commit identity and validates
+  PVR report-to-audit bindings when the receipt names the Polyvalidation Rig.
+
+### Changed
+
+- Done transition and completion close now reload the exact frozen receipt from
+  the lane store. Only a verified `PASS` with validator acceptance and no
+  unexercised surface counts; caller flags and claimed result text cannot
+  replace it.
+
+## [0.13.0] - 2026-08-21
+
+### Added
+
+- Goal enrollment now requires one atomic four-question interview result with
+  a typed receipt and at least one frozen structured done item. Each item names
+  its validator and the exact completion receipt it requires.
+- Completion proofs bind exact done-item IDs to receipt names, validators,
+  passing results, and concrete citations. Watchd persists the validated proofs
+  before a done transition, and completion close repeats the same check.
+
+### Changed
+
+- A first `chitra-goals set` prints `INTERVIEW_REQUIRED` JSON with a persisted
+  nonce and writes no goal. The paired `--interview-result` call performs the
+  enrollment. Goals schema v3 keeps v1/v2 records readable but limits them to
+  display and reasoned administrative disposal.
+- Free-form delivered items and operator acknowledgements no longer satisfy a
+  completion close. Administrative discard remains separate and requires a
+  reason that is logged as not done.
+
+## [0.12.4] - 2026-08-21
+
+### Fixed
+
+- Watchd bounds every tmux subprocess call. A hung tmux server now returns a
+  logged timeout failure instead of stopping the poll loop indefinitely.
+- Watchd, sweepd, and triaged send systemd readiness and watchdog datagrams.
+  The watchdog signal is enabled only when systemd supplies `WATCHDOG_USEC`.
+- The systemd units use `Type=notify` and a watchdog limit set to three times
+  each daemon's normal poll interval. No extra heartbeat state files are
+  written.
+
+## [0.12.3] - 2026-08-21
+
+### Fixed
+
+- Dispatch verifies that a pasted message leaves the composer. Codex gets its
+  kitty-keyboard Enter fallback only when the marker remains in an idle
+  composer; a marker that still remains fails the order.
+- Delivery becomes complete only when one lane transcript contains the user
+  marker followed by agent or tool activity. System records and activity in a
+  different transcript do not count.
+- A send nonce now creates a verify-only state. An unresolved nonce never
+  causes the message to be pasted again, and exhausted verification retries
+  still fail with a critical log.
+- A pre-existing composer draft remains blocked and is never flushed by
+  default.
+
 ## [0.12.2] - 2026-08-17
 
 The merge daemon is being turned on for the first time, on one host. This

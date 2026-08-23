@@ -10,16 +10,15 @@ Chitra-goals is the user-facing CLI for managing session goals. It wraps the det
 chitra-goals set \
   --session-ref agent-1 \
   --goal "Implement user authentication for the API" \
-  --done-when "API login endpoint accepts username+password and returns JWT" \
-  --source "operator:trey" \
-  --open-ask "Retrieve current auth library version"
+  --source "task-file:auth-task.md"
 ```
 
-Creates or updates a goal. On first write, the goal is immutable (lane_id, enrolled_done_when, enrolled_at are write-once). On later writes, only status and reasoning can change. `set` never moves the enrolled anchors. Only `redirect` can, and only under the condition described in its section below.
+The first call returns `INTERVIEW_REQUIRED` JSON with a nonce and four questions. It writes no goal. Record the answers, their `operator:` or `source:` provenance, and at least one structured done item in an `INTERVIEW_RESULT` file. Then repeat the same command with `--interview-result result.json`. That call atomically stores the receipt, frozen items, generated display `done_when`, `enrolled_at`, and `lane_id`.
 
 Validates:
 - Goal text is ≥6 words.
-- done_when is non-empty and plain language.
+- Every interview answer and its provenance are present.
+- At least one done item names its ID, text, validator, and required receipt.
 - Status is one of: open, working, paused, held, complete, abandoned, redirected, deferred.
 
 ### get — Query a goal
@@ -42,13 +41,10 @@ Formats: markdown (default), box (fixed-width Unicode), cards (full sentences).
 
 ```bash
 chitra-goals close \
-  --session-ref agent-1 \
-  --delivered-item "API login endpoint at POST /auth/login" \
-  --delivered-item "JWT token generation and validation" \
-  --close-note "All tests passing. Ready for review."
+  --session-ref agent-1
 ```
 
-Blocks closure if the inventory count is short. Performs inventory-check: counts delivered items against enrolled goal conditions. If discrepancies exist, reports them and asks for operator acknowledgement.
+Completion close requires `done-pending-close` and repeats the exact item ID, receipt name, validator result, and citation check over Watchd's persisted proofs. `--delivered-item` and `--operator-acknowledged-item` are rejected as completion substitutes. Use `--administrative --reason "..."` to discard a dead record without claiming the work is done.
 
 ### hold — Pause a goal
 
@@ -74,19 +70,10 @@ Sets status back to "open" or "working".
 chitra-goals redirect \
   --session-ref agent-1 \
   --goal "Implement user authentication (updated scope: add MFA)" \
-  --done-when "API login and MFA endpoints working" \
   --reason "Operator request: add MFA requirement"
 ```
 
-Updates the goal with a reason. The old goal is kept in history, and the redirect reason is recorded.
-
-A redirect that changes `done_when` also re-freezes the enrollment anchors. It sets
-`enrolled_done_when` to the new `done_when` and stamps `enrolled_at` with the redirect
-time. This is what keeps the lane launchable. Without it, every later
-`chitra-lane-launch` refuses with `lane launch refused: lane identity or frozen done_when
-snapshot does not match`, and the only way out is editing the governed store by hand.
-
-A redirect that leaves `done_when` unchanged keeps the original enrollment anchors.
+Updates strategic fields with a reason and records the prior values in history. Frozen done items and the generated `done_when` cannot be redirected. The operation is labeled as not done.
 
 ### now — Current status
 

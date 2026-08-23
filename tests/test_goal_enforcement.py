@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _goal_fixtures import enrollment_fields
 
 from chitra.goal_enforcement import (
     REVIEWER_ATTEMPTS,
@@ -21,7 +22,7 @@ from chitra.goal_enforcement import (
     review_watched_session,
     unwrap_json_object,
 )
-from chitra.goals import GoalRecord, get_goal, redirect_goal, upsert_goal
+from chitra.goals import EnrolledScopeImmutableError, GoalRecord, get_goal, redirect_goal, upsert_goal
 
 
 def _request_from_prompt(prompt: str) -> dict[str, object]:
@@ -50,6 +51,7 @@ def _goal(root: Path) -> GoalRecord:
             scope="WS1 source tests and documentation only.",
             source="task-file:/tmp/ws1.md",
             status="working",
+            **enrollment_fields("Every required local validation passes with cited output."),
         ),
     )
 
@@ -91,19 +93,19 @@ def test_initial_round_requires_unanimous_isolated_acceptance(tmp_path: Path) ->
     assert (tmp_path / "goal_reviews.jsonl").exists()
 
 
-def test_frozen_goal_uses_redirect_refreshed_enrollment_condition(tmp_path: Path) -> None:
+def test_frozen_goal_uses_immutable_structured_enrollment_condition(tmp_path: Path) -> None:
     enrolled = _goal(tmp_path)
-    redirected = redirect_goal(
-        tmp_path,
-        enrolled.session_ref,
-        reason="operator proposed a smaller validation target",
-        done_when="The focused local validation passes with cited output.",
-    )
+    with pytest.raises(EnrolledScopeImmutableError, match="done_when is frozen"):
+        redirect_goal(
+            tmp_path,
+            enrolled.session_ref,
+            reason="operator proposed a smaller validation target",
+            done_when="The focused local validation passes with cited output.",
+        )
 
-    frozen = freeze_goal(redirected)
+    frozen = freeze_goal(enrolled)
 
-    assert frozen.done_when == redirected.done_when
-    assert frozen.done_when != enrolled.done_when
+    assert frozen.done_when == enrolled.done_when
 
 
 def test_initial_round_can_be_configured_to_one_reviewer(tmp_path: Path) -> None:
@@ -426,5 +428,63 @@ def test_claude_reviewer_uses_a_fresh_process_and_only_watched_behavior_context(
     # The prompt must enumerate the exact FindingCode literals so the reviewer
     # model does not invent an out-of-enum code (e.g. "COMPLETION_WITHOUT_PROOF")
     # that fails ReviewerVerdict validation and forces a fail-closed verdict.
-    for code in ("goal_drift", "smuggled_redirect", "hedged_completion", "unsupported_completion", "other"):
+    for code in (
+        "goal_drift",
+        "smuggled_redirect",
+        "hedged_completion",
+        "unsupported_completion",
+        "false_blocker",
+        "deferred_to_operator",
+        "idle_no_action",
+        "unverified_claim",
+        "other",
+    ):
         assert all(code in command[2] for command in commands)
+
+
+ALL_FINDING_CODES = (
+    "goal_drift",
+    "smuggled_redirect",
+    "hedged_completion",
+    "unsupported_completion",
+    "false_blocker",
+    "deferred_to_operator",
+    "idle_no_action",
+    "unverified_claim",
+    "other",
+)
+
+
+@pytest.mark.parametrize("code", ALL_FINDING_CODES)
+def test_a_verdict_carrying_each_finding_code_round_trips_through_validation(code: str) -> None:
+    verdict = ReviewerVerdict(
+        reviewer_id="reviewer-a",
+        goal_contract_id="sha256:" + "a" * 64,
+        behavior_sha256="b" * 64,
+        verdict="reject",
+        findings=(
+            ReviewFinding(
+                code=code,
+                detail="The turn exhibited this failure class.",
+                citation="an exact substring of the watched turn",
+            ),
+        ),
+    )
+
+    parsed = ReviewerVerdict.model_validate_json(verdict.model_dump_json())
+
+    assert parsed.findings[0].code == code
+
+
+def test_the_prompt_contains_every_finding_code(tmp_path: Path) -> None:
+    goal = freeze_goal(_goal(tmp_path))
+    captured: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(command)
+        return subprocess.CompletedProcess(command, 0, _verdict_json(command), "")
+
+    ClaudeProcessReviewer(runner=runner).review(goal, _behavior(goal), "reviewer-a")
+
+    for code in ALL_FINDING_CODES:
+        assert code in captured[0][2]

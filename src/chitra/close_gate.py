@@ -10,9 +10,9 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Protocol
 
-from chitra.completion_gate import CompletionEvidence
+from chitra.completion_gate import CompletionEvidence, completion_receipt_issues
 
 AGGREGATE_DONE_WHEN_TOKENS: tuple[str, ...] = (
     "representative",
@@ -145,6 +145,75 @@ class CloseGateError(ValueError):
     def __init__(self, verdict: CloseGateVerdict) -> None:
         self.verdict = verdict
         super().__init__(verdict.summary)
+
+
+class StructuredDoneItem(Protocol):
+    @property
+    def id(self) -> str: ...
+
+    @property
+    def text(self) -> str: ...
+
+    @property
+    def validator(self) -> str: ...
+
+    @property
+    def required_receipt(self) -> str: ...
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredCloseVerdict:
+    verdict: Literal["PASS", "FAIL"]
+    required_item_ids: tuple[str, ...]
+    issues: tuple[str, ...]
+    summary: str
+
+
+class StructuredCloseGateError(ValueError):
+    """Raised when exact named completion receipts do not cover frozen items."""
+
+    def __init__(self, verdict: StructuredCloseVerdict) -> None:
+        self.verdict = verdict
+        super().__init__(verdict.summary)
+
+
+def evaluate_structured_close_inventory(
+    enrolled_items: Sequence[StructuredDoneItem],
+    evidence: Sequence[CompletionEvidence],
+) -> StructuredCloseVerdict:
+    """Compare exact frozen item IDs, receipt names, validators, and results."""
+    if not enrolled_items:
+        return StructuredCloseVerdict(
+            verdict="FAIL",
+            required_item_ids=(),
+            issues=("completion close requires at least one frozen done item",),
+            summary="FAIL: completion close requires at least one frozen done item.",
+        )
+    issues = tuple(completion_receipt_issues(enrolled_items, evidence))
+    if issues:
+        return StructuredCloseVerdict(
+            verdict="FAIL",
+            required_item_ids=tuple(item.id for item in enrolled_items),
+            issues=issues,
+            summary="FAIL: " + "; ".join(issues),
+        )
+    return StructuredCloseVerdict(
+        verdict="PASS",
+        required_item_ids=tuple(item.id for item in enrolled_items),
+        issues=(),
+        summary="PASS: every frozen done item has its exact passing named receipt.",
+    )
+
+
+def require_structured_close_inventory(
+    enrolled_items: Sequence[StructuredDoneItem],
+    evidence: Sequence[CompletionEvidence],
+) -> StructuredCloseVerdict:
+    """Return a passing exact-receipt verdict or raise a typed close error."""
+    verdict = evaluate_structured_close_inventory(enrolled_items, evidence)
+    if verdict.verdict == "FAIL":
+        raise StructuredCloseGateError(verdict)
+    return verdict
 
 
 def lint_done_when(done_when: str) -> DoneWhenFlag | None:

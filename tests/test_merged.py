@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _goal_fixtures import enrollment_fields
 
 from chitra import merged
 from chitra.goals import GoalRecord
@@ -149,6 +150,7 @@ def goal(session_ref: str, *, now: str = "", source: str = "") -> GoalRecord:
         source=source or "operator",
         status="working",
         now=now,
+        **enrollment_fields("the pull request is merged and the lane is told"),
     )
 
 
@@ -228,7 +230,7 @@ def test_a_credential_it_cannot_use_fails_the_daemon(tmp_path: Path) -> None:
         "  enabled: true\n"
         "  allowed_repos: [ReticleWorks/chitra]\n"
         "  lane_authors: [lane-bot]\n"
-        "  token_command: ['/bin/false']\n",
+        "  token_command: ['/usr/bin/false']\n",
         encoding="utf-8",
     )
 

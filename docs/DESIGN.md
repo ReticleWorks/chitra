@@ -12,11 +12,27 @@ Task decomposition and response generation remain out of scope. Task decompositi
 
 ## Done-condition ownership and close boundary
 
-Done conditions belong to the operator and the material used to enroll a session. Chitra never enumerates, derives, proposes, authors, annotates, or rewrites `done_when`; post-hoc authorship would let the system fit the condition to whatever already exists. The first record write copies that condition into write-once `enrolled_done_when`/`enrolled_at` anchors, and every later write is checked at the single `_upsert_goal_locked` boundary. A stable `lane_id`, derived from the session name without host or instance suffix, prevents an open lane from being re-enrolled under a fresh volatile `session_ref`. Legacy records with no anchors are backfilled in memory from their current condition and stored timestamps, then persist the normalization on their next write. Enrollment-time interactive elicitation requires a separate operator-interaction channel and is outside this release.
+Done conditions belong to the operator and the material used to enroll a session. A first `chitra-goals set` writes only a nonce and returns four typed interview questions. The paired `--interview-result` call verifies the nonce, all four answers and their provenance, and at least one structured done item. One locked write then stores the interview receipt, frozen done items, generated display `done_when`, and `enrolled_at`. Every item names its validator and exact required completion receipt. A stable `lane_id`, derived from the session name without host or instance suffix, prevents an open lane from being re-enrolled under a fresh volatile `session_ref`. Legacy v1/v2 records remain readable for display and reasoned administrative disposal, but they cannot launch, enter a done state, or use completion close.
 
-`chitra.close_gate` therefore has a deliberately narrower role. It deterministically reads explicit items and counts from `enrolled_done_when`, computes enrolled-minus-current and history-derived descopes, compares the remaining inventory with caller-supplied delivered items or explicit `CompletionEvidence.todo_item` bindings, and blocks `chitra-goals close` before state deletion when the inventory is short. It also treats follow-on/out-of-scope/deferred/future-work language over a still-required item as a silent-descope tell unless a recorded operator redirect removed that condition or the caller supplies an explicit operator acknowledgement. Operator-facing core summaries render a reduced current condition together with its `dropping: ...` delta; adapters that render goal conditions must use `descope_delta(record)` to do the same.
+`chitra.close_gate` compares the exact frozen item IDs, receipt names, validators, passing results, and concrete citations. Watchd runs this binding before `done-pending-close`, persists the validated proofs, and completion close repeats the same deterministic check before deletion. Free-form delivered items and operator acknowledgements cannot satisfy completion. A reasoned administrative discard remains available, but it is logged as not done.
 
-The companion done-condition lint is surfacing-only. At `chitra-goals set`, missing or vague aggregate conditions add one fixed persistent `open_asks` flag for the board's `AWAITING RULING` section. Enrollment is not blocked, the supplied value is unchanged, and Chitra emits no replacement or suggested enumeration.
+### Registered validators
+
+Every enrolled done item names a validator from the instance's registered-validator file, and only Chitra executes it. The lane's own `CHITRA-COMPLETION: {...}` line remains a trigger and an item binding; its claimed `validator_result` is discarded. At a completion-claim turn-end, `watchd` runs the registered argv itself, stores the hash-bound W12 receipt at `validation-receipts/<required_receipt>.json` with the observed exit code as the result, and the gate reads that disk result — a lane claiming `pass` over a failing registered validator stays `completion-disputed`.
+
+The registry lives at `<state root>/validators.json`; set `CHITRA_VALIDATORS_FILE` to point at another path (the launcher is expected to ship and manage this file in a later fleet-repo change). It maps validator names to one command each:
+
+```json
+{
+  "suite": {"argv": ["/usr/bin/env", "pytest", "-q"], "timeout_s": 120.0, "runs_as": "ci"}
+}
+```
+
+- `argv` (required): the exact command Chitra executes; an entry with no arguments is invalid.
+- `timeout_s` (optional, default 120): seconds before the run fails closed.
+- `runs_as` (optional): declared execution identity, recorded verbatim on the receipt.
+
+Enrollment refuses any done item whose validator is not a key in this registry (`chitra-goals set` exits non-zero with `validator not registered`), so a report cannot be a registered command. A missing file is an empty registry. An unrunnable or timed-out validator records exit code 125 — it can never produce a passing receipt. Where a validator name is both registered and legacy-trusted, the registered entry governs execution and verification.
 
 ## Distribution and packaging
 

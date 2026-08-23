@@ -60,6 +60,27 @@ capabilities:
         params: []
         mutates: true
 
+  - name: monitord
+    kind: daemon
+    purpose: Compose journal ingestion, failure-mode detectors and response ladder, enrollment receipts, and presence into one supervised observation daemon.
+    when_to_use: Declare one monitord process per instance instead of the deprecated watchd/triaged/sweepd chain.
+    authority:
+      level: record
+      grants:
+        - Ingest lane transcripts into durable journals and run deterministic detectors over observed events.
+        - Read enrolled goal contracts, execute registered completion validators, verify receipts, and write incident records.
+        - Publish advisory presence records.
+      excludes:
+        - Capture tmux pane content itself, dispatch orders, restart or steer lanes.
+        - Merge, approve, or modify pull requests.
+    default_enabled: true
+    commands:
+      - name: monitord
+        description: Start the composed Chitra monitor daemon.
+        argv: [monitord]
+        params: []
+        mutates: true
+
   - name: draft-scanner
     kind: daemon
     purpose: Detect unsubmitted drafts in configured tmux input boxes.
@@ -117,6 +138,26 @@ capabilities:
         params: []
         mutates: true
 
+  - name: validation-receipts
+    kind: tool
+    purpose: Store and verify hash-bound validation receipts for exact frozen goal items.
+    when_to_use: Use after a validator emits a W12 receipt and before a lane can enter or complete its close path.
+    authority:
+      level: record
+      grants:
+        - Ingest an exact enrolled receipt and copy its hash-bound evidence into the lane store.
+        - List receipts and verify their integrity, validator result, and current target identity.
+      excludes:
+        - Generate validator results or change a frozen done item.
+        - Treat a failed, unexercised, stale, or caller-asserted result as completion evidence.
+    default_enabled: true
+    commands:
+      - name: chitra-receipts
+        description: Ingest, list, or verify per-lane validation receipts.
+        argv: [chitra-receipts]
+        params: []
+        mutates: true
+
   - name: artifacts
     kind: tool
     purpose: Record Claude artifact publication and explicit review metadata.
@@ -133,6 +174,26 @@ capabilities:
       - name: chitra-artifacts
         description: Store and inspect deterministic artifact review records.
         argv: [chitra-artifacts]
+        params: []
+        mutates: true
+
+  - name: topology-conversion
+    kind: tool
+    purpose: Build read-only topology conversion, handoff, shadow, and rollback receipts.
+    when_to_use: Use before a governed migration to bind legacy state, dispatch queue replay, lifecycle evidence, and disposable rollback proofs.
+    authority:
+      level: observe
+      grants:
+        - Read legacy state roots or W10 snapshots and write caller-selected receipt artifacts.
+        - Verify disposable rollback snapshots before restoring them in isolated state roots.
+      excludes:
+        - Dispatch messages, manage services, relaunch clients, apply packages, or merge pull requests.
+        - Treat W10 metadata as converted per-record goal evidence.
+    default_enabled: true
+    commands:
+      - name: chitra-convert
+        description: Build topology conversion and migration proof receipts.
+        argv: [chitra-convert]
         params: []
         mutates: true
 
@@ -296,6 +357,28 @@ capabilities:
         params: []
         mutates: true
 
+  - name: review
+    kind: tool
+    purpose: >-
+      Run one isolated reviewer process against the shared rubric over a lane or
+      monitor turn envelope, enforce grounding and goal binding, and emit the verdict.
+    when_to_use: Use when a judged surface needs a single completion review verdict for one recorded session turn.
+    authority:
+      level: record
+      grants:
+        - Read one JSON turn envelope on stdin and run isolated claude reviewer processes against that turn only.
+        - Emit the bound ReviewerVerdict JSON on stdout with ungrounded rejections dropped to accept.
+      excludes:
+        - Decide whether a lane completes or merge, approve, or modify pull requests.
+        - Store, alter, or delete goals, receipts, or any local record.
+    default_enabled: true
+    commands:
+      - name: chitra-review
+        description: Review one turn envelope from stdin and emit the ReviewerVerdict JSON.
+        argv: [chitra-review]
+        params: []
+        mutates: false
+
   - name: failover
     kind: tool
     purpose: >-
@@ -317,6 +400,32 @@ capabilities:
       - name: chitra-failover
         description: Evaluate, start, or reverse a rate-limit lane pause using the guard's own planner.
         argv: [chitra-failover]
+        params: []
+        mutates: true
+
+  - name: parallel-coordination
+    kind: tool
+    purpose: Publish advisory shared-resource presence and route direct questions to peer monitors.
+    when_to_use: Declare a resource before heavy use, inspect peer declarations, or ask a named peer to coordinate.
+    authority:
+      level: record
+      grants:
+        - Append presence to one named instance's file and read the union of all presence files.
+        - Enqueue one governed dispatch order for a named peer instance's session and read that order's durable result state.
+      excludes:
+        - Claim, lock, expire, steal, wait for, or grant authority over a shared resource.
+        - Create a peer socket, daemon, or implicit message consumer.
+        - Assert delivery or consumption that dispatchd did not already record durably.
+    default_enabled: true
+    commands:
+      - name: chitra-presence
+        description: Publish or list advisory shared-resource presence without blocking.
+        argv: [chitra-presence]
+        params: []
+        mutates: true
+      - name: chitra-peer
+        description: Send peer questions through the governed dispatch queue and read their truthful result state.
+        argv: [chitra-peer]
         params: []
         mutates: true
 

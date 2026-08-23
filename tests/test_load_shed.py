@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _goal_fixtures import enrollment_fields
 
 from chitra.account_registry import RegistryEntry
 from chitra.goals import GoalRecord
@@ -94,6 +95,7 @@ def _goal(session_ref: str, status: str = "working") -> GoalRecord:
         done_when="The lane finishes without unsafe host pressure.",
         source="task",
         status=status,  # type: ignore[arg-type]
+        **enrollment_fields("The lane finishes without unsafe host pressure."),
     )
 
 

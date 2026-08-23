@@ -72,6 +72,7 @@ class LedgerEntry(BaseModel):
     session_ref: str
     tag: str
     routing_hint: str | None = None
+    native_session_id: str | None = None
     task_type: str | None = None
     resolved_zdr: bool = False
     sig_v: int = 1
@@ -168,9 +169,10 @@ def _sign_versioned(
     resolved_zdr: bool = False,
     sig_v: int,
     legacy_fields: _LegacySignatureFields | None = None,
+    native_session_id: str | None = None,
 ) -> str:
     """Sign one current or historical canonical ledger field set."""
-    if sig_v not in (1, 2, 3, 4):
+    if sig_v not in (1, 2, 3, 4, 5):
         raise ValueError(f"unsupported signature version: {sig_v}")
     fields = [sent_at, session_ref, tag, digest, routing_hint or ""]
     if sig_v in (2, 3):
@@ -182,6 +184,8 @@ def _sign_versioned(
             )
     elif sig_v == 4:
         fields.extend([task_type or "", "1" if resolved_zdr else "0"])
+    elif sig_v == 5:
+        fields.extend([task_type or "", "1" if resolved_zdr else "0", native_session_id or ""])
     canonical = "|".join(fields).encode("utf-8")
     return hmac.new(key, canonical, hashlib.sha256).hexdigest()
 
@@ -196,6 +200,7 @@ def sign(
     routing_hint: str | None = None,
     task_type: str | None = None,
     resolved_zdr: bool = False,
+    native_session_id: str | None = None,
     sig_v: int = 4,
 ) -> str:
     """HMAC-SHA256 signature over the current canonical ledger fields."""
@@ -208,6 +213,7 @@ def sign(
         routing_hint=routing_hint,
         task_type=task_type,
         resolved_zdr=resolved_zdr,
+        native_session_id=native_session_id,
         sig_v=sig_v,
     )
 
@@ -221,6 +227,7 @@ def append_entry(
     nudge: str,
     key: bytes,
     routing_hint: str | None = None,
+    native_session_id: str | None = None,
     task_type: str | None = None,
     resolved_zdr: bool = False,
     sent_at: str | None = None,
@@ -229,6 +236,7 @@ def append_entry(
     truncates existing entries."""
     stamp = sent_at or datetime.now(UTC).isoformat()
     digest = message_hash(nudge)
+    sig_v = 5 if native_session_id else 4
     signature = sign(
         key,
         session_ref=session_ref,
@@ -238,15 +246,18 @@ def append_entry(
         routing_hint=routing_hint,
         task_type=task_type,
         resolved_zdr=resolved_zdr,
+        native_session_id=native_session_id,
+        sig_v=sig_v,
     )
     entry = LedgerEntry(
         order_id=order_id,
         session_ref=session_ref,
         tag=tag,
         routing_hint=routing_hint,
+        native_session_id=native_session_id,
         task_type=task_type,
         resolved_zdr=resolved_zdr,
-        sig_v=4,
+        sig_v=sig_v,
         message_hash=digest,
         sent_at=stamp,
         signature=signature,
@@ -269,6 +280,7 @@ def verify_entry(entry: LedgerEntry, *, key: bytes) -> bool:
         routing_hint=entry.routing_hint,
         task_type=entry.task_type,
         resolved_zdr=entry.resolved_zdr,
+        native_session_id=entry.native_session_id,
         sig_v=entry.sig_v,
         legacy_fields=entry._legacy_signature_fields,
     )

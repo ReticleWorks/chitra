@@ -33,6 +33,19 @@ class DispatchStatus(enum.StrEnum):
     # real delivery's own idempotency check. See
     # docs/SOL-ADVERSARIAL-REVIEW finding #1.
     DEFERRED = "deferred"
+    # dispatch_to_tmux pasted the nudge and transcript-grep could not confirm
+    # it structurally (see chitra.dispatch.transcript_confirms_nudge), but
+    # the weaker pane-capture fallback saw the marker in the pane's recent
+    # scrollback. Pane capture cannot distinguish a genuinely-started turn
+    # from a scrollback echo or an unsubmitted composer row, so it is never
+    # treated as a terminal SENT result on its own. dispatchd retries
+    # consumption verification using the same durable retry-attempts sidecar
+    # the lane-lock timeout path uses (chitra.dispatchd._process_claimed_order),
+    # without pasting again; after the retry budget is exhausted it becomes a
+    # terminal FAILED "retry-exhausted" result.
+    # Like DEFERRED, this status is for in-process visibility only -- it is
+    # never written to results/.
+    DELIVERY_UNCONFIRMED = "delivery_unconfirmed"
 
 
 class DispatchOrder(BaseModel):
@@ -136,6 +149,13 @@ class DispatchResult(BaseModel):
     routing_hint: str | None = None
     task_type: str | None = None
     resolved_zdr: bool = False
+    # The adapter-native session identity normalized from the confirmed lane
+    # transcript (chitra.journal.native_session_identity). Derived by
+    # dispatchd when the delivery ledger proof is signed; never taken from
+    # routing_hint, which stays opaque pass-through. Delivery-ledger rows for
+    # genuine Claude/Codex deliveries bind this value so ladder consumption
+    # can reject cross-session evidence.
+    native_session_id: str | None = None
     # A SENT result can be durable before the signed delivery ledger is
     # available so a ledger outage never causes a second paste. Such a result
     # remains in in_flight/ until dispatchd flips this proof bit and moves the

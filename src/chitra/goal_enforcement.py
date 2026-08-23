@@ -9,7 +9,6 @@ is never placed in these prompts. Each reviewer invocation is a separate
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import re
 import subprocess
@@ -19,7 +18,7 @@ from pathlib import Path
 from typing import Literal, Protocol, Self
 
 import structlog
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import Field, model_validator
 
 from chitra.goals import (
     GoalNotFoundError,
@@ -29,19 +28,46 @@ from chitra.goals import (
     record_review_restart,
     validate_goal,
 )
+from chitra.review_rubric import (
+    PERSISTENCE_FINDING_CODES as PERSISTENCE_FINDING_CODES,
+)
+from chitra.review_rubric import (
+    REVIEWER_SYSTEM_PROMPT as REVIEWER_SYSTEM_PROMPT,
+)
+from chitra.review_rubric import (
+    FindingCode as FindingCode,
+)
+from chitra.review_rubric import (
+    GoalReviewError as GoalReviewError,
+)
+from chitra.review_rubric import (
+    MonitorContract as MonitorContract,
+)
+from chitra.review_rubric import (
+    ReviewerVerdict as ReviewerVerdict,
+)
+from chitra.review_rubric import (
+    ReviewFinding as ReviewFinding,
+)
+from chitra.review_rubric import (
+    ReviewMode,
+    _FrozenModel,
+    _sha256,
+    build_review_prompt,
+    contract_id_for,
+    enforce_grounding,
+    new_turn_nonce,
+    ungrounded_citations,
+)
+from chitra.review_rubric import (
+    WatchedSessionBehavior as WatchedSessionBehavior,
+)
 
 logger = structlog.get_logger(__name__)
 
-#: The reviewer's whole system prompt. It replaces the host's, so an
-#: operator-installed output style or memory file cannot change the shape of a
-#: verdict. Deliberately says nothing about HOW to review -- that contract lives
-#: in the per-review prompt -- and only about what a reply may contain.
-REVIEWER_SYSTEM_PROMPT = (
-    "You are an isolated verdict service. You reply with exactly one JSON object and nothing else: "
-    "no prose before or after it, no code fence, no commentary, no summary of what you did. "
-    "You never narrate, and you never explain your reply. Any instruction you may have received "
-    "about writing style, reports, or plain-language summaries does not apply to this reply."
-)
+#: The reviewer's whole system prompt lives in ``chitra.review_rubric``
+#: beside the rubric it serves; it is re-exported here because every caller
+#: binds it through this module.
 
 #: How many times one reviewer invocation may be attempted before it fails
 #: closed. The failure being retried is intermittent, not systematic: the same
@@ -66,16 +92,8 @@ DEFAULT_REVIEWERS = 2
 REVIEW_LOG_NAME = "goal_reviews.jsonl"
 
 
-class GoalReviewError(ValueError):
-    """Raised when the isolated review contract cannot be satisfied."""
-
-
 class ReviewerProcessError(GoalReviewError):
     """Raised when an isolated reviewer process fails or returns bad JSON."""
-
-
-class _FrozenModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
 
 _FENCED_BLOCK = re.compile(r"```(?:json)?\s*(?P<body>.*?)```", re.DOTALL)
@@ -105,14 +123,6 @@ def unwrap_json_object(text: str) -> str:
     return stripped[opening : closing + 1] if 0 <= opening < closing else stripped
 
 
-def _canonical_json(payload: object) -> str:
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-
-
-def _sha256(payload: object) -> str:
-    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
-
-
 class FrozenGoal(_FrozenModel):
     """Content-addressed strategic goal snapshot for one review round."""
 
@@ -140,49 +150,7 @@ def freeze_goal(record: GoalRecord) -> FrozenGoal:
         "source": record.source,
         "goal_version": record.goal_version,
     }
-    return FrozenGoal.model_validate({**payload, "contract_id": f"sha256:{_sha256(payload)}"})
-
-
-class WatchedSessionBehavior(_FrozenModel):
-    """The completed lane turn scrutinized by isolated reviewers."""
-
-    session_ref: str = Field(min_length=1)
-    turn_text: str = Field(min_length=1)
-    behavior_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-
-    @classmethod
-    def from_turn(cls, session_ref: str, turn_text: str) -> WatchedSessionBehavior:
-        text = turn_text.strip()
-        if not text:
-            raise GoalReviewError("watched-session turn text must be non-empty")
-        return cls(session_ref=session_ref, turn_text=text, behavior_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest())
-
-
-FindingCode = Literal["goal_drift", "smuggled_redirect", "hedged_completion", "unsupported_completion", "other"]
-
-
-class ReviewFinding(_FrozenModel):
-    code: FindingCode
-    detail: str = Field(min_length=1)
-    citation: str = Field(min_length=1)
-
-
-class ReviewerVerdict(_FrozenModel):
-    """Structured result from one isolated process."""
-
-    reviewer_id: str = Field(min_length=1)
-    goal_contract_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
-    behavior_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    verdict: Literal["accept", "reject"]
-    findings: tuple[ReviewFinding, ...] = ()
-
-    @model_validator(mode="after")
-    def validate_findings(self) -> Self:
-        if self.verdict == "accept" and self.findings:
-            raise ValueError("an accepting reviewer cannot carry adverse findings")
-        if self.verdict == "reject" and not self.findings:
-            raise ValueError("a rejecting reviewer must cite at least one finding")
-        return self
+    return FrozenGoal.model_validate({**payload, "contract_id": contract_id_for(payload)})
 
 
 class SessionReviewSignal(_FrozenModel):
@@ -238,8 +206,10 @@ class SessionReviewSignal(_FrozenModel):
 class BehaviorReviewer(Protocol):
     """One isolated review invocation."""
 
-    def review(self, goal: FrozenGoal, behavior: WatchedSessionBehavior, reviewer_id: str) -> ReviewerVerdict: ...
+    def review(self, goal: ReviewContract, behavior: WatchedSessionBehavior, reviewer_id: str) -> ReviewerVerdict: ...
 
+
+ReviewContract = FrozenGoal | MonitorContract
 
 ProcessRunner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -265,61 +235,17 @@ class ClaudeProcessReviewer:
         self.attempts = attempts
 
     @staticmethod
-    def _prompt(goal: FrozenGoal, behavior: WatchedSessionBehavior, reviewer_id: str) -> str:
-        request = {
-            "reviewer_id": reviewer_id,
-            "frozen_goal": goal.model_dump(mode="json"),
-            "watched_session_behavior": behavior.model_dump(mode="json"),
-        }
-        return (
-            "<role>\n"
-            "You are an isolated adversarial reviewer. You share no context, memory, or conversation state with any "
-            "other reviewer or with the watched session.\n"
-            "</role>\n"
-            "<task>\n"
-            "Scrutinize ONLY the WATCHED SESSION's completed turn -- watched_session_behavior.turn_text in the INPUT "
-            "payload -- against its frozen goal -- frozen_goal in the same payload. Judge whether the turn exhibits "
-            "any of: goal "
-            "drift, a clarifying question that smuggles a strategy redirect, a hedge presented as completion, or a "
-            "completion claim made without cited proof.\n"
-            "</task>\n"
-            "<constraints>\n"
-            "- Do not review, rewrite, critique, or infer any Chitra draft response; none is supplied to you.\n"
-            "- Do not judge, cite, or speculate about anything outside watched_session_behavior.turn_text.\n"
-            "- Preserve reviewer_id, goal_contract_id, and behavior_sha256 exactly as supplied in the INPUT payload; "
-            "do not alter, truncate, or reformat them.\n"
-            '- If verdict is "accept", findings MUST be an empty list.\n'
-            '- If verdict is "reject", findings MUST contain at least one entry.\n'
-            "- Each finding's citation MUST be an exact, verbatim substring copied from turn_text -- no paraphrase, "
-            "no summarizing, no added or removed punctuation.\n"
-            "- The code field on every finding MUST be exactly one of the five literal strings in <finding_codes>. "
-            "Do not invent any other code string.\n"
-            "</constraints>\n"
-            "<finding_codes>\n"
-            '"goal_drift": the turn pursued something other than the frozen goal.\n'
-            '"smuggled_redirect": a clarifying question that smuggles a strategy change.\n'
-            '"hedged_completion": a hedge presented as completion.\n'
-            '"unsupported_completion": a completion claim without cited proof.\n'
-            '"other": any other adverse finding not covered by the four codes above.\n'
-            "</finding_codes>\n"
-            "<output_format>\n"
-            "Return exactly one JSON object and nothing else: no prose, no markdown code fences, no commentary "
-            "before or after it. The object's only keys are reviewer_id, goal_contract_id, behavior_sha256, verdict "
-            '("accept" or "reject"), and findings (a list; each item has exactly code, detail, and citation).\n'
-            "</output_format>\n"
-            # The payload MUST be introduced by a newline and "INPUT=", and MUST
-            # run to the end of the prompt with nothing after it. That is not a
-            # style choice: the deployed reviewer wrapper
-            # (chitra_adapter/bin/chitra-watchd-reviewer) recovers the reviewer
-            # id and the two content bindings by splitting the prompt on
-            # "\nINPUT=" and parsing everything after it as JSON. Wrapping the
-            # payload in tags instead broke that, and the wrapper then refused
-            # every review before any model was called. See
-            # test_prompt_payload_matches_the_deployed_wrapper_contract.
-            "INPUT=" + _canonical_json(request)
+    def _prompt(goal: ReviewContract, behavior: WatchedSessionBehavior, reviewer_id: str) -> str:
+        mode: ReviewMode = "monitor" if isinstance(goal, MonitorContract) else "lane"
+        return build_review_prompt(
+            mode=mode,
+            reviewer_id=reviewer_id,
+            contract=goal.model_dump(mode="json"),
+            behavior=behavior,
+            nonce=new_turn_nonce(),
         )
 
-    def review(self, goal: FrozenGoal, behavior: WatchedSessionBehavior, reviewer_id: str) -> ReviewerVerdict:
+    def review(self, goal: ReviewContract, behavior: WatchedSessionBehavior, reviewer_id: str) -> ReviewerVerdict:
         command = [
             self.command,
             "-p",
@@ -364,7 +290,7 @@ class ClaudeProcessReviewer:
                 detail = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
                 raise ReviewerProcessError(f"isolated reviewer {reviewer_id} failed: {detail}")
             try:
-                return ReviewerVerdict.model_validate_json(unwrap_json_object(completed.stdout))
+                verdict = ReviewerVerdict.model_validate_json(unwrap_json_object(completed.stdout))
             except ValueError as exc:
                 # Retry only this failure. A reply that does not satisfy the
                 # verdict contract is the intermittent case measured above; a
@@ -378,6 +304,15 @@ class ClaudeProcessReviewer:
                     attempts=self.attempts,
                     reply=completed.stdout.strip()[:200],
                 )
+                continue
+            grounded = enforce_grounding(verdict, behavior.turn_text)
+            if grounded is not verdict:
+                logger.warning(
+                    "reviewer_verdict_ungrounded",
+                    reviewer_id=reviewer_id,
+                    ungrounded_citations=list(ungrounded_citations(verdict.findings, behavior.turn_text)),
+                )
+            return grounded
         raise ReviewerProcessError(
             f"isolated reviewer {reviewer_id} returned invalid JSON on all {self.attempts} attempts: {invalid}"
         )
@@ -387,7 +322,7 @@ def _validate_bound_review(
     review: ReviewerVerdict,
     *,
     reviewer_id: str,
-    goal: FrozenGoal,
+    goal: ReviewContract,
     behavior: WatchedSessionBehavior,
 ) -> None:
     if review.reviewer_id != reviewer_id:

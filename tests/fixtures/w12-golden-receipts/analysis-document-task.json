@@ -1,0 +1,86 @@
+{
+  "artifacts": [
+    {
+      "kind": "pvr-validation-acceptance-manifest",
+      "path": "evidence/document-pvr-contract.json",
+      "sha256": "fae1d064ee9722a45721c90445db9fd6abaa6ff9a82d7eb4128c995c19a84680"
+    },
+    {
+      "kind": "target-digest",
+      "path": "evidence/document-target.sha256",
+      "sha256": "ce1d243727d81cfd1b8e78a9e1f3aa9d93d0d10fc50a112a17393979d67910e0"
+    }
+  ],
+  "exercise": {
+    "command": [
+      "PvrMcpServer.pvr_contract",
+      "family_id=F06",
+      "tracks=CONTENT,CONTRACT,A11Y,DATA"
+    ]
+  },
+  "integrity": {
+    "algorithm": "sha256",
+    "canonicalization": "UTF-8 JSON; keys sorted; separators comma and colon; ensure_ascii false",
+    "digest": "fa638cc981e805f0fe41af833ae7425a0a4b0fec5695d9c3cc3e2ae68cc9535b",
+    "hand_authored_fields": [
+      {
+        "pointer": "/receipt_name",
+        "reason": "stable item-facing name chosen for the golden example"
+      },
+      {
+        "pointer": "/not_exercised",
+        "reason": "human wording of gaps derived from the generated TODO commands and empty surfaces and flows"
+      },
+      {
+        "pointer": "/integrity/canonicalization",
+        "reason": "proposed common-envelope rule, not emitted by PVR today"
+      },
+      {
+        "pointer": "/integrity/scope",
+        "reason": "proposed common-envelope rule, not emitted by PVR today"
+      }
+    ],
+    "scope": "entire receipt with /integrity/digest omitted"
+  },
+  "not_exercised": [
+    {
+      "reason": "the generated F06 command is a TODO placeholder; no content review ran",
+      "surface": "CONTENT"
+    },
+    {
+      "reason": "the generated F06 command is a TODO placeholder; no document contract check ran",
+      "surface": "CONTRACT"
+    },
+    {
+      "reason": "the generated F06 command is a TODO placeholder; no accessibility check ran",
+      "surface": "A11Y"
+    },
+    {
+      "reason": "the generated F06 command is a TODO placeholder; no embedded-data check ran",
+      "surface": "DATA"
+    }
+  ],
+  "produced_at": "2026-08-21T14:51:49Z",
+  "receipt_name": "analysis-document-design-v2.pvr.v1",
+  "result": {
+    "declared_flows": 0,
+    "declared_surfaces": 0,
+    "manifest_schema_valid": true,
+    "status": "not_exercised",
+    "validation_report_produced": false,
+    "validator_acceptance": false
+  },
+  "target": {
+    "artifact": {
+      "path": "/mnt/opshome/scratch/roundtop/chitra-parallel-program-20260821/DESIGN-v2.md",
+      "sha256": "46dcd9b2c75e29a21da8c22133d43eab7ebaf1c1c4e6fce08d845fb90b314476"
+    }
+  },
+  "validator": {
+    "contract_path": "evidence/document-pvr-contract.json",
+    "family_id": "F06",
+    "manifest_schema": "1",
+    "name": "Polyvalidation Rig catalog",
+    "version": "0.2.0"
+  }
+}

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+from _goal_fixtures import enrollment_fields
 
 from chitra.dispatch import DispatchOrder
 from chitra.goal_enforcement import SessionReviewSignal, WatchedSessionBehavior, freeze_goal
@@ -29,6 +30,7 @@ def _goal() -> GoalRecord:
         source="task-file:/tmp/goal.md",
         status="working",
         goal_version=3,
+        **enrollment_fields("Tests pass and a pull request is opened"),
     )
 
 

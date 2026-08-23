@@ -14,6 +14,7 @@ import json
 import os
 import signal
 import threading
+import warnings
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,18 +26,24 @@ from pydantic import BaseModel, ConfigDict, Field
 from chitra._fsio import env_path, write_json_atomic
 from chitra.account_registry import RegistryEntry, load_registry
 from chitra.goals import (
+    GOALS_SCHEMA_NEWER_MESSAGE,
     LOAD_SHED_HOLD_REASON_PREFIX,
     GoalRecord,
     GoalStatus,
     check_specification,
     due_goals,
+    goals_schema_newer_than_installed,
     list_goals,
     session_host,
     session_name,
 )
+from chitra.goals import (
+    SCHEMA as GOALS_INSTALLED_SCHEMA,
+)
 from chitra.lane_config import enabled_lanes
 from chitra.rate_limit_state import Transaction, TransactionPhase, load_load_states, load_transactions
 from chitra.state_paths import state_dir as default_state_dir
+from chitra.systemd_notify import notify_ready, notify_watchdog
 
 logger = structlog.get_logger(__name__)
 
@@ -47,6 +54,32 @@ DIGEST_FILENAME = "sweep-digest.json"
 SNAPSHOT_FILENAME = "sweep-digest-state.json"
 FLAGS_FILENAME = "flags.log"
 FLAG_SEVERITIES: frozenset[str] = frozenset({"CRIT", "IDLE"})
+
+# Roots whose newer-than-installed goals.json has already been journaled; a
+# long-running daemon notices once instead of writing the same warning into
+# the journal on every sweep.
+_SCHEMA_NOTICED_ROOTS: set[str] = set()
+
+
+def note_goals_schema_state(state_dir: Path) -> None:
+    """Journal one read-only notice when this store's file schema is newer.
+
+    The digest reads goal state only, so a newer goals.json keeps sweeping;
+    the notice records that this installed package must not write it instead
+    of exiting into a supervisor restart loop (the chitra.goals.v4 outage
+    class).
+    """
+    file_schema = goals_schema_newer_than_installed(state_dir)
+    if file_schema is None:
+        return
+    key = str(state_dir)
+    if key in _SCHEMA_NOTICED_ROOTS:
+        return
+    _SCHEMA_NOTICED_ROOTS.add(key)
+    print(
+        f"{GOALS_SCHEMA_NEWER_MESSAGE} state_dir={key} file_schema={file_schema} "
+        f"installed_schema={GOALS_INSTALLED_SCHEMA}"
+    )
 
 
 class FlagRecord(BaseModel):
@@ -439,6 +472,7 @@ def compute_delta(previous: SweepSnapshot, current: SweepSnapshot, *, now: datet
 def run_once(config: SweepdConfig, *, now: datetime | None = None) -> SweepDigest:
     """Generate, publish, and then persist one delta baseline transaction."""
     current_now = datetime.now(UTC) if now is None else now
+    note_goals_schema_state(config.state_dir)
     previous = load_snapshot(config.snapshot_path)
     current = build_snapshot(config.state_dir, flags_path=config.flags_path, now=current_now)
     digest = compute_delta(previous, current, now=current_now)
@@ -464,8 +498,10 @@ def run_forever(config: SweepdConfig, *, stop_event: threading.Event | None = No
         digest_path=str(config.digest_path),
         poll_seconds=config.poll_seconds,
     )
+    notify_ready()
     while not active_stop_event.is_set():
         run_once(config)
+        notify_watchdog()
         active_stop_event.wait(config.poll_seconds)
 
 
@@ -488,8 +524,10 @@ def run_lanes_once(lanes_file: Path | None) -> dict[str, SweepDigest]:
 def run_lanes_forever(lanes_file: Path | None, *, poll_seconds: float = DEFAULT_POLL_SECONDS) -> None:
     """Run one shared sweep process over every enabled lane state root."""
     stop_event = threading.Event()
+    notify_ready()
     while not stop_event.is_set():
         run_lanes_once(lanes_file)
+        notify_watchdog()
         stop_event.wait(poll_seconds)
 
 
@@ -507,6 +545,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    warnings.warn(
+        "sweepd is deprecated by chitra-monitord and will be removed "
+        "in a future release; declare one monitord instance instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     """Run the daemon; malformed persisted input deliberately terminates it."""
     args = build_arg_parser().parse_args(argv)
     if args.lanes_file is not None:

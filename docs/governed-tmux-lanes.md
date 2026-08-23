@@ -3,8 +3,11 @@
 Headless Codexman jobs are not lanes. A Chitra lane is one interactive Codex
 or Claude process in its own Tophand tmux session and pane. The launch command
 refuses before creating the session unless `chitra-goals` contains a passing
-record for `<host>:<session>:0.0` (where host is `tophand` or `trinity`) with `goal`, `done_when`, `intent`, `scope`,
-and `source`. It also refuses held or unreadable usage-pause state.
+record for `<host>:<session>:0.0` (where host is `tophand` or `trinity`) with an
+interview receipt, at least one frozen structured done item, and the strategic
+goal fields. The first `chitra-goals set` returns `INTERVIEW_REQUIRED`; the
+paired `set --interview-result <file>` performs the atomic enrollment. The
+launcher also refuses held or unreadable usage-pause state.
 
 ```bash
 chitra-lane-session --lane atlas --host tophand --backend claude --model sonnet --effort high start

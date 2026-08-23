@@ -5,6 +5,10 @@ function. Four shared daemons run continuously when the host role is armed:
 dispatchd, watchd, triaged, and sweepd. The rest are periodic, ad-hoc, or
 observation-only services.
 
+## The Composed Monitor
+
+- **[monitord](monitord.md)** — The single observation-plane daemon: journal ingestion, deterministic detectors and response ladder, enrollment receipts, and presence in one entrypoint. `watchd`, `triaged`, and `sweepd` are deprecated by it.
+
 ## Delivery Systems
 
 The deterministic core that handles message queuing, delivery, and ledger recording.

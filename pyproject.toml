@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "chitra-monitor"
-version = "0.12.2"
+version = "0.16.0"
 description = "Deterministic tmux relay/dedup daemons for AI-agent fleet monitoring"
 readme = "README.md"
 license = "MIT"
@@ -48,9 +48,12 @@ test = [
 
 [project.scripts]
 dispatchd = "chitra.dispatchd:main"
+monitord = "chitra.monitord:main"
 triaged = "chitra.triaged:main"
 draft-scanner = "chitra.draft_scanner:main"
 chitra-goals = "chitra.goals_cli:main"
+chitra-receipts = "chitra.receipts_cli:main"
+chitra-review = "chitra.review_cli:main"
 chitra-artifacts = "chitra.artifacts:main"
 chitra-usage = "chitra.usage:main"
 chitra-rate-limit-guard = "chitra.rate_limit_guard:main"
@@ -65,6 +68,9 @@ chitra-decisions = "chitra.decisions:main"
 chitra-agent = "chitra.agent_cli:main"
 chitra-merge = "chitra.merge_cli:main"
 chitra-failover = "chitra.failover_cli:main"
+chitra-presence = "chitra.presence_cli:main"
+chitra-peer = "chitra.peer_cli:main"
+chitra-convert = "tools.convert.topology:main"
 polyphony-chitra-merged = "chitra.merged:main"
 
 [project.urls]
@@ -74,7 +80,7 @@ Issues = "https://github.com/ReticleWorks/chitra/issues"
 Changelog = "https://github.com/ReticleWorks/chitra/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/chitra", "src/boardd"]
+packages = ["src/chitra", "src/boardd", "tools"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
