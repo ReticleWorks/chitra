@@ -21,6 +21,7 @@ from chitra.goals import (
     load_goals,
     successor_session_ref,
     transfer_goal,
+    update_now,
     upsert_goal,
 )
 from chitra.goals import (
@@ -133,6 +134,17 @@ def test_a_successor_can_itself_be_transferred(tmp_path: Path) -> None:
 
     assert second.session_ref == "tophand:gct-secret-broker-xfer-xfer:0.0"
     assert second.successor_of == successor.session_ref
+
+
+def test_transfer_successor_update_preserves_identity_and_lane(tmp_path: Path) -> None:
+    original = _enrol(tmp_path)
+    _held, successor = transfer_goal(tmp_path, ORIGINAL, to_backend="claude", digest=DIGEST, reason=REASON)
+
+    updated = update_now(tmp_path, successor.session_ref, now="resumed after ownership reconciliation")
+
+    assert updated.goal_id == original.goal_id
+    assert updated.lane_id == original.lane_id
+    assert updated.session_ref == successor.session_ref
 
 
 def test_transfer_refuses_incomplete_or_unknown_input(tmp_path: Path) -> None:

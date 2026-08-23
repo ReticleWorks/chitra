@@ -52,6 +52,7 @@ def _ownership_response(
     lane_id: str = "lane-one",
     generation: int = GENERATION,
     current: datetime = NOW,
+    source_schema: str = "chitra.goals.v1",
 ) -> dict[str, object]:
     return {
         "schema": "chitra.ownership.result.v1",
@@ -64,7 +65,7 @@ def _ownership_response(
         "valid_until": format_timestamp(current + timedelta(seconds=5)),
         "authoritative": True,
         "source": {
-            "schema": "chitra.goals.v1",
+            "schema": source_schema,
             "generation": generation,
             "complete": True,
             "manager_heartbeat_at": format_timestamp(current),
@@ -221,6 +222,27 @@ def test_valid_owned_observation_makes_health_ready(tmp_path: Path) -> None:
         "state_generation": GENERATION,
         "ownership_ready": True,
     }
+
+
+def test_transfer_observation_keeps_logical_lane_and_accepts_goals_v4_fence(tmp_path: Path) -> None:
+    observation = _observation()
+    observation["session_ref"] = "host-a:lane-one-xfer:0.0"
+    observation["ownership"]["lane_id"] = "lane-one"
+    handler = observation_handler(
+        host_uuid=HOST,
+        ledger_path=tmp_path / "ledger.sqlite3",
+        health_path=tmp_path / "health.json",
+        ownership_resolver=lambda query: _ownership_response(
+            query,
+            lane_id="lane-one",
+            source_schema="chitra.goals.v4",
+        ),
+        clock=lambda: NOW,
+    )
+
+    result = handler(observation)
+
+    assert result["status"] == "accepted"
 
 
 def test_observation_expiring_during_ownership_round_trip_is_not_recorded(tmp_path: Path) -> None:

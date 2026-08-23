@@ -26,18 +26,29 @@ HOST = "host-a"
 BOOT = "boot-a"
 
 
-def _goal(session_ref: str, lane_id: str) -> dict[str, object]:
+def _goal(
+    session_ref: str,
+    lane_id: str,
+    *,
+    goal_id: str = "",
+    status: str = "working",
+    successor_of: str = "",
+    transferred_to: str = "",
+) -> dict[str, object]:
     return GoalRecord(
         session_ref=session_ref,
         lane_id=lane_id,
+        goal_id=goal_id,
         goal="Implement the complete bounded ownership authority contract safely",
         done_when="All focused ownership authority tests pass cleanly",
         source="task-file:test",
-        status="working",
+        status=status,
         enrolled_done_when="All focused ownership authority tests pass cleanly",
         enrolled_at="2026-07-15T15:00:00Z",
         created_at="2026-07-15T15:00:00Z",
         updated_at="2026-07-15T15:00:00Z",
+        successor_of=successor_of,
+        transferred_to=transferred_to,
         **enrollment_fields("All focused ownership authority tests pass cleanly"),
     ).to_dict()
 
@@ -72,6 +83,24 @@ def _write_state(
     # carry a mode rather than inherit one. A host with umask 002 writes 0664
     # and every test here reads back state_unsafe -- which is the reader working
     # correctly and the fixture testing the umask it happened to run under.
+    for path in (goals_path, marker_path):
+        path.chmod(0o600)
+    return goals_path, marker_path
+
+
+def _write_document(root: Path, document: dict[str, object]) -> tuple[Path, Path]:
+    goals_path = root / "goals.json"
+    marker_path = root / "goals.managed.json"
+    raw = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
+    goals_path.write_bytes(raw)
+    marker = managed_marker_for_state(
+        raw,
+        host_id=HOST,
+        boot_id=BOOT,
+        generation=17,
+        manager_heartbeat_at=NOW,
+    )
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
     for path in (goals_path, marker_path):
         path.chmod(0o600)
     return goals_path, marker_path
@@ -138,6 +167,97 @@ def test_valid_complete_state_returns_exact_owned_and_unowned(tmp_path: Path) ->
     }
     assert unowned["authoritative"] is True
     assert unowned["result"] == {"session_ref": "host-a:absent:0.0", "status": "unowned"}
+
+
+def test_transfer_ownership_keeps_logical_lane_for_physical_successor(tmp_path: Path) -> None:
+    predecessor_ref = "host-a:logical-lane:0.0"
+    successor_ref = "host-a:logical-lane-xfer:0.0"
+    document = {
+        "schema": "chitra.goals.v4",
+        "updated_at": "2026-07-15T16:00:00Z",
+        "goals": [
+            _goal(
+                predecessor_ref,
+                "logical-lane",
+                goal_id="goal-transfer",
+                status="held",
+                transferred_to=successor_ref,
+            ),
+            _goal(
+                successor_ref,
+                "logical-lane",
+                goal_id="goal-transfer",
+                status="working",
+                successor_of=predecessor_ref,
+            ),
+        ],
+    }
+    goals_path, marker_path = _write_document(tmp_path, document)
+
+    response = ownership_result(
+        _query(successor_ref),
+        provider_instance_id="provider-instance",
+        goals_path=goals_path,
+        marker_path=marker_path,
+        expected_host_id=HOST,
+        expected_boot_id=BOOT,
+        now=NOW,
+    )
+
+    assert response["authoritative"] is True
+    assert response["result"] == {
+        "session_ref": successor_ref,
+        "status": "owned",
+        "lane_id": "logical-lane",
+        "lane_generation": 1,
+    }
+
+
+def test_v4_physical_lane_mismatch_without_transfer_is_malformed(tmp_path: Path) -> None:
+    document = {
+        "schema": "chitra.goals.v4",
+        "updated_at": "2026-07-15T16:00:00Z",
+        "goals": [_goal("host-a:physical-lane:0.0", "logical-lane", goal_id="goal-one")],
+    }
+    goals_path, marker_path = _write_document(tmp_path, document)
+
+    response = ownership_result(
+        _query("host-a:physical-lane:0.0"),
+        provider_instance_id="provider-instance",
+        goals_path=goals_path,
+        marker_path=marker_path,
+        expected_host_id=HOST,
+        expected_boot_id=BOOT,
+        now=NOW,
+    )
+
+    assert response["authoritative"] is False
+    assert response["result"]["reason"] == "state_malformed"
+
+
+def test_duplicate_active_goal_id_is_malformed(tmp_path: Path) -> None:
+    document = {
+        "schema": "chitra.goals.v4",
+        "updated_at": "2026-07-15T16:00:00Z",
+        "goals": [
+            _goal("host-a:lane-one:0.0", "lane-one", goal_id="goal-duplicate"),
+            _goal("host-a:lane-two:0.0", "lane-two", goal_id="goal-duplicate"),
+        ],
+    }
+    goals_path, marker_path = _write_document(tmp_path, document)
+
+    response = ownership_result(
+        _query("host-a:lane-one:0.0"),
+        provider_instance_id="provider-instance",
+        goals_path=goals_path,
+        marker_path=marker_path,
+        expected_host_id=HOST,
+        expected_boot_id=BOOT,
+        now=NOW,
+    )
+
+    assert response["authoritative"] is False
+    assert response["result"]["reason"] == "state_malformed"
 
 
 @pytest.mark.parametrize(

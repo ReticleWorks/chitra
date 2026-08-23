@@ -274,7 +274,7 @@ def test_load_old_record_without_optional_fields_is_backward_compatible(tmp_path
     assert record.goal_history == ()
     assert record.lane_id == "lane"
     assert record.enrolled_done_when == record.done_when
-    assert record.enrolled_at == payload["updated_at"]
+    assert record.enrolled_at == "1970-01-01T00:00:00+00:00"
     with pytest.raises(GoalValidationError, match="legacy goals are display-only"):
         upsert_goal(tmp_path, record)
     assert close_goal(

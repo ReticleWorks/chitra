@@ -112,6 +112,7 @@ _GOAL_STRING_FIELDS = _GOAL_FIELDS - {
     "enrolled_done_when_items",
     "completion_proofs",
 }
+_GOAL_ID_FIELD = "goal_id"
 
 
 class ProtocolError(ValueError):
@@ -256,23 +257,33 @@ def _validate_goals_document(raw: bytes, *, host_id: str) -> dict[str, Ownership
     if not isinstance(payload, dict) or not {"schema", "updated_at", "goals"} <= set(payload):
         raise ValueError("goals state must contain schema, updated_at, and goals")
     schema = payload["schema"]
-    if not isinstance(schema, str) or _schema_version(schema) is None:
+    schema_version = _schema_version(schema) if isinstance(schema, str) else None
+    if schema_version is None:
         raise ValueError(f"goals state schema must match {GOALS_SCHEMA_RE.pattern}, got {schema!r}")
     parse_timestamp(payload["updated_at"], field="goals.updated_at")
     raw_goals = payload["goals"]
     if not isinstance(raw_goals, list) or len(raw_goals) > MAX_GOALS:
         raise ValueError("goals must be a list")
 
-    lanes: dict[str, OwnershipLane] = {}
-    lane_ids: set[str] = set()
+    raw_records: list[dict[str, object]] = []
+    by_session_ref: dict[str, dict[str, object]] = {}
     for raw_goal in raw_goals:
         if not isinstance(raw_goal, dict) or not set(raw_goal) >= _GOAL_FIELDS:
             raise ValueError("each managed goal must be a current canonical goal record")
-        if any(
-            not isinstance(raw_goal[field], str) or len(raw_goal[field].encode("utf-8")) > MAX_GOAL_STRING_BYTES
-            for field in _GOAL_STRING_FIELDS
-        ):
-            raise ValueError("managed goal string fields must be strings")
+        session_ref = _nonempty_string(raw_goal, "session_ref", maximum=MAX_SESSION_REF_BYTES)
+        if session_ref in by_session_ref:
+            raise ValueError("managed goals contain a duplicate session_ref")
+        by_session_ref[session_ref] = raw_goal
+        raw_records.append(raw_goal)
+
+    lanes: dict[str, OwnershipLane] = {}
+    lane_records: dict[str, list[dict[str, object]]] = {}
+    goal_records: dict[str, list[dict[str, object]]] = {}
+    for raw_goal in raw_records:
+        for field in _GOAL_STRING_FIELDS:
+            value = raw_goal[field]
+            if not isinstance(value, str) or len(value.encode("utf-8")) > MAX_GOAL_STRING_BYTES:
+                raise ValueError("managed goal string fields must be strings")
         if raw_goal["status"] not in GOAL_STATUSES:
             raise ValueError("managed goal status is invalid")
         if any(not str(raw_goal[field]).strip() for field in ("goal", "done_when", "source")):
@@ -281,6 +292,15 @@ def _validate_goals_document(raw: bytes, *, host_id: str) -> dict[str, Ownership
             raise ValueError("managed goal interview_receipt must be an object or null")
         if not isinstance(raw_goal["enrolled_done_when_items"], list) or not isinstance(raw_goal["completion_proofs"], list):
             raise ValueError("managed goal enrolled done items and completion proofs must be lists")
+        goal_id = raw_goal.get(_GOAL_ID_FIELD, "")
+        if (
+            not isinstance(goal_id, str)
+            or len(goal_id.encode("utf-8")) > MAX_IDENTIFIER_BYTES
+            or goal_id != goal_id.strip()
+        ):
+            raise ValueError("managed goal goal_id must be a canonical string")
+        if schema_version == 4 and (not isinstance(goal_id, str) or not goal_id.strip()):
+            raise ValueError("v4 managed goals must contain a non-empty goal_id")
         goal_version = raw_goal["goal_version"]
         if isinstance(goal_version, bool) or not isinstance(goal_version, int) or not 1 <= goal_version <= MAX_GENERATION:
             raise ValueError("managed goal goal_version must be positive")
@@ -319,18 +339,85 @@ def _validate_goals_document(raw: bytes, *, host_id: str) -> dict[str, Ownership
         ):
             raise ValueError("managed goal goal_history must contain string objects")
         session_ref = _nonempty_string(raw_goal, "session_ref", maximum=MAX_SESSION_REF_BYTES)
-        record_host, record_lane, _ = canonical_session_parts(session_ref)
+        record_host, _, _ = canonical_session_parts(session_ref)
         lane_id = _nonempty_string(raw_goal, "lane_id", maximum=MAX_IDENTIFIER_BYTES)
-        if record_host != host_id or lane_id != record_lane:
-            raise ValueError("managed goal host or explicit lane_id does not match its session_ref")
-        if session_ref in lanes or lane_id in lane_ids:
-            raise ValueError("managed goals contain a duplicate session_ref or lane_id")
+        if record_host != host_id:
+            raise ValueError("managed goal host does not match its session_ref")
         lanes[session_ref] = OwnershipLane(
             session_ref=session_ref,
             lane_id=lane_id,
             lane_generation=goal_version,
         )
-        lane_ids.add(lane_id)
+        lane_records.setdefault(lane_id, []).append(raw_goal)
+        if isinstance(goal_id, str) and goal_id:
+            goal_records.setdefault(goal_id, []).append(raw_goal)
+
+    def transfer_history_refs(record: Mapping[str, object]) -> set[str]:
+        refs: set[str] = set()
+        current = record
+        while current.get("successor_of"):
+            predecessor_ref = current.get("successor_of")
+            predecessor = by_session_ref.get(predecessor_ref) if isinstance(predecessor_ref, str) else None
+            if predecessor is None or predecessor.get("transferred_to") != current.get("session_ref"):
+                break
+            predecessor_session_ref = predecessor.get("session_ref")
+            if not isinstance(predecessor_session_ref, str) or predecessor_session_ref in refs:
+                break
+            refs.add(predecessor_session_ref)
+            current = predecessor
+        return refs
+
+    def linked_transfer_predecessor(record: Mapping[str, object]) -> dict[str, object] | None:
+        predecessor_ref = record.get("successor_of")
+        if not isinstance(predecessor_ref, str) or not predecessor_ref:
+            return None
+        predecessor = by_session_ref.get(predecessor_ref)
+        if predecessor is None or predecessor.get("transferred_to") != record.get("session_ref"):
+            raise ValueError("managed goal transfer linkage is incomplete")
+        if predecessor.get("status") != "held":
+            raise ValueError("managed goal transfer predecessor must be held")
+        if predecessor.get("lane_id") != record.get("lane_id"):
+            raise ValueError("managed goal transfer must preserve logical lane_id")
+        predecessor_goal_id = predecessor.get(_GOAL_ID_FIELD, "")
+        if predecessor_goal_id and record.get(_GOAL_ID_FIELD, "") and predecessor_goal_id != record.get(_GOAL_ID_FIELD):
+            raise ValueError("managed goal transfer must preserve goal_id")
+        return predecessor
+
+    for raw_goal in raw_records:
+        predecessor = linked_transfer_predecessor(raw_goal)
+        raw_session_ref = raw_goal["session_ref"]
+        if not isinstance(raw_session_ref, str):  # validated above
+            raise ValueError("managed goal session_ref must be a string")
+        _, record_lane, _ = canonical_session_parts(raw_session_ref)
+        if raw_goal["lane_id"] != record_lane and predecessor is None:
+            raise ValueError("managed goal logical lane_id differs from its session_ref without a transfer")
+        transferred_to = raw_goal.get("transferred_to", "")
+        if transferred_to:
+            successor = by_session_ref.get(transferred_to) if isinstance(transferred_to, str) else None
+            if successor is None or successor.get("successor_of") != raw_session_ref:
+                raise ValueError("managed goal transfer successor linkage is incomplete")
+
+    def allowed_history_duplicate(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
+        return (
+            left.get("status") == "held"
+            and isinstance(left.get("session_ref"), str)
+            and left["session_ref"] in transfer_history_refs(right)
+        ) or (
+            right.get("status") == "held"
+            and isinstance(right.get("session_ref"), str)
+            and right["session_ref"] in transfer_history_refs(left)
+        )
+
+    for lane_id, matches in lane_records.items():
+        for index, left in enumerate(matches):
+            for right in matches[index + 1 :]:
+                if not allowed_history_duplicate(left, right):
+                    raise ValueError(f"managed goals contain duplicate active logical lane_id {lane_id!r}")
+    for goal_id, matches in goal_records.items():
+        for index, left in enumerate(matches):
+            for right in matches[index + 1 :]:
+                if not allowed_history_duplicate(left, right):
+                    raise ValueError(f"managed goals contain duplicate active goal_id {goal_id!r}")
     return lanes
 
 

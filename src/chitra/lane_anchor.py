@@ -92,7 +92,7 @@ def ingestion_gate(lane: LaneSpec, *, host: str = SANCTIONED_HOST) -> GoalRecord
     if (
         goal.interview_receipt is None
         or not goal.enrolled_done_when_items
-        or goal.lane_id != lane.tmux_session
+        or goal.lane_id != lane.identifier
         or goal.enrolled_done_when != rendered_done_when
         or goal.done_when != rendered_done_when
     ):

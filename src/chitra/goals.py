@@ -381,16 +381,55 @@ def _transfer_history_refs(records: Sequence[GoalRecord], record: GoalRecord) ->
 
 
 def _backfill_legacy_transfer_identity(
-    records: Sequence[GoalRecord], legacy_missing_refs: set[str]
+    records: Sequence[GoalRecord], legacy_missing_refs: set[str], *, schema: str
 ) -> list[GoalRecord]:
-    """Unify missing IDs and logical lanes across a connected old transfer chain."""
-    if not legacy_missing_refs:
+    """Unify IDs and logical lanes across linked transfer chains.
+
+    A v4 chain with two established, different IDs is ambiguous and therefore
+    fails closed. Older or partially migrated chains use the stable root anchor
+    (or one existing ID when only one is present) for every member, and all
+    members inherit the root's durable logical lane.
+    """
+    if not records:
         return list(records)
+    by_root: dict[str, list[GoalRecord]] = {}
+    for record in records:
+        root = _transfer_chain_root(records, record)
+        by_root.setdefault(root.session_ref, []).append(record)
+    components = tuple(by_root.values())
+    for component in components:
+        if len(component) <= 1:
+            continue
+        explicit_ids = {
+            record.goal_id
+            for record in component
+            if record.session_ref not in legacy_missing_refs
+            and record.goal_id
+        }
+        if (
+            schema == SCHEMA
+            and not legacy_missing_refs.intersection(record.session_ref for record in component)
+            and len(explicit_ids) > 1
+        ):
+            raise ValueError("conflicting goal_id values in an established v4 transfer chain")
     updated: list[GoalRecord] = []
     for record in records:
         root = _transfer_chain_root(records, record)
-        root_goal_id = root.goal_id
-        if root.session_ref in legacy_missing_refs:
+        component = by_root[root.session_ref]
+        explicit_ids = {
+            item.goal_id
+            for item in component
+            if item.session_ref not in legacy_missing_refs and item.goal_id
+        }
+        root_has_explicit_id = (
+            root.session_ref not in legacy_missing_refs
+            and bool(root.goal_id)
+        )
+        if root_has_explicit_id:
+            root_goal_id = root.goal_id
+        elif len(explicit_ids) == 1:
+            root_goal_id = next(iter(explicit_ids))
+        else:
             root_goal_id = legacy_goal_id(
                 session_ref=root.session_ref,
                 lane_id=root.lane_id,
@@ -398,12 +437,30 @@ def _backfill_legacy_transfer_identity(
                 enrolled_at=root.enrolled_at,
             )
         candidate = record
-        if record.session_ref in legacy_missing_refs and record.goal_id != root_goal_id:
+        if (len(component) > 1 or record.session_ref in legacy_missing_refs) and record.goal_id != root_goal_id:
             candidate = replace(candidate, goal_id=root_goal_id)
         if root.session_ref != record.session_ref and record.lane_id != root.lane_id:
             candidate = replace(candidate, lane_id=root.lane_id)
         updated.append(candidate)
     return updated
+
+
+def _validate_goal_id_collisions(records: Sequence[GoalRecord]) -> None:
+    """Reject duplicate active identities while allowing held transfer history."""
+    by_goal_id: dict[str, list[GoalRecord]] = {}
+    for record in records:
+        if record.goal_id:
+            by_goal_id.setdefault(record.goal_id, []).append(record)
+    for goal_id, matches in by_goal_id.items():
+        if len(matches) <= 1:
+            continue
+        for index, left in enumerate(matches):
+            for right in matches[index + 1 :]:
+                linked_history = (
+                    left.status == "held" and left.session_ref in _transfer_history_refs(records, right)
+                ) or (right.status == "held" and right.session_ref in _transfer_history_refs(records, left))
+                if not linked_history:
+                    raise ValueError(f"duplicate active goal_id {goal_id!r} across goal records")
 
 
 def render_done_when_items(items: Sequence[EnrolledDoneWhenItem]) -> str:
@@ -580,10 +637,13 @@ def load_goals_document(root: Path | None = None) -> tuple[list[GoalRecord], str
     upgrades it (see ``GoalsSchemaNewerError``).
 
     Records written before enrollment anchors existed use their current
-    ``done_when`` once, and persist that normalized anchor on their next write.
+    ``done_when`` once. Their missing timestamp falls back to the stable
+    legacy epoch, never the mutable document ``updated_at`` field, and persists
+    that normalized anchor on the next write.
     Records written before ``goal_id`` existed receive a deterministic
-    ``legacy-`` ID from those normalized enrollment anchors and persist it on
-    their next write.
+    ``legacy-`` ID from those normalized enrollment anchors. Linked transfer
+    chains use one root identity and logical lane and persist them on the next
+    write.
     """
     path = goals_path(root)
     try:
@@ -601,22 +661,26 @@ def load_goals_document(root: Path | None = None) -> tuple[list[GoalRecord], str
     document_updated_at = payload.get("updated_at", "")
     if not isinstance(document_updated_at, str):
         raise ValueError("goals.json updated_at must be a string")
-    records = [GoalRecord.from_dict(item, legacy_enrolled_at=document_updated_at) for item in raw_goals]
+    del document_updated_at
+    records = [GoalRecord.from_dict(item) for item in raw_goals]
     legacy_missing_refs = {
         record.session_ref
         for item, record in zip(raw_goals, records, strict=True)
         if not isinstance(item, dict) or not isinstance(item.get("goal_id"), str) or not item["goal_id"].strip()
     }
-    return _backfill_legacy_transfer_identity(records, legacy_missing_refs), schema
+    normalized = _backfill_legacy_transfer_identity(records, legacy_missing_refs, schema=schema)
+    _validate_goal_id_collisions(normalized)
+    return normalized, schema
 
 
 def load_goals(root: Path | None = None) -> list[GoalRecord]:
     """Load records, backfilling legacy enrollment anchors and IDs in memory.
 
     Records written before enrollment anchors existed use their current
-    ``done_when`` once, and persist that normalized anchor on their next write.
-    Records written before ``goal_id`` existed receive the same deterministic
-    ID on every load.
+    ``done_when`` once. Missing timestamps use the stable legacy epoch rather
+    than mutable document metadata. Records written before ``goal_id`` existed
+    receive the same deterministic ID on every load, including across linked
+    transfer chains.
     """
     records, _ = load_goals_document(root)
     return records
@@ -717,6 +781,7 @@ def _upsert_goal_locked(
     if transfer_continuation and (existing is not None or transfer_predecessor is None):
         raise GoalValidationError("transfer continuation requires a new linked successor")
     predecessor = transfer_predecessor
+    transfer_history_refs = _transfer_history_refs(records, rec) if existing is not None or transfer_continuation else set()
     if existing is not None:
         goal_id = existing.goal_id or legacy_goal_id(
             session_ref=existing.session_ref,
@@ -736,9 +801,16 @@ def _upsert_goal_locked(
             if incoming_goal_id:
                 raise GoalValidationError("goal_id is assigned by the atomic enrollment path")
             goal_id = _fresh_goal_id({record.goal_id for record in records})
-        duplicate = next((record for record in records if record.goal_id == goal_id), None)
-        if duplicate is not None and not transfer_continuation:
-            raise GoalValidationError(f"goal_id {goal_id!r} is already assigned to {duplicate.session_ref}")
+    duplicate_records = [record for record in records if record.session_ref != rec.session_ref and record.goal_id == goal_id]
+    if any(
+        record.status != "held" or record.session_ref not in transfer_history_refs for record in duplicate_records
+    ):
+        duplicate = next(
+            record
+            for record in duplicate_records
+            if record.status != "held" or record.session_ref not in transfer_history_refs
+        )
+        raise GoalValidationError(f"goal_id {goal_id!r} is already assigned to {duplicate.session_ref}")
     if existing is None:
         enrollment_issues = validate_enrollment_contract(rec, root=root)
         if enrollment_issues:
@@ -784,7 +856,6 @@ def _upsert_goal_locked(
         else:
             enrolled_done_when = rendered_done_when
             enrolled_at = now
-    transfer_history_refs = _transfer_history_refs(records, rec) if existing is not None or transfer_continuation else set()
     conflicting_lane = next(
         (
             record

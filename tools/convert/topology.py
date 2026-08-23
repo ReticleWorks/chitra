@@ -31,7 +31,7 @@ SCHEMA_NATIVE_CLIENT_PROOF = "chitra.native-client-proof.v1"
 SCHEMA_AUTHORITY_ENROLLMENT = "chitra.authority-enrollment.v1"
 SNAPSHOT_MARKER = ".chitra-disposable-snapshot"
 
-GOAL_SCHEMAS = {"chitra.goals.v1", "chitra.goals.v2", "chitra.goals.v3"}
+GOAL_SCHEMAS = {"chitra.goals.v1", "chitra.goals.v2", "chitra.goals.v3", "chitra.goals.v4"}
 LEGACY_GOAL_SCHEMAS = {"chitra.goals.v1", "chitra.goals.v2"}
 TERMINAL_GOAL_STATUSES = {"done-pending-verification", "done-pending-close"}
 QUEUE_STAGES = ("orders", "in_flight", "deferred", "results", "processed", "invalid")
@@ -1040,7 +1040,7 @@ def _snapshot_goals_manifests(snapshot: Mapping[str, object]) -> list[dict[str, 
             if item.get("relative_path") != "goals.json":
                 continue
             json_meta = item.get("json")
-            if not isinstance(json_meta, dict) or json_meta.get("schema") not in LEGACY_GOAL_SCHEMAS:
+            if not isinstance(json_meta, dict) or json_meta.get("schema") not in GOAL_SCHEMAS:
                 continue
             manifests.append(
                 {
@@ -1779,7 +1779,7 @@ def snapshot_state_root(state_root: Path, snapshot_dir: Path) -> dict[str, objec
     return marker
 
 
-def _contains_v3_or_receipts(root: Path) -> bool:
+def _contains_protected_enrollment(root: Path) -> bool:
     receipts = root / "validation-receipts"
     if receipts.exists() and any(receipts.rglob("*.json")):
         return True
@@ -1790,7 +1790,7 @@ def _contains_v3_or_receipts(root: Path) -> bool:
         payload = _load_json(goals)
     except ConversionError:
         return False
-    if payload.get("schema") == "chitra.goals.v3":
+    if payload.get("schema") in {"chitra.goals.v3", "chitra.goals.v4"}:
         return True
     if payload.get("schema") == "chitra.goals.v2":
         records = payload.get("goals")
@@ -1835,10 +1835,10 @@ def restore_snapshot(snapshot_dir: Path, state_root: Path, *, allow_v3_loss: boo
     marker = _load_json(marker_path)
     snapshot_payload_dir = snapshot_dir / "state-root"
     _validate_snapshot_payload(snapshot_dir, marker)
-    if allow_v3_loss and _contains_v3_or_receipts(state_root):
-        raise ConversionError("allow_v3_loss cannot bypass protected v2/v3 enrollment or validation evidence")
-    if _contains_v3_or_receipts(state_root):
-        raise ConversionError("rollback would lose v2/v3 enrollment or validation evidence")
+    if allow_v3_loss and _contains_protected_enrollment(state_root):
+        raise ConversionError("allow_v3_loss cannot bypass protected v2/v3/v4 enrollment or validation evidence")
+    if _contains_protected_enrollment(state_root):
+        raise ConversionError("rollback would lose v2/v3/v4 enrollment or validation evidence")
     if state_root == Path("/") or len(state_root.parts) < 3:
         raise ConversionError("refusing to restore an unsafe state root")
     state_root.mkdir(parents=True, exist_ok=True)

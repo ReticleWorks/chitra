@@ -26,6 +26,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final
 
+from chitra.goals import GOALS_SCHEMA_RE
 from chitra.ownership_provider import (
     DEFAULT_TIMEOUT_SECONDS,
     PROVIDER_ID,
@@ -114,7 +115,7 @@ def validate_observation(payload: object, *, host_uuid: str, now: datetime | Non
     if host_id != host_uuid:
         raise ProtocolError("host_mismatch", "observation host_id does not match this Petra authority")
     try:
-        ref_host, ref_lane, _ = canonical_session_parts(session_ref)
+        ref_host, _, _ = canonical_session_parts(session_ref)
         observed_at = parse_timestamp(payload["observed_at"], field="observed_at")
         expires_at = parse_timestamp(payload["expires_at"], field="expires_at")
     except (TypeError, ValueError) as exc:
@@ -149,8 +150,6 @@ def validate_observation(payload: object, *, host_uuid: str, now: datetime | Non
     ownership_generation = ownership.get("ownership_generation")
     if provider_id != PROVIDER_ID:
         raise ProtocolError("invalid_ownership", "ownership provider_id must be chitra")
-    if lane_id != ref_lane:
-        raise ProtocolError("invalid_ownership", "ownership lane_id must match the exact session_ref")
     if isinstance(lane_generation, bool) or not isinstance(lane_generation, int) or lane_generation < 1:
         raise ProtocolError("invalid_ownership", "lane_generation must be a positive integer")
     if isinstance(ownership_generation, bool) or not isinstance(ownership_generation, int) or ownership_generation < 1:
@@ -233,7 +232,8 @@ def validate_ownership_fence(
     if (
         not isinstance(source, dict)
         or set(source) != _OWNERSHIP_SOURCE_FIELDS
-        or source.get("schema") != "chitra.goals.v1"
+        or not isinstance(source.get("schema"), str)
+        or GOALS_SCHEMA_RE.fullmatch(source["schema"]) is None
         or source.get("complete") is not True
     ):
         raise ProtocolError("ownership_not_ready", "Chitra managed state is incomplete")

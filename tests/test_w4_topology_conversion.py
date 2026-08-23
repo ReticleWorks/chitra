@@ -196,6 +196,66 @@ def test_w10_snapshot_metadata_reconciles_expected_legacy_topology(tmp_path: Pat
     }
 
 
+def test_converter_accepts_v4_goal_documents_and_preserves_the_source_schema(tmp_path: Path) -> None:
+    payload = _enrolled_goals_document(tmp_path)
+    payload["schema"] = "chitra.goals.v4"
+    records = cast(list[dict[str, object]], payload["goals"])
+    records[0]["goal_id"] = "goal-authority"
+
+    converted = topology.convert_goals_document(
+        payload,
+        source_path=str(tmp_path / "goals.json"),
+        source_sha256="a" * 64,
+        produced_at="2026-08-23T00:00:00+00:00",
+    )
+
+    assert converted["source"] == {
+        "path": str(tmp_path / "goals.json"),
+        "sha256": "a" * 64,
+        "schema": "chitra.goals.v4",
+    }
+    converted_records = cast(list[dict[str, object]], converted["records"])
+    assert converted_records[0]["legacy_schema"] == "chitra.goals.v4"
+    assert cast(dict[str, object], converted_records[0]["legacy_record"])["goal_id"] == "goal-authority"
+
+
+def test_w10_snapshot_metadata_includes_v4_goal_manifests() -> None:
+    snapshot = {
+        "hosts": {
+            "host-a": {
+                "state_directories": [
+                    {
+                        "path": "/state/authority",
+                        "files": [
+                            {
+                                "relative_path": "goals.json",
+                                "sha256": "b" * 64,
+                                "size": 10,
+                                "json": {"schema": "chitra.goals.v4", "goal_count": 1},
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+    }
+
+    manifests = topology._snapshot_goals_manifests(snapshot)
+
+    assert manifests == [
+        {
+            "host": "host-a",
+            "state_root": "/state/authority",
+            "relative_path": "goals.json",
+            "schema": "chitra.goals.v4",
+            "sha256": "b" * 64,
+            "size": 10,
+            "goal_count": 1,
+            "done_when_nonempty_count": 0,
+        }
+    ]
+
+
 def _enrolled_goals_document(state_root: Path) -> dict[str, object]:
     return {
         "schema": "chitra.goals.v3",
@@ -903,12 +963,21 @@ def test_rollback_validates_snapshot_before_touching_destination_and_refuses_v2_
         ],
     }
     _write_json(state / "goals.json", enrolled)
-    with pytest.raises(ConversionError, match="v2/v3 enrollment"):
+    with pytest.raises(ConversionError, match="v2/v3/v4 enrollment"):
         restore_snapshot(snapshot, state)
     assert json.loads((state / "goals.json").read_text(encoding="utf-8"))["schema"] == "chitra.goals.v2"
     with pytest.raises(ConversionError, match="allow_v3_loss cannot bypass"):
         restore_snapshot(snapshot, state, allow_v3_loss=True)
     assert json.loads((state / "goals.json").read_text(encoding="utf-8"))["schema"] == "chitra.goals.v2"
+
+    enrolled["schema"] = "chitra.goals.v4"
+    cast(list[dict[str, object]], enrolled["goals"])[0]["goal_id"] = "goal-rollback"
+    _write_json(state / "goals.json", enrolled)
+    with pytest.raises(ConversionError, match="v2/v3/v4 enrollment"):
+        restore_snapshot(snapshot, state)
+    with pytest.raises(ConversionError, match="allow_v3_loss cannot bypass"):
+        restore_snapshot(snapshot, state, allow_v3_loss=True)
+    assert json.loads((state / "goals.json").read_text(encoding="utf-8"))["schema"] == "chitra.goals.v4"
 
     corrupt_state = tmp_path / "corrupt-state"
     corrupt_snapshot = tmp_path / "corrupt-snapshot"

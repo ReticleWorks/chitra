@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 from _goal_fixtures import enrollment_fields
 
-from chitra.goals import EnrolledScopeImmutableError, GoalRecord, hold_goal, redirect_goal, upsert_goal
+from chitra.goals import EnrolledScopeImmutableError, GoalRecord, hold_goal, redirect_goal, transfer_goal, upsert_goal
 from chitra.lane_anchor import LaneLaunchRefused, LaneStartupFailed, _pane_pythonpath, ingestion_gate, start_lane
 from chitra.lane_config import load_lanes
 
@@ -181,6 +181,53 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
         "CHITRA_PANE_TARGET": "alpha:0.0",
         "CHITRA_SOCKET_PATH": str(control_socket),
     }
+
+
+def test_transfer_launch_preserves_logical_lane_identity_in_ownership_and_env(tmp_path):
+    import yaml
+
+    manifest = _manifest(tmp_path)
+    manifest["lanes"][0].update({"id": "logical-alpha", "tmux_session": "logical-alpha-xfer"})
+    path = tmp_path / "lanes.yaml"
+    path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    lane = load_lanes(path)[0]
+    original = upsert_goal(
+        lane.state_dir,
+        GoalRecord(
+            session_ref="tophand:logical-alpha:0.0",
+            goal="Keep the logical lane identity through a physical backend transfer.",
+            done_when="The successor launches with the same logical lane identity and proof.",
+            intent="Fence one durable lane while its physical session name changes.",
+            scope="One transferred lane launch and ownership check.",
+            source="task-file:transfer-launch",
+            status="working",
+            **enrollment_fields("The successor launches with the same logical lane identity and proof."),
+        ),
+    )
+    _held, successor = transfer_goal(
+        lane.state_dir,
+        original.session_ref,
+        to_backend="claude",
+        digest="transfer-launch-proof",
+        reason="provider replacement",
+    )
+
+    gated = ingestion_gate(lane)
+    assert gated.session_ref == successor.session_ref == "tophand:logical-alpha-xfer:0.0"
+    assert gated.lane_id == lane.identifier == "logical-alpha"
+
+    calls: list[list[str]] = []
+
+    def runner(command):
+        calls.append(list(command))
+        return subprocess.CompletedProcess(command, 1 if len(calls) == 1 else 0, "", "")
+
+    assert start_lane(lane, runner=runner, socket_path=tmp_path / "control.sock", self_test=False)
+    new_session = calls[1]
+    assert "CHITRA_LANE_ID=logical-alpha" in new_session
+    assert "CHITRA_SESSION_REF=tophand:logical-alpha-xfer:0.0" in new_session
+    assert "-s" in new_session
+    assert new_session[new_session.index("-s") + 1] == "logical-alpha-xfer"
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required for the environment delivery proof")
