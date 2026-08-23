@@ -92,6 +92,21 @@ def test_second_reservation_of_a_live_claim_loses_the_race_and_skips(tmp_path: P
     assert second is None
 
 
+def test_reservation_publishes_a_complete_pid_marker_and_never_replaces_the_winner(tmp_path: Path) -> None:
+    """The stale sweep must never observe an empty pre-PID owner marker."""
+    in_flight_dir = tmp_path / "in_flight"
+    first = reserve_claim(in_flight_dir, "ord-marker")
+    assert first is not None
+
+    assert first.marker_path.read_text(encoding="utf-8") == str(os.getpid())
+    assert not list(in_flight_dir.glob(".*.owner.*.tmp"))
+
+    second = reserve_claim(in_flight_dir, "ord-marker")
+
+    assert second is None
+    assert first.marker_path.read_text(encoding="utf-8") == str(os.getpid())
+
+
 def test_claim_renames_the_pending_order_into_in_flight_under_the_reservation(tmp_path: Path) -> None:
     in_flight_dir = tmp_path / "in_flight"
     in_flight_dir.mkdir()

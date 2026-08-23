@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import tempfile
 import uuid
 from dataclasses import dataclass
 from enum import StrEnum
@@ -162,12 +163,35 @@ def reserve_claim(in_flight_dir: Path, order_id: str) -> ClaimReservation | None
     marker already exists -- the caller lost the race and must skip the
     order entirely.
     """
+    in_flight_dir.mkdir(parents=True, exist_ok=True)
     marker_path = in_flight_dir / f".{order_id}.owner"
+    temporary_path: str | None = None
     try:
-        with marker_path.open("x", encoding="utf-8") as handle:
+        # Publish the PID-bearing marker with an exclusive hard-link. A plain
+        # ``open(..., "x")`` leaves an observable empty-file window between
+        # creation and the PID write; the concurrent stale-claim sweep could
+        # mistake that live pre-rename reservation for a dead owner and
+        # remove it. The temporary file is written completely in the same
+        # directory, then ``link`` makes the final name appear atomically.
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=in_flight_dir,
+            prefix=f".{order_id}.owner.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = handle.name
             handle.write(str(os.getpid()))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temporary_path, marker_path)
     except FileExistsError:
         return None
+    finally:
+        if temporary_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary_path)
     return ClaimReservation(order_id=order_id, marker_path=marker_path)
 
 
