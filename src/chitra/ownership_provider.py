@@ -343,11 +343,16 @@ def _validate_goals_document(raw: bytes, *, host_id: str) -> dict[str, Ownership
         lane_id = _nonempty_string(raw_goal, "lane_id", maximum=MAX_IDENTIFIER_BYTES)
         if record_host != host_id:
             raise ValueError("managed goal host does not match its session_ref")
-        lanes[session_ref] = OwnershipLane(
-            session_ref=session_ref,
-            lane_id=lane_id,
-            lane_generation=goal_version,
-        )
+        # A transferred predecessor remains in the validated document so its
+        # history and links can be fenced, but it no longer owns the physical
+        # session once the successor is present. Only the active successor may
+        # answer as authoritative ownership for that transfer chain.
+        if not (raw_goal["status"] == "held" and raw_goal.get("transferred_to")):
+            lanes[session_ref] = OwnershipLane(
+                session_ref=session_ref,
+                lane_id=lane_id,
+                lane_generation=goal_version,
+            )
         lane_records.setdefault(lane_id, []).append(raw_goal)
         if isinstance(goal_id, str) and goal_id:
             goal_records.setdefault(goal_id, []).append(raw_goal)

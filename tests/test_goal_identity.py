@@ -219,6 +219,37 @@ def test_established_v4_transfer_id_conflict_fails_closed(tmp_path: Path) -> Non
         load_goals(tmp_path)
 
 
+def test_partial_v4_transfer_with_two_established_ids_fails_closed(tmp_path: Path) -> None:
+    root_ref = "tophand:partial-conflict:0.0"
+    middle_ref = "tophand:partial-conflict-xfer:0.0"
+    successor_ref = "tophand:partial-conflict-xfer-xfer:0.0"
+    root = replace(_record(root_ref), status="held", goal_id="goal-A", transferred_to=middle_ref)
+    middle = replace(
+        _record(middle_ref),
+        status="held",
+        goal_id="goal-B",
+        lane_id=root.lane_id,
+        successor_of=root_ref,
+        transferred_to=successor_ref,
+    )
+    successor = replace(
+        _record(successor_ref),
+        status="working",
+        goal_id="",
+        lane_id=root.lane_id,
+        successor_of=middle_ref,
+    )
+    payload = {
+        "schema": "chitra.goals.v4",
+        "updated_at": "2026-07-10T00:00:00+00:00",
+        "goals": [root.to_dict(), middle.to_dict(), successor.to_dict()],
+    }
+    (tmp_path / "goals.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="conflicting goal_id"):
+        load_goals(tmp_path)
+
+
 def test_lifecycle_transitions_preserve_goal_id(tmp_path: Path) -> None:
     enrolled = upsert_goal(tmp_path, _record())
     goal_id = enrolled.goal_id

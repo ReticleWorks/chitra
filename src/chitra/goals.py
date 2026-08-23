@@ -406,11 +406,7 @@ def _backfill_legacy_transfer_identity(
             if record.session_ref not in legacy_missing_refs
             and record.goal_id
         }
-        if (
-            schema == SCHEMA
-            and not legacy_missing_refs.intersection(record.session_ref for record in component)
-            and len(explicit_ids) > 1
-        ):
+        if schema == SCHEMA and len(explicit_ids) > 1:
             raise ValueError("conflicting goal_id values in an established v4 transfer chain")
     updated: list[GoalRecord] = []
     for record in records:

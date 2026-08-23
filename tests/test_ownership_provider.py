@@ -212,6 +212,22 @@ def test_transfer_ownership_keeps_logical_lane_for_physical_successor(tmp_path: 
         "lane_generation": 1,
     }
 
+    predecessor_response = ownership_result(
+        _query(predecessor_ref),
+        provider_instance_id="provider-instance",
+        goals_path=goals_path,
+        marker_path=marker_path,
+        expected_host_id=HOST,
+        expected_boot_id=BOOT,
+        now=NOW,
+    )
+
+    assert predecessor_response["authoritative"] is True
+    assert predecessor_response["result"] == {
+        "session_ref": predecessor_ref,
+        "status": "unowned",
+    }
+
 
 def test_v4_physical_lane_mismatch_without_transfer_is_malformed(tmp_path: Path) -> None:
     document = {

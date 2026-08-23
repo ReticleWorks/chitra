@@ -245,6 +245,29 @@ def test_transfer_observation_keeps_logical_lane_and_accepts_goals_v4_fence(tmp_
     assert result["status"] == "accepted"
 
 
+def test_transferred_predecessor_unowned_result_is_rejected(tmp_path: Path) -> None:
+    observation = _observation()
+    observation["session_ref"] = "host-a:logical-lane:0.0"
+    observation["ownership"]["lane_id"] = "logical-lane"  # type: ignore[index]
+    handler = observation_handler(
+        host_uuid=HOST,
+        ledger_path=tmp_path / "ledger.sqlite3",
+        health_path=tmp_path / "health.json",
+        ownership_resolver=lambda query: _ownership_response(
+            query,
+            source_schema="chitra.goals.v4",
+        )
+        | {"result": {"session_ref": query["session_ref"], "status": "unowned"}},
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(ProtocolError) as exc_info:
+        handler(observation)
+
+    assert exc_info.value.reason == "ownership_not_owned"
+    assert not (tmp_path / "ledger.sqlite3").exists()
+
+
 def test_observation_expiring_during_ownership_round_trip_is_not_recorded(tmp_path: Path) -> None:
     ledger_path = tmp_path / "ledger.sqlite3"
     completed_at = NOW + timedelta(seconds=31)
