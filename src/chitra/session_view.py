@@ -314,10 +314,11 @@ def render_joined_session_view(
             view = replace(view, goal=goal.goal, done_when=goal.done_when, goal_status=goal.status)
     else:
         view = project_joined_session(source, goal=goal)
-    title = f"Joined session {view.session_ref}"
+    title = f"Lane {view.lane_id}"
     lines = [f"# {title}" if fmt == "markdown" else title]
     lines.append(f"Goal: {view.goal if view.goal is not None else 'unavailable (goal record not joined)'}")
     lines.append(f"Lifecycle: {view.lifecycle}")
+    lines.append(f"Physical session generation: {view.physical_session_generation} (continuity context)")
     if view.plan_version is None:
         lines.append("Road map: unavailable (no lane update has been observed).")
     else:
@@ -329,20 +330,21 @@ def render_joined_session_view(
         for step in view.steps:
             title_text = step.title or step.id
             owner = f"; owner: {step.owner}" if step.owner else ""
-            lines.append(f"- [{step.status}] {title_text} ({step.id}{owner})")
+            status = "done (lane-reported; Chitra verification not implied)" if step.status == "done" else step.status
+            lines.append(f"- [{status}] {title_text} ({step.id}{owner})")
     else:
         lines.append("Steps: unavailable (no lane plan has been observed).")
-    lines.append(f"Current work: {view.current_work or 'unknown (no current action reported).'}")
+    lines.append(f"NOW: {view.current_work or 'unknown (no current action reported).'}")
     lines.append(f"Owner: {view.owner or 'unknown (no current step owner reported).'}")
     lines.extend(_problem_lines("Open problems", view.open_problems))
     lines.extend(_problem_lines("Resolved problems", view.resolved_problems))
     lines.append(f"Chitra action: {view.chitra_action or 'none recorded.'}")
-    lines.append(f"Next action: {view.next_action or 'unknown (no next action reported).'}")
+    lines.append(f"NEXT: {view.next_action or 'unknown (no next action reported).'}")
     if view.next_check is None:
-        lines.append("Next check: unknown (no durable check is recorded).")
+        lines.append("CHECK: unknown (no durable check is recorded).")
     else:
         wake = f"; wake condition: {view.next_check.wake_condition}" if view.next_check.wake_condition else ""
-        lines.append(f"Next check: {view.next_check.at} — {view.next_check.reason}{wake}")
+        lines.append(f"CHECK: {view.next_check.at} — {view.next_check.reason}{wake}")
     return "\n".join(lines)
 
 

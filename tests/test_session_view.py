@@ -155,7 +155,7 @@ def test_projection_does_not_invent_work_or_progress_without_a_lane_update() -> 
     assert "Goal: Ship the joined session report" in rendered
     assert "Road map: unavailable" in rendered
     assert "Progress: unavailable (no lane update has been observed)." in rendered
-    assert "Current work: unknown" in rendered
+    assert "NOW: unknown" in rendered
 
 
 def test_all_blocked_projection_shows_blocked_position_without_fake_active_work() -> None:
@@ -179,3 +179,38 @@ def test_all_blocked_projection_shows_blocked_position_without_fake_active_work(
     assert view.owner == "lane"
     assert view.current_work is None
     assert view.progress is not None and view.progress.percentage == 0.0
+
+
+def test_valid_updates_can_show_progress_moving_down() -> None:
+    first = _record(update=_update()).model_copy(update={"revision": 2})
+    later = _update(sequence=4).model_copy(update={
+        "steps": (
+            RoadmapStep(id="design", status="blocked", title="Design the view", owner="lane"),
+            RoadmapStep(id="implement", status="blocked", title="Implement the view", owner="lane"),
+        ),
+        "current_action": "",
+        "next_action": "Wait for the durable check",
+    })
+    view = build_joined_session_view(first.model_copy(update={"current_update": later}))
+    assert view.progress is not None and view.progress.percentage == 0.0
+
+
+def test_report_is_provider_neutral_and_uses_plain_now_next_check_labels() -> None:
+    top = render_joined_session_view(_record())
+    orb = render_joined_session_view(_record().model_copy(update={
+        "session_ref": "amp:lane-a-1",
+        "provider": ProviderIdentity(kind="amp", handle="amp-lane-a", capabilities=ProviderCapabilities.from_supported(("send",))),
+    }))
+    assert "Lane lane-a" in top and "Lane lane-a" in orb
+    assert "NOW:" in top and "NEXT:" in top and "CHECK:" in top
+    assert "pid" not in top.lower() and "tmux" not in top.lower() and "debug" not in top.lower()
+
+
+def test_rotation_keeps_logical_lane_and_shows_generation_context() -> None:
+    rotated = _record().model_copy(update={"session_ref": "amp:lane-a-2", "physical_session_generation": 2})
+    update = _update().model_copy(update={"session_ref": "amp:lane-a-2"})
+    view = build_joined_session_view(rotated.model_copy(update={"current_update": update}))
+    assert view.lane_id == "lane-a"
+    assert view.session_ref == "amp:lane-a-2"
+    assert view.physical_session_generation == 2
+    assert "continuity context" in render_joined_session_view(view)
