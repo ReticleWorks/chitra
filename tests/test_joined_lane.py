@@ -365,7 +365,8 @@ def test_wake_is_idempotent_and_preserves_operation_identity(tmp_path: Path) -> 
     assert second.status == "wake_reused"
     saved = store.require("lane-a")
     assert saved.pending_operation.operation_id == "op-1"
-    assert saved.recovery.attempted_remedy == "wake:wake-1"
+    assert saved.last_intervention is not None
+    assert saved.last_intervention.operation_id == "wake-1"
 
 
 def test_reconcile_report_blocks_dispatch_barrier_for_matching_session() -> None:

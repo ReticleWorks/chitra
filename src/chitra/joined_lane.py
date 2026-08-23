@@ -23,6 +23,7 @@ from pydantic import ValidationError
 from ._fsio import locked_json_store, write_json_atomic
 from .session_contract import (
     ContractValidationError,
+    InterventionEvidence,
     JoinedLaneRecord,
     NextCheck,
     ProviderOperationResult,
@@ -561,9 +562,10 @@ def _wake_id(record: object) -> str:
     next_wake = _text(_value(next_check, "wake_condition", "")) if next_check is not None else ""
     if next_wake:
         return next_wake
-    recovery = _value(record, "recovery", None)
-    attempted = _text(_value(recovery, "attempted_remedy", "")) if recovery is not None else ""
-    return attempted.removeprefix("wake:") if attempted.startswith("wake:") else ""
+    intervention = _value(record, "last_intervention", None)
+    if intervention is not None and _value(intervention, "action", "") == "Wake condition observed":
+        return _text(_value(intervention, "operation_id", ""))
+    return ""
 
 
 def _canonical_next_check(record: object, at: str, reason: str) -> object:
@@ -616,12 +618,14 @@ def _apply_state(record: Any, updates: Mapping[str, Any]) -> Any:
             current_check = applied.get("next_check") or _value(record, "next_check")
             if hasattr(current_check, "model_copy"):
                 applied["next_check"] = current_check.model_copy(update={"wake_condition": updates["wake_id"] or None})
-        if "recovery" in model_fields and _value(record, "recovery", None) is not None:
-            recovery = applied.get("recovery") or _value(record, "recovery")
-            if hasattr(recovery, "model_copy"):
-                applied["recovery"] = recovery.model_copy(
-                    update={"attempted_remedy": f"wake:{updates['wake_id']}" if updates["wake_id"] else ""}
-                )
+        if "last_intervention" in model_fields and updates["wake_id"]:
+            applied["last_intervention"] = InterventionEvidence(
+                operation_id=updates["wake_id"],
+                action="Wake condition observed",
+                consumed=True,
+                useful_work_resumed=None,
+                observed_at=updates["wake_observed_at"],
+            )
     return _copy_model(record, applied)
 
 
@@ -953,6 +957,7 @@ class JoinedLaneReconciler:
         }
         if wake_id:
             updates["wake_id"] = wake_id
+            updates["wake_observed_at"] = self._now().astimezone(UTC).isoformat()
         updated = self._save(record, **updates)
         return self.reconcile(updated)
 
