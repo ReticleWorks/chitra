@@ -207,6 +207,8 @@ def test_report_is_provider_neutral_and_uses_plain_now_next_check_labels() -> No
     }))
     assert "Lane lane-a" in top and "Lane lane-a" in orb
     assert "NOW:" in top and "NEXT:" in top and "CHECK:" in top
+    assert "Provider: tophand — tophand-lane-a" in top
+    assert "Recovery action: none recorded." in top
     assert "pid" not in top.lower() and "tmux" not in top.lower() and "debug" not in top.lower()
 
 

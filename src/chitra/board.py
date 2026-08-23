@@ -12,6 +12,7 @@ import os
 import textwrap
 import unicodedata
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from chitra.goals import GoalRecord, GoalStatus, done_when_with_delta, session_host, session_name
@@ -88,6 +89,17 @@ class ArtifactRosterRecord(Protocol):
 
     @property
     def review_status(self) -> Literal["unreviewed", "reviewed"]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _JoinedGoalProjection(GoalProjection):
+    """Goal fields supplied to the canonical joined-lane renderer."""
+
+    goal_id: str
+    lane_id: str
+    goal: str
+    done_when: str
+    status: str
 
 
 def marker_for(status: GoalStatus) -> str:
@@ -314,13 +326,13 @@ def _render_cards(records: Sequence[RosterRecord]) -> str:
     return "\n\n".join((body, "\n".join(awaiting))) if awaiting else body
 
 
-def render_roster(
+def _render_legacy_roster(
     records: Sequence[RosterRecord],
     *,
     fmt: Literal["cards", "box", "markdown"] = ROSTER_DEFAULT_FORMAT,
     artifacts: Sequence[ArtifactRosterRecord] = (),
 ) -> str:
-    """Render every stored lane, stable order (host, session name, full ref).
+    """Render legacy goal records, stable order (host, session name, full ref).
 
     Default (``ROSTER_DEFAULT_FORMAT``, currently ``markdown``): a
     client-rendered table. ``cards``: one labelled stanza per lane (readable
@@ -382,6 +394,63 @@ def render_roster(
     awaiting_ruling = _awaiting_ruling_lines(records, fmt="box")
     roster = "\n\n".join((table, "\n".join(awaiting_ruling))) if awaiting_ruling else table
     return "\n\n".join((roster, artifact_block)) if artifact_block else roster
+
+
+def _joined_goal(record: JoinedLaneRecord, goals: Sequence[RosterRecord]) -> GoalProjection | None:
+    """Find the existing goal record that owns a joined lane."""
+
+    candidate = next((goal for goal in goals if goal.session_ref == record.session_ref), None)
+    if candidate is None:
+        candidate = next((goal for goal in goals if getattr(goal, "goal_id", "") == record.goal_id), None)
+    if candidate is None:
+        candidate = next((goal for goal in goals if getattr(goal, "lane_id", "") == record.lane_id), None)
+    if candidate is not None:
+        return _JoinedGoalProjection(
+            goal_id=str(getattr(candidate, "goal_id", "") or record.goal_id),
+            lane_id=str(getattr(candidate, "lane_id", "") or record.lane_id),
+            goal=candidate.goal,
+            done_when=candidate.done_when,
+            status=str(candidate.status),
+        )
+    return None
+
+
+def render_roster(
+    records: Sequence[RosterRecord],
+    *,
+    fmt: Literal["cards", "box", "markdown"] = ROSTER_DEFAULT_FORMAT,
+    artifacts: Sequence[ArtifactRosterRecord] = (),
+    joined_records: Sequence[JoinedLaneRecord] = (),
+) -> str:
+    """Render joined lanes through the canonical report and legacy lanes as before."""
+
+    if not joined_records:
+        return _render_legacy_roster(records, fmt=fmt, artifacts=artifacts)
+
+    joined_sessions = {record.session_ref for record in joined_records}
+    joined_goal_ids = {record.goal_id for record in joined_records}
+    joined_lane_ids = {record.lane_id for record in joined_records}
+    legacy_records = [
+        record
+        for record in records
+        if record.session_ref not in joined_sessions
+        and getattr(record, "goal_id", "") not in joined_goal_ids
+        and getattr(record, "lane_id", "") not in joined_lane_ids
+    ]
+    parts: list[str] = []
+    if legacy_records:
+        parts.append(_render_legacy_roster(legacy_records, fmt=fmt))
+    for record in sorted(
+        joined_records,
+        key=lambda item: (session_host(item.session_ref), session_name(item.session_ref), item.session_ref),
+    ):
+        goal = _joined_goal(record, records)
+        report_fmt: Literal["text", "markdown"] = "markdown" if fmt == "markdown" else "text"
+        parts.append(_render_joined_session_view(record, goal=goal, fmt=report_fmt))
+    artifact_block = _unreviewed_artifact_block(artifacts, fmt=fmt)
+    if artifact_block:
+        parts.append(artifact_block)
+    return "\n\n".join(parts) if parts else "no lanes recorded"
 
 
 def render_joined_session_view(

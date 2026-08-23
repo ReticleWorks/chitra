@@ -276,6 +276,15 @@ button { font: inherit; color: inherit; background: none; border: none; padding:
 .lane .result b { color: var(--ink); font-weight: 600; }
 .lane .donewhen { font-size: 0.77rem; color: var(--ink-soft); }
 .lane .donewhen b { font-weight: 600; color: var(--ink); }
+.joined-summary { display: flex; flex-direction: column; gap: 0.38rem; font-size: 0.79rem; color: var(--ink-soft); }
+.joined-line b, .joined-progress-head b, .joined-problems b { color: var(--ink); font-weight: 600; }
+.joined-meta { font-size: 0.72rem; color: var(--ink-faint); }
+.joined-problems.open { color: var(--bad); }
+.joined-progress { display: flex; flex-direction: column; gap: 0.25rem; }
+.joined-progress-head { display: flex; justify-content: space-between; gap: 0.5rem; }
+.progress-track { height: 0.38rem; overflow: hidden; border-radius: 999px; background: var(--inset); }
+.progress-fill { height: 100%; border-radius: inherit; background: var(--good); transition: width 180ms ease; }
+.progress-fill.unknown { background: var(--warn); opacity: 0.55; }
 .attn {
   border-left: 2px solid var(--bad);
   background: var(--bad-bg);

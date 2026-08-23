@@ -18,6 +18,7 @@ from chitra import goals as goal_store
 from chitra._fsio import locked_json_store, parse_iso8601, write_json_atomic
 from chitra.artifacts import list_unreviewed_artifacts
 from chitra.completion_gate import CompletionEvidence
+from chitra.joined_lane import JoinedLaneError, JoinedLaneStore
 from chitra.lane_read import extract_open_asks, read_last_assistant_message
 from chitra.policy_config import load_policy_config, resolve_guidance
 from chitra.state_paths import state_dir
@@ -628,7 +629,19 @@ def main(argv: list[str] | None = None) -> int:
                     goal_store.add_ask(args.root, args.session_ref, ask)
         else:
             records = goal_store.list_goals(args.root)
-            print(board.render_roster(records, fmt=args.format, artifacts=list_unreviewed_artifacts(args.root)))
+            try:
+                joined_records = JoinedLaneStore(args.root).list()
+            except (JoinedLaneError, OSError) as exc:
+                print(f"chitra-goals: joined-lane report unavailable: {exc}", file=sys.stderr)
+                joined_records = ()
+            print(
+                board.render_roster(
+                    records,
+                    fmt=args.format,
+                    artifacts=list_unreviewed_artifacts(args.root),
+                    joined_records=joined_records,
+                )
+            )
             if args.lint:
                 roster_lint = getattr(board, "roster_lint", None)
                 if roster_lint is not None:

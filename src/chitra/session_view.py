@@ -341,6 +341,7 @@ def render_joined_session_view(
         lines.append("Steps: unavailable (no lane plan has been observed).")
     lines.append(f"NOW: {view.current_work or 'unknown (no current action reported).'}")
     lines.append(f"Owner: {view.owner or 'unknown (no current step owner reported).'}")
+    lines.append(f"Provider: {view.provider.kind} — {view.provider.handle}")
     lines.extend(_problem_lines("Open problems", view.open_problems))
     lines.extend(_problem_lines("Resolved problems", view.resolved_problems))
     lines.append(f"Chitra action: {view.chitra_action or 'none recorded.'}")

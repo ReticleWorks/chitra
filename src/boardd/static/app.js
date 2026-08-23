@@ -90,6 +90,86 @@ function pill(p) {
   return el("span", { class: `pill ${p.tone}` }, p.label);
 }
 
+function joinedLine(value, fallback = "unknown") {
+  return value && value.text ? tline(value) : el("span", {}, fallback);
+}
+
+function joinedProgress(progress) {
+  const known = progress && progress.percentage != null;
+  const percentage = known ? Math.max(0, Math.min(100, Number(progress.percentage))) : 0;
+  const label = known
+    ? String(progress.percentage) + "% (" + progress.completed_steps + "/" + progress.total_steps + ")"
+    : "unavailable (" + (progress?.reason ?? "no lane update has been observed") + ")";
+  return el("div", { class: "joined-progress" },
+    el("div", { class: "joined-progress-head" },
+      el("b", {}, "Progress"),
+      el("span", {}, label)),
+    el("div", { class: "progress-track", role: "progressbar", "aria-valuemin": "0", "aria-valuemax": "100",
+      "aria-valuenow": known ? String(progress.percentage) : "0", "aria-label": label },
+      el("div", { class: "progress-fill" + (known ? "" : " unknown"), style: "width:" + percentage + "%" })),
+  );
+}
+
+function joinedProblemSummary(report) {
+  const open = report.open_problems?.length ?? 0;
+  const resolved = report.resolved_problems?.length ?? 0;
+  const summary = el("div", { class: "joined-problems" + (open ? " open" : "") },
+    el("b", {}, "Problems: "),
+    String(open) + " open · " + String(resolved) + " resolved");
+  if (open) {
+    summary.append(el("div", { class: "joined-problem-line" },
+      el("b", {}, "Open: "),
+      ...report.open_problems.map((problem) => joinedLine(problem.summary, problem.id)).reduce((children, value, index) => {
+        if (index) children.push("; ");
+        children.push(value);
+        return children;
+      }, [])));
+  }
+  if (resolved) {
+    summary.append(el("div", { class: "joined-problem-line" },
+      el("b", {}, "Resolved: "),
+      ...report.resolved_problems.map((problem) => joinedLine(problem.summary, problem.id)).reduce((children, value, index) => {
+        if (index) children.push("; ");
+        children.push(value);
+        return children;
+      }, [])));
+  }
+  return summary;
+}
+
+function joinedSummary(report) {
+  const position = report.roadmap?.position;
+  const owner = report.owner?.id ?? "unknown";
+  const provider = report.provider ? report.provider.kind + " · " + report.provider.handle : "unknown";
+  const summary = el("div", { class: "joined-summary" });
+  const check = report.next_check;
+  summary.append(
+    joinedProgress(report.progress),
+    el("div", { class: "joined-line" },
+      el("b", {}, "Road map: "),
+      position ? el("span", {}, joinedLine(position.title, position.id), " (", position.status, ")") : "unknown position"),
+    el("div", { class: "joined-line" },
+      el("b", {}, "NOW: "),
+      joinedLine(report.now)),
+    el("div", { class: "joined-line" },
+      el("b", {}, "NEXT: "),
+      joinedLine(report.next)),
+    el("div", { class: "joined-line" },
+      el("b", {}, "CHECK: "),
+      check ? String(check.at) + " — " : "unknown — ",
+      check ? joinedLine(check.reason) : "no durable check recorded"),
+    el("div", { class: "joined-meta" },
+      "Owner: " + owner + " · Provider: " + provider),
+    joinedProblemSummary(report),
+  );
+  if (report.recovery_action) {
+    summary.append(el("div", { class: "joined-line" },
+      el("b", {}, "Recovery: "),
+      joinedLine(report.recovery_action)));
+  }
+  return summary;
+}
+
 // ------------------------------------------------------------ liveness
 
 function setLiveness(next) {
@@ -289,7 +369,16 @@ function laneCard(lane) {
     el("span", { class: "title" }, lane.title),
     el("span", { class: "age" }, `Updated ${ageWords(lane.updated_ts)}`)));
 
-  card.append(el("div", { class: "goalline" }, el("b", {}, "Goal: "), tline(lane.goal)));
+  const joined = lane.joined_session;
+  card.append(el("div", { class: "goalline" }, el("b", {}, "Goal: "), tline(joined?.goal ?? lane.goal)));
+
+  if (joined) {
+    card.append(joinedSummary(joined));
+    card.append(el("div", { class: "ops" },
+      el("code", {}, lane.session_ref),
+      el("span", {}, lane.goal_version != null ? "goal v" + lane.goal_version : "")));
+    return card;
+  }
 
   if (lane.scope.narrowed) {
     const dropped = lane.scope.dropped.map((d) => d.text).join(" ");
@@ -338,6 +427,69 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawe
 
 const DMARKS = { verified: ["v", "✓"], pending: ["n", "○"], unbound: ["n", "–"], review: ["q", "?"] };
 
+function joinedProblemSection(label, problems) {
+  const list = el("ul", { class: "dod" });
+  if (!problems?.length) {
+    list.append(el("li", {}, "None recorded."));
+  } else {
+    for (const problem of problems) {
+      const detail = el("li", {},
+        el("span", { class: "dmark " + (problem.state === "open" ? "q" : "v") },
+          problem.state === "open" ? "!" : "✓"),
+        el("span", { class: "cond" },
+          el("b", {}, problem.id + ": "),
+          joinedLine(problem.summary),
+          problem.need ? el("span", { class: "lbl q" }, "Need: ", joinedLine(problem.need)) : null,
+          problem.resolution ? el("span", { class: "lbl v" }, "Resolved: ", joinedLine(problem.resolution)) : null));
+      list.append(detail);
+    }
+  }
+  return el("div", { class: "d-sec" }, el("h5", {}, label), list);
+}
+
+function joinedDetails(report) {
+  const root = el("div", { class: "joined-details" });
+  const goalSec = el("div", { class: "d-sec" }, el("h5", {}, "Goal"),
+    el("p", {}, joinedLine(report.goal)));
+  const progressSec = el("div", { class: "d-sec" }, el("h5", {}, "Progress"), joinedProgress(report.progress));
+  const position = report.roadmap?.position;
+  const roadmap = el("div", { class: "d-sec" },
+    el("h5", {}, "Road map"),
+    el("p", {}, "Version ", report.roadmap?.version ?? "unknown", " · ", report.roadmap?.assessment ?? "unknown"),
+    el("p", { class: "soft" }, "Position: ",
+      position ? el("span", {}, joinedLine(position.title, position.id), " (", position.status, ")") : "unknown"),
+  );
+  const steps = el("ul", { class: "dod" });
+  for (const step of report.roadmap?.steps ?? []) {
+    steps.append(el("li", {},
+      el("span", { class: "dmark " + (step.status === "done" ? "v" : step.status === "blocked" ? "q" : "n") },
+        step.status === "done" ? "✓" : step.status === "blocked" ? "!" : "○"),
+      el("span", { class: "cond" }, joinedLine(step.title, step.id),
+        el("span", { class: "lbl " + (step.status === "active" ? "v" : "n") }, step.status))));
+  }
+  if (report.roadmap?.steps?.length) roadmap.append(steps);
+  const now = el("div", { class: "d-sec" }, el("h5", {}, "NOW"), el("p", {}, joinedLine(report.now)));
+  const next = el("div", { class: "d-sec" }, el("h5", {}, "NEXT"), el("p", {}, joinedLine(report.next)));
+  const check = report.next_check
+    ? el("p", {}, report.next_check.at, " — ", joinedLine(report.next_check.reason),
+      report.next_check.wake_condition ? el("span", { class: "soft" }, "Wake: ", joinedLine(report.next_check.wake_condition)) : null)
+    : el("p", {}, "Unknown — no durable check recorded.");
+  const checkSec = el("div", { class: "d-sec" }, el("h5", {}, "CHECK"), check);
+  const ownerSec = el("div", { class: "d-sec" }, el("h5", {}, "Owner and provider"),
+    el("p", {}, (report.owner?.id ?? "unknown") + " · " +
+      (report.provider ? report.provider.kind + " · " + report.provider.handle : "unknown")));
+  root.append(goalSec, progressSec, roadmap, now, next, checkSec, ownerSec,
+    joinedProblemSection("Open problems", report.open_problems),
+    joinedProblemSection("Resolved problems", report.resolved_problems));
+  if (report.recovery_action || report.chitra_action) {
+    const recovery = el("div", { class: "d-sec" }, el("h5", {}, "Recovery"),
+      report.recovery_action ? el("p", {}, el("b", {}, "Action: "), joinedLine(report.recovery_action)) : null,
+      report.chitra_action ? el("p", { class: "soft" }, "Chitra: ", joinedLine(report.chitra_action)) : null);
+    root.append(recovery);
+  }
+  return root;
+}
+
 function renderDrawer(lane) {
   const drawer = $("drawer");
   drawer.replaceChildren();
@@ -352,11 +504,14 @@ function renderDrawer(lane) {
 
   const body = el("div", { class: "d-body" });
 
-  const goalSec = el("div", { class: "d-sec" }, el("h5", {}, "Goal"),
-    el("p", {}, tline(lane.goal)));
-  const goalRaw = rawBox(lane.goal);
-  if (goalRaw) goalSec.append(goalRaw);
-  body.append(goalSec);
+  if (lane.joined_session) {
+    body.append(joinedDetails(lane.joined_session));
+  } else {
+    const goalSec = el("div", { class: "d-sec" }, el("h5", {}, "Goal"),
+      el("p", {}, tline(lane.goal)));
+    const goalRaw = rawBox(lane.goal);
+    if (goalRaw) goalSec.append(goalRaw);
+    body.append(goalSec);
 
   if (lane.intent) {
     body.append(el("div", { class: "d-sec" }, el("h5", {}, "Why this lane exists"),
@@ -393,13 +548,14 @@ function renderDrawer(lane) {
   }
   body.append(nowSec);
 
-  if (lane.open_asks.length) {
-    const asks = el("ul", { class: "dod" });
-    for (const ask of lane.open_asks) {
-      asks.append(el("li", {}, el("span", { class: "dmark q" }, "?"),
-        el("span", { class: "cond" }, tline(ask))));
+    if (lane.open_asks.length) {
+      const asks = el("ul", { class: "dod" });
+      for (const ask of lane.open_asks) {
+        asks.append(el("li", {}, el("span", { class: "dmark q" }, "?"),
+          el("span", { class: "cond" }, tline(ask))));
+      }
+      body.append(el("div", { class: "d-sec" }, el("h5", {}, "Waiting on you"), asks));
     }
-    body.append(el("div", { class: "d-sec" }, el("h5", {}, "Waiting on you"), asks));
   }
 
   const laneEvents = state.events.filter((ev) => ev.lane === lane.session_ref);

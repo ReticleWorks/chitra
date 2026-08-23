@@ -1,18 +1,21 @@
 """boardd configuration.
 
 Everything is environment-driven so the same code runs against the bundled
-fixture state dir (tests/fixtures/boardd_state) and the real
-/var/lib/polyphony-chitra on twinridge.
+fixture state dir (tests/fixtures/boardd_state) and the configured Chitra
+state root.
 """
 
 import os
 from pathlib import Path
 
+from chitra.state_paths import state_dir
+
 PKG_DIR = Path(__file__).resolve().parent
 
-# Directory holding goals.json (chitra.goals.v1) and sweep-digest.json.
-# Real deployment: /var/lib/polyphony-chitra on host twinridge.
-STATE_DIR = Path(os.environ.get("BOARDD_STATE_DIR", "/var/lib/polyphony-chitra"))
+# Directory holding Chitra's goals, digest, and joined-lane records.  The
+# existing boardd override remains useful for fixtures and an explicitly
+# isolated deployment; normal operation follows Chitra's state-root authority.
+STATE_DIR = Path(os.environ.get("BOARDD_STATE_DIR", str(state_dir())))
 
 # Translation cache seed (read-only, ships with the app).
 TRANSLATION_SEED = Path(

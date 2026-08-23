@@ -40,7 +40,7 @@ Delayed, then Disconnected, with a Retry button.
 
 | Env var | Default | Meaning |
 | --- | --- | --- |
-| `BOARDD_STATE_DIR` | `/var/lib/polyphony-chitra` | Directory holding `goals.json` (chitra.goals.v1) and `sweep-digest.json`. |
+| `BOARDD_STATE_DIR` | `CHITRA_STATE_DIR` or `/var/lib/chitra` | Optional boardd override. The shared Chitra state root holds `goals.json`, `sweep-digest.json`, and `joined-lanes/*.json`. |
 | `BOARDD_TRANSLATION_SEED` | bundled `boardd/data/translations-seed.json` | Hash-keyed translation cache seed. |
 | `BOARDD_STALE_AFTER_SECONDS` | `900` | Age after which the state file itself is called stale in the UI. |
 | `BOARDD_HEARTBEAT_SECONDS` | `15` | SSE heartbeat interval. |

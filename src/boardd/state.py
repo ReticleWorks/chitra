@@ -1,8 +1,8 @@
 """State loading and view building.
 
-boardd is a pure reader. This module reads the two daemon-owned files
-(goals.json, sweep-digest.json), never writes them, and builds the single
-view dict served by /api/state and pushed over SSE.
+boardd is a pure reader. This module reads the daemon-owned goals and digest
+files plus canonical joined-lane records, never writes them, and builds the
+single view dict served by /api/state and pushed over SSE.
 
 Honesty rules enforced here, not in the template:
 - Agent-reported results always carry verified=False and the UI mark
@@ -17,9 +17,14 @@ Honesty rules enforced here, not in the template:
 
 import json
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from chitra.joined_lane import JoinedLaneError, JoinedLaneStore
+from chitra.session_contract import JoinedLaneRecord, Problem, RoadmapStep
+from chitra.session_view import GoalProjection, JoinedSessionView, build_joined_session_view
 
 from .config import DIGEST_FILE, GOALS_FILE, STALE_AFTER_SECONDS
 from .translate import TranslationCache
@@ -57,6 +62,194 @@ def _event_ts(hhmm: str, sweep_at: datetime | None) -> str | None:
         return None
     h, m = hhmm.split(":")
     return sweep_at.replace(hour=int(h), minute=int(m), second=0).isoformat()
+
+
+@dataclass(frozen=True, slots=True)
+class _GoalProjection(GoalProjection):
+    """The goal fields needed to join a lane report without a second store."""
+
+    goal_id: str
+    lane_id: str
+    goal: str
+    done_when: str
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class _JoinedReport:
+    record: JoinedLaneRecord
+    view: JoinedSessionView
+
+
+def _goal_entries(goals_doc: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    entries = goals_doc.get("goals", [])
+    if not isinstance(entries, list):
+        return ()
+    return tuple(entry for entry in entries if isinstance(entry, dict))
+
+
+def _goal_for_joined(record: JoinedLaneRecord, goals: tuple[dict[str, Any], ...]) -> _GoalProjection | None:
+    """Join a lane to its existing goal identity, including physical rotation."""
+
+    candidate = next((goal for goal in goals if goal.get("session_ref") == record.session_ref), None)
+    if candidate is None:
+        candidate = next((goal for goal in goals if goal.get("goal_id") == record.goal_id), None)
+    if candidate is None:
+        candidate = next((goal for goal in goals if goal.get("lane_id") == record.lane_id), None)
+    if candidate is None:
+        return None
+    return _GoalProjection(
+        goal_id=str(candidate.get("goal_id") or record.goal_id),
+        lane_id=str(candidate.get("lane_id") or record.lane_id),
+        goal=str(candidate.get("goal") or ""),
+        done_when=str(candidate.get("done_when") or ""),
+        status=str(candidate.get("status") or "working"),
+    )
+
+
+def _load_joined_lanes(state_dir: Path) -> tuple[tuple[JoinedLaneRecord, ...], list[str]]:
+    """Read canonical joined records and surface corruption as source errors."""
+
+    try:
+        records = tuple(JoinedLaneStore(state_dir).list())
+    except (JoinedLaneError, OSError) as exc:
+        return (), [f"joined-lanes unreadable: {exc}"]
+    return records, []
+
+
+def _line(tc: TranslationCache, value: str | None) -> dict[str, Any] | None:
+    return tc.get(value) if value else None
+
+
+def _step_payload(step: RoadmapStep, tc: TranslationCache) -> dict[str, Any]:
+    return {
+        "id": step.id,
+        "status": step.status,
+        "title": tc.get(step.title or step.id),
+        "owner": step.owner or None,
+        "milestone_id": step.milestone_id,
+    }
+
+
+def _problem_payload(problem: Problem, tc: TranslationCache) -> dict[str, Any]:
+    return {
+        "id": problem.id,
+        "summary": tc.get(problem.summary),
+        "owner": problem.owner,
+        "state": problem.state,
+        "need": _line(tc, problem.need),
+        "resolution": _line(tc, problem.resolution),
+        "reopen_event": _line(tc, problem.reopen_event),
+    }
+
+
+def _joined_payload(
+    view: JoinedSessionView,
+    tc: TranslationCache,
+    *,
+    owner_id: str,
+    owner_role: str,
+) -> dict[str, Any]:
+    """Return only user-facing joined fields for the board browser payload."""
+
+    progress = view.progress
+    current_step = view.current_step
+    next_check = view.next_check
+    provider = view.provider
+    update = view.steps
+    return {
+        "schema": view.schema,
+        "lane_id": view.lane_id,
+        "goal_id": view.goal_id,
+        "goal_version": view.goal_version,
+        "session_ref": view.session_ref,
+        "lifecycle": view.lifecycle,
+        "physical_session_generation": view.physical_session_generation,
+        "goal": _line(tc, view.goal) or tc.get("unavailable (goal record not joined)"),
+        "done_when": _line(tc, view.done_when) or tc.get("unavailable (goal record not joined)"),
+        "goal_status": view.goal_status,
+        "progress": None
+        if progress is None
+        else {
+            "percentage": progress.percentage,
+            "completed_steps": progress.completed_steps,
+            "total_steps": progress.total_steps,
+            "reason": progress.reason,
+        },
+        "roadmap": {
+            "version": view.plan_version,
+            "assessment": view.plan_state,
+            "revision_note": _line(tc, view.plan_revision_note),
+            "position": None
+            if current_step is None
+            else _step_payload(current_step, tc),
+            "steps": [_step_payload(step, tc) for step in update],
+        },
+        "now": _line(tc, view.current_work),
+        "next": _line(tc, view.next_action),
+        "next_check": None
+        if next_check is None
+        else {
+            "at": next_check.at,
+            "reason": tc.get(next_check.reason),
+            "wake_condition": _line(tc, next_check.wake_condition),
+        },
+        "owner": {
+            "id": view.owner or owner_id,
+            "role": "lane-step" if view.owner else owner_role,
+        },
+        "provider": {
+            "kind": provider.kind,
+            "handle": provider.handle,
+            "generation": provider.generation,
+        },
+        "open_problems": [_problem_payload(problem, tc) for problem in view.open_problems],
+        "resolved_problems": [_problem_payload(problem, tc) for problem in view.resolved_problems],
+        "chitra_action": _line(tc, view.chitra_action),
+        "recovery_action": tc.get(view.recovery.attempted_remedy or "none recorded."),
+        "last_useful_progress": None
+        if view.last_useful_progress is None
+        else {
+            "summary": tc.get(view.last_useful_progress.summary),
+            "observed_at": view.last_useful_progress.observed_at,
+            "update_sequence": view.last_useful_progress.update_sequence,
+        },
+        "observed_at": view.observed_at,
+        "update_sequence": view.update_sequence,
+    }
+
+
+def _joined_reports(
+    records: tuple[JoinedLaneRecord, ...],
+    goals: tuple[dict[str, Any], ...],
+) -> tuple[tuple[_JoinedReport, ...], list[str]]:
+    reports: list[_JoinedReport] = []
+    errors: list[str] = []
+    for record in records:
+        goal = _goal_for_joined(record, goals)
+        try:
+            view = build_joined_session_view(record, goal=goal)
+        except ValueError as exc:
+            errors.append(f"joined-lane {record.lane_id} omitted: {exc}")
+            continue
+        reports.append(_JoinedReport(record=record, view=view))
+    return tuple(reports), errors
+
+
+def _report_for_goal(goal: dict[str, Any], reports: tuple[_JoinedReport, ...]) -> _JoinedReport | None:
+    session_ref = goal.get("session_ref")
+    goal_id = goal.get("goal_id")
+    lane_id = goal.get("lane_id")
+    for report in reports:
+        if session_ref and report.record.session_ref == session_ref:
+            return report
+    for report in reports:
+        if goal_id and report.record.goal_id == goal_id:
+            return report
+    for report in reports:
+        if lane_id and report.record.lane_id == lane_id:
+            return report
+    return None
 
 
 # ------------------------------------------------------------ done-when
@@ -192,11 +385,16 @@ def build_view(state_dir: Path, tc: TranslationCache, now: datetime | None = Non
     now = now or datetime.now(UTC)
     goals_doc = raw["goals"] or {}
     digest_doc = raw["digest"] or {}
+    goals = _goal_entries(goals_doc)
+    joined_records, joined_errors = _load_joined_lanes(state_dir)
+    raw["errors"].extend(joined_errors)
+    joined_reports, report_errors = _joined_reports(joined_records, goals)
+    raw["errors"].extend(report_errors)
 
     goals_at = _parse_ts(goals_doc.get("updated_at"))
     sweep_at = _parse_ts(digest_doc.get("sweep_at"))
 
-    status_by_lane = {g.get("session_ref"): g.get("status") for g in goals_doc.get("goals", [])}
+    status_by_lane = {g.get("session_ref"): g.get("status") for g in goals}
     events = []
     for ev in digest_doc.get("events", []):
         events.append(
@@ -220,8 +418,10 @@ def build_view(state_dir: Path, tc: TranslationCache, now: datetime | None = Non
 
     lanes = []
     needs_you = []
-    for g in goals_doc.get("goals", []):
-        ref = g.get("session_ref", "")
+    matched_reports: set[str] = set()
+    for g in goals:
+        report = _report_for_goal(g, joined_reports)
+        ref = report.record.session_ref if report is not None else g.get("session_ref", "")
         movement = build_movement(g, tc)
         done_when = build_done_when(g, tc)
         scope = build_scope(g, tc)
@@ -238,8 +438,20 @@ def build_view(state_dir: Path, tc: TranslationCache, now: datetime | None = Non
             "scope": scope,
             "open_asks": asks,
             "goal_version": g.get("goal_version"),
-            "updated_ts": (latest or {}).get("ts") or (goals_at.isoformat() if goals_at else None),
+            "updated_ts": (
+                (latest or {}).get("ts")
+                or (report.view.observed_at if report is not None else None)
+                or (goals_at.isoformat() if goals_at else None)
+            ),
         }
+        if report is not None:
+            matched_reports.add(report.record.lane_id)
+            lane["joined_session"] = _joined_payload(
+                report.view,
+                tc,
+                owner_id=report.record.owner.owner_id,
+                owner_role=report.record.owner.role,
+            )
         lanes.append(lane)
         for ask in asks:
             needs_you.append(
@@ -250,6 +462,40 @@ def build_view(state_dir: Path, tc: TranslationCache, now: datetime | None = Non
                     "context": movement["sentence"],
                 }
             )
+
+    for report in joined_reports:
+        if report.record.lane_id in matched_reports:
+            continue
+        view = report.view
+        ref = report.record.session_ref
+        fallback_goal: dict[str, Any] = {
+            "session_ref": ref,
+            "status": "working" if view.lifecycle == "active" else "idle",
+            "now": view.current_work or "",
+            "done_when": view.done_when or "",
+            "open_asks": [],
+        }
+        latest = latest_by_lane.get(ref)
+        lane = {
+            "session_ref": ref,
+            "title": ref,
+            "goal": tc.get(view.goal or ""),
+            "intent": None,
+            "movement": build_movement(fallback_goal, tc),
+            "latest_result": latest,
+            "done_when": build_done_when(fallback_goal, tc),
+            "scope": {"narrowed": False, "dropped": []},
+            "open_asks": [],
+            "goal_version": report.record.goal_version,
+            "updated_ts": (latest or {}).get("ts") or view.observed_at,
+            "joined_session": _joined_payload(
+                view,
+                tc,
+                owner_id=report.record.owner.owner_id,
+                owner_role=report.record.owner.role,
+            ),
+        }
+        lanes.append(lane)
 
     counts: dict[str, int] = {}
     for lane in lanes:
@@ -269,6 +515,7 @@ def build_view(state_dir: Path, tc: TranslationCache, now: datetime | None = Non
             "goals_age_seconds": goals_age,
             "data_stale": data_stale,
             "note": goals_doc.get("note"),
+            "joined_lane_count": len(joined_reports),
             "errors": raw["errors"],
         },
         "summary": {
