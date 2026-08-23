@@ -2,6 +2,11 @@
 delivers each order via ``chitra.dispatch.dispatch_to_tmux``, enforcing the
 single-writer rule via ``LaneLock``.
 
+The queue's filesystem state -- subdirectory layout, claim/ownership
+markers, send nonces, and retry sidecars -- is typed and owned by
+``chitra.queue_state``; this module composes those primitives into the
+delivery policy below.
+
 Queue layout (default ``queue_dir``, overridable per call/CLI):
 
     queue_dir/orders/*.json      -- DispatchOrder JSON, one file per order
@@ -101,7 +106,6 @@ import contextlib
 import json
 import os
 import time
-import uuid
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -116,7 +120,6 @@ from .dispatch import (
     LaneLock,
     LaneLockError,
     TmuxRunner,
-    _pid_alive,
     dispatch_to_tmux,
     nudge_confirmation_marker,
     transcript_confirms_nudge,
@@ -135,6 +138,13 @@ from .goals import (
 from .journal import native_session_identity
 from .orders import DispatchOrder, DispatchResult, DispatchStatus
 from .policy_config import PolicyConfig, load_policy_config
+from .queue_state import (
+    LaneLockRetryTracker,
+    QueueLayout,
+    QueueSubdir,
+    reclaim_stale_claims,
+    reserve_claim,
+)
 from .routing_config import RoutingConfig, load_routing_config, resolve_route, resolve_routing_hint
 from .state_paths import default_attestation_ledger_path, default_ledger_key_path, default_ledger_path, default_queue_dir
 
@@ -194,12 +204,8 @@ SESSION_DENY_PREFIXES_ENV_VAR = "CHITRA_DENIED_SESSION_PREFIXES"
 
 
 def _ensure_queue_dirs(queue_dir: Path) -> tuple[Path, Path, Path]:
-    orders = queue_dir / "orders"
-    results = queue_dir / "results"
-    processed = queue_dir / "processed"
-    for d in (orders, results, processed, queue_dir / "in_flight", queue_dir / "deferred"):
-        d.mkdir(parents=True, exist_ok=True)
-    return orders, results, processed
+    """Create the standard queue subdirectories via the typed layout seam."""
+    return QueueLayout(queue_dir).create()
 
 
 def resolve_session_prefixes(prefixes: Sequence[str] | None, *, env_var: str) -> tuple[str, ...]:
@@ -269,7 +275,7 @@ def _finalize_claimed_order(
     else:
         claimed_path.replace(destination_dir / claimed_path.name)
     if retry_state_dir is not None:
-        _remove_lane_lock_retry_attempts(retry_state_dir, retry_order_id or claimed_path.stem)
+        LaneLockRetryTracker(retry_state_dir).clear(retry_order_id or claimed_path.stem)
     return result
 
 
@@ -388,75 +394,21 @@ def _complete_existing_result(
 
     processed_dir.mkdir(parents=True, exist_ok=True)
     claimed_path.replace(processed_dir / claimed_path.name)
-    _remove_lane_lock_retry_attempts(deferred_dir, order.order_id)
-
-
-def _reserve_owner_marker(in_flight_dir: Path, order_id: str) -> Path | None:
-    """Atomically reserve an order before moving it into ``in_flight``.
-
-    The marker is intentionally created *before* the order rename. A peer
-    worker that sees the order still under ``orders/`` then sees the live
-    reservation and skips it, rather than racing the tiny former window
-    between the rename and owner-marker write.
-    """
-    owner_path = in_flight_dir / f".{order_id}.owner"
-    try:
-        with owner_path.open("x", encoding="utf-8") as handle:
-            handle.write(str(os.getpid()))
-    except FileExistsError:
-        return None
-    return owner_path
+    LaneLockRetryTracker(deferred_dir).clear(order.order_id)
 
 
 def _reclaim_stale_in_flight(queue_dir: Path) -> None:
     """Return an orphaned ``in_flight/`` order to ``orders/`` for reclaiming.
 
-    Mirrors ``chitra.dispatch.LaneLock``'s own stale-lock reclaim: every
-    successful claim writes an owner marker (this process's pid) next to the
-    claimed order file; a claim whose owner pid is no longer alive was
-    abandoned by a crashed worker and is safe to return to ``orders/`` for a
-    fresh claim. A claim whose owner is still alive is a real
-    currently-in-progress delivery and is never touched -- this must never
-    steal a claim out from under a live worker. Called at the top of every
+    Delegates to :func:`chitra.queue_state.reclaim_stale_claims`: a claim
+    whose owner pid is no longer alive was abandoned by a crashed worker and
+    is safe to return to ``orders/`` for a fresh claim, while a claim whose
+    owner is still alive is never touched. Called at the top of every
     ``run_once`` pass so a crash between claiming an order and writing its
     result is always eventually retried, never stranded. See
     docs/SOL-ADVERSARIAL-REVIEW findings #2 and #5.
     """
-    in_flight_dir = queue_dir / "in_flight"
-    orders_dir = queue_dir / "orders"
-    if not in_flight_dir.is_dir():
-        return
-    for claimed in in_flight_dir.glob("*.json"):
-        owner_path = in_flight_dir / f".{claimed.stem}.owner"
-        try:
-            pid = int(owner_path.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            pid = 0  # no/corrupt owner marker -- treat as abandoned, safe to reclaim
-        if pid and _pid_alive(pid):
-            continue
-        logger.warning("dispatchd_reclaiming_stale_in_flight_order", path=str(claimed), owner_pid=pid)
-        with contextlib.suppress(OSError):
-            claimed.replace(orders_dir / claimed.name)
-        with contextlib.suppress(OSError):
-            owner_path.unlink()
-
-    # A worker can die after creating its reservation but before moving the
-    # order file into in_flight/. Such an orphan marker must not permanently
-    # block the still-pending order, but a live owner's short pre-rename window
-    # must remain protected.
-    for owner_path in in_flight_dir.glob(".*.owner"):
-        order_id = owner_path.name[1 : -len(".owner")]
-        if not order_id or (in_flight_dir / f"{order_id}.json").exists():
-            continue
-        try:
-            pid = int(owner_path.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            pid = 0
-        if pid and _pid_alive(pid):
-            continue
-        logger.warning("dispatchd_reclaiming_stale_reservation", path=str(owner_path), owner_pid=pid)
-        with contextlib.suppress(OSError):
-            owner_path.unlink()
+    reclaim_stale_claims(QueueLayout(queue_dir))
 
 
 def requeue_deferred_for_session(queue_dir: Path, session_ref: str) -> list[str]:
@@ -470,7 +422,7 @@ def requeue_deferred_for_session(queue_dir: Path, session_ref: str) -> list[str]
     they are requeued (their original arrival order, oldest first).
     """
     orders_dir, _, _ = _ensure_queue_dirs(queue_dir)
-    deferred_dir = queue_dir / "deferred"
+    deferred_dir = QueueLayout(queue_dir).deferred
     dated: list[tuple[int, int, Path]] = []
     for path in deferred_dir.glob("*.json"):
         try:
@@ -500,45 +452,23 @@ def requeue_deferred_for_session(queue_dir: Path, session_ref: str) -> list[str]
 
 
 def _lane_lock_retry_state_path(deferred_dir: Path, order_id: str) -> Path:
-    """Return the sidecar that makes a lane-lock retry durable.
-
-    The sidecar deliberately has no ``.json`` suffix: normal deferred order
-    scans only consider JSON order files, so this control record can never be
-    mistaken for a dispatch order.
-    """
-    return deferred_dir / f".{order_id}.lane-lock-attempts"
+    """Return the durable lane-lock retry sidecar path (see ``chitra.queue_state.LaneLockRetryTracker``)."""
+    return LaneLockRetryTracker(deferred_dir).state_path(order_id)
 
 
 def _read_lane_lock_retry_attempts(deferred_dir: Path, order_id: str, *, retry_limit: int) -> int:
-    """Read a retry count, failing closed if a manually-corrupt sidecar appears."""
-    path = _lane_lock_retry_state_path(deferred_dir, order_id)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        attempts = payload["attempts"]
-        if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
-            raise ValueError("attempts must be a non-negative integer")
-    except FileNotFoundError:
-        return 0
-    except (OSError, ValueError, TypeError, KeyError) as exc:
-        # Atomic writes prevent a process crash from producing this state.
-        # Treat an externally corrupted record as exhausted rather than
-        # resetting it and allowing an unbounded retry loop.
-        logger.error("dispatchd_lane_lock_retry_state_invalid", path=str(path), error=str(exc))
-        return retry_limit
-    return attempts
+    """Read the retry count, failing closed on a corrupted sidecar."""
+    return LaneLockRetryTracker(deferred_dir).attempts(order_id, retry_limit=retry_limit)
 
 
 def _record_lane_lock_retry_attempt(deferred_dir: Path, order_id: str, *, retry_limit: int) -> int:
     """Atomically increment and persist one lane-lock timeout count."""
-    attempts = _read_lane_lock_retry_attempts(deferred_dir, order_id, retry_limit=retry_limit) + 1
-    write_json_atomic(_lane_lock_retry_state_path(deferred_dir, order_id), {"attempts": attempts})
-    return attempts
+    return LaneLockRetryTracker(deferred_dir).record_attempt(order_id, retry_limit=retry_limit)
 
 
 def _remove_lane_lock_retry_attempts(deferred_dir: Path, order_id: str) -> None:
     """Best-effort cleanup after a terminal result has made retry state moot."""
-    with contextlib.suppress(OSError):
-        _lane_lock_retry_state_path(deferred_dir, order_id).unlink()
+    LaneLockRetryTracker(deferred_dir).clear(order_id)
 
 
 def _requeue_lane_lock_deferred(queue_dir: Path, orders_dir: Path) -> list[Path]:
@@ -550,10 +480,11 @@ def _requeue_lane_lock_deferred(queue_dir: Path, orders_dir: Path) -> list[Path]
     then moves the order, so a crash at either point leaves a recoverable
     order plus an accurate retry count.
     """
-    deferred_dir = queue_dir / "deferred"
+    deferred_dir = QueueLayout(queue_dir).deferred
+    retry_tracker = LaneLockRetryTracker(deferred_dir)
     dated: list[tuple[int, int, Path]] = []
     for path in deferred_dir.glob("*.json"):
-        if not _lane_lock_retry_state_path(deferred_dir, path.stem).exists():
+        if not retry_tracker.state_path(path.stem).exists():
             continue
         try:
             stat = path.stat()
@@ -641,29 +572,27 @@ def process_one_order(
         raise ValueError("lane_lock_retry_attempts must be at least 1")
     policy = policy or PolicyConfig()
     tuning = tuning or DispatchTuning()
-    deferred_dir = orders_dir.parent / "deferred"
-    in_flight_dir = orders_dir.parent / "in_flight"
+    layout = QueueLayout(orders_dir.parent)
+    deferred_dir = layout.deferred
+    in_flight_dir = layout.in_flight
     in_flight_dir.mkdir(parents=True, exist_ok=True)
 
     # Atomically reserve the order before moving it out of orders/. The
     # reservation closes the former rename->owner-marker window that could
     # otherwise let another worker reclaim a live order as stale.
-    claimed_path = in_flight_dir / order_path.name
-    owner_path = _reserve_owner_marker(in_flight_dir, order_path.stem)
-    if owner_path is None:
+    reservation = reserve_claim(in_flight_dir, order_path.stem)
+    if reservation is None:
         logger.info("dispatchd_order_reserved_elsewhere", path=str(order_path))
         return None
     try:
-        order_path.rename(claimed_path)
+        claimed_path = reservation.claim(order_path)
     except FileNotFoundError:
         logger.info("dispatchd_order_claimed_elsewhere", path=str(order_path))
-        with contextlib.suppress(OSError):
-            owner_path.unlink()
+        reservation.release()
         return None
     except OSError as exc:
         logger.error("dispatchd_order_claim_failed", path=str(order_path), error=str(exc))
-        with contextlib.suppress(OSError):
-            owner_path.unlink()
+        reservation.release()
         return None
 
     # The reservation marker now records which live process holds this claim,
@@ -695,8 +624,7 @@ def process_one_order(
             lane_lock_retry_attempts=lane_lock_retry_attempts,
         )
     finally:
-        with contextlib.suppress(OSError):
-            owner_path.unlink()
+        reservation.release()
 
 
 def _process_claimed_order(
@@ -729,6 +657,10 @@ def _process_claimed_order(
     in one ``finally`` regardless of which of this function's many return
     points is taken.
     """
+    # ``in_flight/`` always sits directly under the queue root, so the typed
+    # layout (and every other queue path) derives from this call's own claim.
+    layout = QueueLayout(in_flight_dir.parent)
+    retry_tracker = LaneLockRetryTracker(deferred_dir)
     try:
         order = DispatchOrder.model_validate_json(claimed_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -739,7 +671,7 @@ def _process_claimed_order(
             status=DispatchStatus.FAILED,
             reason=f"invalid-order: {exc}",
         )
-        destination = invalid_dir or processed_dir.parent / "invalid"
+        destination = invalid_dir or processed_dir.parent / QueueSubdir.INVALID
         return _finalize_claimed_order(
             claimed_path,
             results_dir=results_dir,
@@ -762,6 +694,8 @@ def _process_claimed_order(
             if resolved_hint is not None:
                 order.routing_hint = resolved_hint
 
+    # The caller-supplied results directory stays authoritative for the
+    # idempotency lookup, matching where _write_result_atomic persists.
     existing_result = results_dir / f"{order.order_id}.json"
     if existing_result.exists():
         logger.info("dispatchd_order_already_processed", order_id=order.order_id)
@@ -778,7 +712,7 @@ def _process_claimed_order(
         return None
 
     attestation_id = order.decision_attestation.attestation_id if order.decision_attestation is not None else None
-    if _read_lane_lock_retry_attempts(deferred_dir, order.order_id, retry_limit=lane_lock_retry_attempts) >= lane_lock_retry_attempts:
+    if retry_tracker.attempts(order.order_id, retry_limit=lane_lock_retry_attempts) >= lane_lock_retry_attempts:
         logger.error(
             "dispatchd_lane_lock_retry_exhausted",
             order_id=order.order_id,
@@ -925,7 +859,7 @@ def _process_claimed_order(
     try:
         lock.acquire(blocking=True, timeout_seconds=tuning.lane_lock_timeout_seconds)
     except LaneLockError as exc:
-        attempts = _record_lane_lock_retry_attempt(deferred_dir, order.order_id, retry_limit=lane_lock_retry_attempts)
+        attempts = retry_tracker.record_attempt(order.order_id, retry_limit=lane_lock_retry_attempts)
         logger.warning(
             "dispatchd_lane_lock_failed",
             order_id=order.order_id,
@@ -1039,7 +973,7 @@ def _process_claimed_order(
             # A guard hold changes this into a hold-owned deferral. Reset a
             # prior lane-lock retry marker so run_once does not churn it back
             # into orders while the hold remains active.
-            _remove_lane_lock_retry_attempts(deferred_dir, order.order_id)
+            retry_tracker.clear(order.order_id)
             with contextlib.suppress(OSError):
                 claimed_path.replace(deferred_dir / claimed_path.name)
             return DispatchResult(
@@ -1060,8 +994,8 @@ def _process_claimed_order(
         # means a PRIOR attempt got at least as far as (about to) paste before
         # this process/run restarted. Reconcile against the target transcript.
         # The nonce makes this a verify-only state: never paste again.
-        nonce_path = in_flight_dir / f".{order.order_id}.nonce"
-        if nonce_path.exists():
+        nonce = layout.send_nonce(order.order_id)
+        if nonce.exists():
             logger.warning("dispatchd_order_reconciling_after_possible_crash", order_id=order.order_id, session_ref=order.session_ref)
             parts = order.session_ref.split(":")
             host = parts[0] if len(parts) == 3 else ""
@@ -1095,7 +1029,7 @@ def _process_claimed_order(
                     marker=nudge_confirmation_marker(order.nudge),
                 )
         else:
-            nonce_path.write_text(uuid.uuid4().hex, encoding="utf-8")
+            nonce.mint()
             result = dispatch_to_tmux(
                 order,
                 policy=policy,
@@ -1129,7 +1063,7 @@ def _process_claimed_order(
         # send-nonce written before this delivery attempt: the retried pass's
         # existing crash-reconciliation check (nonce present, no result)
         # re-greps the lane transcript without pasting again.
-        attempts = _record_lane_lock_retry_attempt(deferred_dir, order.order_id, retry_limit=lane_lock_retry_attempts)
+        attempts = retry_tracker.record_attempt(order.order_id, retry_limit=lane_lock_retry_attempts)
         logger.warning(
             "dispatchd_delivery_unconfirmed",
             order_id=order.order_id,
@@ -1157,8 +1091,7 @@ def _process_claimed_order(
             )
             result.status = DispatchStatus.FAILED
             result.reason = "retry-exhausted"
-            with contextlib.suppress(OSError):
-                (in_flight_dir / f".{order.order_id}.nonce").unlink()
+            layout.send_nonce(order.order_id).clear()
             return _finalize_claimed_order(
                 claimed_path,
                 results_dir=results_dir,
@@ -1201,8 +1134,7 @@ def _process_claimed_order(
         retry_state_dir=deferred_dir,
         retry_order_id=order.order_id,
     )
-    with contextlib.suppress(OSError):
-        (in_flight_dir / f".{order.order_id}.nonce").unlink()
+    layout.send_nonce(order.order_id).clear()
     return result
 
 
