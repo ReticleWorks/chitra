@@ -1,6 +1,9 @@
 # Daemons and Tools
 
-Chitra provides a set of command-line tools and daemons organized by function. Two run continuously (dispatchd, triaged). The rest are periodic, ad-hoc, or observation-only services.
+Chitra provides a set of command-line tools and daemons organized by
+function. Four shared daemons run continuously when the host role is armed:
+dispatchd, watchd, triaged, and sweepd. The rest are periodic, ad-hoc, or
+observation-only services.
 
 ## Delivery Systems
 
@@ -31,9 +34,11 @@ Auxiliary tools for testing, debugging, and drift detection.
 **Start chitra for the first time:**
 
 ```bash
-# Continuous daemons
+# Continuous shared daemons
 systemctl start chitra-dispatchd
+systemctl start chitra-watchd
 systemctl start chitra-triaged
+systemctl start chitra-sweepd
 
 # Periodic rate-limit check
 systemctl start --timer chitra-rate-limit-guard.timer
