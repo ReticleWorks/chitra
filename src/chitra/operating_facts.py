@@ -234,10 +234,18 @@ def _read_source(path: Path, category: FactCategory) -> _SourceResult:
         return _SourceResult(None, "inaccessible", f"invalid operating-facts snapshot: {exc}")
 
     prefix = _CATEGORY_PREFIX[category]
-    wrong_category = tuple(fact.name for fact in snapshot.facts if fact.name != prefix and not fact.name.startswith(prefix + "."))
-    if wrong_category:
-        return _SourceResult(None, "inaccessible", f"facts do not belong to {category}: {', '.join(wrong_category)}")
-    return _SourceResult(snapshot.facts, "known")
+    selected = tuple(
+        fact for fact in snapshot.facts if fact.name == prefix or fact.name.startswith(prefix + ".")
+    )
+    # A Fleet production snapshot is intentionally multi-category.  Select the
+    # requested namespace while still rejecting arbitrary unrelated documents.
+    recognized = tuple(
+        fact for fact in snapshot.facts
+        if any(fact.name == known or fact.name.startswith(known + ".") for known in _CATEGORY_PREFIX.values())
+    )
+    if not selected and not recognized:
+        return _SourceResult(None, "inaccessible", f"facts do not belong to {category}")
+    return _SourceResult(selected, "known")
 
 
 def _merge(name: str, candidates: Sequence[_Candidate]) -> OperatingFact:
