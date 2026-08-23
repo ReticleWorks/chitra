@@ -7,6 +7,14 @@ from collections.abc import Mapping
 from typing import cast
 
 import pytest
+from _provider_fakes import (
+    AMP_FIXTURES,
+    FAKE_SCENARIOS,
+    TOPHAND_FIXTURES,
+    FakeAmpProvider,
+    FakeTophandProvider,
+    fake_provider_scenario,
+)
 
 from chitra.provider_protocol import (
     CancelCurrentTurnRequest as _CancelCurrentTurnRequest,
@@ -32,14 +40,6 @@ from chitra.provider_protocol import (
 )
 from chitra.provider_protocol import (
     SendRequest as _SendRequest,
-)
-from test_support.provider_fakes import (
-    AMP_FIXTURES,
-    FAKE_SCENARIOS,
-    TOPHAND_FIXTURES,
-    FakeAmpProvider,
-    FakeTophandProvider,
-    fake_provider_scenario,
 )
 
 
