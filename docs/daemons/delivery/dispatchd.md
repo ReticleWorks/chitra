@@ -108,7 +108,9 @@ dispatchd --queue-dir /var/lib/chitra/queue --once
 
 **Run as a systemd service (continuous):**
 
-See `packaging/systemd/chitra-dispatchd.service.example` in the repo.
+See the packaged unit at `packaging/systemd/chitra-dispatchd.service` in the
+repo. It is the canonical unit for the released `/opt/chitra/venv` layout and
+the declaration-driven `--lanes-file` mode.
 
 **Check delivered messages:**
 
