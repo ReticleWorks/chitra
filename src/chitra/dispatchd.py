@@ -132,7 +132,7 @@ from .goals import (
 from .goals import (
     SCHEMA as GOALS_INSTALLED_SCHEMA,
 )
-from .joined_lane import JoinedLaneReconciler, JoinedLaneStore, ReconcileReport
+from .joined_lane import JoinedLaneReconciler, JoinedLaneStore, ReconcileReport, build_production_reconciler
 from .journal import native_session_identity
 from .orders import DispatchOrder, DispatchResult, DispatchStatus
 from .policy_config import PolicyConfig, load_policy_config
@@ -542,6 +542,46 @@ def _remove_lane_lock_retry_attempts(deferred_dir: Path, order_id: str) -> None:
         _lane_lock_retry_state_path(deferred_dir, order_id).unlink()
 
 
+def _joined_lane_deferred_marker_path(deferred_dir: Path, order_id: str) -> Path:
+    """Return the durable marker identifying a joined-lane barrier defer."""
+
+    return deferred_dir / f".{order_id}.joined-lane.json"
+
+
+def _requeue_joined_lane_deferred(queue_dir: Path, report: ReconcileReport) -> list[Path]:
+    """Return only joined-lane deferred orders whose barrier now allows them."""
+
+    if report.errors:
+        return []
+    orders_dir = queue_dir / "orders"
+    deferred_dir = queue_dir / "deferred"
+    requeued: list[Path] = []
+    for marker in sorted(deferred_dir.glob(".*.joined-lane.json")):
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            order_id = payload["order_id"]
+            session_ref = payload["session_ref"]
+            if not isinstance(order_id, str) or not isinstance(session_ref, str):
+                raise ValueError("invalid joined-lane defer marker")
+            if not report.allows(session_ref):
+                continue
+            source = deferred_dir / f"{order_id}.json"
+            target = orders_dir / source.name
+            order = DispatchOrder.model_validate_json(source.read_text(encoding="utf-8"))
+            if order.order_id != order_id or order.session_ref != session_ref:
+                raise ValueError("joined-lane defer marker does not match order")
+            if target.exists():
+                continue
+            source.replace(target)
+            marker.unlink()
+            requeued.append(target)
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            logger.error("dispatchd_joined_lane_requeue_failed", marker=str(marker), error=str(exc))
+    if requeued:
+        logger.info("dispatchd_joined_lane_requeued", order_ids=[path.stem for path in requeued])
+    return requeued
+
+
 def _requeue_lane_lock_deferred(queue_dir: Path, orders_dir: Path) -> list[Path]:
     """Atomically return retryable lane-lock deferrals after current pending work.
 
@@ -763,6 +803,10 @@ def _process_claimed_order(
         )
         deferred_dir.mkdir(parents=True, exist_ok=True)
         try:
+            write_json_atomic(
+                _joined_lane_deferred_marker_path(deferred_dir, order.order_id),
+                {"order_id": order.order_id, "session_ref": order.session_ref, "reason": reason},
+            )
             claimed_path.replace(deferred_dir / claimed_path.name)
         except OSError as exc:
             logger.error("dispatchd_joined_lane_defer_failed", order_id=order.order_id, error=str(exc))
@@ -1305,6 +1349,7 @@ def run_once(
                 if unfinished
                 else ReconcileReport(())
             )
+    _requeue_joined_lane_deferred(queue_dir, joined_lane_report)
     _reclaim_stale_in_flight(queue_dir)
     note_goals_schema_state(goals_root)
     if isinstance(_preloaded_routing_config, _ConfigNotPreloaded):
@@ -1554,6 +1599,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Maximum lane-lock timeout attempts before processing fails (default: 20).",
     )
     parser.add_argument("--poll-seconds", type=float, default=DEFAULT_POLL_SECONDS)
+    parser.add_argument("--joined-lane-root", type=Path, default=None)
     parser.add_argument("--once", action="store_true", help="Drain the queue once and exit (for tests/cron), instead of looping forever.")
     return parser
 
@@ -1561,6 +1607,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     queue_dir = args.queue_dir or default_queue_dir()
+    joined_lane_root = args.joined_lane_root or queue_dir
+    # Startup always installs a concrete barrier.  Until the daemon's live
+    # provider adapters are configured, these probes report missing evidence;
+    # unfinished lanes therefore remain durably blocked instead of bypassing
+    # reconciliation.
+    joined_lane_reconciler = build_production_reconciler(
+        joined_lane_root,
+        provider_probe=lambda _record: None,
+        journal_probe=lambda _record: None,
+        ownership_probe=lambda _record: None,
+    )
     allowed_session_prefixes = resolve_session_prefixes(args.allow_session_prefix, env_var=SESSION_ALLOW_PREFIXES_ENV_VAR)
     denied_session_prefixes = resolve_session_prefixes(args.deny_session_prefix, env_var=SESSION_DENY_PREFIXES_ENV_VAR)
     tuning = DispatchTuning(
@@ -1602,6 +1659,8 @@ def main(argv: list[str] | None = None) -> int:
             allowed_session_prefixes=allowed_session_prefixes,
             denied_session_prefixes=denied_session_prefixes,
             lane_lock_retry_attempts=args.lane_lock_retry_attempts,
+            joined_lane_root=joined_lane_root,
+            joined_lane_reconciler=joined_lane_reconciler,
         )
         print(json.dumps([r.model_dump(mode="json") for r in results], indent=2))
         return 0
@@ -1620,6 +1679,8 @@ def main(argv: list[str] | None = None) -> int:
         allowed_session_prefixes=allowed_session_prefixes,
         denied_session_prefixes=denied_session_prefixes,
         lane_lock_retry_attempts=args.lane_lock_retry_attempts,
+        joined_lane_root=joined_lane_root,
+        joined_lane_reconciler=joined_lane_reconciler,
     )
     return 0
 

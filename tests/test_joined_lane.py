@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import chitra.dispatchd as dispatchd
 from chitra.dispatchd import run_once
 from chitra.joined_lane import (
     JoinedLaneConflictError,
@@ -18,7 +19,9 @@ from chitra.joined_lane import (
     ReconcileOutcome,
     ReconcileReport,
 )
+from chitra.ledger import LedgerEntry
 from chitra.orders import DispatchOrder, DispatchStatus
+from chitra.provider_protocol import ProviderUpdate, UpdateKind
 from chitra.session_contract import (
     JoinedLaneRecord,
     LaneUpdate,
@@ -139,17 +142,68 @@ def record(
     ).model_copy(update={"revision": revision})
 
 
-def accepted_observation(operation_id: str, *, status: str = "accepted", **updates: object) -> dict[str, object]:
-    values: dict[str, object] = {
-        "status": status,
-        "operation_id": operation_id,
-        "lane_id": "lane-a",
-        "provider_handle": "thread-a",
-        "provider_instance_id": "instance-a",
-        "provider_generation": 1,
-    }
-    values.update(updates)
-    return values
+def accepted_observation(
+    operation_id: str,
+    *,
+    status: str = "accepted",
+    provider_instance_id: str = "instance-a",
+    provider_generation: int = 1,
+) -> ProviderOperationResult:
+    if status == "unknown":
+        accepted: bool | None = None
+        consumed: bool | None = None
+    elif status == "lost-response":
+        accepted = None
+        consumed = None
+    elif status == "rejected":
+        accepted = False
+        consumed = False
+    else:
+        accepted = True
+        consumed = status == "consumed"
+        status = "consumed" if consumed else "accepted"
+    return ProviderOperationResult(
+        operation_id=operation_id,
+        kind="send",
+        lane_id="lane-a",
+        provider_handle="thread-a",
+        idempotency_key=f"idem-{operation_id}",
+        payload_digest=f"digest-{operation_id}",
+        provider_instance_id=provider_instance_id,
+        provider_generation=provider_generation,
+        status=status,
+        accepted=accepted,
+        consumed=consumed,
+        observed_at="2026-08-23T14:00:01+00:00",
+    )
+
+
+def journal_observation(operation_id: str, *, consumed: bool | None, event_id: str = "evt-1") -> ProviderUpdate:
+    return ProviderUpdate(
+        event_id=event_id,
+        cursor="1",
+        kind=UpdateKind.STEER_CONSUMED if consumed is True else UpdateKind.STEER_ACCEPTED,
+        provider_session_id="thread-a",
+        observed_at="2026-08-23T14:00:02+00:00",
+        operation_id=operation_id,
+        lane_id="lane-a",
+        idempotency_key=f"idem-{operation_id}",
+        payload_digest=f"digest-{operation_id}",
+        provider_instance_id="instance-a",
+        provider_generation=1,
+        payload={"result_evidence": {"accepted": True, "consumed": consumed}},
+    )
+
+
+def ledger_observation(operation_id: str) -> LedgerEntry:
+    return LedgerEntry(
+        order_id=operation_id,
+        session_ref="tophand:lane-a",
+        tag="[C]",
+        message_hash="digest",
+        sent_at="2026-08-23T14:00:02+00:00",
+        signature="signature",
+    )
 
 
 def ownership() -> dict[str, object]:
@@ -197,6 +251,44 @@ def test_corrupt_newest_without_predecessor_fails_closed(tmp_path: Path) -> None
         store.load("lane-a")
 
 
+def test_previous_only_document_is_discovered_and_reconciled(tmp_path: Path) -> None:
+    store = JoinedLaneStore(tmp_path)
+    pending = pending_operation()
+    store.create(record(pending=pending))
+    store.previous_path("lane-a").write_text(store.path("lane-a").read_text(encoding="utf-8"), encoding="utf-8")
+    store.path("lane-a").unlink()
+    assert [item.lane_id for item in store.unfinished()] == ["lane-a"]
+    report = JoinedLaneReconciler(
+        store,
+        provider_probe=lambda _record: accepted_observation("op-1"),
+        journal_probe=lambda _record: None,
+        ownership_probe=lambda _record: ownership(),
+    ).reconcile_all()
+    assert report.outcomes[0].lane_id == "lane-a"
+
+
+def test_lost_reply_retries_same_pending_operation_without_duplicate(tmp_path: Path) -> None:
+    store = JoinedLaneStore(tmp_path)
+    pending = pending_operation()
+    store.create(record(pending=pending))
+    seen: list[PendingProviderOperation] = []
+
+    def retry(operation: PendingProviderOperation) -> ProviderOperationResult:
+        seen.append(operation)
+        return accepted_observation(operation.operation_id)
+
+    outcome = JoinedLaneReconciler(
+        store,
+        provider_probe=lambda _record: accepted_observation("op-1", status="lost-response"),
+        journal_probe=lambda _record: None,
+        ownership_probe=lambda _record: ownership(),
+        retry_pending_operation=retry,
+    ).reconcile_all().outcomes[0]
+    assert outcome.status == "awaiting_ack"
+    assert seen == [pending]
+    assert store.require("lane-a").pending_operation.operation_id == "op-1"
+
+
 def test_legacy_wire_schema_is_rejected_without_migration(tmp_path: Path) -> None:
     store = JoinedLaneStore(tmp_path)
     store.path("lane-a").parent.mkdir(parents=True)
@@ -239,6 +331,7 @@ def test_provider_acceptance_without_durable_ack_is_held(tmp_path: Path) -> None
     reconciler = JoinedLaneReconciler(
         store,
         provider_probe=lambda _record: accepted_observation("op-1"),
+        journal_probe=lambda _record: None,
         ownership_probe=lambda _record: ownership(),
         now=fixed_now,
         next_check_delay_seconds=10,
@@ -257,8 +350,8 @@ def test_sent_direction_without_journal_observation_is_not_replayed(tmp_path: Pa
     reconciler = JoinedLaneReconciler(
         store,
         provider_probe=lambda _record: accepted_observation("op-1"),
-        journal_probe=lambda _record: accepted_observation("op-1", status="sent"),
-        ledger_probe=lambda _record: accepted_observation("op-1", status="acknowledged"),
+        journal_probe=lambda _record: journal_observation("op-1", consumed=None),
+        ledger_probe=lambda _record: ledger_observation("op-1"),
         ownership_probe=lambda _record: ownership(),
     )
     outcome = reconciler.reconcile_all().outcomes[0]
@@ -274,14 +367,14 @@ def test_exact_journal_observation_allows_progress_but_ledger_alone_does_not(tmp
         store,
         provider_probe=lambda _record: accepted_observation("op-1"),
         journal_probe=lambda current: probes["journal"](current),
-        ledger_probe=lambda _record: accepted_observation("op-1", status="observed"),
+        ledger_probe=lambda _record: ledger_observation("op-1"),
         ownership_probe=lambda _record: ownership(),
         now=fixed_now,
     )
     held = reconciler.reconcile_all().outcomes[0]
     assert not held.send_allowed
 
-    probes["journal"] = lambda _record: accepted_observation("op-1", status="observed", event_id="evt-1")
+    probes["journal"] = lambda _record: journal_observation("op-1", consumed=True, event_id="evt-1")
     observed = reconciler.reconcile_all().outcomes[0]
     assert (observed.status, observed.send_allowed) == ("observed", True)
     assert store.require("lane-a").last_operation_result.status == "consumed"
@@ -294,6 +387,7 @@ def test_identity_mismatch_is_durable_and_fail_closed(tmp_path: Path) -> None:
     reconciler = JoinedLaneReconciler(
         store,
         provider_probe=lambda _record: accepted_observation("op-1", provider_instance_id="new-instance"),
+        journal_probe=lambda _record: None,
         ownership_probe=lambda _record: ownership(),
         now=fixed_now,
     )
@@ -310,6 +404,7 @@ def test_missing_provider_or_ownership_evidence_fails_closed(tmp_path: Path) -> 
     reconciler = JoinedLaneReconciler(
         store,
         provider_probe=lambda _record: None,
+        journal_probe=lambda _record: None,
         ownership_probe=lambda _record: None,
         now=fixed_now,
     )
@@ -326,6 +421,7 @@ def test_non_authoritative_ownership_evidence_fails_closed(tmp_path: Path) -> No
     reconciler = JoinedLaneReconciler(
         store,
         provider_probe=lambda _record: accepted_observation("op-1"),
+        journal_probe=lambda _record: None,
         ownership_probe=lambda _record: bad_ownership,
         now=fixed_now,
     )
@@ -340,6 +436,7 @@ def test_active_lane_with_consumed_history_still_fences_provider_generation(tmp_
     reconciler = JoinedLaneReconciler(
         store,
         provider_probe=lambda _record: accepted_observation("op-1", provider_generation=2),
+        journal_probe=lambda _record: None,
         ownership_probe=lambda _record: ownership(),
         now=fixed_now,
     )
@@ -355,7 +452,8 @@ def test_wake_is_idempotent_and_preserves_operation_identity(tmp_path: Path) -> 
     reconciler = JoinedLaneReconciler(
         store,
         provider_probe=lambda _record: accepted_observation("op-1"),
-        ledger_probe=lambda _record: accepted_observation("op-1", status="acknowledged"),
+        journal_probe=lambda _record: None,
+        ledger_probe=lambda _record: ledger_observation("op-1"),
         ownership_probe=lambda _record: ownership(),
         now=fixed_now,
     )
@@ -396,6 +494,34 @@ def test_dispatchd_runs_restart_gate_before_claim_and_defers_blocked_order(tmp_p
     assert results[0].status == DispatchStatus.DEFERRED
     assert not order_path.exists()
     assert (queue / "deferred" / "op-1.json").exists()
+
+
+def test_dispatchd_requeues_matching_joined_lane_defer_when_barrier_clears(tmp_path: Path) -> None:
+    queue = tmp_path / "queue"
+    orders = queue / "orders"
+    orders.mkdir(parents=True)
+    order = DispatchOrder(order_id="op-1", session_ref="tophand:lane-a", nudge="continue")
+    orders.joinpath("op-1.json").write_text(order.model_dump_json(), encoding="utf-8")
+    blocked = ReconcileReport((ReconcileOutcome("lane-a", order.session_ref, "blocked", False, "identity mismatch"),))
+    assert run_once(queue, reconciliation_gate=lambda: blocked)[0].status == DispatchStatus.DEFERRED
+    allowed = ReconcileReport((ReconcileOutcome("lane-a", order.session_ref, "observed", True),))
+    results = run_once(queue, reconciliation_gate=lambda: allowed)
+    assert results[0].order_id == "op-1"
+    assert not (queue / "deferred" / ".op-1.joined-lane.json").exists()
+
+
+def test_main_wires_startup_reconciler_before_run_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    sentinel = object()
+    monkeypatch.setattr(dispatchd, "build_production_reconciler", lambda root, **kwargs: sentinel)
+
+    def fake_run_once(queue_dir: Path, **kwargs: object) -> list[object]:
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(dispatchd, "run_once", fake_run_once)
+    assert dispatchd.main(["--once", "--queue-dir", str(tmp_path / "queue")]) == 0
+    assert captured["joined_lane_reconciler"] is sentinel
 
 
 def test_dispatchd_without_reconciler_fails_closed_when_unfinished_lane_exists(tmp_path: Path) -> None:
