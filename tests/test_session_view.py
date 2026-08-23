@@ -13,6 +13,7 @@ from chitra.session_contract import (
     ProblemHistoryEvent,
     ProviderCapabilities,
     ProviderIdentity,
+    RecoveryState,
     RoadmapStep,
 )
 from chitra.session_view import (
@@ -118,6 +119,9 @@ def test_projection_joins_goal_roadmap_progress_owner_problems_and_next_check() 
     assert view.next_action == "Run the deterministic view tests"
     assert view.next_check is not None and view.next_check.wake_condition == "A newer lane update is observed"
 
+    rendered = render_joined_session_view(view)
+    assert "Road map position: Implement the view (active)" in rendered
+
     payload = view.to_dict()
     assert payload["schema"] == "chitra.joined-session-view.v1"
     assert payload["progress"] == {
@@ -204,6 +208,24 @@ def test_report_is_provider_neutral_and_uses_plain_now_next_check_labels() -> No
     assert "Lane lane-a" in top and "Lane lane-a" in orb
     assert "NOW:" in top and "NEXT:" in top and "CHECK:" in top
     assert "pid" not in top.lower() and "tmux" not in top.lower() and "debug" not in top.lower()
+
+
+def test_report_shows_the_recorded_recovery_action() -> None:
+    record = _record(update=_update()).model_copy(
+        update={
+            "last_intervention": None,
+            "recovery": RecoveryState(
+                stage="relaunch",
+                failure_signature="provider-stall",
+                attempted_remedy="checkpoint",
+                attempt_count=1,
+            ),
+        }
+    )
+
+    rendered = render_joined_session_view(record)
+
+    assert "Recovery action: checkpoint" in rendered
 
 
 def test_rotation_keeps_logical_lane_and_shows_generation_context() -> None:

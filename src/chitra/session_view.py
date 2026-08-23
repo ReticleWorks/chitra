@@ -324,6 +324,11 @@ def render_joined_session_view(
     else:
         revision = f"; {view.plan_revision_note}" if view.plan_revision_note else ""
         lines.append(f"Road map: version {view.plan_version}, assessment {view.plan_state}{revision}")
+    if view.current_step is None:
+        lines.append("Road map position: unknown (no active or blocked step is reported).")
+    else:
+        position = view.current_step.title or view.current_step.id
+        lines.append(f"Road map position: {position} ({view.current_step.status})")
     lines.append(_progress_line(view))
     if view.steps:
         lines.append("Steps:")
@@ -339,6 +344,7 @@ def render_joined_session_view(
     lines.extend(_problem_lines("Open problems", view.open_problems))
     lines.extend(_problem_lines("Resolved problems", view.resolved_problems))
     lines.append(f"Chitra action: {view.chitra_action or 'none recorded.'}")
+    lines.append(f"Recovery action: {view.recovery.attempted_remedy or 'none recorded.'}")
     lines.append(f"NEXT: {view.next_action or 'unknown (no next action reported).'}")
     if view.next_check is None:
         lines.append("CHECK: unknown (no durable check is recorded).")
