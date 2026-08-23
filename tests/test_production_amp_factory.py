@@ -390,6 +390,32 @@ def test_amp_factory_rejects_conflicting_amp_runtime_fact_shapes(
     assert _AmpAdapter.calls == []
 
 
+def test_amp_factory_rejects_authoritative_version_drift_in_production(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The production route rejects a Fleet version that differs from Chitra's identity."""
+    _install_amp_fakes(monkeypatch)
+    lane = _lane(tmp_path)
+    record = _record(lane)
+    source = _amp_facts(record)[0]
+    value = cast(dict[str, object], source.value)
+    surface = cast(dict[str, object], value["orb_lane_surface"])
+    runtime = cast(dict[str, object], value["amp"])
+    drift = f"{record.provider.provider_version}-drift"
+    value["orb_lane_surface"] = {**surface, "amp_version": drift}
+    value["amp"] = {**runtime, "version": drift}
+    drifted_fact = source.model_copy(update={"value": value})
+    resolver = build_recovery_provider_resolver(
+        lane,
+        facts_reader=lambda _record: (drifted_fact,),
+    )
+
+    assert resolver(record) is None
+    assert _AmpProfile.calls == []
+    assert _AmpTransport.calls == []
+    assert _AmpAdapter.calls == []
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     (("orb_size", "a1.large"), ("visibility", "public"), ("enabled", True)),
