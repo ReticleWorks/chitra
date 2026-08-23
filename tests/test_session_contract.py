@@ -583,6 +583,7 @@ def test_record_transition_rejects_goal_rollback_and_destructive_active_clears()
         provider=ProviderIdentity(kind="tophand", handle="thread-a", capabilities=ProviderCapabilities()),
         current_update=previous_update,
     )
+    validate_record_transition(previous, previous.model_copy(update={"revision": 2}))
     with pytest.raises(ContractValidationError, match="goal_version"):
         validate_record_transition(previous, previous.model_copy(update={"revision": 2, "goal_version": 1, "current_update": None}))
     with pytest.raises(ContractValidationError, match="current_update"):

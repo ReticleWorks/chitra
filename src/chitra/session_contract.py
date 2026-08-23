@@ -1397,7 +1397,11 @@ def validate_record_transition(
         or current.operation_history[: len(previous.operation_history)] != previous.operation_history
     ):
         errors.append("operation history must preserve its append-only prefix")
-    if previous.current_update is not None and current.current_update is not None:
+    if (
+        previous.current_update is not None
+        and current.current_update is not None
+        and previous.current_update != current.current_update
+    ):
         try:
             validate_update(previous.current_update, current.current_update)
         except ContractValidationError as exc:
