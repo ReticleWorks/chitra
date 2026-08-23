@@ -2,31 +2,118 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from typing import cast
 
 import pytest
 
 from chitra.provider_protocol import (
-    AMP_FIXTURES,
-    FAKE_SCENARIOS,
-    TOPHAND_FIXTURES,
-    CancelCurrentTurnRequest,
-    CheckpointRequest,
+    CancelCurrentTurnRequest as _CancelCurrentTurnRequest,
+)
+from chitra.provider_protocol import (
+    CheckpointRequest as _CheckpointRequest,
+)
+from chitra.provider_protocol import (
     ChildRosterEntry,
-    CloseRequest,
-    CreateOrResumeRequest,
-    FakeAmpProvider,
-    FakeTophandProvider,
+    OperationKind,
     PendingProviderOperation,
     Provider,
     ProviderCapabilities,
     ProviderState,
     ProviderUpdate,
-    SendRequest,
     UpdateKind,
+)
+from chitra.provider_protocol import (
+    CloseRequest as _CloseRequest,
+)
+from chitra.provider_protocol import (
+    CreateOrResumeRequest as _CreateOrResumeRequest,
+)
+from chitra.provider_protocol import (
+    SendRequest as _SendRequest,
+)
+from test_support.provider_fakes import (
+    AMP_FIXTURES,
+    FAKE_SCENARIOS,
+    TOPHAND_FIXTURES,
+    FakeAmpProvider,
+    FakeTophandProvider,
     fake_provider_scenario,
 )
+
+
+def _operation(
+    kind: str, operation: object, idempotency_key: str | None, payload: tuple[object, ...], **kwargs: object
+) -> PendingProviderOperation:
+    if isinstance(operation, PendingProviderOperation):
+        if idempotency_key is not None:
+            raise ValueError("nested operation envelope cannot be combined with operation identity fields")
+        return operation
+    if not isinstance(operation, str) or not operation.strip():
+        raise ValueError("operation_id must be supplied")
+    if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+        raise ValueError("idempotency_key must be supplied")
+    lane_id = str(kwargs.get("lane_id", "host:lane:instance"))
+    provider_instance_id = str(kwargs.get("provider_instance_id", "default"))
+    provider_generation = int(str(kwargs.get("provider_generation", 1)))
+    provider_handle = str(kwargs.get("provider_handle", "provider"))
+    created_at = str(kwargs.get("created_at", "2026-01-01T00:00:00Z"))
+    attempt = int(str(kwargs.get("attempt", 1)))
+    digest = (
+        str(kwargs.get("payload_digest", ""))
+        or hashlib.sha256("|".join((operation, kind, idempotency_key, lane_id, *(str(value) for value in payload))).encode()).hexdigest()
+    )
+    return PendingProviderOperation(
+        operation_id=operation,
+        kind=cast(OperationKind, kind),
+        lane_id=lane_id,
+        provider_handle=provider_handle,
+        idempotency_key=idempotency_key,
+        payload_digest=digest,
+        provider_instance_id=provider_instance_id,
+        provider_generation=provider_generation,
+        created_at=created_at,
+        attempt=attempt,
+    )
+
+
+def CreateOrResumeRequest(
+    operation: object = None,
+    idempotency_key: str | None = None,
+    session_ref: str = "",
+    provider_session_id: str | None = None,
+    context_ref: str | None = None,
+    **kwargs: object,
+) -> _CreateOrResumeRequest:
+    return _CreateOrResumeRequest(
+        operation=_operation("create_or_resume", operation, idempotency_key, (session_ref, provider_session_id, context_ref), **kwargs),
+        session_ref=session_ref,
+        provider_session_id=provider_session_id,
+        context_ref=context_ref,
+    )
+
+
+def SendRequest(operation: object = None, idempotency_key: str | None = None, text: str = "", **kwargs: object) -> _SendRequest:
+    return _SendRequest(operation=_operation("send", operation, idempotency_key, (text,), **kwargs), text=text)
+
+
+def CheckpointRequest(
+    operation: object = None, idempotency_key: str | None = None, label: str = "checkpoint", **kwargs: object
+) -> _CheckpointRequest:
+    return _CheckpointRequest(operation=_operation("checkpoint", operation, idempotency_key, (label,), **kwargs), label=label)
+
+
+def CancelCurrentTurnRequest(
+    operation: object = None, idempotency_key: str | None = None, reason: str = "cancelled by monitor", **kwargs: object
+) -> _CancelCurrentTurnRequest:
+    return _CancelCurrentTurnRequest(
+        operation=_operation("cancel_current_turn", operation, idempotency_key, (reason,), **kwargs), reason=reason
+    )
+
+
+def CloseRequest(operation: object = None, idempotency_key: str | None = None, archive: bool = True, **kwargs: object) -> _CloseRequest:
+    return _CloseRequest(operation=_operation("close", operation, idempotency_key, (archive,), **kwargs), archive=archive)
 
 
 def _create(provider: Provider) -> None:
@@ -133,6 +220,8 @@ def test_operation_envelope_and_update_identity_are_retained() -> None:
     update = provider.read_updates().updates[0]
     assert update.operation_id == create.operation_id
     assert update.lane_id == create.lane_id
+    assert update.idempotency_key == create.idempotency_key
+    assert update.payload_digest == create.payload_digest
     assert update.provider_instance_id == "tophand-a"
     assert update.child_roster == ()
     result_evidence = cast(Mapping[str, object], update.payload["result_evidence"])
@@ -176,6 +265,8 @@ def test_updates_carry_canonical_child_roster_evidence() -> None:
         lane_id="host:lane:instance",
         idempotency_key="idem-send-1",
         payload_digest="digest-send-1",
+        provider_instance_id="tophand-a",
+        provider_generation=1,
         child_roster=(child,),
     )
     assert update.child_roster == (child,)
