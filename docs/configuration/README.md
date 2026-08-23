@@ -163,27 +163,18 @@ rate-limit-guard --policy-config /etc/chitra/policy.yaml
 
 ## Running with systemd
 
-Example service unit (see `packaging/systemd/` for templates):
+The Debian package installs the shared daemon units from
+`packaging/systemd/`. The checked-in units are the canonical service contract:
 
-```ini
-[Unit]
-Description=Chitra dispatchd
-After=network.target
+- `chitra-dispatchd.service`
+- `chitra-watchd.service`
+- `chitra-triaged.service`
+- `chitra-sweepd.service`
 
-[Service]
-Type=simple
-User=chitra
-WorkingDirectory=/var/lib/chitra
-Environment="CHITRA_STATE_DIR=/var/lib/chitra"
-Environment="CHITRA_ROUTING_CONFIG=/etc/chitra/routing.yaml"
-Environment="CHITRA_POLICY_CONFIG=/etc/chitra/policy.yaml"
-ExecStart=/usr/local/bin/dispatchd --poll-seconds 5
-Restart=always
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-```
+They use the released virtual environment at `/opt/chitra/venv` and the
+declaration at `/etc/chitra/lanes.yaml`. A fleet deployment that uses isolated
+instance templates owns those templates in the fleet repository; do not copy a
+shared unit into an instance-specific service name.
 
 ## Example policy walkthrough
 

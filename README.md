@@ -30,7 +30,9 @@ BrowserStack's `chitragupta-node` and `chitragupta-rails` are open-source SDKs t
 
 ## What's in this repo
 
-chitra installs twelve command-line entrypoints backed by a set of small, single-purpose modules. `dispatchd` and `triaged` are the always-on daemons; the rest are periodic or ad-hoc tools.
+chitra installs command-line entrypoints backed by a set of small,
+single-purpose modules. `dispatchd`, `triaged`, `watchd`, and `sweepd` are the
+always-on shared daemons; the rest are periodic or ad-hoc tools.
 
 **Delivery**
 - `chitra.dispatch` / `chitra.dispatchd` — drain a JSON order queue and deliver each message into a tmux session via bracketed paste, confirming delivery by grepping the session's own transcript. One writer per session (`LaneLock`); idempotent and crash-safe (see [Delivery guarantees](#delivery-guarantees)).
