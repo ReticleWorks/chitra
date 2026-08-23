@@ -102,7 +102,7 @@ import json
 import os
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import structlog
@@ -137,6 +137,13 @@ from .journal import native_session_identity
 from .orders import DispatchOrder, DispatchResult, DispatchStatus
 from .policy_config import PolicyConfig, load_policy_config
 from .recovery import RecoverySupervisor, run_recovery_supervision
+from .recovery_provider import (
+    RecoveryFactsReader,
+    RecoveryProviderFactory,
+    RecoverySink,
+    RecoveryVerifier,
+    build_recovery_provider_resolver,
+)
 from .routing_config import RoutingConfig, load_routing_config, resolve_route, resolve_routing_hint
 from .state_paths import default_attestation_ledger_path, default_ledger_key_path, default_ledger_path, default_queue_dir, state_dir
 
@@ -1502,6 +1509,16 @@ def run_lanes_once(
     tuning: DispatchTuning | None = None,
     dispatch_runner: TmuxRunner | None = None,
     ownership_socket_path: Path | None = None,
+    tophand_factory: RecoveryProviderFactory | None = None,
+    amp_factory: RecoveryProviderFactory | None = None,
+    provider_factories: Mapping[str, RecoveryProviderFactory] | None = None,
+    pending_sink: RecoverySink | None = None,
+    cursor_sink: RecoverySink | None = None,
+    result_sink: RecoverySink | None = None,
+    event_sink: RecoverySink | None = None,
+    checkpoint_verifier: RecoveryVerifier | None = None,
+    cancel_verifier: RecoveryVerifier | None = None,
+    facts_reader: RecoveryFactsReader | None = None,
 ) -> dict[str, list[DispatchResult]]:
     """Drain every enabled lane from one rendered declaration.
 
@@ -1516,11 +1533,47 @@ def run_lanes_once(
 
     results: dict[str, list[DispatchResult]] = {}
     for lane in enabled_lanes(lanes_file):
+        if all(
+            dependency is None
+            for dependency in (
+                tophand_factory,
+                amp_factory,
+                provider_factories,
+                pending_sink,
+                cursor_sink,
+                result_sink,
+                event_sink,
+                checkpoint_verifier,
+                cancel_verifier,
+                facts_reader,
+            )
+        ):
+            provider_resolver = build_recovery_provider_resolver(lane)
+        else:
+            provider_resolver = build_recovery_provider_resolver(
+                lane,
+                tophand_factory=tophand_factory,
+                amp_factory=amp_factory,
+                provider_factories=provider_factories,
+                pending_sink=pending_sink,
+                cursor_sink=cursor_sink,
+                result_sink=result_sink,
+                event_sink=event_sink,
+                checkpoint_verifier=checkpoint_verifier,
+                cancel_verifier=cancel_verifier,
+                facts_reader=facts_reader,
+            )
         lane_reconciler = build_filesystem_reconciler(
             lane.state_dir,
             ledger_path=lane.state_dir / "ledger.jsonl",
             ledger_key_path=lane.state_dir / "ledger.key",
             ownership_socket_path=ownership_socket_path or Path("/run/chitra-ownership/provider.sock"),
+        )
+        recovery_supervisor = RecoverySupervisor(
+            lane.state_dir,
+            provider_resolver,
+            goal_root=lane.state_dir,
+            ledger_key_path=lane.state_dir / "ledger.key",
         )
         results[lane.identifier] = run_once(
             lane.queue_dir,
@@ -1538,6 +1591,7 @@ def run_lanes_once(
             tmux_socket=lane.tmux_socket,
             joined_lane_root=lane.state_dir,
             joined_lane_reconciler=lane_reconciler,
+            recovery_supervisor=recovery_supervisor,
         )
     return results
 
@@ -1550,6 +1604,16 @@ def run_lanes_forever(
     policy_config_path: Path | None = None,
     tuning: DispatchTuning | None = None,
     ownership_socket_path: Path | None = None,
+    tophand_factory: RecoveryProviderFactory | None = None,
+    amp_factory: RecoveryProviderFactory | None = None,
+    provider_factories: Mapping[str, RecoveryProviderFactory] | None = None,
+    pending_sink: RecoverySink | None = None,
+    cursor_sink: RecoverySink | None = None,
+    result_sink: RecoverySink | None = None,
+    event_sink: RecoverySink | None = None,
+    checkpoint_verifier: RecoveryVerifier | None = None,
+    cancel_verifier: RecoveryVerifier | None = None,
+    facts_reader: RecoveryFactsReader | None = None,
 ) -> None:
     """Run one shared dispatchd process over all enabled lane queues."""
     while True:
@@ -1559,6 +1623,16 @@ def run_lanes_forever(
             policy_config_path=policy_config_path,
             tuning=tuning,
             ownership_socket_path=ownership_socket_path,
+            tophand_factory=tophand_factory,
+            amp_factory=amp_factory,
+            provider_factories=provider_factories,
+            pending_sink=pending_sink,
+            cursor_sink=cursor_sink,
+            result_sink=result_sink,
+            event_sink=event_sink,
+            checkpoint_verifier=checkpoint_verifier,
+            cancel_verifier=cancel_verifier,
+            facts_reader=facts_reader,
         )
         time.sleep(poll_seconds)
 

@@ -774,7 +774,7 @@ def test_lanes_file_entrypoint_reconciles_before_claim_and_fails_closed(tmp_path
 
     assert dispatchd.main(["--lanes-file", str(tmp_path / "lanes.yaml"), "--once"]) == 0
     assert built_roots == [state_root]
-    assert reconciler_calls == 1
+    assert reconciler_calls == 2
     assert not order_path.exists()
     assert (queue / "deferred" / order_path.name).exists()
     assert not (queue / "results" / order_path.name).exists()

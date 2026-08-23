@@ -20,16 +20,21 @@ from _goal_fixtures import enrollment_fields, ingest_passing_receipt
 
 import chitra.recovery as recovery
 from chitra import dispatchd
+from chitra.detect.detectors import Finding
+from chitra.detect.ladder import IncidentStore
 from chitra.goals import GoalRecord, get_goal, upsert_goal
 from chitra.joined_lane import JoinedLaneStore, ReconcileReport
 from chitra.lane_config import LaneCredentials, LaneSpec
+from chitra.orders import DispatchOrder
 from chitra.provider_protocol import (
     ProviderName,
+    ProviderOperationResult,
     ProviderState,
     ProviderStatus,
     ReadUpdatesResult,
     SendRequest,
 )
+from chitra.recovery_provider import build_recovery_provider_resolver
 from chitra.session_contract import (
     JoinedLaneRecord,
     LaneUpdate,
@@ -108,19 +113,38 @@ def _lane(identifier: str, root: Path) -> LaneSpec:
     )
 
 
-class _LostReplyProvider:
-    """Canonical provider double: the first send has no durable reply."""
+class _AcceptedReplyProvider:
+    """Canonical provider double: acceptance leaves one pending operation."""
 
     provider_name = ProviderName.TOPHAND
     capabilities = ProviderCapabilities.from_supported(("send", "checkpoint", "create_or_resume", "read_updates"))
 
-    def __init__(self) -> None:
+    def __init__(self, events: list[str] | None = None) -> None:
         self.send_operation_ids: list[str] = []
+        self.send_requests: list[SendRequest] = []
         self.read_updates_calls = 0
+        self.events = events
 
-    def send(self, request: SendRequest) -> object:
+    def send(self, request: SendRequest) -> ProviderOperationResult:
+        if self.events is not None:
+            self.events.append("recovery-send")
         self.send_operation_ids.append(request.operation_id)
-        raise RuntimeError("provider response unavailable")
+        self.send_requests.append(request)
+        return ProviderOperationResult(
+            operation_id=request.operation_id,
+            kind=request.operation.kind,
+            lane_id=request.lane_id,
+            provider_handle=request.provider_handle,
+            idempotency_key=request.idempotency_key,
+            payload_digest=request.payload_digest,
+            provider_instance_id=request.provider_instance_id,
+            provider_generation=request.provider_generation,
+            status="accepted",
+            accepted=True,
+            consumed=False,
+            observed_at=NOW.isoformat(),
+            evidence="provider accepted the operation; consumption remains unknown",
+        )
 
     def read_updates(self, cursor: str | None = None) -> ReadUpdatesResult:
         self.read_updates_calls += 1
@@ -176,28 +200,186 @@ def test_dispatch_reconciles_each_lane_before_any_recovery_send(
     except TypeError as exc:
         pytest.fail(f"dispatchd lacks the canonical recovery_supervisor seam: {exc}")
 
-    assert events == ["reconcile", "recovery-send"]
+    assert events == ["reconcile", "recovery-send", "reconcile"]
 
 
-def test_restarted_supervisor_reconciles_pending_operation_without_duplicate_send(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_production_dispatch_recovers_due_lane_before_queued_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real lanes-file supervisor sends the pending envelope before queue work resumes."""
+    enrolled = _goal(tmp_path)
+    base = _lane_record()
+    record = base.model_copy(
+        update={
+            "goal_id": enrolled.goal_id,
+            "current_update": base.current_update.model_copy(update={"goal_id": enrolled.goal_id}),
+        }
+    )
+    store = JoinedLaneStore(tmp_path)
+    store.create(record)
+    finding = Finding(
+        detector="isolated-review",
+        fingerprint_seed={"signature": "isolated-review:dispatch-order"},
+        event_refs=(),
+        unmet_item="isolated reviewer availability",
+        expected_next_progress="a material lane update",
+        detail="the isolated reviewer was unavailable",
+    )
+    recovery.RecoveryEngine(state_root=tmp_path).schedule(record, finding.fingerprint, now=NOW)
+    IncidentStore(tmp_path, "lane-a").open_incident(lane="lane-a", finding=finding, order_marker="review-marker")
+
+    queue = tmp_path / "queue"
+    orders = queue / "orders"
+    orders.mkdir(parents=True)
+    order = DispatchOrder(order_id="queued-order", session_ref=record.session_ref, nudge="continue")
+    order_path = orders / f"{order.order_id}.json"
+    order_path.write_text(order.model_dump_json(), encoding="utf-8")
+
+    events: list[str] = []
+
+    def reconcile() -> ReconcileReport:
+        events.append("reconcile")
+        return ReconcileReport(())
+
+    provider = _AcceptedReplyProvider(events)
+    supervisor = recovery.RecoverySupervisor(tmp_path, lambda _record: provider, goal_root=tmp_path)
+    monkeypatch.setattr(
+        dispatchd,
+        "process_one_order",
+        lambda *_args, **_kwargs: events.append("queue-dispatch"),
+    )
+
+    dispatchd.run_once(queue, reconciliation_gate=reconcile, recovery_supervisor=supervisor)
+
+    assert events == ["reconcile", "recovery-send", "reconcile", "queue-dispatch"]
+    pending = store.require("lane-a").pending_operation
+    assert pending is not None
+    assert provider.send_requests[0].operation_id == pending.operation_id
+    assert order_path.exists(), "the test stub did not consume the queued order"
+
+
+def test_provider_resolver_allowlists_kind_and_passes_canonical_boundaries(tmp_path: Path) -> None:
+    """Injected adapters receive Chitra-owned boundaries without provider discovery."""
+    lane = _lane("lane-a", tmp_path)
+    pending_sink = object()
+    cursor_sink = object()
+    result_sink = object()
+    event_sink = object()
+    checkpoint_verifier = object()
+    cancel_verifier = object()
+    calls: list[dict[str, object]] = []
+
+    def factory(**kwargs: object) -> None:
+        calls.append(kwargs)
+        return None
+
+    resolver = build_recovery_provider_resolver(
+        lane,
+        provider_factories={"tophand": factory},
+        pending_sink=pending_sink,  # type: ignore[arg-type]
+        cursor_sink=cursor_sink,  # type: ignore[arg-type]
+        result_sink=result_sink,  # type: ignore[arg-type]
+        event_sink=event_sink,  # type: ignore[arg-type]
+        checkpoint_verifier=checkpoint_verifier,  # type: ignore[arg-type]
+        cancel_verifier=cancel_verifier,  # type: ignore[arg-type]
+        facts_reader=lambda _record: (),
+    )
+    assert resolver(_lane_record()) is None
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["identity"] == _lane_record().provider
+    assert call["lane"] == lane
+    assert call["record"] == _lane_record()
+    assert call["state_root"] == lane.state_dir
+    assert call["pending_sink"] is pending_sink
+    assert call["cursor_sink"] is cursor_sink
+    assert call["result_sink"] is result_sink
+    assert call["event_sink"] is event_sink
+    assert call["checkpoint_verifier"] is checkpoint_verifier
+    assert call["cancel_verifier"] is cancel_verifier
+    assert callable(call["facts_reader"])
+    assert call["operating_facts"] == ()
+
+    amp_calls: list[dict[str, object]] = []
+
+    def amp_factory(**kwargs: object) -> None:
+        amp_calls.append(kwargs)
+        return None
+
+    amp_resolver = build_recovery_provider_resolver(
+        lane,
+        amp_factory=amp_factory,
+        pending_sink=pending_sink,  # type: ignore[arg-type]
+        cursor_sink=cursor_sink,  # type: ignore[arg-type]
+        result_sink=result_sink,  # type: ignore[arg-type]
+        event_sink=event_sink,  # type: ignore[arg-type]
+        checkpoint_verifier=checkpoint_verifier,  # type: ignore[arg-type]
+        cancel_verifier=cancel_verifier,  # type: ignore[arg-type]
+        facts_reader=lambda _record: (),
+    )
+    amp_record = _lane_record().model_copy(
+        update={"provider": _lane_record().provider.model_copy(update={"kind": "amp"})}
+    )
+    assert amp_resolver(amp_record) is None
+    assert len(amp_calls) == 1
+    assert amp_calls[0]["identity"] == amp_record.provider
+
+
+def test_provider_resolver_returns_unknown_for_unallowlisted_kind_or_lane() -> None:
+    calls = 0
+
+    def factory(**_kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        return None
+
+    lane = SimpleNamespace(identifier="lane-a", state_dir=Path("/state"))
+    resolver = build_recovery_provider_resolver(  # type: ignore[arg-type]
+        lane,  # type: ignore[arg-type]
+        tophand_factory=factory,  # type: ignore[arg-type]
+    )
+    unknown = SimpleNamespace(lane_id="lane-a", provider=SimpleNamespace(kind="unknown"))
+    wrong_lane = SimpleNamespace(lane_id="lane-b", provider=SimpleNamespace(kind="tophand"))
+    assert resolver(unknown) is None  # type: ignore[arg-type]
+    assert resolver(wrong_lane) is None  # type: ignore[arg-type]
+    assert calls == 0
+
+
+def test_restarted_supervisor_reconciles_pending_operation_without_duplicate_send(tmp_path: Path) -> None:
     """A fresh supervisor observes the same pending operation, never resends it."""
     supervisor_type = getattr(recovery, "RecoverySupervisor", None)
     if supervisor_type is None:
         pytest.fail("canonical RecoverySupervisor is not committed; do not add a second recovery controller")
 
-    record = _lane_record()
-    _goal(tmp_path)
+    enrolled = _goal(tmp_path)
+    record = _lane_record().model_copy(
+        update={
+            "goal_id": enrolled.goal_id,
+            "current_update": _lane_record().current_update.model_copy(update={"goal_id": enrolled.goal_id}),
+        }
+    )
     store = JoinedLaneStore(tmp_path)
     store.create(record)
+    finding = Finding(
+        detector="isolated-review",
+        fingerprint_seed={"signature": "isolated-review:behavior-hash"},
+        event_refs=(),
+        unmet_item="isolated reviewer availability",
+        expected_next_progress="a material lane update",
+        detail="the isolated reviewer was unavailable",
+    )
     recovery.RecoveryEngine(state_root=tmp_path).schedule(
         record,
-        "isolated-review:behavior-hash",
+        finding.fingerprint,
         now=NOW,
         reason="The isolated reviewer was unavailable",
         wake_condition="isolated reviewer availability or a material lane update",
     )
-    provider = _LostReplyProvider()
-    monkeypatch.setattr(recovery, "get_goal", lambda _root, _session_ref: get_goal(tmp_path, "tophand:lane-a:1"))
+    incident = IncidentStore(tmp_path, "lane-a")
+    incident.open_incident(
+        lane="lane-a",
+        finding=finding,
+        order_marker="review-marker",
+    )
+    provider = _AcceptedReplyProvider()
 
     def resolve(candidate: JoinedLaneRecord) -> object:
         assert candidate.lane_id == "lane-a"
@@ -210,6 +392,14 @@ def test_restarted_supervisor_reconciles_pending_operation_without_duplicate_sen
     assert persisted.pending_operation is not None
     operation_id = persisted.pending_operation.operation_id
     assert provider.send_operation_ids == [operation_id]
+    request = provider.send_requests[0]
+    assert request.operation_id == operation_id
+    assert request.lane_id == persisted.lane_id
+    assert request.provider_handle == persisted.provider.handle
+    assert request.provider_instance_id == persisted.provider.instance_id
+    assert request.provider_generation == persisted.provider.generation
+    assert request.idempotency_key == persisted.pending_operation.idempotency_key
+    assert request.payload_digest == persisted.pending_operation.payload_digest
 
     restarted_supervisor = supervisor_type(tmp_path, resolve, goal_root=tmp_path)
     second = restarted_supervisor.run_once(now=NOW + timedelta(minutes=10))
@@ -293,6 +483,31 @@ def test_watchd_reviewer_failure_calls_canonical_run_recovery_check_without_user
         watcher.shutdown()
 
 
+def test_lanes_file_constructs_per_lane_provider_resolver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shipped lanes-file path builds one resolver for every enabled lane."""
+    lanes = (_lane("alpha", tmp_path), _lane("beta", tmp_path))
+    resolver_calls: list[str] = []
+
+    def build_resolver(lane: LaneSpec) -> object:
+        resolver_calls.append(lane.identifier)
+        return lambda _record: None
+
+    class FakeReconciler:
+        def reconcile_all(self) -> ReconcileReport:
+            return ReconcileReport(())
+
+    monkeypatch.setattr("chitra.lane_config.enabled_lanes", lambda _path: lanes)
+    monkeypatch.setattr(dispatchd, "build_recovery_provider_resolver", build_resolver, raising=False)
+    monkeypatch.setattr(dispatchd, "build_filesystem_reconciler", lambda _root, **_kwargs: FakeReconciler())
+    monkeypatch.setattr(dispatchd, "RecoverySupervisor", lambda *_args, **_kwargs: object(), raising=False)
+    monkeypatch.setattr(dispatchd, "run_recovery_supervision", lambda _supervisor: (), raising=False)
+
+    assert dispatchd.main(["--lanes-file", str(tmp_path / "lanes.yaml"), "--once"]) == 0
+    assert resolver_calls == ["alpha", "beta"]
+
+
 def test_lanes_file_constructs_per_lane_provider_resolver_and_supervisor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -338,5 +553,12 @@ def test_lanes_file_constructs_per_lane_provider_resolver_and_supervisor(
     assert dispatchd.main(["--lanes-file", str(tmp_path / "lanes.yaml"), "--once"]) == 0
     assert resolver_calls == ["alpha", "beta"]
     assert [root for root, _resolver in supervisor_calls] == [lane.state_dir for lane in lanes]
-    assert events == [("alpha", "reconcile"), ("alpha", "recovery"), ("beta", "reconcile"), ("beta", "recovery")]
+    assert events == [
+        ("alpha", "reconcile"),
+        ("alpha", "recovery"),
+        ("alpha", "reconcile"),
+        ("beta", "reconcile"),
+        ("beta", "recovery"),
+        ("beta", "reconcile"),
+    ]
     assert len(supervisor_instances) == 2
