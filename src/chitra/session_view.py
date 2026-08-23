@@ -114,7 +114,7 @@ class JoinedSessionView:
     session_ref: str
     lifecycle: LaneLifecycle
     provider: ProviderIdentity
-    physical_session_generation: int
+    physical_session_generation: int | None
     chitra_ownership_epoch: int
     update_cursor: str
     revision: int
@@ -204,10 +204,6 @@ def build_joined_session_view(
     last_intervention: InterventionEvidence | None = record.last_intervention
     if record.last_intervention is not None:
         chitra_action = record.last_intervention.action
-    elif record.recovery.last_intervention.strip():
-        # Older joined records may carry only the recovery summary.  Preserve
-        # that evidence without presenting it as a new intervention.
-        chitra_action = record.recovery.last_intervention
 
     return JoinedSessionView(
         schema=JOINED_SESSION_VIEW_SCHEMA,
