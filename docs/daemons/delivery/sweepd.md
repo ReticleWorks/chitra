@@ -100,7 +100,9 @@ Omit `--once` to run continuously.
 
 **Run as a systemd service:**
 
-See `packaging/systemd/chitra-sweepd.service.example` in the repo.
+See the packaged unit at `packaging/systemd/chitra-sweepd.service` in the
+repo. It is the canonical unit for the released `/opt/chitra/venv` layout and
+the declaration-driven `--lanes-file` mode.
 
 **Monitor for status changes:**
 

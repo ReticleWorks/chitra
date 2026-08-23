@@ -51,7 +51,6 @@ def test_watchdog_for_another_pid_is_disabled() -> None:
         ("chitra-watchd.service", "15"),
         ("chitra-sweepd.service", "180"),
         ("chitra-triaged.service", "6"),
-        ("chitra-triaged.service.example", "6"),
     ],
 )
 def test_daemon_units_enable_systemd_watchdog(unit_name: str, watchdog_seconds: str) -> None:

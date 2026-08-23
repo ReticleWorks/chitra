@@ -83,7 +83,9 @@ Custom rules can be added via policy config. When a rule matches, triaged flags 
 
 **Run as a systemd service:**
 
-See `packaging/systemd/chitra-triaged.service.example` in the repo.
+See the packaged unit at `packaging/systemd/chitra-triaged.service` in the
+repo. It is the canonical unit for the released `/opt/chitra/venv` layout and
+the declaration-driven `--lanes-file` mode.
 
 **View triage events:**
 
