@@ -283,8 +283,12 @@ class LaneUpdate(_ContractModel):
         if len(active) > 1:
             raise ValueError("a lane roadmap may have at most one active step")
         non_terminal = [step for step in steps if step.status not in ("done", "dropped")]
-        if non_terminal and len(active) != 1:
-            raise ValueError("a roadmap with unfinished work must have one active step")
+        # A blocked plan is still a valid, useful snapshot.  Recovery may need
+        # to report every remaining step as blocked while Chitra owns the next
+        # intervention.  Pending work without an active step remains invalid:
+        # it would not identify where the lane is working.
+        if non_terminal and not active and not all(step.status == "blocked" for step in non_terminal):
+            raise ValueError("a roadmap with unfinished work must have one active step or all unfinished steps blocked")
         if active and not self.current_action.strip():
             raise ValueError("a roadmap with an active step requires current_action")
         if (self.operation_id is None) != (self.idempotency_key is None):
@@ -363,6 +367,20 @@ def _step_id_set(update: LaneUpdate) -> set[str]:
     return set(update.step_ids)
 
 
+def _roadmap_structure(update: LaneUpdate) -> tuple[tuple[tuple[str, str, str, str | None], ...], tuple[tuple[str, str], ...]]:
+    """Return the plan shape without mutable step status.
+
+    Plan versions identify structure, not progress.  A lane can move an
+    existing step from active to blocked or done without spending a new plan
+    version, but changing its title, owner, milestone, order, or the
+    milestone metadata is a plan edit and must be called out as a revision.
+    """
+
+    steps = tuple((step.id, step.title, step.owner, step.milestone_id) for step in update.steps)
+    milestones = tuple((milestone.id, milestone.title) for milestone in update.milestones)
+    return steps, milestones
+
+
 def validate_update(previous: LaneUpdate, current: LaneUpdate) -> None:
     """Raise when ``current`` cannot follow ``previous`` in one lane stream.
 
@@ -386,6 +404,8 @@ def validate_update(previous: LaneUpdate, current: LaneUpdate) -> None:
     elif current.plan_version == previous.plan_version:
         if current.step_ids != previous.step_ids:
             errors.append("step IDs changed without a plan revision")
+        elif _roadmap_structure(current) != _roadmap_structure(previous):
+            errors.append("roadmap structure, titles, owners, or milestones changed without a plan revision")
         if current.revision_note.strip():
             errors.append("revision_note is only allowed when the plan changes")
     elif current.plan_version != previous.plan_version + 1:
@@ -408,6 +428,11 @@ def validate_update(previous: LaneUpdate, current: LaneUpdate) -> None:
             errors.append(f"resolved problem {problem_id} requires an explicit reopen_event")
         if old_problem.state == "resolved" and new_problem.state == "resolved" and new_problem != old_problem:
             errors.append(f"resolved problem {problem_id} history cannot be rewritten")
+        if old_problem.state == "open" and new_problem.state == "open":
+            if old_problem.reopen_event != new_problem.reopen_event:
+                errors.append(f"open problem {problem_id} reopen history cannot be rewritten")
+            if old_problem.resolution != new_problem.resolution:
+                errors.append(f"open problem {problem_id} resolution history cannot be rewritten")
         if new_problem.summary != old_problem.summary or new_problem.owner != old_problem.owner:
             errors.append(f"problem {problem_id} summary and owner are immutable")
     if (

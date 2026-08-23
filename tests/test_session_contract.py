@@ -20,6 +20,7 @@ from chitra.session_contract import (
     ProviderIdentity,
     ProviderOperationResult,
     RecoveryState,
+    RoadmapMilestone,
     RoadmapStep,
     UsageReport,
     calculate_progress,
@@ -102,6 +103,59 @@ def test_update_sequence_and_plan_revision_rules() -> None:
     assert is_valid_update(first, revised)
     with pytest.raises(ContractValidationError, match="goal_id"):
         validate_update(first, same_plan.model_copy(update={"goal_id": "other-goal"}))
+
+
+def test_same_plan_freezes_titles_owners_and_milestones_but_allows_status_progress() -> None:
+    first = _update(sequence=5).model_copy(
+        update={
+            "steps": (
+                RoadmapStep(id="design", status="done", title="Design", owner="lane", milestone_id="m1"),
+                RoadmapStep(id="implement", status="active", title="Implement", owner="lane", milestone_id="m1"),
+            ),
+            "milestones": (RoadmapMilestone(id="m1", title="Build"),),
+        }
+    )
+    blocked = first.model_copy(
+        update={
+            "sequence": 6,
+            "steps": (
+                RoadmapStep(id="design", status="done", title="Design", owner="lane", milestone_id="m1"),
+                RoadmapStep(id="implement", status="blocked", title="Implement", owner="lane", milestone_id="m1"),
+            ),
+        }
+    )
+    assert is_valid_update(first, blocked)
+    owner_changed = blocked.model_copy(
+        update={
+            "sequence": 7,
+            "steps": (
+                RoadmapStep(id="design", status="done", title="Design", owner="other", milestone_id="m1"),
+                RoadmapStep(id="implement", status="blocked", title="Implement", owner="lane", milestone_id="m1"),
+            ),
+        }
+    )
+    with pytest.raises(ContractValidationError, match="without a plan revision"):
+        validate_update(blocked, owner_changed)
+    revised = owner_changed.model_copy(update={"plan_version": 2, "revision_note": "Move design ownership"})
+    assert is_valid_update(blocked, revised)
+
+
+def test_all_blocked_roadmap_is_valid_without_inventing_an_active_step() -> None:
+    update = LaneUpdate(
+        lane_id="lane-a",
+        goal_id="goal-123",
+        session_ref="tophand:lane-a-1",
+        goal_version=1,
+        sequence=1,
+        observed_at="2026-08-23T14:00:00+00:00",
+        plan_version=1,
+        steps=(
+            RoadmapStep(id="a", status="blocked", owner="lane"),
+            RoadmapStep(id="b", status="blocked", owner="lane"),
+        ),
+        next_action="Wait for the durable recovery check",
+    )
+    assert update.current_action == ""
 
 
 def test_goal_revision_and_problem_history_need_explicit_non_destructive_changes() -> None:

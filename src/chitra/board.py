@@ -11,10 +11,13 @@ from __future__ import annotations
 import os
 import textwrap
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Literal, Protocol
 
 from chitra.goals import GoalRecord, GoalStatus, done_when_with_delta, session_host, session_name
+from chitra.session_contract import JoinedLaneRecord
+from chitra.session_view import GoalProjection, JoinedSessionView
+from chitra.session_view import render_joined_session_view as _render_joined_session_view
 
 # Minimum column widths (display columns). Cells WRAP to multiple lines rather
 # than truncate, so nothing is lost; these are floors for the terminal-width-
@@ -379,6 +382,25 @@ def render_roster(
     awaiting_ruling = _awaiting_ruling_lines(records, fmt="box")
     roster = "\n\n".join((table, "\n".join(awaiting_ruling))) if awaiting_ruling else table
     return "\n\n".join((roster, artifact_block)) if artifact_block else roster
+
+
+def render_joined_session_view(
+    source: JoinedSessionView | JoinedLaneRecord | Mapping[str, object],
+    *,
+    goal: GoalProjection | None = None,
+    fmt: Literal["text", "markdown"] = "text",
+) -> str:
+    """Render the canonical joined-session report through the board surface.
+
+    The board remains a reader. Importing here keeps the existing roster
+    surface lightweight and makes the joined view available without adding a
+    second control path or an HTML mutation endpoint.
+    """
+
+    return _render_joined_session_view(source, goal=goal, fmt=fmt)
+
+
+render_session_view = render_joined_session_view
 
 
 def _terminal_width() -> int:
