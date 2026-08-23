@@ -382,6 +382,7 @@ class DeterministicFakeProvider(AbstractProvider):
             payload_digest=resolved_payload_digest,
             provider_instance_id=resolved_provider_instance_id,
             provider_generation=resolved_provider_generation,
+            provider_handle=self._session_id,
             payload=resolved_payload,
             child_roster=child_roster,
         )

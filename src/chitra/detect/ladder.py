@@ -330,6 +330,27 @@ class ResponseLadder:
             action="advance", stage=advanced.stage, record=advanced, reason="same fingerprint recurred after proven consumption"
         )
 
+    def stage_action_proven(self, record: IncidentRecord) -> bool:
+        """Verify that a persisted stage was reached through the ladder.
+
+        Recovery supervision runs without a fresh detector ``Finding``. In
+        that path the stage alone is not enough: a forged or truncated latest
+        incident must not authorize the next provider action.
+        """
+
+        records = [candidate for candidate in self.store.load() if candidate.fingerprint == record.fingerprint]
+        if not records or records[-1] != record:
+            return False
+        stage_index = LADDER_STAGES.index(record.stage)
+        if stage_index == 0:
+            return len(records) == 1
+        if len(records) < 2:
+            return False
+        previous = records[-2]
+        if previous.stage != LADDER_STAGES[stage_index - 1] or not self._consumption_proven(previous):
+            return False
+        return record.stage != "relaunch" or bool(previous.rescue_bundle_sha256 and previous.checkpoint_ref)
+
     def _consumption_proven(self, record: IncidentRecord) -> bool:
         proof = record.consumption
         if proof is None:

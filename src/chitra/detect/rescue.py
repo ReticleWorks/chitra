@@ -50,6 +50,10 @@ class RecoveryCheckpointBinding(BaseModel):
     idempotency_key: str = Field(min_length=1)
     payload_digest: str = Field(min_length=1)
     event_sequence: int = Field(ge=1)
+    # Provider operation/thread handles and physical provider sessions are
+    # distinct identities.  ``None`` keeps old signed receipts readable;
+    # new recovery bindings always carry the exact session value.
+    provider_session_id: str | None = None
 
 
 class RescueBundle(BaseModel):

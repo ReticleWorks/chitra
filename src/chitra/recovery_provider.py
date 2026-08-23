@@ -374,6 +374,7 @@ class _PackagedTophandProvider:
             idempotency_key_text = cast(str, idempotency_key)
             payload_digest_text = cast(str, payload_digest)
             instance_id_text = cast(str, instance_id)
+            provider_handle_text = cast(str, provider_handle)
             provider_session_id = item.get("provider_session_id")
             provider_session_id_text = provider_session_id if isinstance(provider_session_id, str) else None
             updates.append(
@@ -389,6 +390,7 @@ class _PackagedTophandProvider:
                     payload_digest=payload_digest_text,
                     provider_instance_id=instance_id_text,
                     provider_generation=generation,
+                    provider_handle=provider_handle_text,
                     payload=cast(Mapping[str, object], payload),
                 )
             )
@@ -455,6 +457,7 @@ def _canonical_tophand_factory(
             lane_id=record.lane_id,
             goal_id=record.goal_id,
             session_ref=record.session_ref,
+            provider_session_id=identity.provider_session_id or record.session_ref,
             provider_handle=identity.handle,
             provider_instance_id=identity.instance_id,
             provider_generation=identity.generation,
@@ -518,6 +521,7 @@ def _canonical_recovery_bindings(
                 kind=prior.kind,
                 lane_id=prior.lane_id,
                 provider_handle=prior.provider_handle,
+                provider_session_id=current.provider.provider_session_id or current.session_ref,
                 idempotency_key=prior.idempotency_key,
                 payload_digest=prior.payload_digest,
                 provider_instance_id=prior.provider_instance_id,
@@ -565,6 +569,7 @@ def _canonical_recovery_bindings(
             cycle_id=cycle_id,
             operation_id=operation.operation_id,
             provider_handle=operation.provider_handle,
+            provider_session_id=operation.provider_session_id,
             provider_instance_id=operation.provider_instance_id,
             provider_generation=operation.provider_generation,
             idempotency_key=operation.idempotency_key,

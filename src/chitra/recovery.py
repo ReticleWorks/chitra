@@ -417,27 +417,11 @@ class RecoveryEngine:
         if working.next_check is not None and _now(working.next_check.at) > current and not named_wake:
             return self._decision("noop", working, "scheduled check is not due")
         del wake_event
-        resolved_goal = goal or self._goal_for(working)
-        if resolved_goal is None:
-            return self._wait(working, current, "the enrolled goal record becomes readable", persist)
-        if (resolved_goal.lane_id, resolved_goal.goal_id) != (working.lane_id, working.goal_id):
-            return self._wait(working, current, "the exact enrolled lane and goal identity reconcile", persist)
-        refreshed_facts = tuple(facts)
-        if not refreshed_facts and self.facts_reader is not None:
-            try:
-                refreshed_facts = tuple(self.facts_reader(working))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("recovery_facts_unavailable", lane_id=working.lane_id, error=str(exc))
-        evidence = self._latest_progress(working, events, progress_rows)
-        if evidence is not None and self._new_progress(working.last_useful_progress, evidence):
-            recovery = working.recovery.model_copy(update={"stage": "complete", "next_allowed_attempt": None})
-            candidate = self._persist(
-                working.model_copy(update={"last_useful_progress": evidence, "recovery": recovery, "next_check": None}),
-                persist=persist,
-            )
-            return RecoveryDecision("progress_confirmed", "complete", candidate, "material progress confirmed")
         if named_wake:
             assert wake_id is not None and observed_wake_condition is not None and wake_event_sequence is not None
+            # Record exact wake evidence before consulting the goal store. A
+            # goal-store outage must not discard a proven wake or make the
+            # supervisor rediscover it on every pass.
             working = self._record_wake(working, wake_id, observed_wake_condition, wake_event_sequence, current, persist)
             signature = working.recovery.failure_signature or f"named-wake:{observed_wake_condition}"
             recovery = working.recovery.model_copy(
@@ -463,6 +447,25 @@ class RecoveryEngine:
                 ),
                 persist=persist,
             )
+        resolved_goal = goal or self._goal_for(working)
+        if resolved_goal is None:
+            return self._wait(working, current, "the enrolled goal record becomes readable", persist)
+        if (resolved_goal.lane_id, resolved_goal.goal_id) != (working.lane_id, working.goal_id):
+            return self._wait(working, current, "the exact enrolled lane and goal identity reconcile", persist)
+        refreshed_facts = tuple(facts)
+        if not refreshed_facts and self.facts_reader is not None:
+            try:
+                refreshed_facts = tuple(self.facts_reader(working))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("recovery_facts_unavailable", lane_id=working.lane_id, error=str(exc))
+        evidence = self._latest_progress(working, events, progress_rows)
+        if evidence is not None and self._new_progress(working.last_useful_progress, evidence):
+            recovery = working.recovery.model_copy(update={"stage": "complete", "next_allowed_attempt": None})
+            candidate = self._persist(
+                working.model_copy(update={"last_useful_progress": evidence, "recovery": recovery, "next_check": None}),
+                persist=persist,
+            )
+            return RecoveryDecision("progress_confirmed", "complete", candidate, "material progress confirmed")
         if working.pending_operation is not None:
             return self._reconcile_pending(working, resolved_goal, current, refreshed_facts, persist)
         stage = working.recovery.stage
@@ -699,8 +702,12 @@ class RecoveryEngine:
                 return self._decision("waiting", record, "recovery requires a matching canonical ladder incident")
             return (
                 None
-                if incident.stage == expected
-                else self._decision("waiting", record, f"canonical response ladder remains at {incident.stage}")
+                if incident.stage == expected and self.response_ladder.stage_action_proven(incident)
+                else self._decision(
+                    "waiting",
+                    record,
+                    f"canonical response ladder lacks proven entry to {expected} stage",
+                )
             )
         marker = f"recovery-{record.lane_id}-{record.recovery.cycle_id}-{action}"
         try:
@@ -745,6 +752,8 @@ class RecoveryEngine:
             provider_handle=record.provider.handle,
             idempotency_key=f"{operation_id}-idem",
             payload_digest=digest,
+            provider_session_id=record.provider.provider_session_id or record.session_ref,
+            payload=payload,
             provider_instance_id=record.provider.instance_id,
             provider_generation=record.provider.generation,
             created_at=current.isoformat(),
@@ -826,7 +835,7 @@ class RecoveryEngine:
                     CreateOrResumeRequest(
                         operation=operation,
                         session_ref=record.session_ref,
-                        provider_session_id=record.provider.handle,
+                        provider_session_id=operation.provider_session_id or record.session_ref,
                         context_ref=record.checkpoint_reference,
                     )
                 )
@@ -906,6 +915,7 @@ class RecoveryEngine:
             cycle_id=cycle_id,
             operation_id=operation.operation_id,
             provider_handle=operation.provider_handle,
+            provider_session_id=operation.provider_session_id,
             provider_instance_id=operation.provider_instance_id,
             provider_generation=operation.provider_generation,
             idempotency_key=operation.idempotency_key,
@@ -947,7 +957,7 @@ class RecoveryEngine:
             )
             return self._decision("checkpoint", candidate, "governed checkpoint validated", operation, facts=facts)
         if action == "relaunch":
-            status = self._provider_status()
+            status = self._provider_status(record)
             if status is None or status.provider_session_id is None or status.provider_session_id == record.session_ref:
                 return self._pending(record, current, "relaunch lacks a rotated physical session observation", persist)
             candidate = self._persist(self._rotate_session(record, status, current), persist=persist, transition="provider-transfer")
@@ -983,7 +993,7 @@ class RecoveryEngine:
         )
         return self._decision(cast(RecoveryAction, action), candidate, f"{action} consumption is proven", operation, facts=facts)
 
-    def _provider_status(self) -> ProviderStatus | None:
+    def _provider_status(self, record: JoinedLaneRecord | None = None) -> ProviderStatus | None:
         if self.provider is None:
             return None
         try:
@@ -996,6 +1006,14 @@ class RecoveryEngine:
             or not status.provider_available
             or status.unknown
             or status.state in {ProviderState.OUTAGE, ProviderState.STALE}
+            or status.context_available is False
+            or (
+                record is not None
+                and (
+                    str(status.provider) != str(record.provider.kind)
+                    or status.generation < (record.provider.generation or 0)
+                )
+            )
         ):
             return None
         return status
@@ -1014,15 +1032,24 @@ class RecoveryEngine:
         recovery = record.recovery.model_copy(
             update={"stage": "diagnostic", "next_allowed_attempt": check.at, "pending_payload": None}
         )
+        # Wake receipts are historical evidence for the old physical session.
+        # Compact them before rebinding the joined record to the rotated
+        # session; rewriting their session identity would forge the evidence.
+        archive_digest = record.wake_archive_digest
+        for receipt in record.wake_receipts:
+            archive_digest = extend_wake_archive_digest(archive_digest, receipt)
         return record.model_copy(
             update={
                 "session_ref": status.provider_session_id,
                 "physical_session_generation": physical_generation,
                 "chitra_ownership_epoch": record.chitra_ownership_epoch + 1,
-                "provider": provider,
+                "provider": provider.model_copy(update={"provider_session_id": status.provider_session_id}),
                 "current_update": update,
                 "pending_operation": None,
                 "last_operation_result": None,
+                "wake_receipts": (),
+                "wake_archive_count": record.wake_archive_count + len(record.wake_receipts),
+                "wake_archive_digest": archive_digest,
                 "recovery": recovery,
                 "next_check": check,
             }
@@ -1039,10 +1066,17 @@ class RecoveryEngine:
             batch = self.provider.read_updates(record.update_cursor or None)
         except Exception:  # noqa: BLE001
             return stored
+        # Legacy pending rows predate the separate provider session field.
+        # Their typed migration source is the provider identity, then the
+        # joined lane session_ref.  The provider operation handle is never a
+        # substitute for either session identity.
+        expected_session_id = pending.provider_session_id or record.provider.provider_session_id or record.session_ref
         for update in reversed(batch.updates):
             actual = (
                 update.operation_id,
                 update.lane_id,
+                update.provider_session_id,
+                update.provider_handle,
                 update.idempotency_key,
                 update.payload_digest,
                 update.provider_instance_id,
@@ -1051,6 +1085,8 @@ class RecoveryEngine:
             expected = (
                 pending.operation_id,
                 pending.lane_id,
+                expected_session_id,
+                pending.provider_handle,
                 pending.idempotency_key,
                 pending.payload_digest,
                 pending.provider_instance_id,
@@ -1108,11 +1144,34 @@ class RecoveryEngine:
         if record.last_operation_result is not None and record.last_operation_result.status == "consumed":
             return self._finish_consumed(record, current, facts, persist)
         observed = self._provider_probe(record)
+        if observed is not None and observed.status == "consumed":
+            # The provider read is already an exact, cursor-addressable
+            # consumption observation.  Preserve it before applying the
+            # normal stage transition; do not downgrade it to transport-only
+            # acceptance through the dispatch reconciler.
+            recorded = self._persist(record.model_copy(update={"last_operation_result": observed}), persist=persist)
+            return self._finish_consumed(recorded, current, facts, persist)
         if observed is None or observed.status in {"unknown", "lost-response"}:
             pending = record.pending_operation
             action = record.recovery.attempted_remedy
-            payload = record.recovery.pending_payload
+            # Retry the exact payload allocated with this operation. Rebuilding
+            # it from the current update is unsafe: a changed ``next_action``
+            # changes the digest and otherwise leaves a lost operation wedged
+            # forever even though the same idempotent send is still retryable.
+            payload = (
+                pending.payload
+                if pending is not None and pending.payload
+                else record.recovery.pending_payload
+                or self._action_payload(record, goal, action, facts)
+            )
             sequence = record.recovery.event_sequence
+            if not persist or self.store_for(record.lane_id) is None:
+                return self._pending(
+                    record,
+                    current,
+                    "pending recovery operation requires durable joined-lane storage before retry",
+                    persist,
+                )
             if (
                 pending is not None
                 and payload is not None
@@ -1157,6 +1216,31 @@ class RecoverySupervisor:
         self.ledger_key_path = ledger_key_path or state_root / "ledger.key"
         self.facts_reader = facts_reader
 
+    @staticmethod
+    def _named_wake(
+        record: JoinedLaneRecord,
+        journal: EventJournal,
+        events: Sequence[CanonicalEvent],
+    ) -> tuple[str, str, int] | None:
+        """Return the newest exact wake event that the record has not consumed."""
+
+        condition = record.wake_condition
+        if not condition:
+            return None
+        known = {receipt.wake_id for receipt in record.wake_receipts}
+        known.update(receipt.wake_id for receipt in journal.load_wakes())
+        for sequence, event in reversed(tuple(enumerate(events, 1))):
+            if (
+                event.lane == record.lane_id
+                and event.goal_ref == record.goal_id
+                and event.session_id == record.session_ref
+                and event.event_id not in known
+                and event.payload.get("wake_condition") == condition
+                and event.payload.get("wake_condition_changed") is True
+            ):
+                return event.event_id, condition, sequence
+        return None
+
     def run_once(self, *, now: datetime | None = None) -> tuple[RecoveryDecision, ...]:
         decisions: list[RecoveryDecision] = []
         store = CanonicalJoinedLaneStore(self.state_root)
@@ -1167,15 +1251,24 @@ class RecoverySupervisor:
             try:
                 provider = self.provider_resolver(record)
                 journal = EventJournal(self.state_root, record.lane_id)
+                journal_events = tuple(journal.load())
                 try:
                     key = self.ledger_key_path.read_bytes()
                 except OSError:
                     key = None
                 ladder = ResponseLadder(
                     IncidentStore(self.state_root, record.lane_id),
-                    journal_events=journal.load(),
+                    journal_events=journal_events,
                     ledger_key=key,
                 )
+                wake = self._named_wake(record, journal, journal_events)
+                kwargs: dict[str, Any] = {"now": now}
+                if wake is not None:
+                    kwargs.update(
+                        wake_id=wake[0],
+                        observed_wake_condition=wake[1],
+                        wake_event_sequence=wake[2],
+                    )
                 decisions.append(
                     RecoveryEngine(
                         provider=provider,
@@ -1185,15 +1278,24 @@ class RecoverySupervisor:
                         response_ladder=ladder,
                     ).run_once(
                         record,
-                        now=now,
+                        **kwargs,
                         facts=tuple(self.facts_reader(record)) if self.facts_reader is not None else (),
                     )
                 )
-            except Exception as exc:  # noqa: BLE001 - one lane must not starve its siblings
+            except Exception as exc:  # noqa: BLE001 - one lane must not abort the pass
                 logger.warning(
-                    "recovery_lane_pass_failed",
+                    "recovery_supervision_lane_failed_closed",
                     lane_id=record.lane_id,
+                    session_ref=record.session_ref,
                     error=str(exc),
+                )
+                decisions.append(
+                    RecoveryDecision(
+                        "waiting",
+                        record.recovery.stage,
+                        record,
+                        f"recovery supervision failed closed for this lane: {exc}",
+                    )
                 )
         return tuple(decisions)
 

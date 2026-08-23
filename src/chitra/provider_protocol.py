@@ -236,6 +236,10 @@ class ProviderUpdate:
     payload_digest: str
     provider_instance_id: str
     provider_generation: int
+    # The provider operation/thread handle is distinct from the physical
+    # session ID above.  Adapters that can supply both should do so; legacy
+    # events may carry the handle in their payload for migration.
+    provider_handle: str | None = None
     payload: Mapping[str, object] = field(default_factory=dict)
     child_roster: tuple[ChildRosterEntry, ...] = ()
 
@@ -244,6 +248,7 @@ class ProviderUpdate:
         _required_text(self.cursor, "cursor")
         _required_text(str(self.kind), "kind")
         _optional_text(self.provider_session_id, "provider_session_id")
+        _optional_text(self.provider_handle, "provider_handle")
         _required_text(self.observed_at, "observed_at")
         _required_text(self.operation_id, "operation_id")
         _required_text(self.lane_id, "lane_id")

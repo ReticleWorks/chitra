@@ -524,8 +524,9 @@ def test_supervisor_isolates_one_lane_failure_and_continues(tmp_path: Path) -> N
         return provider
 
     decisions = recovery.RecoverySupervisor(tmp_path, resolve, goal_root=tmp_path).run_once(now=NOW)
-    assert len(decisions) == 1
-    assert decisions[0].record.lane_id == "lane-b"
+    assert [decision.record.lane_id for decision in decisions] == ["lane-a", "lane-b"]
+    assert decisions[0].action == "waiting"
+    assert "failed closed" in decisions[0].reason
     assert provider.send_operation_ids
 
 

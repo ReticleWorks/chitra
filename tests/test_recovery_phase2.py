@@ -137,6 +137,7 @@ class SequenceProvider:
             cycle_id=cycle_id,
             operation_id=request.operation_id,
             provider_handle=request.provider_handle,
+            provider_session_id=request.operation.provider_session_id,
             provider_instance_id=request.provider_instance_id,
             provider_generation=request.provider_generation,
             idempotency_key=request.idempotency_key,
@@ -283,7 +284,7 @@ class AcceptedThenObservedProvider:
             event_id="consumed-after-restart",
             cursor="1",
             kind=UpdateKind.STEER_CONSUMED,
-            provider_session_id="tophand-lane-a",
+            provider_session_id="tophand:lane-a:1",
             observed_at=(NOW + timedelta(minutes=1)).isoformat(),
             operation_id=result.operation_id,
             lane_id=result.lane_id,
@@ -291,6 +292,7 @@ class AcceptedThenObservedProvider:
             payload_digest=result.payload_digest,
             provider_instance_id=result.provider_instance_id or "",
             provider_generation=result.provider_generation or 1,
+            provider_handle=result.provider_handle,
         )
         return ReadUpdatesResult(cursor, "1", (update,))
 

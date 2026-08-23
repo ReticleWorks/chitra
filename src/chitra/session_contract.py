@@ -625,6 +625,10 @@ class ProviderIdentity(_ContractModel):
     kind: ProviderKind
     handle: Identifier
     capabilities: ProviderCapabilities
+    # Provider adapters may expose a physical session ID distinct from the
+    # operation/thread handle.  Keep both values typed instead of relying on
+    # a provider-specific string format.
+    provider_session_id: Identifier | None = None
     # Unknown restart-fence values stay null.  The contract never invents a
     # provider instance or generation from a durable handle alone.
     instance_id: Identifier | None = None
@@ -692,6 +696,16 @@ class PendingProviderOperation(_ContractModel):
     provider_handle: Identifier
     idempotency_key: Identifier
     payload_digest: Text
+    # ``provider_handle`` identifies the provider operation endpoint.  It is
+    # not the physical session ID carried by provider update events.  New
+    # operations persist the exact session identity separately; old records
+    # omit it and are migrated by recovery from the joined lane's
+    # ``session_ref``.
+    provider_session_id: Identifier | None = None
+    # Retain the exact provider payload so a lost reply can be retried after
+    # the lane's current update changes. An empty value is accepted only for
+    # legacy records written before this field existed.
+    payload: str = ""
     provider_instance_id: Identifier | None = None
     provider_generation: int | None = Field(default=None, ge=1)
     created_at: Timestamp
@@ -1307,6 +1321,8 @@ class JoinedLaneRecord(_ContractModel):
             raise ValueError("joined-lane wake receipt IDs must be unique")
         if any((receipt.lane_id, receipt.goal_id) != (self.lane_id, self.goal_id) for receipt in self.wake_receipts):
             raise ValueError("wake receipt logical identity must match joined lane")
+        if any(receipt.session_ref != self.session_ref for receipt in self.wake_receipts):
+            raise ValueError("wake receipt session identity must match joined lane")
         wake_times = [datetime.fromisoformat(receipt.observed_at.replace("Z", "+00:00")) for receipt in self.wake_receipts]
         if any(left > right for left, right in zip(wake_times, wake_times[1:], strict=False)):
             raise ValueError("wake receipt timestamps must be monotonic")
@@ -1326,6 +1342,12 @@ class JoinedLaneRecord(_ContractModel):
             ):
                 raise ValueError("provider operation does not belong to joined lane")
         if self.pending_operation is not None:
+            if self.pending_operation.provider_session_id not in (
+                None,
+                self.session_ref,
+                self.provider.provider_session_id,
+            ):
+                raise ValueError("pending operation provider session does not match joined lane session")
             validate_pending_operation(self.provider, self.pending_operation)
             if self.pending_operation.operation_id not in history_ids:
                 raise ValueError("pending operation must be retained in operation history")

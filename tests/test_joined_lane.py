@@ -222,7 +222,7 @@ def journal_observation(operation_id: str, *, consumed: bool | None, event_id: s
         event_id=event_id,
         cursor="1",
         kind=UpdateKind.STEER_CONSUMED if consumed is True else UpdateKind.STEER_ACCEPTED,
-        provider_session_id="thread-a",
+        provider_session_id="tophand:lane-a",
         observed_at="2026-08-23T14:00:02+00:00",
         operation_id=operation_id,
         lane_id="lane-a",
@@ -230,6 +230,7 @@ def journal_observation(operation_id: str, *, consumed: bool | None, event_id: s
         payload_digest=f"digest-{operation_id}",
         provider_instance_id="instance-a",
         provider_generation=1,
+        provider_handle="thread-a",
         payload={"result_evidence": {"accepted": True, "consumed": consumed}},
     )
 

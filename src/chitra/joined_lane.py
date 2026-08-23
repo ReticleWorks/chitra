@@ -312,6 +312,17 @@ class JoinedLaneStore:
         records: list[Any] = []
         for lane_id in sorted(lane_ids):
             records.append(self.require(lane_id))
+        # The write path fences new assignments under the ownership lock, but
+        # a restart must also reject a pre-existing split-brain snapshot. Do
+        # not let recovery iterate two active lanes that claim one provider
+        # session or provider generation.
+        for index, candidate in enumerate(records):
+            for existing in records[:index]:
+                if _owner_conflicts(candidate, existing):
+                    raise JoinedLaneConflictError(
+                        f"active provider owner is assigned to joined lanes "
+                        f"{_value(existing, 'lane_id', '')!r} and {_value(candidate, 'lane_id', '')!r}"
+                    )
         return tuple(records)
 
     def unfinished(self) -> tuple[Any, ...]:
@@ -568,9 +579,12 @@ class ProviderObservation:
             raise ValueError("provider update consumed evidence must be boolean or null")
         instance_id = update.provider_instance_id
         generation = update.provider_generation
-        provider_handle = update.provider_session_id
+        provider_handle = update.provider_handle
+        if provider_handle is None:
+            payload_handle = update.payload.get("provider_handle")
+            provider_handle = payload_handle if isinstance(payload_handle, str) else None
         if instance_id is None or generation is None or provider_handle is None:
-            raise ValueError("provider update lacks complete provider identity")
+            raise ValueError("provider update lacks complete provider/session identity")
         return cls(
             status=str(update.kind),
             accepted=accepted,
@@ -1388,9 +1402,16 @@ def journal_provider_probe(root: Path) -> JournalProbe:
         provider_generation = record.provider.generation
         if provider_instance_id is None or provider_generation is None:
             return None
+        expected_session_id = pending.provider_session_id or record.provider.provider_session_id or record.session_ref
         for event in reversed(EventJournal(root, record.lane_id).load()):
             payload = event.payload
-            if event.lane != record.lane_id or event.goal_ref != record.goal_id or event.session_id != record.session_ref:
+            observed_session_id = payload.get("provider_session_id", event.session_id)
+            if (
+                event.lane != record.lane_id
+                or event.goal_ref != record.goal_id
+                or event.session_id != record.session_ref
+                or observed_session_id != expected_session_id
+            ):
                 continue
             if payload.get("operation_id") != pending.operation_id:
                 continue
@@ -1422,7 +1443,8 @@ def journal_provider_probe(root: Path) -> JournalProbe:
                 event_id=event.event_id,
                 cursor=event.event_id,
                 kind=kind,
-                provider_session_id=pending.provider_handle,
+                provider_session_id=expected_session_id,
+                provider_handle=pending.provider_handle,
                 observed_at=event.observed_at,
                 operation_id=pending.operation_id,
                 lane_id=record.lane_id,
