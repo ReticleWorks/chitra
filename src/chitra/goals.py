@@ -6,6 +6,7 @@ stated goal, completion condition, and current state.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Iterable, Sequence
@@ -13,6 +14,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
+from uuid import uuid4
 
 import structlog
 from pydantic import ConfigDict, SkipValidation, TypeAdapter, ValidationInfo, model_validator
@@ -49,17 +51,19 @@ GOAL_STATUSES: tuple[GoalStatus, ...] = (
     "done-pending-verification",
     "done-pending-close",
 )
-SCHEMA = "chitra.goals.v3"
+SCHEMA = "chitra.goals.v4"
 # v3 adds the machine-enforced interview receipt, frozen structured done items,
-# and completion proofs. v1/v2 remain readable for display and administrative
-# disposal, but their missing v3 enrollment contract can never pass launch,
-# enter a done state, or use completion close.
-SUPPORTED_SCHEMAS = (SCHEMA, "chitra.goals.v2", "chitra.goals.v1")
+# and completion proofs. v4 adds the stable logical goal identity. v1/v2
+# remain readable for display and administrative disposal, but their missing
+# v3 enrollment contract can never pass launch, enter a done state, or use
+# completion close.
+SUPPORTED_SCHEMAS = (SCHEMA, "chitra.goals.v3", "chitra.goals.v2", "chitra.goals.v1")
 # Reads tolerate every chitra.goals.v<N> document (unknown fields are ignored
 # on load), so a file written by a newer package can never crash a daemon at
 # load time; GOALS_SCHEMA_RE is the read gate, not SUPPORTED_SCHEMAS. Writes
-# keep the file's own schema label and refuse a file newer than SCHEMA unless
-# the caller explicitly migrates (see GoalsSchemaNewerError).
+# keep a readable older file's label unless identity-bearing output needs the
+# v4 label, and refuse a file newer than SCHEMA unless the caller explicitly
+# migrates (see GoalsSchemaNewerError).
 GOALS_SCHEMA_RE = re.compile(r"^chitra\.goals\.v([0-9]+)$")
 GOALS_SCHEMA_NEWER_MESSAGE = "goals schema newer than installed package"
 
@@ -127,7 +131,7 @@ class EnrolledDoneWhenItem:
 
 @pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True, extra="ignore"))
 class GoalRecord:
-    """The five canonical fields plus monitor-maintained tactical metadata.
+    """The canonical goal identity and fields plus tactical metadata.
 
     ``extra="ignore"`` is the persisted-read contract: fields this package
     does not know (written by a newer schema) are dropped in memory instead
@@ -163,6 +167,12 @@ class GoalRecord:
     interview_receipt: InterviewReceipt | None = None
     enrolled_done_when_items: tuple[EnrolledDoneWhenItem, ...] = ()
     completion_proofs: tuple[CompletionEvidence, ...] = ()
+    # ``goal_id`` is kept at the end of the dataclass to preserve positional
+    # construction compatibility. It is intentionally empty on an in-memory
+    # enrollment request: the atomic store write assigns the fresh ID, while
+    # persisted records without one receive a deterministic ``legacy-`` ID
+    # from their immutable enrollment anchor.
+    goal_id: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return cast(dict[str, object], _GOAL_RECORD_ADAPTER.dump_python(self, mode="json"))
@@ -201,6 +211,7 @@ class GoalRecord:
                 raise ValueError(f"goal record {field} must be a string")
             normalized[field] = value
         for field in (
+            "goal_id",
             "lane_id",
             "enrolled_done_when",
             "enrolled_at",
@@ -225,6 +236,13 @@ class GoalRecord:
         if not isinstance(legacy_enrolled_at, str):
             legacy_enrolled_at = ""
         normalized["enrolled_at"] = normalized["enrolled_at"] or created_at or legacy_enrolled_at or LEGACY_ENROLLED_AT
+        if not cast(str, normalized["goal_id"]).strip():
+            normalized["goal_id"] = legacy_goal_id(
+                session_ref=session_ref,
+                lane_id=cast(str, normalized["lane_id"]),
+                enrolled_done_when=cast(str, normalized["enrolled_done_when"]),
+                enrolled_at=cast(str, normalized["enrolled_at"]),
+            )
         raw_open_asks = payload.get("open_asks", [])
         if not isinstance(raw_open_asks, list) or not all(isinstance(ask, str) for ask in raw_open_asks):
             raise ValueError("goal record open_asks must be a list of strings")
@@ -289,6 +307,103 @@ def session_name(session_ref: str) -> str:
 def lane_id_from_session_ref(session_ref: str) -> str:
     """Return the durable lane name without host or volatile instance suffix."""
     return session_name(session_ref)
+
+
+def legacy_goal_id(
+    *,
+    session_ref: str,
+    lane_id: str,
+    enrolled_done_when: str,
+    enrolled_at: str,
+) -> str:
+    """Derive a stable, visibly legacy ID from the enrollment anchor.
+
+    Strategic fields such as ``goal`` and ``source`` are deliberately absent:
+    redirects and backend handoffs must not create a new logical goal. The
+    physical session reference is also absent because a backend transfer can
+    change it; the durable lane and the two write-once enrollment fields are
+    the identity anchor. The canonical JSON input makes the derivation
+    independent of dictionary ordering and produces a collision-resistant
+    full SHA-256 ID.
+    """
+    del session_ref
+    anchor = json.dumps(
+        {
+            "enrolled_at": enrolled_at,
+            "enrolled_done_when": enrolled_done_when,
+            "lane_id": lane_id,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(anchor.encode("utf-8")).hexdigest()
+    return f"legacy-{digest}"
+
+
+def _fresh_goal_id(existing_ids: set[str]) -> str:
+    """Return a new enrollment ID, retrying the vanishingly rare collision."""
+    for _ in range(8):
+        candidate = f"goal-{uuid4().hex}"
+        if candidate not in existing_ids:
+            return candidate
+    raise GoalValidationError("could not allocate a unique goal_id")
+
+
+def _transfer_chain_root(records: Sequence[GoalRecord], record: GoalRecord) -> GoalRecord:
+    """Return the oldest linked predecessor, stopping at malformed links."""
+    by_session_ref = {item.session_ref: item for item in records}
+    current = record
+    seen: set[str] = set()
+    while current.successor_of and current.session_ref not in seen:
+        seen.add(current.session_ref)
+        predecessor = by_session_ref.get(current.successor_of)
+        if predecessor is None or predecessor.transferred_to != current.session_ref:
+            break
+        current = predecessor
+    return current
+
+
+def _transfer_history_refs(records: Sequence[GoalRecord], record: GoalRecord) -> set[str]:
+    """Return linked predecessor refs whose held records may share one lane."""
+    by_session_ref = {item.session_ref: item for item in records}
+    refs: set[str] = set()
+    current = record
+    while current.successor_of:
+        predecessor = by_session_ref.get(current.successor_of)
+        if predecessor is None or predecessor.transferred_to != current.session_ref:
+            break
+        if predecessor.session_ref in refs:
+            break
+        refs.add(predecessor.session_ref)
+        current = predecessor
+    return refs
+
+
+def _backfill_legacy_transfer_identity(
+    records: Sequence[GoalRecord], legacy_missing_refs: set[str]
+) -> list[GoalRecord]:
+    """Unify missing IDs and logical lanes across a connected old transfer chain."""
+    if not legacy_missing_refs:
+        return list(records)
+    updated: list[GoalRecord] = []
+    for record in records:
+        root = _transfer_chain_root(records, record)
+        root_goal_id = root.goal_id
+        if root.session_ref in legacy_missing_refs:
+            root_goal_id = legacy_goal_id(
+                session_ref=root.session_ref,
+                lane_id=root.lane_id,
+                enrolled_done_when=root.enrolled_done_when,
+                enrolled_at=root.enrolled_at,
+            )
+        candidate = record
+        if record.session_ref in legacy_missing_refs and record.goal_id != root_goal_id:
+            candidate = replace(candidate, goal_id=root_goal_id)
+        if root.session_ref != record.session_ref and record.lane_id != root.lane_id:
+            candidate = replace(candidate, lane_id=root.lane_id)
+        updated.append(candidate)
+    return updated
 
 
 def render_done_when_items(items: Sequence[EnrolledDoneWhenItem]) -> str:
@@ -456,7 +571,7 @@ def _utc_now() -> str:
 
 
 def load_goals_document(root: Path | None = None) -> tuple[list[GoalRecord], str]:
-    """Load records plus the file's own ``file_schema``, backfilling legacy anchors.
+    """Load records plus the file's own ``file_schema``, backfilling legacy IDs.
 
     Any ``chitra.goals.v<N>`` document loads; unknown top-level and per-record
     fields are ignored in memory so a newer writer's file stays readable here
@@ -466,6 +581,9 @@ def load_goals_document(root: Path | None = None) -> tuple[list[GoalRecord], str
 
     Records written before enrollment anchors existed use their current
     ``done_when`` once, and persist that normalized anchor on their next write.
+    Records written before ``goal_id`` existed receive a deterministic
+    ``legacy-`` ID from those normalized enrollment anchors and persist it on
+    their next write.
     """
     path = goals_path(root)
     try:
@@ -484,14 +602,21 @@ def load_goals_document(root: Path | None = None) -> tuple[list[GoalRecord], str
     if not isinstance(document_updated_at, str):
         raise ValueError("goals.json updated_at must be a string")
     records = [GoalRecord.from_dict(item, legacy_enrolled_at=document_updated_at) for item in raw_goals]
-    return records, schema
+    legacy_missing_refs = {
+        record.session_ref
+        for item, record in zip(raw_goals, records, strict=True)
+        if not isinstance(item, dict) or not isinstance(item.get("goal_id"), str) or not item["goal_id"].strip()
+    }
+    return _backfill_legacy_transfer_identity(records, legacy_missing_refs), schema
 
 
 def load_goals(root: Path | None = None) -> list[GoalRecord]:
-    """Load records, backfilling legacy enrollment anchors in memory.
+    """Load records, backfilling legacy enrollment anchors and IDs in memory.
 
     Records written before enrollment anchors existed use their current
     ``done_when`` once, and persist that normalized anchor on their next write.
+    Records written before ``goal_id`` existed receive the same deterministic
+    ID on every load.
     """
     records, _ = load_goals_document(root)
     return records
@@ -502,8 +627,10 @@ def _write_goals(root: Path | None, records: list[GoalRecord], *, migrate: bool 
 
     A file labeled with a schema newer than this package's SCHEMA is refused
     unless ``migrate`` is set: an installed 0.x daemon must never silently
-    rewrite a document it cannot fully understand. Any other readable file
-    keeps its own label -- writes never bump the schema implicitly.
+    rewrite a document it cannot fully understand. A readable older file keeps
+    its label unless this write carries a ``goal_id``; identity-bearing output
+    is labeled v4 so an older v3 writer cannot silently discard the ID on a
+    later rewrite.
     """
     path = goals_path(root)
     file_schema = stored_file_schema(root)
@@ -515,6 +642,8 @@ def _write_goals(root: Path | None, records: list[GoalRecord], *, migrate: bool 
                     f"goals.json file schema {file_schema} is newer than installed package schema {SCHEMA}; "
                     "refusing to rewrite it without --migrate"
                 )
+        elif any(record.goal_id.strip() for record in records):
+            target_schema = SCHEMA
         else:
             target_schema = file_schema
     payload = {"schema": target_schema, "updated_at": _utc_now(), "goals": [record.to_dict() for record in records]}
@@ -555,6 +684,7 @@ def _upsert_goal_locked(
     allow_done_transition: bool = False,
     allow_completion_proofs: bool = False,
     allow_legacy_administrative: bool = False,
+    transfer_continuation: bool = False,
     mutation_time: str | None = None,
     migrate: bool = False,
 ) -> GoalRecord:
@@ -575,6 +705,40 @@ def _upsert_goal_locked(
         raise GoalValidationError("legacy goals are display-only; use a reasoned administrative redirect or discard")
     if existing is not None and not _strategic_fields_match(existing, rec) and not allow_strategic_change:
         raise GoalRedirectRequiredError("strategic goal fields changed; use chitra-goals redirect --reason ...")
+    incoming_goal_id = rec.goal_id.strip()
+    transfer_predecessor = next(
+        (
+            record
+            for record in records
+            if record.session_ref == rec.successor_of and record.transferred_to == rec.session_ref
+        ),
+        None,
+    )
+    if transfer_continuation and (existing is not None or transfer_predecessor is None):
+        raise GoalValidationError("transfer continuation requires a new linked successor")
+    predecessor = transfer_predecessor
+    if existing is not None:
+        goal_id = existing.goal_id or legacy_goal_id(
+            session_ref=existing.session_ref,
+            lane_id=existing.lane_id,
+            enrolled_done_when=existing.enrolled_done_when,
+            enrolled_at=existing.enrolled_at,
+        )
+        if incoming_goal_id and incoming_goal_id != goal_id:
+            raise GoalValidationError("goal_id is immutable once a goal is enrolled")
+    else:
+        if transfer_continuation:
+            assert predecessor is not None
+            if not incoming_goal_id or incoming_goal_id != predecessor.goal_id:
+                raise GoalValidationError("transfer continuation must preserve the predecessor goal_id")
+            goal_id = incoming_goal_id
+        else:
+            if incoming_goal_id:
+                raise GoalValidationError("goal_id is assigned by the atomic enrollment path")
+            goal_id = _fresh_goal_id({record.goal_id for record in records})
+        duplicate = next((record for record in records if record.goal_id == goal_id), None)
+        if duplicate is not None and not transfer_continuation:
+            raise GoalValidationError(f"goal_id {goal_id!r} is already assigned to {duplicate.session_ref}")
     if existing is None:
         enrollment_issues = validate_enrollment_contract(rec, root=root)
         if enrollment_issues:
@@ -599,15 +763,36 @@ def _upsert_goal_locked(
         enrolled_done_when = existing.enrolled_done_when
         enrolled_at = existing.enrolled_at
     else:
-        if rec.lane_id.strip() and rec.lane_id.strip() != derived_lane_id:
+        if transfer_continuation:
+            assert predecessor is not None
+            if rec.lane_id.strip() and rec.lane_id != predecessor.lane_id:
+                raise GoalValidationError("transfer continuation must preserve the predecessor lane_id")
+            if rec.enrolled_done_when and rec.enrolled_done_when != predecessor.enrolled_done_when:
+                raise EnrolledScopeImmutableError("transfer continuation must preserve enrolled_done_when")
+            if rec.enrolled_at and rec.enrolled_at != predecessor.enrolled_at:
+                raise EnrolledScopeImmutableError("transfer continuation must preserve enrolled_at")
+            lane_id = predecessor.lane_id
+        elif rec.lane_id.strip() and rec.lane_id.strip() != derived_lane_id:
             raise GoalValidationError("lane_id must be derived from the durable session name")
         rendered_done_when = render_done_when_items(rec.enrolled_done_when_items)
         if rec.enrolled_done_when and rec.enrolled_done_when != rendered_done_when:
             raise EnrolledScopeImmutableError("enrolled_done_when must be generated from enrolled_done_when_items")
-        enrolled_done_when = rendered_done_when
-        enrolled_at = now
+        if transfer_continuation:
+            assert predecessor is not None
+            enrolled_done_when = predecessor.enrolled_done_when
+            enrolled_at = predecessor.enrolled_at
+        else:
+            enrolled_done_when = rendered_done_when
+            enrolled_at = now
+    transfer_history_refs = _transfer_history_refs(records, rec) if existing is not None or transfer_continuation else set()
     conflicting_lane = next(
-        (record for record in records if record.session_ref != rec.session_ref and record.lane_id == lane_id),
+        (
+            record
+            for record in records
+            if record.session_ref != rec.session_ref
+            and record.lane_id == lane_id
+            and not (record.session_ref in transfer_history_refs and record.status == "held")
+        ),
         None,
     )
     if conflicting_lane is not None:
@@ -630,6 +815,7 @@ def _upsert_goal_locked(
         done_when=rec.done_when,
         source=rec.source,
         status=rec.status,
+        goal_id=goal_id,
         lane_id=lane_id,
         enrolled_done_when=enrolled_done_when,
         enrolled_at=enrolled_at,
@@ -932,6 +1118,10 @@ def transfer_goal(
             done_when=existing.done_when,
             source=f"{existing.source}; digest:{digest.strip()}",
             status="idle",
+            goal_id=existing.goal_id,
+            lane_id=existing.lane_id,
+            enrolled_done_when=existing.enrolled_done_when,
+            enrolled_at=existing.enrolled_at,
             intent=existing.intent,
             scope=existing.scope,
             interview_receipt=existing.interview_receipt,
@@ -952,7 +1142,7 @@ def transfer_goal(
                 transferred_to=successor_ref,
             ),
         )
-        stored_successor = _upsert_goal_locked(root, successor)
+        stored_successor = _upsert_goal_locked(root, successor, transfer_continuation=True)
     logger.info(
         "goal_mutated",
         session_ref=session_ref,

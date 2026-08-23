@@ -66,7 +66,7 @@ def note_goals_schema_state(state_dir: Path) -> None:
 
     The digest reads goal state only, so a newer goals.json keeps sweeping;
     the notice records that this installed package must not write it instead
-    of exiting into a supervisor restart loop (the chitra.goals.v4 outage
+    of exiting into a supervisor restart loop (the chitra.goals.v5 outage
     class).
     """
     file_schema = goals_schema_newer_than_installed(state_dir)

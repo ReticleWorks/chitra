@@ -154,7 +154,7 @@ def note_goals_schema_state(goals_root: Path | None) -> None:
 
     A newer goals.json never stops the queue: goal state is treated as
     read-only and the daemon keeps running instead of exiting into a
-    supervisor restart loop (the chitra.goals.v4 outage class).
+    supervisor restart loop (the chitra.goals.v5 outage class).
     """
     file_schema = goals_schema_newer_than_installed(goals_root)
     if file_schema is None:

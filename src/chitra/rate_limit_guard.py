@@ -172,7 +172,7 @@ def note_goals_schema_state(goals_root: Path | None) -> None:
     A newer goals.json never fails the guard: goal holds and resumes are
     paused for the pass while the transaction ledger keeps advancing, so the
     process degrades read-only instead of exiting into a supervisor restart
-    loop (the chitra.goals.v4 outage class).
+    loop (the chitra.goals.v5 outage class).
     """
     file_schema = goals_schema_newer_than_installed(goals_root)
     if file_schema is None:
@@ -1014,7 +1014,7 @@ def sweep(
     report.shed_lanes = list(load_state.shed_lanes)
 
     if goals_schema_newer_than_installed(goals_root) is not None:
-        # Read-only degradation (the chitra.goals.v4 outage class): a store
+        # Read-only degradation (the chitra.goals.v5 outage class): a store
         # newer than this package refuses every goal write, so hold/resume
         # planning is paused for this pass and the sweep returns a report
         # instead of failing. Non-goals state (transactions, registry,

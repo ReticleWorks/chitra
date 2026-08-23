@@ -1801,7 +1801,7 @@ def test_run_forever_uses_shipped_defaults_when_no_config_has_loaded(monkeypatch
 
 
 def _newer_store_document(root: Path) -> None:
-    """A synthetic chitra.goals.v4 store: this package's schema family, but a
+    """A synthetic chitra.goals.v5 store: this package's schema family, but a
     version the installed package neither fully understands nor may rewrite."""
     record = GoalRecord(
         session_ref="host-a:f2:0.0",
@@ -1813,13 +1813,13 @@ def _newer_store_document(root: Path) -> None:
     ).to_dict()
     record["future_v4_field"] = {"unknown": True}
     (root / "goals.json").write_text(
-        json.dumps({"schema": "chitra.goals.v4", "updated_at": "2026-08-22T00:00:00+00:00", "goals": [record]}),
+        json.dumps({"schema": "chitra.goals.v5", "updated_at": "2026-08-22T00:00:00+00:00", "goals": [record]}),
         encoding="utf-8",
     )
 
 
 def test_daemon_runs_read_only_against_a_newer_goals_schema(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """The v4-outage rule: dispatchd starts and drains its queue against a
+    """The v5-outage rule: dispatchd starts and drains its queue against a
     goals.json labeled newer than the installed package. It journals the
     read-only degradation once instead of crashing into a supervisor restart
     loop, and never rewrites the file's own schema label."""
@@ -1850,4 +1850,4 @@ def test_daemon_runs_read_only_against_a_newer_goals_schema(tmp_path: Path, caps
     assert results[0].status == DispatchStatus.SENT
     notices = [line for line in capsys.readouterr().out.splitlines() if GOALS_SCHEMA_NEWER_MESSAGE in line]
     assert len(notices) == 1
-    assert json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))["schema"] == "chitra.goals.v4"
+    assert json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))["schema"] == "chitra.goals.v5"

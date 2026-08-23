@@ -146,7 +146,7 @@ def test_store_round_trip_and_atomic_write(tmp_path: Path) -> None:
     assert load_goals(tmp_path) == [stored]
     assert not list(tmp_path.glob("*.tmp"))
     payload = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
-    assert payload["schema"] == "chitra.goals.v3"
+    assert payload["schema"] == "chitra.goals.v4"
     assert payload["goals"][0]["needs"] == "you: run the interview"
     assert payload["goals"][0]["goal_version"] == 1
     assert payload["goals"][0]["goal_history"] == []
@@ -1107,15 +1107,15 @@ def _write_schema_document(root: Path, schema: str, *, extra_document_field: boo
 
 
 def test_load_accepts_any_chitra_goals_version_and_ignores_unknown_fields(tmp_path: Path) -> None:
-    """A file written by a newer package (chitra.goals.v4+) loads here: any
+    """A file written by a newer package (chitra.goals.v5+) loads here: any
     chitra.goals.v<N> label is accepted and unknown top-level or per-record
     fields are dropped in memory instead of crashing the reader -- the
     outage class where an installed daemon died at load on a newer store."""
-    _write_schema_document(tmp_path, "chitra.goals.v4", extra_document_field=True, extra_record_field=True)
+    _write_schema_document(tmp_path, "chitra.goals.v5", extra_document_field=True, extra_record_field=True)
 
     records, file_schema = load_goals_document(tmp_path)
 
-    assert file_schema == "chitra.goals.v4"
+    assert file_schema == "chitra.goals.v5"
     assert [record.session_ref for record in records] == [_record().session_ref]
     assert records[0].goal == _record().goal
     assert not hasattr(records[0], "future_v4_field")
@@ -1131,9 +1131,8 @@ def test_load_still_refuses_a_label_outside_the_chitra_goals_family(tmp_path: Pa
         load_goals(tmp_path)
 
 
-def test_write_keeps_an_older_file_its_own_schema_label(tmp_path: Path) -> None:
-    """Writes never bump the schema implicitly: a readable older store keeps
-    its own label after this package mutates it."""
+def test_write_upgrades_an_older_file_when_identity_is_present(tmp_path: Path) -> None:
+    """Identity-bearing writes declare v4 so an older writer cannot drop IDs."""
     upsert_goal(tmp_path, _record())
     payload = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
     payload["schema"] = "chitra.goals.v2"
@@ -1142,7 +1141,7 @@ def test_write_keeps_an_older_file_its_own_schema_label(tmp_path: Path) -> None:
     stored = update_now(tmp_path, _record().session_ref, now="revising under v2 label")
 
     rewritten = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
-    assert rewritten["schema"] == "chitra.goals.v2"
+    assert rewritten["schema"] == "chitra.goals.v4"
     assert get_goal(tmp_path, stored.session_ref) == stored
 
 
@@ -1153,32 +1152,32 @@ def test_write_to_a_newer_store_is_refused_and_migrate_relabels_it(tmp_path: Pat
     upsert_goal(tmp_path, _record())
     path = tmp_path / "goals.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["schema"] = "chitra.goals.v4"
+    payload["schema"] = "chitra.goals.v5"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(GoalsSchemaNewerError, match="newer than installed package schema"):
         update_now(tmp_path, _record().session_ref, now="must refuse without migration")
-    assert json.loads(path.read_text(encoding="utf-8"))["schema"] == "chitra.goals.v4"
+    assert json.loads(path.read_text(encoding="utf-8"))["schema"] == "chitra.goals.v5"
 
     update_now(tmp_path, _record().session_ref, now="operator-approved rewrite", migrate=True)
     migrated = json.loads(path.read_text(encoding="utf-8"))
-    assert migrated["schema"] == "chitra.goals.v3"
+    assert migrated["schema"] == "chitra.goals.v4"
     assert get_goal(tmp_path, _record().session_ref) is not None
 
 
-@pytest.mark.parametrize("schema", ["chitra.goals.v1", "chitra.goals.v2", "chitra.goals.v3", "chitra.goals.v7"])
+@pytest.mark.parametrize("schema", ["chitra.goals.v1", "chitra.goals.v2", "chitra.goals.v3", "chitra.goals.v4", "chitra.goals.v7"])
 def test_schema_version_comparisons(schema: str) -> None:
     version = int(schema.rsplit("v", 1)[1])
-    assert schema_is_newer_than_installed(schema) == (version > 3)
+    assert schema_is_newer_than_installed(schema) == (version > 4)
 
 
 def test_goal_cli_set_against_a_newer_store_exits_3_with_the_migrate_hint(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The v4-outage CLI contract: a write against a store labeled newer than
+    """The v5-outage CLI contract: a write against a store labeled newer than
     this package exits 3 with the --migrate hint, and the store's schema
     label is untouched so a newer package can still read its own file."""
-    document = {"schema": "chitra.goals.v4", "updated_at": "2026-08-22T00:00:00+00:00", "goals": []}
+    document = {"schema": "chitra.goals.v5", "updated_at": "2026-08-22T00:00:00+00:00", "goals": []}
     (tmp_path / "goals.json").write_text(json.dumps(document), encoding="utf-8")
     record = _record()
     set_args = [
@@ -1232,7 +1231,7 @@ def test_goal_cli_set_against_a_newer_store_exits_3_with_the_migrate_hint(
     captured = capsys.readouterr()
     assert "newer than installed package schema" in captured.err
     assert "--migrate" in captured.err
-    assert json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))["schema"] == "chitra.goals.v4"
+    assert json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))["schema"] == "chitra.goals.v5"
 
 
 # ---------------------------------------------------------------------------

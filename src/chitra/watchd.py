@@ -100,7 +100,7 @@ def note_goals_schema_state(goals_root: Path | None) -> None:
 
     A newer goals.json never stops the watcher: goal state is treated as
     read-only and the daemon keeps polling instead of exiting into a
-    supervisor restart loop (the chitra.goals.v4 outage class).
+    supervisor restart loop (the chitra.goals.v5 outage class).
     """
     file_schema = goals_schema_newer_than_installed(goals_root)
     if file_schema is None:
@@ -976,7 +976,7 @@ class Watchd:
             return 0
         root = self.config.goals_root or self.config.state_dir
         if goals_schema_newer_than_installed(root) is not None:
-            # Read-only degradation (the chitra.goals.v4 outage class): a
+            # Read-only degradation (the chitra.goals.v5 outage class): a
             # store newer than this package refuses our writes, so skip goal
             # mutations and keep polling instead of killing run_forever.
             note_goals_schema_state(root)

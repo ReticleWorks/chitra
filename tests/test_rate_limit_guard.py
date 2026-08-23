@@ -852,14 +852,14 @@ def test_registry_entry_records_the_observed_account(tmp_path: Path) -> None:
 
 
 def test_sweep_survives_a_newer_goals_store_read_only(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """The v4-outage rule for the guard: a goals.json labeled newer than the
+    """The v5-outage rule for the guard: a goals.json labeled newer than the
     installed package must not fail the sweep. The sweep journals one
     read-only notice, skips every goal mutation and hold/resume planning,
     and still advances its own non-goals state (transactions) so an operator
     sees a report instead of an exit code."""
     upsert_goal(tmp_path, _goal())
     payload = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
-    payload["schema"] = "chitra.goals.v4"
+    payload["schema"] = "chitra.goals.v5"
     (tmp_path / "goals.json").write_text(json.dumps(payload), encoding="utf-8")
     usage_dir = tmp_path / "usage"
     _write_snapshot(usage_dir, _snapshot(session_id="s1", tmux_session="lane1", five_hour_pct=93, ts=_iso()))
@@ -878,7 +878,7 @@ def test_sweep_survives_a_newer_goals_store_read_only(tmp_path: Path, capsys: py
     assert get_transaction(tmp_path, "host-b:lane1:0.0") is None
     assert report.paused == [] and report.resumed == []
     document = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
-    assert document["schema"] == "chitra.goals.v4"
+    assert document["schema"] == "chitra.goals.v5"
     notices = [line for line in capsys.readouterr().out.splitlines() if GOALS_SCHEMA_NEWER_MESSAGE in line]
     assert len(notices) == 1
 

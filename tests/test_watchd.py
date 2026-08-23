@@ -899,14 +899,14 @@ def test_delivered_order_triggers_review_of_next_turn_end(tmp_path: Path) -> Non
 
 
 def test_watchd_survives_a_newer_goals_store_read_only(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """The v4-outage rule for the state-writing watcher: against a goals.json
+    """The v5-outage rule for the state-writing watcher: against a goals.json
     labeled newer than the installed package, poll_once journals the read-only
     degradation once and keeps emitting pane events instead of letting
     GoalsSchemaNewerError kill run_forever's loop; goal mutations are skipped,
     so the newer writer's file is never rewritten."""
     goal = _tracked_goal(tmp_path)
     payload = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
-    payload["schema"] = "chitra.goals.v4"
+    payload["schema"] = "chitra.goals.v5"
     (tmp_path / "goals.json").write_text(json.dumps(payload), encoding="utf-8")
 
     captures = iter(["Working... esc to interrupt\n", "I need the exact release target before continuing.\n❯\n"])
@@ -930,7 +930,7 @@ def test_watchd_survives_a_newer_goals_store_read_only(tmp_path: Path, capsys: p
     assert stored is not None
     assert stored.status == "working"
     document = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
-    assert document["schema"] == "chitra.goals.v4"
+    assert document["schema"] == "chitra.goals.v5"
     notices = [line for line in capsys.readouterr().out.splitlines() if GOALS_SCHEMA_NEWER_MESSAGE in line]
     assert len(notices) == 1
 
@@ -946,7 +946,7 @@ def test_watchd_does_not_drain_completed_reviews_before_newer_schema_guard(
     """
     goal = _tracked_goal(tmp_path)
     payload = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
-    payload["schema"] = "chitra.goals.v4"
+    payload["schema"] = "chitra.goals.v5"
     (tmp_path / "goals.json").write_text(json.dumps(payload), encoding="utf-8")
 
     watcher = Watchd(WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"), runner=lambda _: _completed([], ""))
@@ -963,7 +963,7 @@ def test_watchd_does_not_drain_completed_reviews_before_newer_schema_guard(
         monkeypatch.undo()
         watcher.shutdown()
 
-    assert json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))["schema"] == "chitra.goals.v4"
+    assert json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))["schema"] == "chitra.goals.v5"
 
 
 def test_list_panes_uses_live_tmux_enumeration_and_deduplicates_pane_id() -> None:

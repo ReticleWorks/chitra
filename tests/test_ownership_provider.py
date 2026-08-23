@@ -103,7 +103,7 @@ def test_missing_state_returns_non_authoritative_unknown(tmp_path: Path) -> None
         # The schema this provider expects, which follows chitra.goals. The
         # document fixture above stays on v1 on purpose, to prove a host that
         # has not upgraded yet still reads authoritatively.
-        "schema": "chitra.goals.v3",
+        "schema": "chitra.goals.v4",
         "generation": 0,
         "complete": False,
         "manager_heartbeat_at": "",
@@ -294,14 +294,14 @@ def _read_args(goals_path: Path, marker_path: Path) -> dict[str, object]:
 
 def test_newer_goals_schema_and_future_fields_stay_authoritative(tmp_path: Path) -> None:
     """P6 forward compatibility: the provider accepts every schema
-    chitra.goals accepts -- including chitra.goals.v4 from a newer writer --
+    chitra.goals accepts -- including chitra.goals.v5 from a newer writer --
     and ignores unknown top-level or per-record fields instead of turning
     managed state into unknown/malformed during the exact version-skew
     incident P6 exists to handle. Duplicate keys, sizes, digests, required
     fields, and status checks are unchanged."""
     goals_path, marker_path = _write_state(tmp_path)
     payload = json.loads(goals_path.read_bytes())
-    payload["schema"] = "chitra.goals.v4"
+    payload["schema"] = "chitra.goals.v5"
     payload["future_v4_envelope"] = {"unknown": True}
     record = payload["goals"][0]
     record["future_v4_field"] = {"nested": [1, 2, 3]}
