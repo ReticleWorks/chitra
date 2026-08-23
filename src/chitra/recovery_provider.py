@@ -180,6 +180,17 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _provider_state(value: object) -> ProviderState:
+    """Normalize adapter text into the shared status enum."""
+
+    if isinstance(value, ProviderState):
+        return value
+    try:
+        return ProviderState(value) if isinstance(value, str) else ProviderState.UNKNOWN
+    except ValueError:
+        return ProviderState.UNKNOWN
+
+
 def _operation_dict(operation: object) -> dict[str, object]:
     if isinstance(operation, PendingProviderOperation):
         return cast(dict[str, object], operation.model_dump(mode="json"))
@@ -361,9 +372,7 @@ class _PackagedTophandProvider:
     def status(self) -> ProviderStatus:
         adapter = cast(Any, self._adapter)
         raw = _mapping(adapter.status(), "Tophand status")
-        state = raw.get("state", "unknown")
-        if state not in {item.value for item in ProviderState}:
-            state = "unknown"
+        state = _provider_state(raw.get("state", "unknown"))
         provider_session_id = raw.get("provider_session_id")
         generation = raw.get("generation", 0)
         if isinstance(generation, bool) or not isinstance(generation, int):
@@ -374,7 +383,7 @@ class _PackagedTophandProvider:
         reason = raw.get("reason")
         return ProviderStatus(
             provider=ProviderName.TOPHAND,
-            state=cast(Any, state),
+            state=state,
             provider_session_id=provider_session_id if isinstance(provider_session_id, str) else None,
             generation=generation,
             fresh=raw.get("fresh") is True,
@@ -819,9 +828,7 @@ class _PackagedAmpProvider:
     def status(self) -> ProviderStatus:
         adapter = cast(Any, self._adapter)
         raw = _mapping(adapter.status(None), "Amp status")
-        state = raw.get("state", "unknown")
-        if state not in {item.value for item in ProviderState}:
-            state = "unknown"
+        state = _provider_state(raw.get("state", "unknown"))
         generation = raw.get("generation", 0)
         if isinstance(generation, bool) or not isinstance(generation, int):
             generation = 0
@@ -832,7 +839,7 @@ class _PackagedAmpProvider:
         context_available = raw.get("context_available")
         return ProviderStatus(
             provider=ProviderName.AMP,
-            state=cast(Any, state),
+            state=state,
             provider_session_id=provider_session_id if isinstance(provider_session_id, str) else None,
             generation=generation,
             fresh=raw.get("fresh") is True,
