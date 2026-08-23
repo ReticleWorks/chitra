@@ -36,15 +36,26 @@ class AmpCreateSearchEvidence:
 
     operation_id: str
     create_tag: str
+    anchor_thread_ref: str
     match_count: int
+    complete: bool
+    visibility_watermark: str
     observed_at: str
     evidence: str
 
     def __post_init__(self) -> None:
-        if not self.operation_id.strip() or not self.create_tag.strip() or not self.evidence.strip():
+        if (
+            not self.operation_id.strip()
+            or not self.create_tag.strip()
+            or not self.anchor_thread_ref.strip()
+            or not self.visibility_watermark.strip()
+            or not self.evidence.strip()
+        ):
             raise ValueError("create search evidence fields must be non-empty")
         if isinstance(self.match_count, bool) or not isinstance(self.match_count, int) or self.match_count < 0:
             raise ValueError("create search match_count must be a non-negative integer")
+        if not isinstance(self.complete, bool):
+            raise ValueError("create search complete must be a boolean")
         _observed_at(self.observed_at)
 
 
@@ -153,9 +164,21 @@ def evaluate_amp_create_policy(
         return AmpCreatePolicyDecision(
             "unknown-and-hold", False, False, "exact deterministic create-tag search is unavailable", search
         )
-    if search.operation_id != pending.operation_id or search.create_tag != expected_amp_create_tag(record):
+    if (
+        search.operation_id != pending.operation_id
+        or search.create_tag != expected_amp_create_tag(record)
+        or search.anchor_thread_ref != record.provider.parent_thread_ref
+    ):
         return AmpCreatePolicyDecision(
-            "unknown-and-hold", False, False, "create search evidence does not match the pending operation tag", search
+            "unknown-and-hold",
+            False,
+            False,
+            "create search evidence does not match the pending operation tag and anchor",
+            search,
+        )
+    if not search.complete:
+        return AmpCreatePolicyDecision(
+            "unknown-and-hold", False, False, "create search does not prove a complete anchor visibility window", search
         )
     current = now or datetime.now(UTC)
     if current.tzinfo is None:

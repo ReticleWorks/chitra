@@ -882,6 +882,36 @@ class JoinedLaneReconciler:
             next_at = _text(_value(check, "at", "")) if check is not None else ""
         return ReconcileOutcome(record.lane_id, record.session_ref, status, allowed, reason, next_at, record)
 
+    def _apply_mutation_policy(
+        self,
+        outcome: ReconcileOutcome,
+        policy_outcome: ReconcileOutcome | None,
+    ) -> ReconcileOutcome:
+        """Keep read reconciliation evidence while denying the next provider mutation."""
+
+        if policy_outcome is None or (not outcome.send_allowed and policy_outcome.status != "cancel_required"):
+            return outcome
+        outcome_record = outcome.record
+        policy_record = policy_outcome.record
+        if outcome_record is not None and policy_record is not None and _revision(outcome_record) > _revision(policy_record):
+            outcome_record = self._save(
+                outcome_record,
+                status="blocked",
+                next_check_at=policy_outcome.next_check_at,
+                last_error=policy_outcome.reason,
+            )
+        elif policy_record is not None:
+            outcome_record = policy_record
+        return ReconcileOutcome(
+            outcome.lane_id,
+            outcome.session_ref,
+            policy_outcome.status,
+            False,
+            policy_outcome.reason,
+            policy_outcome.next_check_at,
+            outcome_record,
+        )
+
     def _amp_usage_policy_gate(
         self, record: JoinedLaneRecord
     ) -> tuple[ReconcileOutcome | None, AmpCreatePolicyDecision | None]:
@@ -925,15 +955,18 @@ class JoinedLaneReconciler:
 
     def reconcile(self, record: Any) -> ReconcileOutcome:
         try:
-            policy_outcome, create_decision = self._amp_usage_policy_gate(record)
-            if policy_outcome is not None:
-                return policy_outcome
             if not _record_pending(record):
                 return self._outcome(record, _record_status(record), True)
+            policy_outcome, create_decision = self._amp_usage_policy_gate(record)
             provider_result = self.provider_probe(record)
             provider = ProviderObservation.from_operation(provider_result) if provider_result is not None else None
             ownership = self.ownership_probe(record)
+            journal_update = self.journal_probe(record)
+            journal = ProviderObservation.from_update(journal_update) if journal_update is not None else None
+            ledger_entry = self.ledger_probe(record) if self.ledger_probe else None
             if provider is None and (create_decision is None or not create_decision.create_allowed):
+                if policy_outcome is not None:
+                    return policy_outcome
                 reason = "provider identity/status evidence is unavailable"
                 if create_decision is not None and create_decision.action == "adopt":
                     reason = "one matching Amp thread exists, but the Adapter did not return adoption evidence"
@@ -982,9 +1015,6 @@ class JoinedLaneReconciler:
             if provider is None:
                 raise JoinedLaneIdentityError("create reconciliation did not produce provider evidence")
 
-            journal_update = self.journal_probe(record)
-            journal = ProviderObservation.from_update(journal_update) if journal_update is not None else None
-            ledger_entry = self.ledger_probe(record) if self.ledger_probe else None
             journal_matches = self._observation_matches(record, journal)
             ledger_matches = self._ledger_matches(record, ledger_entry)
             ack_evidence = (
@@ -1014,17 +1044,26 @@ class JoinedLaneReconciler:
                 pending = _value(record, "pending_operation", None)
                 retry_result = (
                     None
-                    if create_retry_attempted or (create_decision is not None and not create_decision.create_allowed)
+                    if (
+                        policy_outcome is not None
+                        or create_retry_attempted
+                        or (create_decision is not None and not create_decision.create_allowed)
+                    )
                     else self.retry_pending_operation(pending)
                     if self.retry_pending_operation and pending is not None
                     else None
                 )
                 if retry_result is None:
                     reason = f"provider result: {provider.status}; exact journal evidence did not prove consumption"
-                    if create_decision is not None and create_decision.action == "adopt":
+                    if policy_outcome is not None:
+                        reason = policy_outcome.reason
+                    elif create_decision is not None and create_decision.action == "adopt":
                         reason = "one matching Amp thread must be adopted; create retry is denied"
                     updated = self._save(record, status="blocked", next_check_at=self._next_check(), last_error=reason)
-                    return self._outcome(updated, "blocked", False, reason)
+                    return self._apply_mutation_policy(
+                        self._outcome(updated, "blocked", False, reason),
+                        policy_outcome,
+                    )
                 if pending is None:
                     raise JoinedLaneIdentityError("retry callback was given no pending operation")
                 if (
@@ -1050,14 +1089,20 @@ class JoinedLaneReconciler:
                     next_check_at=self._next_check(),
                     last_error=f"provider result: {provider.status}",
                 )
-                return self._outcome(updated, "blocked", False, f"provider result: {provider.status}")
+                return self._apply_mutation_policy(
+                    self._outcome(updated, "blocked", False, f"provider result: {provider.status}"),
+                    policy_outcome,
+                )
 
             # A consumed operation remains in the canonical record as
             # evidence.  It is not a new send to reconcile, but the lane is
             # still active and its provider/ownership identity was checked
             # above before the next send can proceed.
             if current_result is not None and current_result.consumed is True:
-                return self._outcome(record, "observed", True, "previous operation already consumed")
+                return self._apply_mutation_policy(
+                    self._outcome(record, "observed", True, "previous operation already consumed"),
+                    policy_outcome,
+                )
 
             if provider is not None and provider.accepted and not accepted:
                 accepted = True
@@ -1082,7 +1127,10 @@ class JoinedLaneReconciler:
                     next_check_at=self._next_check(),
                     last_error="provider accepted; acknowledgement not durable",
                 )
-                return self._outcome(updated, "awaiting_ack", False, "provider accepted; waiting for durable acknowledgement")
+                return self._apply_mutation_policy(
+                    self._outcome(updated, "awaiting_ack", False, "provider accepted; waiting for durable acknowledgement"),
+                    policy_outcome,
+                )
 
             if evidence_ack and not acknowledged:
                 acknowledged = True
@@ -1104,7 +1152,10 @@ class JoinedLaneReconciler:
                     if result is not None:
                         updates["last_operation_result"] = result
                 updated = self._save(record, **updates)
-                return self._outcome(updated, "observed", True, "direction observed")
+                return self._apply_mutation_policy(
+                    self._outcome(updated, "observed", True, "direction observed"),
+                    policy_outcome,
+                )
 
             in_flight = accepted or acknowledged or observed or _value(record, "pending_operation", None) is not None
             if in_flight:
@@ -1114,8 +1165,14 @@ class JoinedLaneReconciler:
                     next_check_at=self._next_check(),
                     last_error="direction sent or accepted but not observed in the journal",
                 )
-                return self._outcome(updated, "sent_unobserved", False, "sent-but-unobserved direction")
-            return self._outcome(record, _record_status(record), True)
+                return self._apply_mutation_policy(
+                    self._outcome(updated, "sent_unobserved", False, "sent-but-unobserved direction"),
+                    policy_outcome,
+                )
+            return self._apply_mutation_policy(
+                self._outcome(record, _record_status(record), True),
+                policy_outcome,
+            )
         except (OSError, JoinedLaneError, ValidationError, TypeError, ValueError) as exc:
             try:
                 updated = self._save(record, status="blocked", next_check_at=self._next_check(), last_error=f"reconciliation failed: {exc}")

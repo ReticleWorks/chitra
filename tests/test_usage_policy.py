@@ -163,13 +163,38 @@ def pre_create_record() -> JoinedLaneRecord:
     )
 
 
-def create_search(record: JoinedLaneRecord, matches: int) -> AmpCreateSearchEvidence:
+def with_pending_send(record: JoinedLaneRecord) -> JoinedLaneRecord:
+    pending = PendingProviderOperation(
+        operation_id="send-1",
+        kind="send",
+        lane_id=record.lane_id,
+        provider_handle=record.provider.handle,
+        idempotency_key="idem-send-1",
+        payload_digest="digest-send-1",
+        provider_instance_id=record.provider.instance_id,
+        provider_generation=record.provider.generation,
+        created_at="2026-08-23T14:59:00+00:00",
+    )
+    reference = OperationReference(
+        operation_id=pending.operation_id,
+        idempotency_key=pending.idempotency_key,
+        payload_digest=pending.payload_digest,
+        kind=pending.kind,
+        created_at=pending.created_at,
+    )
+    return record.model_copy(update={"pending_operation": pending, "operation_history": (reference,)})
+
+
+def create_search(record: JoinedLaneRecord, matches: int, *, complete: bool = True) -> AmpCreateSearchEvidence:
     pending = record.pending_operation
     assert pending is not None
     return AmpCreateSearchEvidence(
         operation_id=pending.operation_id,
         create_tag=expected_amp_create_tag(record),
+        anchor_thread_ref="thread-anchor-a",
         match_count=matches,
+        complete=complete,
+        visibility_watermark="anchor:thread-anchor-a:cursor-42",
         observed_at="2026-08-23T14:59:30+00:00",
         evidence=f"evidence:create-search:{matches}",
     )
@@ -297,11 +322,14 @@ def test_pre_create_policy_uses_exact_tag_cardinality_without_invented_usage() -
     zero = evaluate_amp_create_policy(record, create_search(record, 0), now=NOW)
     one = evaluate_amp_create_policy(record, create_search(record, 1), now=NOW)
     many = evaluate_amp_create_policy(record, create_search(record, 2), now=NOW)
+    incomplete = evaluate_amp_create_policy(record, create_search(record, 0, complete=False), now=NOW)
 
     assert (zero.action, zero.create_allowed) == ("create-once", True)
     assert (one.action, one.create_allowed) == ("adopt", False)
     assert one.provider_reconciliation_allowed
     assert (many.action, many.provider_reconciliation_allowed) == ("ambiguous-and-hold", False)
+    assert (incomplete.action, incomplete.provider_reconciliation_allowed) == ("unknown-and-hold", False)
+    assert "complete anchor visibility window" in incomplete.reason
 
 
 def test_zero_match_pre_create_search_allows_one_exact_retry_before_usage_exists(tmp_path: Path) -> None:
@@ -415,43 +443,41 @@ def test_ceiling_restart_marks_canonical_cancel_and_quiescence_as_pending(tmp_pa
     assert outcome.status == "cancel_required"
     assert "supervisor must schedule a canonical cancel operation" in outcome.reason
     assert "verify provider quiescence" in outcome.reason
-    assert calls == []
+    assert calls == ["provider", "ownership", "journal"]
 
 
-def test_restart_blocks_before_adapter_probe_or_retry_when_policy_is_missing(tmp_path: Path) -> None:
-    pending = PendingProviderOperation(
-        operation_id="send-1",
-        kind="send",
-        lane_id="lane-a",
-        provider_handle="thread-parent-a",
-        idempotency_key="idem-send-1",
-        payload_digest="digest-send-1",
-        provider_instance_id="amp-instance-a",
-        provider_generation=1,
-        created_at="2026-08-23T14:59:00+00:00",
-    )
-    reference = OperationReference(
-        operation_id=pending.operation_id,
-        idempotency_key=pending.idempotency_key,
-        payload_digest=pending.payload_digest,
-        kind=pending.kind,
-        created_at=pending.created_at,
-    )
-    record = lane_record().model_copy(update={"pending_operation": pending, "operation_history": (reference,)})
+def test_restart_reconciles_reads_but_holds_retry_when_policy_is_missing(tmp_path: Path) -> None:
+    record = with_pending_send(lane_record())
+    pending = record.pending_operation
+    assert pending is not None
     store = JoinedLaneStore(tmp_path)
     store.create(record)
     calls: list[str] = []
 
-    def called(name: str) -> None:
-        calls.append(name)
+    def provider_probe(current: JoinedLaneRecord) -> ProviderOperationResult:
+        calls.append("provider")
+        return create_result(current, status="lost-response")
+
+    def ownership_probe(current: JoinedLaneRecord) -> dict[str, object]:
+        calls.append("ownership")
+        return authoritative_ownership(current)
+
+    def journal_probe(_record: JoinedLaneRecord) -> None:
+        calls.append("journal")
+
+    def retry_operation(_operation: PendingProviderOperation) -> None:
+        calls.append("retry")
+
+    def usage_probe(_record: JoinedLaneRecord) -> None:
+        calls.append("usage")
 
     reconciler = JoinedLaneReconciler(
         store,
-        provider_probe=lambda _record: called("provider"),
-        journal_probe=lambda _record: called("journal"),
-        ownership_probe=lambda _record: called("ownership"),
-        retry_pending_operation=lambda _operation: called("retry"),
-        usage_probe=lambda _record: called("usage"),
+        provider_probe=provider_probe,
+        journal_probe=journal_probe,
+        ownership_probe=ownership_probe,
+        retry_pending_operation=retry_operation,
+        usage_probe=usage_probe,
         now=lambda: NOW,
     )
 
@@ -460,7 +486,45 @@ def test_restart_blocks_before_adapter_probe_or_retry_when_policy_is_missing(tmp
     assert not report.ready
     assert len(report.blocked) == 1
     assert report.blocked[0].reason == "Amp lane has no Chitra launch policy"
-    assert calls == []
+    assert calls == ["provider", "ownership", "journal"]
     persisted = store.require("lane-a")
     assert persisted.pending_operation == pending
-    assert persisted.operation_history == (reference,)
+    assert persisted.operation_history == record.operation_history
+
+
+def test_stale_usage_allows_reconciliation_reads_but_holds_provider_retry(tmp_path: Path) -> None:
+    record = with_pending_send(lane_record(policy=launch_policy()))
+    stale_report = usage_report(5.0).model_copy(update={"observed_at": "2026-08-23T14:00:00+00:00"})
+    store = JoinedLaneStore(tmp_path)
+    store.create(record)
+    calls: list[str] = []
+
+    def provider_probe(current: JoinedLaneRecord) -> ProviderOperationResult:
+        calls.append("provider")
+        return create_result(current, status="lost-response")
+
+    def ownership_probe(current: JoinedLaneRecord) -> dict[str, object]:
+        calls.append("ownership")
+        return authoritative_ownership(current)
+
+    def journal_probe(_record: JoinedLaneRecord) -> None:
+        calls.append("journal")
+
+    def retry_operation(_operation: PendingProviderOperation) -> None:
+        calls.append("retry")
+
+    reconciler = JoinedLaneReconciler(
+        store,
+        provider_probe=provider_probe,
+        journal_probe=journal_probe,
+        ownership_probe=ownership_probe,
+        retry_pending_operation=retry_operation,
+        usage_probe=lambda _record: stale_report,
+        now=lambda: NOW,
+    )
+
+    outcome = reconciler.reconcile_all().outcomes[0]
+
+    assert not outcome.send_allowed
+    assert outcome.reason == "usage evidence is stale"
+    assert calls == ["provider", "ownership", "journal"]
