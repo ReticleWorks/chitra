@@ -2,16 +2,195 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SYSTEMD_DIR = REPO_ROOT / "packaging" / "systemd"
+OWNERSHIP_MANIFEST = SYSTEMD_DIR / "ownership.json"
 _ENVIRONMENT_NAME = re.compile(r"^Environment=(?P<name>[A-Z][A-Z0-9_]*)=", re.MULTILINE)
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SYSTEMD_TOKEN = re.compile(r"%[A-Za-z]|\$\{[A-Z][A-Z0-9_]*\}")
 
 
 def _environment_names(unit_path: Path) -> set[str]:
     return set(_ENVIRONMENT_NAME.findall(unit_path.read_text(encoding="utf-8")))
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _assert_relative_unit_name(filename: str) -> None:
+    path = Path(filename)
+    assert not path.is_absolute(), filename
+    assert ".." not in path.parts, filename
+    assert path.name == filename, filename
+
+
+def _assert_sha256(value: object, label: str) -> None:
+    assert isinstance(value, str) and _SHA256.fullmatch(value), label
+
+
+def _configured_external_roots(manifest: dict[str, object]) -> dict[str, Path]:
+    repositories = manifest["external_repositories"]
+    assert isinstance(repositories, dict)
+    roots: dict[str, Path] = {}
+    for repository, metadata in repositories.items():
+        assert isinstance(repository, str)
+        assert isinstance(metadata, dict)
+        environment_variable = metadata["environment_variable"]
+        assert isinstance(environment_variable, str)
+        raw_root = os.environ.get(environment_variable)
+        if raw_root is None:
+            continue
+        root = Path(raw_root).expanduser()
+        assert root.is_dir(), f"{environment_variable} does not name a directory: {root}"
+        roots[repository] = root
+    return roots
+
+
+def test_systemd_ownership_manifest_is_explicit_and_deterministic() -> None:
+    """Keep unit ownership and the cross-repository inventory reviewable.
+
+    Chitra owns the shared package units. Fleet and Polyphony own their
+    deployment-specific templates. The rate-limit template is the only
+    byte-identical cross-repository mirror found by the inventory scan.
+    """
+    manifest = json.loads(OWNERSHIP_MANIFEST.read_text(encoding="utf-8"))
+    assert manifest["schema"] == "chitra.systemd-ownership.v1"
+    assert manifest["hash"] == "sha256-bytes"
+    assert manifest["scope"] == "core-daemon-units-and-deployment-variants"
+    assert set(manifest["external_repositories"]) == {
+        "ReticleWorks/fleet-repo",
+        "ReticleWorks/polyphony",
+    }
+    classes = manifest["classes"]
+    assert {entry["owner"] for entry in classes.values()} >= {
+        "ReticleWorks/chitra",
+        "ReticleWorks/fleet-repo",
+        "ReticleWorks/polyphony",
+    }
+    for class_name, entry in classes.items():
+        assert isinstance(class_name, str)
+        assert isinstance(entry["owner"], str)
+        assert isinstance(entry["parameter_mode"], str)
+        for filename, expected_hash in entry["units"].items():
+            _assert_relative_unit_name(filename)
+            if class_name == "shared-mirror":
+                assert set(expected_hash) == {"fleet", "polyphony"}
+                for side, side_hash in expected_hash.items():
+                    _assert_sha256(side_hash, f"{class_name}.{filename}.{side}")
+            else:
+                _assert_sha256(expected_hash, f"{class_name}.{filename}")
+
+    shared = classes["shared-package"]
+    assert shared["parameter_mode"] == "literal"
+    assert set(shared["units"]) == {
+        "chitra-dispatchd.service",
+        "chitra-sweepd.service",
+        "chitra-triaged.service",
+        "chitra-watchd.service",
+    }
+    for filename, expected_hash in shared["units"].items():
+        unit = SYSTEMD_DIR / filename
+        assert unit.is_file(), filename
+        assert _sha256(unit) == expected_hash, filename
+        text = unit.read_text(encoding="utf-8")
+        assert not any(token in text for token in shared["forbidden_tokens"]), filename
+
+    mirrored = classes["shared-mirror"]["units"]
+    assert set(mirrored) == {
+        "chitra-rate-limit-guard@.service",
+        "chitra-rate-limit-guard@.timer",
+    }
+    for hashes in mirrored.values():
+        assert hashes["fleet"] == hashes["polyphony"]
+    mirror = classes["shared-mirror"]
+    assert mirror["roots"] == {
+        "fleet": "packages/chitra/units",
+        "polyphony": "infra/systemd",
+    }
+    assert mirror["parameter_mode"] == "instance-template"
+    assert mirror["required_tokens"] == ["%i"]
+    assert set(mirror["required_tokens"]) <= set(mirror["allowed_tokens"])
+
+
+def test_systemd_ownership_manifest_rejects_duplicate_class_ownership() -> None:
+    """A unit name may have intentional variants, but one class owns each copy."""
+    manifest = json.loads(OWNERSHIP_MANIFEST.read_text(encoding="utf-8"))
+    seen: dict[tuple[str, str, str], str] = {}
+    for class_name, entry in manifest["classes"].items():
+        if "root" not in entry:
+            continue
+        units = entry["units"]
+        for filename in units:
+            key = (entry["owner"], entry["root"], filename)
+            previous = seen.setdefault(key, class_name)
+            assert previous == class_name, f"{key} appears in {previous} and {class_name}"
+
+
+def test_instance_template_classes_require_instance_parameter() -> None:
+    """Instance units must carry the instance parameter in their contract."""
+    manifest = json.loads(OWNERSHIP_MANIFEST.read_text(encoding="utf-8"))
+    for class_name in ("package-instance", "fleet-instance", "polyphony-instance", "shared-mirror"):
+        entry = manifest["classes"][class_name]
+        assert entry["parameter_mode"] == "instance-template"
+        assert entry["required_tokens"] == ["%i"]
+        assert set(entry["required_tokens"]) <= set(entry["allowed_tokens"])
+
+
+def test_external_ownership_hashes_when_repositories_are_configured() -> None:
+    """Verify external hashes and mirrors when an inventory checkout is supplied.
+
+    Chitra's normal package CI has only this checkout, so the external
+    repositories are opt-in through the documented environment variables. A
+    consolidation or release job can set both variables to run this check;
+    no developer-specific sibling path is assumed here.
+    """
+    manifest = json.loads(OWNERSHIP_MANIFEST.read_text(encoding="utf-8"))
+    roots = _configured_external_roots(manifest)
+    required_repositories = {"ReticleWorks/fleet-repo", "ReticleWorks/polyphony"}
+    if not required_repositories <= roots.keys():
+        pytest.skip(
+            "set CHITRA_OWNERSHIP_FLEET_ROOT and CHITRA_OWNERSHIP_POLYPHONY_ROOT "
+            "to run cross-repository ownership verification"
+        )
+
+    classes = manifest["classes"]
+    for class_name, entry in classes.items():
+        owner = entry["owner"]
+        if class_name == "shared-mirror" or owner not in roots:
+            continue
+        root = roots[owner] / entry["root"]
+        for filename, expected_hash in entry["units"].items():
+            unit = root / filename
+            assert unit.is_file(), f"{class_name}: missing {unit}"
+            assert _sha256(unit) == expected_hash, f"{class_name}: stale hash for {filename}"
+            if entry["parameter_mode"] == "instance-template":
+                text = unit.read_text(encoding="utf-8")
+                for token in entry["required_tokens"]:
+                    assert token in text, f"{class_name}: {filename} lacks {token}"
+                assert set(_SYSTEMD_TOKEN.findall(text)) <= set(entry["allowed_tokens"]), (
+                    f"{class_name}: {filename} has an undeclared systemd token"
+                )
+
+    mirror = classes["shared-mirror"]
+    fleet_root = roots[mirror["owner"]] / mirror["roots"]["fleet"]
+    polyphony_root = roots[mirror["mirror"]] / mirror["roots"]["polyphony"]
+    for filename, hashes in mirror["units"].items():
+        fleet_unit = fleet_root / filename
+        polyphony_unit = polyphony_root / filename
+        assert fleet_unit.is_file(), fleet_unit
+        assert polyphony_unit.is_file(), polyphony_unit
+        assert _sha256(fleet_unit) == hashes["fleet"], f"shared mirror stale in Fleet: {filename}"
+        assert _sha256(polyphony_unit) == hashes["polyphony"], f"shared mirror stale in Polyphony: {filename}"
+        assert fleet_unit.read_bytes() == polyphony_unit.read_bytes(), f"shared mirror diverged: {filename}"
 
 
 def test_shipped_systemd_environment_variables_are_consumed_by_their_entrypoints() -> None:
