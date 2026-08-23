@@ -49,6 +49,8 @@ from .provider_protocol import (
 )
 from .recovery import RecoveryProviderResolver
 from .session_contract import (
+    ChildRosterEntry,
+    CloseArchiveResult,
     JoinedLaneRecord,
     LaneUpdate,
     OperatingFact,
@@ -56,6 +58,7 @@ from .session_contract import (
     ProviderIdentity,
     validate_update,
 )
+from .usage_policy import launch_policy_problem
 
 try:
     # Fleet packages this exact module under /opt/polyphony/deploy-main.  The
@@ -68,6 +71,27 @@ except ImportError:  # pragma: no cover - exercised by source-only installs
     _packaged_tophand_builder: Callable[..., object] | None = None
 else:
     _packaged_tophand_builder = cast(Callable[..., object], _imported_tophand_builder)
+
+try:
+    # Amp is an optional, disabled-by-policy production capability.  Keep the
+    # import path closed and explicit so a lane cannot select arbitrary code.
+    from tools.support.chitra_adapter.amp_adapter import (  # type: ignore[import-untyped]
+        AmpAdapter as _imported_amp_adapter,
+    )
+    from tools.support.chitra_adapter.amp_cli_transport import (  # type: ignore[import-untyped]
+        AmpCliProfile as _imported_amp_profile,
+    )
+    from tools.support.chitra_adapter.amp_cli_transport import (
+        AmpCliTransport as _imported_amp_transport,
+    )
+except ImportError:  # pragma: no cover - exercised by source-only installs
+    _packaged_amp_adapter: Callable[..., object] | None = None
+    _packaged_amp_profile: Callable[..., object] | None = None
+    _packaged_amp_transport: Callable[..., object] | None = None
+else:
+    _packaged_amp_adapter = cast(Callable[..., object], _imported_amp_adapter)
+    _packaged_amp_profile = cast(Callable[..., object], _imported_amp_profile)
+    _packaged_amp_transport = cast(Callable[..., object], _imported_amp_transport)
 
 logger = structlog.get_logger(__name__)
 
@@ -167,8 +191,14 @@ def _operation_dict(operation: object) -> dict[str, object]:
 def _mapping(value: object, name: str) -> Mapping[str, object]:
     if isinstance(value, Mapping):
         return value
-    if hasattr(value, "model_dump"):
-        dumped = value.model_dump(mode="json")
+    for method_name in ("model_dump", "to_dict"):
+        method = getattr(value, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            dumped = method(mode="json") if method_name == "model_dump" else method()
+        except TypeError:
+            dumped = method()
         if isinstance(dumped, Mapping):
             return cast(Mapping[str, object], dumped)
     raise TypeError(f"{name} must be a mapping")
@@ -177,10 +207,12 @@ def _mapping(value: object, name: str) -> Mapping[str, object]:
 def _provider_result(
     value: object,
     operation: PendingProviderOperation,
+    *,
+    provider_label: str = "provider",
 ) -> ProviderOperationResult:
     """Translate the packaged adapter result into Chitra's typed result."""
 
-    raw = _mapping(value, "Tophand provider result")
+    raw = _mapping(value, f"{provider_label} provider result")
     for field in (
         "operation_id",
         "kind",
@@ -194,7 +226,7 @@ def _provider_result(
         observed = raw.get(field)
         expected = getattr(operation, field)
         if observed is not None and observed != expected:
-            raise ValueError(f"Tophand provider result {field} changed")
+            raise ValueError(f"{provider_label} provider result {field} changed")
     status = raw.get("status")
     if status not in {"accepted", "consumed", "rejected", "unknown", "lost-response"}:
         status = "unknown"
@@ -226,6 +258,29 @@ def _provider_result(
         consumed=consumed,
         observed_at=observed_at,
         evidence=evidence if isinstance(evidence, str) else "",
+    )
+
+
+def _unknown_provider_result(
+    operation: PendingProviderOperation,
+    evidence: str,
+) -> ProviderOperationResult:
+    """Return an explicit unknown result without claiming an Amp mutation."""
+
+    return ProviderOperationResult(
+        operation_id=operation.operation_id,
+        kind=operation.kind,
+        lane_id=operation.lane_id,
+        provider_handle=operation.provider_handle,
+        idempotency_key=operation.idempotency_key,
+        payload_digest=operation.payload_digest,
+        provider_instance_id=operation.provider_instance_id,
+        provider_generation=operation.provider_generation,
+        status="unknown",
+        accepted=None,
+        consumed=None,
+        observed_at=_now(),
+        evidence=evidence,
     )
 
 
@@ -418,6 +473,429 @@ class _PackagedTophandProvider:
         raise RuntimeError("Tophand close is not part of recovery supervision")
 
 
+_AMP_CAPABILITY_NAMES = (
+    "create_or_resume",
+    "status",
+    "send",
+    "read_updates",
+    "checkpoint",
+    "usage",
+    "cancel_current_turn",
+    "close",
+    "resume_after_close",
+    "subagents",
+    "parent_child_usage",
+)
+
+_AMP_RUNTIME_FACT_NAMES = frozenset(("fleet.provider-capabilities", "fleet.versions"))
+_TWINRIDGE_AMP_BINARY = "/usr/local/bin/amp"
+
+
+def _amp_runtime_config(
+    operating_facts: Sequence[OperatingFact],
+    *,
+    expected_project_ref: str,
+    expected_profile_digest: str,
+    expected_version: str,
+) -> tuple[str, str] | None:
+    """Return the reviewed Amp binary and version from current Fleet facts.
+
+    The packaged ``AmpCliTransport`` has a macOS development default.  A
+    production lane must never inherit it.  Fleet therefore publishes the
+    exact Linux wrapper and its reviewed version under the explicit ``amp``
+    record in either the versions or provider-capabilities fact.  Missing,
+    stale, conflicting, malformed, or policy-mismatched data leaves the lane
+    unavailable instead of selecting a path or version by convention.
+    """
+
+    candidates: set[tuple[str, str]] = set()
+    for fact in operating_facts:
+        if fact.name not in _AMP_RUNTIME_FACT_NAMES:
+            continue
+        if fact.state in {"stale", "conflicting", "inaccessible"}:
+            return None
+        if fact.state != "known":
+            continue
+        value = fact.value
+        if not isinstance(value, Mapping):
+            continue
+        # Fleet publishes the lane-specific runtime surface beneath this
+        # explicit namespace.  Do not fall back to a top-level or inferred
+        # provider record.
+        surface = value.get("orb_lane_surface")
+        if not isinstance(surface, Mapping) or surface.get("provider") != "amp":
+            continue
+        if not fact.is_current():
+            return None
+        binary = surface.get("amp_binary_path")
+        version = surface.get("amp_version")
+        if (
+            not isinstance(binary, str)
+            or binary != _TWINRIDGE_AMP_BINARY
+            or not isinstance(version, str)
+            or not version.strip()
+        ):
+            return None
+        project_ref = surface.get("project_ref")
+        if project_ref is not None and project_ref != expected_project_ref:
+            return None
+        profile_digest = surface.get("profile_digest")
+        if profile_digest is not None and profile_digest != expected_profile_digest:
+            return None
+        if version != expected_version:
+            return None
+        candidates.add((binary, version))
+    if len(candidates) != 1:
+        return None
+    return next(iter(candidates))
+
+
+def _amp_capabilities(value: object) -> ProviderCapabilities:
+    raw = value if isinstance(value, Mapping) else {}
+    supported = tuple(name for name in _AMP_CAPABILITY_NAMES if raw.get(name) is True)
+    return ProviderCapabilities.from_supported(cast(Any, supported))
+
+
+def _amp_child_roster(lane_reader: Callable[[], object]) -> tuple[ChildRosterEntry, ...]:
+    context = _mapping(lane_reader(), "Amp lane context")
+    values = context.get("child_roster", ())
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+        raise TypeError("Amp lane child_roster must be a sequence")
+    entries: list[ChildRosterEntry] = []
+    for value in values:
+        entries.append(ChildRosterEntry.model_validate(value, strict=True))
+    return tuple(entries)
+
+
+def _amp_usage_report(value: object, lane_reader: Callable[[], object]) -> UsageReport:
+    """Translate Amp evidence without allowing it to replace Chitra's roster."""
+
+    raw = dict(_mapping(value, "Amp usage report"))
+    # ``usage_scope`` is provider evidence, not part of Chitra's typed report.
+    # The launch policy remains the only owner of any ceiling.
+    raw.pop("usage_scope", None)
+    raw.pop("ceiling", None)
+    expected = _amp_child_roster(lane_reader)
+    observed = raw.get("child_roster", ())
+    if not isinstance(observed, Sequence) or isinstance(observed, (str, bytes)):
+        raise TypeError("Amp usage child_roster must be a sequence")
+    if observed and not all(
+        isinstance(value, Mapping) and "retained_state" in value and "material_result" in value
+        for value in observed
+    ):
+        by_id = {entry.child_id: entry for entry in expected}
+        observed_ids = {
+            str(value.get("child_id", value.get("thread_id", value.get("id", ""))))
+            for value in observed
+            if isinstance(value, Mapping)
+        }
+        if observed_ids != set(by_id):
+            raise ValueError("Amp usage roster does not match Chitra's observed child roster")
+        raw["child_roster"] = [by_id[child_id].model_dump(mode="json") for child_id in sorted(by_id)]
+    elif observed:
+        canonical = tuple(ChildRosterEntry.model_validate(value, strict=True) for value in observed)
+        if canonical != expected:
+            raise ValueError("Amp usage changed Chitra's child roster evidence")
+        raw["child_roster"] = [entry.model_dump(mode="json") for entry in canonical]
+    elif expected and raw.get("complete") is True:
+        raise ValueError("complete Amp usage omitted Chitra's observed child roster")
+    return UsageReport.from_dict(raw)
+
+
+def _unknown_close_result(operation: PendingProviderOperation, evidence: str) -> CloseArchiveResult:
+    provider_generation = operation.provider_generation
+    if provider_generation is None:  # MutationRequest normally prevents this.
+        raise ValueError("close operation lacks provider generation")
+    return CloseArchiveResult(
+        operation_id=operation.operation_id,
+        lane_id=operation.lane_id,
+        provider_handle=operation.provider_handle,
+        provider_instance_id=operation.provider_instance_id or "unknown-instance",
+        provider_generation=provider_generation,
+        idempotency_key=operation.idempotency_key,
+        payload_digest=operation.payload_digest,
+        state="unknown",
+        provider_thread_ref=operation.provider_handle,
+        same_provider_thread=None,
+        later_resume_supported=None,
+        checkpoint_ref=None,
+        quiescent=None,
+        observed_at=_now(),
+        evidence=evidence or "Amp close evidence is unavailable",
+    )
+
+
+def _amp_close_result(
+    value: object,
+    operation: PendingProviderOperation,
+    *,
+    expected_checkpoint_ref: str | None,
+) -> CloseArchiveResult:
+    raw = dict(_mapping(value, "Amp close result"))
+    provider_generation = operation.provider_generation
+    provider_instance_id = operation.provider_instance_id
+    if provider_generation is None or provider_instance_id is None:
+        return _unknown_close_result(operation, "close operation lacks a complete provider identity")
+    for field in (
+        "operation_id",
+        "lane_id",
+        "provider_handle",
+        "idempotency_key",
+        "payload_digest",
+        "provider_instance_id",
+        "provider_generation",
+    ):
+        observed = raw.get(field)
+        expected = getattr(operation, field)
+        if observed is not None and observed != expected:
+            return _unknown_close_result(operation, f"Amp close result {field} changed")
+    state = raw.get("state")
+    if state not in {"closed", "archived", "unknown", "failed"}:
+        return _unknown_close_result(operation, "Amp close result state is unknown")
+    provider_thread_ref = raw.get("provider_thread_ref")
+    if not isinstance(provider_thread_ref, str) or not provider_thread_ref:
+        return _unknown_close_result(operation, "Amp close result has no provider thread evidence")
+    checkpoint_ref = raw.get("checkpoint_ref")
+    if checkpoint_ref is not None and not isinstance(checkpoint_ref, str):
+        return _unknown_close_result(operation, "Amp close checkpoint evidence is malformed")
+    same_provider_thread = raw.get("same_provider_thread")
+    later_resume_supported = raw.get("later_resume_supported")
+    quiescent = raw.get("quiescent")
+    evidence = raw.get("evidence")
+    observed_at = raw.get("observed_at")
+    if not isinstance(observed_at, str) or not observed_at.strip():
+        observed_at = _now()
+    if not isinstance(evidence, str) or not evidence.strip():
+        evidence = "Amp close evidence is unavailable"
+    if state in {"closed", "archived"} and (
+        state != "archived"
+        or expected_checkpoint_ref is None
+        or checkpoint_ref != expected_checkpoint_ref
+        or provider_thread_ref != operation.provider_handle
+        or same_provider_thread is not True
+        or quiescent is not True
+    ):
+        return _unknown_close_result(operation, "Amp archive did not prove Chitra's governed close conditions")
+    return CloseArchiveResult(
+        operation_id=operation.operation_id,
+        lane_id=operation.lane_id,
+        provider_handle=operation.provider_handle,
+        provider_instance_id=provider_instance_id,
+        provider_generation=provider_generation,
+        idempotency_key=operation.idempotency_key,
+        payload_digest=operation.payload_digest,
+        state=cast(Any, state),
+        provider_thread_ref=provider_thread_ref,
+        same_provider_thread=same_provider_thread if isinstance(same_provider_thread, bool) else None,
+        later_resume_supported=later_resume_supported if isinstance(later_resume_supported, bool) else None,
+        checkpoint_ref=checkpoint_ref,
+        quiescent=quiescent if isinstance(quiescent, bool) else None,
+        observed_at=observed_at,
+        evidence=evidence,
+    )
+
+
+class _PackagedAmpProvider:
+    """Typed Chitra facade over the single allowlisted Amp adapter.
+
+    Amp supplies transport observations.  Chitra supplies durable operation,
+    checkpoint, cursor, result, event, facts, and close authority.  In
+    particular, ``checkpoint`` is exposed to satisfy the shared Provider
+    protocol but never calls an Amp checkpoint primitive.
+    """
+
+    def __init__(
+        self,
+        adapter: object,
+        *,
+        result_sink: RecoverySink,
+        cursor_sink: RecoverySink,
+        lane_reader: Callable[[], object],
+    ) -> None:
+        self._adapter = adapter
+        self._result_sink = result_sink
+        self._cursor_sink = cursor_sink
+        self._lane_reader = lane_reader
+
+    @property
+    def provider_name(self) -> ProviderName:
+        return ProviderName.AMP
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return _amp_capabilities(getattr(self._adapter, "capabilities", {}))
+
+    def _payload(self, request: object, operation: PendingProviderOperation) -> dict[str, object]:
+        payload: dict[str, object] = {"operation": _operation_dict(operation)}
+        if isinstance(request, SendRequest):
+            payload["text"] = request.text
+        elif isinstance(request, CreateOrResumeRequest):
+            payload.update(
+                {
+                    "session_ref": request.session_ref,
+                    "provider_session_id": request.provider_session_id,
+                    "context_ref": request.context_ref,
+                }
+            )
+        elif isinstance(request, CancelCurrentTurnRequest):
+            payload["reason"] = request.reason
+            context = _mapping(self._lane_reader(), "Amp lane context")
+            current_turn_id = context.get("current_turn_id")
+            if isinstance(current_turn_id, str) and current_turn_id:
+                payload["current_turn_id"] = current_turn_id
+        elif isinstance(request, CloseRequest):
+            payload["archive"] = request.archive
+        return payload
+
+    def _call(
+        self,
+        method: str,
+        request: object,
+        operation: PendingProviderOperation,
+    ) -> ProviderOperationResult:
+        raw = getattr(self._adapter, method)(self._payload(request, operation))
+        result = _provider_result(raw, operation, provider_label="Amp")
+        self._result_sink(raw)
+        return result
+
+    def create_or_resume(self, request: CreateOrResumeRequest) -> ProviderOperationResult:
+        # The exact pending envelope crosses unchanged.  AmpAdapter performs
+        # the exact-tag search and holds on zero-result lost creates.
+        return self._call("create_or_resume", request, request.operation)
+
+    def status(self) -> ProviderStatus:
+        adapter = cast(Any, self._adapter)
+        raw = _mapping(adapter.status(None), "Amp status")
+        state = raw.get("state", "unknown")
+        if state not in {item.value for item in ProviderState}:
+            state = "unknown"
+        generation = raw.get("generation", 0)
+        if isinstance(generation, bool) or not isinstance(generation, int):
+            generation = 0
+        provider_session_id = raw.get("provider_session_id")
+        current_turn_id = raw.get("current_turn_id")
+        last_event_id = raw.get("last_event_id")
+        reason = raw.get("reason")
+        context_available = raw.get("context_available")
+        return ProviderStatus(
+            provider=ProviderName.AMP,
+            state=cast(Any, state),
+            provider_session_id=provider_session_id if isinstance(provider_session_id, str) else None,
+            generation=generation,
+            fresh=raw.get("fresh") is True,
+            provider_available=raw.get("provider_available") is True,
+            context_available=context_available if isinstance(context_available, bool) else None,
+            current_turn_id=current_turn_id if isinstance(current_turn_id, str) else None,
+            last_event_id=last_event_id if isinstance(last_event_id, str) else None,
+            reason=reason if isinstance(reason, str) else "",
+        )
+
+    def send(self, request: SendRequest) -> ProviderOperationResult:
+        return self._call("send", request, request.operation)
+
+    def read_updates(self, cursor: str | None = None) -> ReadUpdatesResult:
+        adapter = cast(Any, self._adapter)
+        raw = _mapping(adapter.read_updates(cursor), "Amp update batch")
+        values = raw.get("updates", ())
+        if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+            raise TypeError("Amp updates must be a sequence")
+        updates: list[ProviderUpdate] = []
+        for value in values:
+            item = _mapping(value, "Amp update")
+            required = tuple(item.get(name) for name in ("operation_id", "event_id", "cursor"))
+            if not all(isinstance(field, str) and field for field in required):
+                continue
+            generation = item.get("provider_generation", 0)
+            if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+                continue
+            identity = tuple(
+                item.get(name)
+                for name in (
+                    "provider_instance_id",
+                    "lane_id",
+                    "provider_handle",
+                    "idempotency_key",
+                    "payload_digest",
+                )
+            )
+            if not all(isinstance(field, str) and field for field in identity):
+                continue
+            payload = item.get("payload", {})
+            if not isinstance(payload, Mapping):
+                payload = {}
+            observed_at = item.get("observed_at")
+            if not isinstance(observed_at, str) or not observed_at:
+                observed_at = _now()
+            provider_session_id = item.get("provider_session_id")
+            updates.append(
+                ProviderUpdate(
+                    event_id=cast(str, item["event_id"]),
+                    cursor=cast(str, item["cursor"]),
+                    kind=cast(Any, item.get("kind", "unknown")),
+                    provider_session_id=provider_session_id if isinstance(provider_session_id, str) else None,
+                    observed_at=observed_at,
+                    operation_id=cast(str, item["operation_id"]),
+                    lane_id=cast(str, item["lane_id"]),
+                    idempotency_key=cast(str, item["idempotency_key"]),
+                    payload_digest=cast(str, item["payload_digest"]),
+                    provider_instance_id=cast(str, item["provider_instance_id"]),
+                    provider_generation=generation,
+                    payload=cast(Mapping[str, object], payload),
+                )
+            )
+        next_cursor = raw.get("next_cursor", raw.get("cursor"))
+        next_cursor_text = next_cursor if isinstance(next_cursor, str) else cursor or ""
+        self._cursor_sink(next_cursor_text)
+        reason = raw.get("reason")
+        return ReadUpdatesResult(
+            requested_cursor=cursor,
+            next_cursor=next_cursor_text,
+            updates=tuple(updates),
+            provider_available=raw.get("provider_available") is not False,
+            complete=raw.get("complete") is not False,
+            reason=reason if isinstance(reason, str) else "",
+        )
+
+    def checkpoint(self, request: CheckpointRequest) -> ProviderOperationResult:
+        # CheckpointRequest is recorded and verified by Chitra.  Amp CLI has
+        # no provider checkpoint primitive, so this method cannot claim one.
+        return _unknown_provider_result(
+            request.operation,
+            "Chitra owns the checkpoint receipt; Amp has no checkpoint primitive",
+        )
+
+    def usage(self) -> UsageReport:
+        adapter = cast(Any, self._adapter)
+        raw = adapter.usage(None)
+        return _amp_usage_report(raw, self._lane_reader)
+
+    def cancel_current_turn(self, request: CancelCurrentTurnRequest) -> ProviderOperationResult:
+        return self._call("cancel_current_turn", request, request.operation)
+
+    def close(self, request: CloseRequest) -> CloseArchiveResult:
+        if not request.archive:
+            return _unknown_close_result(request.operation, "Amp close is archive-only")
+        try:
+            context = _mapping(self._lane_reader(), "Amp lane context")
+            expected_checkpoint_ref = context.get("checkpoint_ref")
+            if not isinstance(expected_checkpoint_ref, str) or not expected_checkpoint_ref:
+                return _unknown_close_result(request.operation, "Chitra has no durable checkpoint reference")
+            if context.get("quiescent") is not True:
+                return _unknown_close_result(request.operation, "Chitra has not observed lane quiescence")
+            # AmpAdapter.close is the canonical composite operation.  It
+            # validates Amp quiescence/usage and returns Chitra's checkpoint
+            # reference plus archive evidence from the transport.
+            adapter = cast(Any, self._adapter)
+            raw = adapter.close(self._payload(request, request.operation))
+            return _amp_close_result(
+                raw,
+                request.operation,
+                expected_checkpoint_ref=expected_checkpoint_ref,
+            )
+        except Exception as exc:  # noqa: BLE001 - provider outage is an unknown result
+            return _unknown_close_result(request.operation, f"Amp close evidence unavailable: {exc}")
+
+
 def _canonical_tophand_factory(
     *,
     identity: ProviderIdentity,
@@ -480,6 +958,122 @@ def _canonical_tophand_factory(
     if adapter is None:
         return None
     provider = _PackagedTophandProvider(adapter, result_sink=result_sink)
+    return provider if isinstance(provider, Provider) else None
+
+
+def _canonical_amp_factory(
+    *,
+    identity: ProviderIdentity,
+    lane: LaneSpec,
+    record: JoinedLaneRecord,
+    state_root: Path,
+    pending_sink: RecoverySink,
+    cursor_sink: RecoverySink,
+    result_sink: RecoverySink,
+    event_sink: RecoverySink,
+    checkpoint_verifier: RecoveryVerifier,
+    cancel_verifier: RecoveryVerifier,
+    facts_reader: RecoveryFactsReader,
+    operating_facts: tuple[OperatingFact, ...],
+) -> Provider | None:
+    """Build the one static Amp route after Chitra's launch-policy gate."""
+
+    del pending_sink, event_sink, checkpoint_verifier, cancel_verifier
+    if identity.kind != "amp":
+        return None
+    if (
+        _packaged_amp_adapter is None
+        or _packaged_amp_profile is None
+        or _packaged_amp_transport is None
+        or identity.instance_id is None
+        or identity.generation is None
+    ):
+        return None
+    if launch_policy_problem(record) is not None:
+        return None
+    policy = record.launch_policy
+    if policy is None:  # The policy check above is intentionally repeated for type narrowing.
+        return None
+    runtime = _amp_runtime_config(
+        operating_facts,
+        expected_project_ref=policy.project_ref,
+        expected_profile_digest=policy.profile_digest,
+        expected_version=identity.provider_version,
+    )
+    if runtime is None:
+        return None
+    amp_binary, amp_version = runtime
+
+    store = JoinedLaneStore(state_root)
+    initial_facts = tuple(operating_facts)
+
+    def lane_reader() -> dict[str, object]:
+        current = store.load(lane.identifier) or record
+        current_facts = tuple(facts_reader(current))
+        update = current.current_update
+        roster = () if update is None else update.child_roster
+        known_handles = [current.provider.handle]
+        if current.last_close_result is not None:
+            known_handles.append(current.last_close_result.provider_thread_ref)
+        context: dict[str, object] = {
+            "lane_id": current.lane_id,
+            "goal_id": current.goal_id,
+            "goal_version": current.goal_version,
+            "session_ref": current.session_ref,
+            "provider_handle": current.provider.handle,
+            "provider_instance_id": current.provider.instance_id,
+            "provider_generation": current.provider.generation,
+            "parent_thread_ref": current.provider.parent_thread_ref,
+            "project_ref": current.provider.project_ref,
+            "profile_digest": current.provider.profile_digest,
+            "provider_version": current.provider.provider_version,
+            "known_provider_handles": tuple(dict.fromkeys(known_handles)),
+            "child_roster": tuple(entry.model_dump(mode="json") for entry in roster),
+            "child_ids": tuple(entry.child_id for entry in roster),
+            "checkpoint_ref": current.checkpoint_reference,
+            "quiescent": current.checkpoint_reference is not None and current.pending_operation is None,
+            "observed_at": update.observed_at if update is not None else _now(),
+            "operating_facts": tuple(fact.model_dump(mode="json") for fact in current_facts),
+        }
+        if not current_facts and initial_facts:
+            context["operating_facts"] = tuple(fact.model_dump(mode="json") for fact in initial_facts)
+        return context
+
+    try:
+        # The project and private visibility are fixed Chitra policy inputs.
+        # The Amp flag remains disabled unless this explicit lane policy passed.
+        profile = _packaged_amp_profile(
+            project_ref=policy.project_ref,
+            orb_size="a1.tiny",
+            profile_digest=policy.profile_digest,
+            visibility="private",
+        )
+        transport = _packaged_amp_transport(
+            profile,
+            amp_binary=amp_binary,
+            amp_version=amp_version,
+        )
+        adapter = _packaged_amp_adapter(
+            transport=transport,
+            project_ref=policy.project_ref,
+            visibility="private",
+            enabled=True,
+            profile_digest=policy.profile_digest,
+            anchor_thread_id=identity.parent_thread_ref,
+            lane_reader=lane_reader,
+            amp_version=amp_version,
+        )
+    except Exception as exc:  # noqa: BLE001 - unavailable provider is canonical unknown
+        logger.warning("packaged_amp_unavailable", lane_id=record.lane_id, error=str(exc))
+        return None
+    if adapter is None:
+        return None
+    provider = _PackagedAmpProvider(
+        adapter,
+        result_sink=result_sink,
+        cursor_sink=cursor_sink,
+        lane_reader=lane_reader,
+    )
     return provider if isinstance(provider, Provider) else None
 
 
@@ -678,6 +1272,7 @@ def build_recovery_provider_resolver(
             cancel_verifier,
         ) = _canonical_recovery_bindings(lane)
         tophand_factory = _canonical_tophand_factory
+        amp_factory = _canonical_amp_factory
 
     factories = _factory_map(
         tophand_factory=tophand_factory,

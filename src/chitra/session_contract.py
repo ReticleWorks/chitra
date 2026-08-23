@@ -683,7 +683,9 @@ def validate_pending_operation(provider: ProviderIdentity, operation: PendingPro
         raise ContractValidationError("pending operation provider generation does not match provider identity")
     if not provider.supports(operation.kind):
         raise ContractValidationError(f"provider does not support operation {operation.kind}")
-    if operation.kind == "close" and not provider.capabilities.checkpoint:
+    # Amp archive close is governed by Chitra's durable checkpoint reference;
+    # Amp's transport may correctly report no checkpoint primitive.
+    if operation.kind == "close" and provider.kind != "amp" and not provider.capabilities.checkpoint:
         raise ContractValidationError("close requires checkpoint capability")
 
 

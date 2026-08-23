@@ -32,6 +32,7 @@ from .session_contract import (
     ContractValidationError,
     InterventionEvidence,
     JoinedLaneRecord,
+    LaneLaunchPolicy,
     NextCheck,
     OperationReference,
     PendingProviderOperation,
@@ -442,6 +443,11 @@ class JoinedLaneStore:
         provider_result: ProviderOperationResult | None,
         *,
         provider_kind: str,
+        provider_capabilities: ProviderCapabilities | None = None,
+        provider_project_ref: str | None = None,
+        provider_profile_digest: str | None = None,
+        provider_version: str | None = None,
+        launch_policy: LaneLaunchPolicy | None = None,
     ) -> JoinedLaneRecord:
         """Atomically materialize a missing lane from exact goal/evidence.
 
@@ -464,12 +470,51 @@ class JoinedLaneStore:
             raise JoinedLaneIdentityError("provider evidence lane_id does not match goal")
         if provider_kind not in {"tophand", "amp"}:
             raise JoinedLaneIdentityError(f"unsupported provider kind: {provider_kind}")
+        if provider_kind == "amp":
+            if not isinstance(provider_capabilities, ProviderCapabilities):
+                raise JoinedLaneIdentityError("Amp bootstrap requires measured provider capabilities")
+            if launch_policy is None:
+                raise JoinedLaneIdentityError("Amp bootstrap requires an authoritative Chitra launch policy")
+            if not all(
+                isinstance(value, str) and value.strip()
+                for value in (provider_project_ref, provider_profile_digest, provider_version)
+            ):
+                raise JoinedLaneIdentityError("Amp bootstrap requires authoritative project, profile, and version facts")
+            assert provider_project_ref is not None
+            assert provider_profile_digest is not None
+            assert provider_version is not None
+            if (
+                launch_policy.lane_id,
+                launch_policy.goal_id,
+                launch_policy.goal_version,
+                launch_policy.provider_kind,
+                launch_policy.project_ref,
+                launch_policy.profile_digest,
+                launch_policy.provider_version,
+            ) != (
+                lane_id,
+                goal_id,
+                goal_version,
+                "amp",
+                provider_project_ref,
+                provider_profile_digest,
+                provider_version,
+            ):
+                raise JoinedLaneIdentityError("Amp launch policy does not match authoritative provider facts")
+            capabilities = provider_capabilities
+        else:
+            capabilities = ProviderCapabilities.from_supported(("send", "read_updates"))
+        resolved_provider_version = provider_version if provider_kind == "amp" and provider_version is not None else ""
         provider = ProviderIdentity(
             kind=cast(Literal["tophand", "amp"], provider_kind),
             handle=provider_result.provider_handle,
+            provider_session_id=session_ref,
             instance_id=provider_result.provider_instance_id,
             generation=provider_result.provider_generation,
-            capabilities=ProviderCapabilities.from_supported(("send", "read_updates")),
+            project_ref=provider_project_ref if provider_kind == "amp" else None,
+            profile_digest=provider_profile_digest if provider_kind == "amp" else None,
+            provider_version=resolved_provider_version,
+            capabilities=capabilities,
         )
         history = (
             OperationReference(
@@ -486,6 +531,7 @@ class JoinedLaneStore:
             goal_version=goal_version,
             session_ref=session_ref,
             provider=provider,
+            launch_policy=launch_policy if provider_kind == "amp" else None,
             operation_history=history,
             last_operation_result=provider_result,
         )
