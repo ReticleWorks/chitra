@@ -104,6 +104,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
+from typing import cast
 
 import structlog
 
@@ -134,8 +135,12 @@ from .goals import (
 )
 from .joined_lane import JoinedLaneReconciler, JoinedLaneStore, ReconcileReport, build_filesystem_reconciler
 from .journal import native_session_identity
+from .lane_config import LaneCredentials, LaneSpec
+from .operating_facts import OperatingFactsSources
 from .orders import DispatchOrder, DispatchResult, DispatchStatus
 from .policy_config import PolicyConfig, load_policy_config
+from .provider_protocol import Provider
+from .recovery import RecoveryFactsReader as EngineRecoveryFactsReader
 from .recovery import RecoverySupervisor, run_recovery_supervision
 from .recovery_provider import (
     RecoveryFactsReader,
@@ -143,8 +148,10 @@ from .recovery_provider import (
     RecoverySink,
     RecoveryVerifier,
     build_recovery_provider_resolver,
+    default_operating_facts_reader,
 )
 from .routing_config import RoutingConfig, load_routing_config, resolve_route, resolve_routing_hint
+from .session_contract import JoinedLaneRecord
 from .state_paths import default_attestation_ledger_path, default_ledger_key_path, default_ledger_path, default_queue_dir, state_dir
 
 logger = structlog.get_logger(__name__)
@@ -1447,6 +1454,8 @@ def run_forever(
     exiting into a supervisor restart loop.
     """
     queue_dir = queue_dir or default_queue_dir()
+    if recovery_supervisor is None and joined_lane_root is not None:
+        recovery_supervisor = build_single_queue_recovery_supervisor(joined_lane_root)
     logger.info("dispatchd_started", queue_dir=str(queue_dir), poll_seconds=poll_seconds)
     last_routing_config: RoutingConfig | None = None
     last_policy = PolicyConfig()
@@ -1519,6 +1528,7 @@ def run_lanes_once(
     checkpoint_verifier: RecoveryVerifier | None = None,
     cancel_verifier: RecoveryVerifier | None = None,
     facts_reader: RecoveryFactsReader | None = None,
+    operating_facts_sources: OperatingFactsSources | None = None,
 ) -> dict[str, list[DispatchResult]]:
     """Drain every enabled lane from one rendered declaration.
 
@@ -1532,6 +1542,7 @@ def run_lanes_once(
     from chitra.lane_config import enabled_lanes
 
     results: dict[str, list[DispatchResult]] = {}
+    resolved_facts_reader = facts_reader or default_operating_facts_reader(operating_facts_sources)
     for lane in enabled_lanes(lanes_file):
         if all(
             dependency is None
@@ -1545,10 +1556,23 @@ def run_lanes_once(
                 event_sink,
                 checkpoint_verifier,
                 cancel_verifier,
-                facts_reader,
             )
         ):
-            provider_resolver = build_recovery_provider_resolver(lane)
+            if facts_reader is None and operating_facts_sources is None:
+                provider_resolver = build_recovery_provider_resolver(lane)
+            elif facts_reader is None:
+                provider_resolver = build_recovery_provider_resolver(
+                    lane,
+                    operating_facts_sources=operating_facts_sources,
+                )
+            elif operating_facts_sources is None:
+                provider_resolver = build_recovery_provider_resolver(lane, facts_reader=facts_reader)
+            else:
+                provider_resolver = build_recovery_provider_resolver(
+                    lane,
+                    facts_reader=facts_reader,
+                    operating_facts_sources=operating_facts_sources,
+                )
         else:
             provider_resolver = build_recovery_provider_resolver(
                 lane,
@@ -1562,6 +1586,7 @@ def run_lanes_once(
                 checkpoint_verifier=checkpoint_verifier,
                 cancel_verifier=cancel_verifier,
                 facts_reader=facts_reader,
+                operating_facts_sources=operating_facts_sources,
             )
         lane_reconciler = build_filesystem_reconciler(
             lane.state_dir,
@@ -1574,6 +1599,7 @@ def run_lanes_once(
             provider_resolver,
             goal_root=lane.state_dir,
             ledger_key_path=lane.state_dir / "ledger.key",
+            facts_reader=cast(EngineRecoveryFactsReader, resolved_facts_reader),
         )
         results[lane.identifier] = run_once(
             lane.queue_dir,
@@ -1596,6 +1622,49 @@ def run_lanes_once(
     return results
 
 
+def build_single_queue_recovery_supervisor(
+    state_root: Path,
+    *,
+    facts_reader: RecoveryFactsReader | None = None,
+) -> RecoverySupervisor:
+    """Build the canonical recovery owner for the legacy single-queue mode.
+
+    The multi-lane manifest supplies a complete ``LaneSpec``.  The legacy
+    queue has only one Chitra state root, so this constructor derives the
+    non-authoritative path fields from that root while preserving the exact
+    lane identity carried by each joined-lane record.  It never reads
+    credentials or starts a provider during construction.
+    """
+
+    def resolve(record: JoinedLaneRecord) -> Provider | None:
+        lane_id = record.lane_id
+        lane = LaneSpec(
+            identifier=lane_id,
+            account=lane_id,
+            uid=os.getuid() if hasattr(os, "getuid") else 1,
+            home=state_root,
+            workdir=state_root,
+            config_dir=state_root,
+            state_dir=state_root,
+            tmux_socket=state_root / "tmux.sock",
+            tmux_session=lane_id,
+            credentials=LaneCredentials(
+                claude_credentials=state_root / "credentials.json",
+                ssh_dispatch_key=state_root / "dispatch.key",
+            ),
+        )
+        resolver = build_recovery_provider_resolver(lane)
+        return resolver(record)
+
+    return RecoverySupervisor(
+        state_root,
+        resolve,
+        goal_root=state_root,
+        ledger_key_path=state_root / "ledger.key",
+        facts_reader=cast(EngineRecoveryFactsReader, facts_reader or default_operating_facts_reader()),
+    )
+
+
 def run_lanes_forever(
     lanes_file: Path | None = None,
     *,
@@ -1614,6 +1683,7 @@ def run_lanes_forever(
     checkpoint_verifier: RecoveryVerifier | None = None,
     cancel_verifier: RecoveryVerifier | None = None,
     facts_reader: RecoveryFactsReader | None = None,
+    operating_facts_sources: OperatingFactsSources | None = None,
 ) -> None:
     """Run one shared dispatchd process over all enabled lane queues."""
     while True:
@@ -1633,6 +1703,7 @@ def run_lanes_forever(
             checkpoint_verifier=checkpoint_verifier,
             cancel_verifier=cancel_verifier,
             facts_reader=facts_reader,
+            operating_facts_sources=operating_facts_sources,
         )
         time.sleep(poll_seconds)
 
@@ -1746,6 +1817,7 @@ def main(argv: list[str] | None = None) -> int:
         ledger_key_path=args.ledger_key_path or default_ledger_key_path(),
         ownership_socket_path=args.ownership_socket_path or Path("/run/chitra-ownership/provider.sock"),
     )
+    recovery_supervisor = build_single_queue_recovery_supervisor(joined_lane_root)
     if args.once:
         results = run_once(
             queue_dir,
@@ -1763,6 +1835,7 @@ def main(argv: list[str] | None = None) -> int:
             lane_lock_retry_attempts=args.lane_lock_retry_attempts,
             joined_lane_root=joined_lane_root,
             joined_lane_reconciler=joined_lane_reconciler,
+            recovery_supervisor=recovery_supervisor,
         )
         print(json.dumps([r.model_dump(mode="json") for r in results], indent=2))
         return 0
@@ -1783,6 +1856,7 @@ def main(argv: list[str] | None = None) -> int:
         lane_lock_retry_attempts=args.lane_lock_retry_attempts,
         joined_lane_root=joined_lane_root,
         joined_lane_reconciler=joined_lane_reconciler,
+        recovery_supervisor=recovery_supervisor,
     )
     return 0
 

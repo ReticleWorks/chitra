@@ -779,6 +779,7 @@ class RecoveryEngine:
                 "attempt_count": record.recovery.attempt_count + 1,
                 "event_sequence": self._event_sequence(record),
                 "next_allowed_attempt": current.isoformat(),
+                "pending_payload": payload,
             }
         )
         candidate = record.model_copy(
@@ -934,7 +935,14 @@ class RecoveryEngine:
                 return self._pending(record, current, "checkpoint lacks a signed, sealed RESCUE receipt", persist)
             check = self._check(current, "Relaunch from the governed checkpoint", "the rotated physical session is observed")
             candidate = self._persist(
-                record.model_copy(update={"pending_operation": None, "checkpoint_reference": reference, "next_check": check}),
+                record.model_copy(
+                    update={
+                        "pending_operation": None,
+                        "checkpoint_reference": reference,
+                        "next_check": check,
+                        "recovery": record.recovery.model_copy(update={"pending_payload": None}),
+                    }
+                ),
                 persist=persist,
             )
             return self._decision("checkpoint", candidate, "governed checkpoint validated", operation, facts=facts)
@@ -954,6 +962,7 @@ class RecoveryEngine:
         )
         check = self._check(current, f"Advance after consumed {action}", condition, action == "diagnostic")
         recovery = record.recovery.model_copy(update={"stage": next_stage, "next_allowed_attempt": check.at})
+        recovery = recovery.model_copy(update={"pending_payload": None})
         intervention = InterventionEvidence(
             operation_id=operation.operation_id,
             action=action,
@@ -981,7 +990,13 @@ class RecoveryEngine:
             status = self.provider.status()
         except Exception:  # noqa: BLE001
             return None
-        if not isinstance(status, ProviderStatus) or status.unknown or status.state in {ProviderState.OUTAGE, ProviderState.STALE}:
+        if (
+            not isinstance(status, ProviderStatus)
+            or not status.fresh
+            or not status.provider_available
+            or status.unknown
+            or status.state in {ProviderState.OUTAGE, ProviderState.STALE}
+        ):
             return None
         return status
 
@@ -996,7 +1011,9 @@ class RecoveryEngine:
         if update is not None:
             update = update.model_copy(update={"session_ref": status.provider_session_id})
         check = self._check(current, "Check useful progress after relaunch", "a material update after relaunch")
-        recovery = record.recovery.model_copy(update={"stage": "diagnostic", "next_allowed_attempt": check.at})
+        recovery = record.recovery.model_copy(
+            update={"stage": "diagnostic", "next_allowed_attempt": check.at, "pending_payload": None}
+        )
         return record.model_copy(
             update={
                 "session_ref": status.provider_session_id,
@@ -1094,7 +1111,7 @@ class RecoveryEngine:
         if observed is None or observed.status in {"unknown", "lost-response"}:
             pending = record.pending_operation
             action = record.recovery.attempted_remedy
-            payload = self._action_payload(record, goal, action, facts)
+            payload = record.recovery.pending_payload
             sequence = record.recovery.event_sequence
             if (
                 pending is not None
@@ -1132,11 +1149,13 @@ class RecoverySupervisor:
         *,
         goal_root: Path | None = None,
         ledger_key_path: Path | None = None,
+        facts_reader: RecoveryFactsReader | None = None,
     ) -> None:
         self.state_root = state_root
         self.provider_resolver = provider_resolver
         self.goal_root = goal_root or state_root
         self.ledger_key_path = ledger_key_path or state_root / "ledger.key"
+        self.facts_reader = facts_reader
 
     def run_once(self, *, now: datetime | None = None) -> tuple[RecoveryDecision, ...]:
         decisions: list[RecoveryDecision] = []
@@ -1145,26 +1164,37 @@ class RecoverySupervisor:
             record = cast(JoinedLaneRecord, value)
             if record.recovery.stage in {"none", "complete"}:
                 continue
-            provider = self.provider_resolver(record)
-            journal = EventJournal(self.state_root, record.lane_id)
             try:
-                key = self.ledger_key_path.read_bytes()
-            except OSError:
-                key = None
-            ladder = ResponseLadder(
-                IncidentStore(self.state_root, record.lane_id),
-                journal_events=journal.load(),
-                ledger_key=key,
-            )
-            decisions.append(
-                RecoveryEngine(
-                    provider=provider,
-                    state_root=self.state_root,
-                    goal_root=self.goal_root,
-                    journal=journal,
-                    response_ladder=ladder,
-                ).run_once(record, now=now)
-            )
+                provider = self.provider_resolver(record)
+                journal = EventJournal(self.state_root, record.lane_id)
+                try:
+                    key = self.ledger_key_path.read_bytes()
+                except OSError:
+                    key = None
+                ladder = ResponseLadder(
+                    IncidentStore(self.state_root, record.lane_id),
+                    journal_events=journal.load(),
+                    ledger_key=key,
+                )
+                decisions.append(
+                    RecoveryEngine(
+                        provider=provider,
+                        state_root=self.state_root,
+                        goal_root=self.goal_root,
+                        journal=journal,
+                        response_ladder=ladder,
+                    ).run_once(
+                        record,
+                        now=now,
+                        facts=tuple(self.facts_reader(record)) if self.facts_reader is not None else (),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - one lane must not starve its siblings
+                logger.warning(
+                    "recovery_lane_pass_failed",
+                    lane_id=record.lane_id,
+                    error=str(exc),
+                )
         return tuple(decisions)
 
 

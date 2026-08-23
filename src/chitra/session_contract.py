@@ -885,6 +885,9 @@ class RecoveryState(_ContractModel):
     attempted_remedy: str = ""
     attempt_count: int = Field(default=0, ge=0)
     next_allowed_attempt: str | None = None
+    # Chitra retains the exact payload that produced a pending operation.  A
+    # restart must never rebuild a retry from a later mutable ``next_action``.
+    pending_payload: str | None = None
 
     @field_validator("attempt_count")
     @classmethod

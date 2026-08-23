@@ -38,6 +38,7 @@ from chitra.recovery_provider import build_recovery_provider_resolver
 from chitra.session_contract import (
     JoinedLaneRecord,
     LaneUpdate,
+    OperatingFact,
     ProviderCapabilities,
     ProviderIdentity,
     RoadmapStep,
@@ -411,6 +412,138 @@ def test_restarted_supervisor_reconciles_pending_operation_without_duplicate_sen
     assert provider.read_updates_calls >= 1
 
 
+def test_pending_retry_reuses_persisted_payload_after_update_changes(tmp_path: Path) -> None:
+    """A restart retries the exact envelope, never a later mutable next_action."""
+    enrolled = _goal(tmp_path)
+    base = _lane_record()
+    record = base.model_copy(
+        update={
+            "goal_id": enrolled.goal_id,
+            "current_update": base.current_update.model_copy(update={"goal_id": enrolled.goal_id}),
+        }
+    )
+    store = JoinedLaneStore(tmp_path)
+    store.create(record)
+    finding = Finding(
+        detector="isolated-review",
+        fingerprint_seed={"signature": "isolated-review:persisted-payload"},
+        event_refs=(),
+        unmet_item="isolated reviewer availability",
+        expected_next_progress="a material lane update",
+        detail="the isolated reviewer was unavailable",
+    )
+    recovery.RecoveryEngine(state_root=tmp_path).schedule(record, finding.fingerprint, now=NOW)
+    IncidentStore(tmp_path, "lane-a").open_incident(
+        lane="lane-a",
+        finding=finding,
+        order_marker="persisted-payload-marker",
+    )
+
+    class UnknownProvider(_AcceptedReplyProvider):
+        def send(self, request: SendRequest) -> ProviderOperationResult:
+            self.send_requests.append(request)
+            self.send_operation_ids.append(request.operation_id)
+            return ProviderOperationResult(
+                operation_id=request.operation_id,
+                kind=request.operation.kind,
+                lane_id=request.lane_id,
+                provider_handle=request.provider_handle,
+                idempotency_key=request.idempotency_key,
+                payload_digest=request.payload_digest,
+                provider_instance_id=request.provider_instance_id,
+                provider_generation=request.provider_generation,
+                status="unknown",
+                observed_at=NOW.isoformat(),
+                evidence="response was lost",
+            )
+
+    provider = UnknownProvider()
+    supervisor = recovery.RecoverySupervisor(tmp_path, lambda _record: provider, goal_root=tmp_path)
+    supervisor.run_once(now=NOW)
+    first = store.require("lane-a")
+    assert first.pending_operation is not None
+    assert first.recovery.pending_payload is not None
+    original_payload = first.recovery.pending_payload
+
+    changed_update = first.current_update.model_copy(
+        update={"next_action": "a different later action", "sequence": first.current_update.sequence + 1}
+    )
+    store.save(first.model_copy(update={"current_update": changed_update, "revision": first.revision + 1}))
+    supervisor.run_once(now=NOW + timedelta(minutes=10))
+
+    assert len(provider.send_requests) == 2
+    assert provider.send_requests[1].text == original_payload
+
+
+def test_supervisor_isolates_one_lane_failure_and_continues(tmp_path: Path) -> None:
+    """A corrupt or unavailable lane cannot starve another due lane."""
+    first_goal = _goal(tmp_path, session_ref="tophand:lane-a:1")
+    second_goal = _goal(tmp_path, session_ref="tophand:lane-b:1")
+    base = _lane_record()
+    first = base.model_copy(
+        update={
+            "goal_id": first_goal.goal_id,
+            "current_update": base.current_update.model_copy(update={"goal_id": first_goal.goal_id}),
+        }
+    )
+    second = base.model_copy(
+        update={
+            "lane_id": "lane-b",
+            "goal_id": second_goal.goal_id,
+            "session_ref": "tophand:lane-b:1",
+            "provider": base.provider.model_copy(update={"handle": "tophand-lane-b", "instance_id": "instance-b"}),
+            "current_update": base.current_update.model_copy(
+                update={"lane_id": "lane-b", "goal_id": second_goal.goal_id, "session_ref": "tophand:lane-b:1"}
+            ),
+        }
+    )
+    store = JoinedLaneStore(tmp_path)
+    store.create(first)
+    store.create(second)
+    for lane_id, candidate in (("lane-a", first), ("lane-b", second)):
+        finding = Finding(
+            detector="isolated-review",
+            fingerprint_seed={"signature": f"isolated-review:{lane_id}"},
+            event_refs=(),
+            unmet_item="isolated reviewer availability",
+            expected_next_progress="a material lane update",
+            detail="the isolated reviewer was unavailable",
+        )
+        recovery.RecoveryEngine(state_root=tmp_path).schedule(candidate, finding.fingerprint, now=NOW)
+        IncidentStore(tmp_path, lane_id).open_incident(
+            lane=lane_id,
+            finding=finding,
+            order_marker=f"marker-{lane_id}",
+        )
+
+    provider = _AcceptedReplyProvider()
+
+    def resolve(candidate: JoinedLaneRecord) -> object:
+        if candidate.lane_id == "lane-a":
+            raise RuntimeError("lane-a provider outage")
+        return provider
+
+    decisions = recovery.RecoverySupervisor(tmp_path, resolve, goal_root=tmp_path).run_once(now=NOW)
+    assert len(decisions) == 1
+    assert decisions[0].record.lane_id == "lane-b"
+    assert provider.send_operation_ids
+
+
+def test_relaunch_requires_fresh_available_provider_status() -> None:
+    class StaleProvider(_AcceptedReplyProvider):
+        def status(self) -> ProviderStatus:
+            return ProviderStatus(
+                provider=ProviderName.TOPHAND,
+                state=ProviderState.IDLE,
+                provider_session_id="tophand:lane-a:2",
+                generation=2,
+                fresh=False,
+                provider_available=True,
+            )
+
+    assert recovery.RecoveryEngine(provider=StaleProvider())._provider_status() is None
+
+
 def test_watchd_reviewer_failure_calls_canonical_run_recovery_check_without_user_ask(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -508,6 +641,94 @@ def test_lanes_file_constructs_per_lane_provider_resolver(
     assert resolver_calls == ["alpha", "beta"]
 
 
+def test_lanes_file_passes_all_operating_fact_categories_to_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rendered lanes path gives recovery one complete facts snapshot."""
+    lane = _lane("lane-a", tmp_path)
+    goal = _goal(lane.state_dir)
+    base = _lane_record()
+    record = base.model_copy(
+        update={
+            "goal_id": goal.goal_id,
+            "current_update": base.current_update.model_copy(update={"goal_id": goal.goal_id}),
+        }
+    )
+    JoinedLaneStore(lane.state_dir).create(record)
+    finding = Finding(
+        detector="isolated-review",
+        fingerprint_seed={"signature": "isolated-review:facts"},
+        event_refs=(),
+        unmet_item="isolated reviewer availability",
+        expected_next_progress="a material lane update",
+        detail="the isolated reviewer was unavailable",
+    )
+    recovery.RecoveryEngine(state_root=lane.state_dir).schedule(record, finding.fingerprint, now=NOW)
+    IncidentStore(lane.state_dir, lane.identifier).open_incident(
+        lane=lane.identifier,
+        finding=finding,
+        order_marker="facts-marker",
+    )
+    facts = tuple(
+        OperatingFact(
+            name=f"fleet.{category}",
+            value={"category": category},
+            state="known",
+            source="fleet-authority",
+            revision=f"revision-{index}",
+            observed_at=NOW.isoformat(),
+            freshness="current",
+            fresh_until=(NOW + timedelta(minutes=10)).isoformat(),
+            within_authority=True,
+        )
+        for index, category in enumerate(
+            (
+                "placement",
+                "routing",
+                "credential-readiness",
+                "access",
+                "capacity",
+                "versions",
+                "provider-capabilities",
+            )
+        )
+    )
+    factory_calls: list[dict[str, object]] = []
+    reader_calls: list[JoinedLaneRecord] = []
+
+    def factory(**kwargs: object) -> _AcceptedReplyProvider:
+        factory_calls.append(kwargs)
+        return _AcceptedReplyProvider()
+
+    def reader(candidate: JoinedLaneRecord) -> tuple[OperatingFact, ...]:
+        reader_calls.append(candidate)
+        return facts
+
+    class FakeReconciler:
+        def reconcile_all(self) -> ReconcileReport:
+            return ReconcileReport(())
+
+    monkeypatch.setattr("chitra.lane_config.enabled_lanes", lambda _path: (lane,))
+    monkeypatch.setattr(dispatchd, "build_filesystem_reconciler", lambda _root, **_kwargs: FakeReconciler())
+
+    dispatchd.run_lanes_once(
+        tmp_path / "lanes.yaml",
+        provider_factories={"tophand": factory},
+        pending_sink=lambda value: value,
+        cursor_sink=lambda value: value,
+        result_sink=lambda value: value,
+        event_sink=lambda value: value,
+        checkpoint_verifier=lambda _value: True,
+        cancel_verifier=lambda _value: True,
+        facts_reader=reader,
+        ownership_socket_path=tmp_path / "ownership.sock",
+    )
+
+    assert len(factory_calls) == 1
+    assert tuple(factory_calls[0]["operating_facts"]) == facts
+    assert len(reader_calls) >= 2
+
+
 def test_lanes_file_constructs_per_lane_provider_resolver_and_supervisor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -562,3 +783,144 @@ def test_lanes_file_constructs_per_lane_provider_resolver_and_supervisor(
         ("beta", "reconcile"),
     ]
     assert len(supervisor_instances) == 2
+
+
+def test_lanes_file_once_activates_packaged_tophand_before_queue_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact shipped entrypoint must resolve and send through Tophand."""
+    lane = _lane("lane-a", tmp_path)
+    goal = _goal(lane.state_dir)
+    base = _lane_record()
+    record = base.model_copy(
+        update={
+            "goal_id": goal.goal_id,
+            "current_update": base.current_update.model_copy(update={"goal_id": goal.goal_id}),
+        }
+    )
+    store = JoinedLaneStore(lane.state_dir)
+    store.create(record)
+    finding = Finding(
+        detector="isolated-review",
+        fingerprint_seed={"signature": "isolated-review:entrypoint"},
+        event_refs=(),
+        unmet_item="isolated reviewer availability",
+        expected_next_progress="a material lane update",
+        detail="the isolated reviewer was unavailable",
+    )
+    recovery.RecoveryEngine(state_root=lane.state_dir).schedule(
+        record,
+        finding.fingerprint,
+        now=NOW,
+        wake_condition="isolated reviewer availability or a material lane update",
+    )
+    IncidentStore(lane.state_dir, lane.identifier).open_incident(
+        lane=lane.identifier,
+        finding=finding,
+        order_marker="entrypoint-review-marker",
+    )
+
+    queue = lane.queue_dir
+    orders = queue / "orders"
+    orders.mkdir(parents=True)
+    order = DispatchOrder(order_id="entrypoint-order", session_ref=record.session_ref, nudge="continue")
+    (orders / f"{order.order_id}.json").write_text(order.model_dump_json(), encoding="utf-8")
+
+    manifest = tmp_path / "lanes.yaml"
+    manifest.write_text(
+        "\n".join(
+            (
+                "lanes:",
+                f"  - id: {lane.identifier}",
+                f"    account: {lane.account}",
+                f"    uid: {lane.uid}",
+                f"    home: {lane.home}",
+                f"    workdir: {lane.workdir}",
+                f"    config_dir: {lane.config_dir}",
+                f"    state_dir: {lane.state_dir}",
+                f"    tmux_socket: {lane.tmux_socket}",
+                f"    tmux_session: {lane.tmux_session}",
+                "    credentials:",
+                f"      claude_credentials: {lane.credentials.claude_credentials}",
+                f"      ssh_dispatch_key: {lane.credentials.ssh_dispatch_key}",
+                "    enabled: true",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    events: list[str] = []
+    sent_payloads: list[dict[str, object]] = []
+
+    class PackagedTophand:
+        capabilities = {
+            "create_or_resume": True,
+            "status": True,
+            "send": True,
+            "read_updates": True,
+            "checkpoint": True,
+        }
+
+        def send(self, request: dict[str, object]) -> dict[str, object]:
+            events.append("recovery-send")
+            sent_payloads.append(request)
+            operation = request["operation"]
+            assert isinstance(operation, dict)
+            return {
+                **operation,
+                "status": "accepted",
+                "accepted": True,
+                "consumed": None,
+                "observed_at": NOW.isoformat(),
+                "evidence": "packaged Tophand accepted the exact Chitra envelope",
+            }
+
+        def read_updates(self, _cursor: str | None = None) -> dict[str, object]:
+            return {"updates": (), "next_cursor": "0", "provider_available": True, "complete": True}
+
+        def status(self) -> dict[str, object]:
+            return {
+                "state": "idle",
+                "provider_session_id": record.session_ref,
+                "generation": 1,
+                "fresh": True,
+                "provider_available": True,
+            }
+
+    def packaged_builder(**_kwargs: object) -> PackagedTophand:
+        return PackagedTophand()
+
+    monkeypatch.setattr(
+        "chitra.recovery_provider._packaged_tophand_builder",
+        packaged_builder,
+        raising=True,
+    )
+
+    class FakeReconciler:
+        def reconcile_all(self) -> ReconcileReport:
+            events.append("reconcile")
+            return ReconcileReport(())
+
+    monkeypatch.setattr(
+        dispatchd,
+        "build_filesystem_reconciler",
+        lambda _root, **_kwargs: FakeReconciler(),
+    )
+    monkeypatch.setattr(
+        dispatchd,
+        "process_one_order",
+        lambda *_args, **_kwargs: events.append("queue-dispatch") or None,
+    )
+
+    assert dispatchd.main(["--lanes-file", str(manifest), "--once"]) == 0
+
+    persisted = store.require(lane.identifier)
+    assert persisted.pending_operation is not None
+    assert sent_payloads == [
+        {
+            "operation": persisted.pending_operation.model_dump(mode="json"),
+            "text": sent_payloads[0]["text"],
+        }
+    ]
+    assert events == ["reconcile", "recovery-send", "reconcile", "queue-dispatch"]
