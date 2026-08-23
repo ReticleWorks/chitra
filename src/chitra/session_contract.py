@@ -23,16 +23,19 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, Validation
 
 SESSION_UPDATE_SCHEMA: Literal["chitra.session-update.v1"] = "chitra.session-update.v1"
 LANE_RECORD_SCHEMA: Literal["chitra.lanes.v1"] = "chitra.lanes.v1"
+LANE_LAUNCH_POLICY_SCHEMA: Literal["chitra.lane-launch-policy.v1"] = "chitra.lane-launch-policy.v1"
 
 # The aliases are intentionally public.  A caller should not have to repeat
 # string literals when checking compatibility with the adapter.
 SESSION_UPDATE_VERSION = SESSION_UPDATE_SCHEMA
 LANE_RECORD_VERSION = LANE_RECORD_SCHEMA
 MAX_INLINE_WAKE_RECEIPTS = 64
+LANE_LAUNCH_POLICY_VERSION = LANE_LAUNCH_POLICY_SCHEMA
 
 Identifier = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")]
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 Timestamp = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+Sha256Digest = Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"^sha256:[0-9a-f]{64}$")]
 
 StepStatus = Literal["pending", "active", "blocked", "done", "dropped"]
 PlanState = Literal["forming", "valid", "invalid", "missing", "stale", "conflicting"]
@@ -628,6 +631,7 @@ class ProviderIdentity(_ContractModel):
     generation: int | None = Field(default=None, ge=1)
     parent_thread_ref: str | None = None
     project_ref: str | None = None
+    profile_digest: Sha256Digest | None = None
     provider_version: str = ""
 
     @field_validator("generation")
@@ -651,6 +655,8 @@ def _provider_identity_key(provider: ProviderIdentity) -> tuple[object, ...]:
         provider.generation,
         provider.parent_thread_ref,
         provider.project_ref,
+        provider.profile_digest,
+        provider.provider_version,
     )
 
 
@@ -967,6 +973,51 @@ def extend_wake_archive_digest(previous: str, receipt: WakeReceipt) -> str:
     return hashlib.sha256(f"{previous}\0{payload}".encode()).hexdigest()
 
 
+class LaneLaunchPolicy(_ContractModel):
+    """Chitra-owned launch and cost boundary for one Amp lane generation."""
+
+    schema: Literal["chitra.lane-launch-policy.v1"] = LANE_LAUNCH_POLICY_SCHEMA  # type: ignore[assignment]
+    lane_id: Identifier
+    goal_id: Identifier
+    goal_version: int = Field(ge=1)
+    provider_kind: Literal["amp"] = "amp"
+    project_ref: Text
+    profile_digest: Sha256Digest
+    provider_version: Text
+    cost_ceiling_usd: int | float = Field(ge=0)
+    turn_reserve_usd: int | float = Field(ge=0)
+    usage_poll_interval_seconds: int = Field(ge=1)
+    usage_max_age_seconds: int = Field(ge=1)
+    created_at: Timestamp
+
+    @field_validator("goal_version", "usage_poll_interval_seconds", "usage_max_age_seconds")
+    @classmethod
+    def reject_bool_counts(cls, value: int) -> int:
+        if isinstance(value, bool):
+            raise ValueError("launch policy counts must be integers")
+        return value
+
+    @field_validator("cost_ceiling_usd", "turn_reserve_usd")
+    @classmethod
+    def validate_costs(cls, value: int | float) -> int | float:
+        if isinstance(value, bool) or not math.isfinite(float(value)):
+            raise ValueError("launch policy cost values must be finite numbers")
+        return value
+
+    @field_validator("created_at")
+    @classmethod
+    def validate_created_at(cls, value: str) -> str:
+        return _timestamp(value, "launch_policy.created_at")
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> Self:
+        if float(self.turn_reserve_usd) > float(self.cost_ceiling_usd):
+            raise ValueError("turn reserve must not exceed the lane cost ceiling")
+        if self.usage_poll_interval_seconds > self.usage_max_age_seconds:
+            raise ValueError("usage poll interval must not exceed maximum usage evidence age")
+        return self
+
+
 class UsageComponent(_ContractModel):
     """Parent or child usage amount in one named unit."""
 
@@ -1173,6 +1224,7 @@ class JoinedLaneRecord(_ContractModel):
     chitra_ownership_epoch: int = Field(default=1, ge=1)
     owner: OwnerIdentity = Field(default_factory=lambda: OwnerIdentity(owner_id="chitra"))
     provider: ProviderIdentity
+    launch_policy: LaneLaunchPolicy | None = None
     update_cursor: str = ""
     send_deduplication_key: str = ""
     current_update: LaneUpdate | None = None
@@ -1214,6 +1266,24 @@ class JoinedLaneRecord(_ContractModel):
     @model_validator(mode="after")
     def validate_references(self) -> Self:
         validate_active_owner_set((self.owner,))
+        if self.launch_policy is not None and (
+            self.launch_policy.lane_id,
+            self.launch_policy.goal_id,
+            self.launch_policy.goal_version,
+            self.launch_policy.provider_kind,
+            self.launch_policy.project_ref,
+            self.launch_policy.profile_digest,
+            self.launch_policy.provider_version,
+        ) != (
+            self.lane_id,
+            self.goal_id,
+            self.goal_version,
+            self.provider.kind,
+            self.provider.project_ref,
+            self.provider.profile_digest,
+            self.provider.provider_version,
+        ):
+            raise ValueError("launch policy does not match the joined lane and provider identity")
         if self.current_update is not None:
             update = _revalidate_update(self.current_update)
             if (update.lane_id, update.goal_id, update.goal_version, update.session_ref) != (
@@ -1388,6 +1458,8 @@ def validate_record_transition(
         errors.append("goal_id is immutable")
     if current.goal_version < previous.goal_version:
         errors.append("goal_version must not roll back")
+    if previous.launch_policy != current.launch_policy and previous.goal_version == current.goal_version:
+        errors.append("launch policy is immutable within one goal version")
     if current.session_ref != previous.session_ref and normalized_transition not in ("provider-transfer", "resume"):
         errors.append("session_ref changes require an explicit provider-transfer or resume transition")
     if current.revision <= previous.revision:
@@ -1531,7 +1603,10 @@ __all__ = [
     "FactState",
     "InterventionEvidence",
     "JoinedLaneRecord",
+    "LaneLaunchPolicy",
     "LaneRecord",
+    "LANE_LAUNCH_POLICY_SCHEMA",
+    "LANE_LAUNCH_POLICY_VERSION",
     "LANE_RECORD_SCHEMA",
     "LANE_RECORD_VERSION",
     "MAX_INLINE_WAKE_RECEIPTS",

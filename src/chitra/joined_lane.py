@@ -41,7 +41,15 @@ from .session_contract import (
     RecordTransitionKind,
     WakeReceipt,
     extend_wake_archive_digest,
+    UsageReport,
     validate_record_transition,
+)
+from .usage_policy import (
+    AmpCreatePolicyDecision,
+    AmpCreateSearchEvidence,
+    evaluate_amp_create_policy,
+    evaluate_usage_policy,
+    launch_policy_problem,
 )
 
 LANE_DIRECTORY: Final[str] = "joined-lanes"
@@ -581,6 +589,8 @@ ProviderProbe = Callable[[JoinedLaneRecord], ProviderOperationResult | None]
 JournalProbe = Callable[[JoinedLaneRecord], ProviderUpdate | None]
 LedgerProbe = Callable[[JoinedLaneRecord], LedgerEntry | None]
 RetryPendingOperation = Callable[[PendingProviderOperation], ProviderOperationResult | None]
+UsageProbe = Callable[[JoinedLaneRecord], UsageReport | None]
+AmpCreateSearchProbe = Callable[[JoinedLaneRecord], AmpCreateSearchEvidence | None]
 
 
 def _provider_identity(record: object) -> tuple[str, str, int | None]:
@@ -742,6 +752,8 @@ class JoinedLaneReconciler:
         ledger_probe: LedgerProbe | None = None,
         ownership_probe: OwnershipProbe,
         retry_pending_operation: RetryPendingOperation | None = None,
+        usage_probe: UsageProbe | None = None,
+        amp_create_search_probe: AmpCreateSearchProbe | None = None,
         next_check_delay_seconds: int = 30,
         now: Callable[[], datetime] | None = None,
     ) -> None:
@@ -753,6 +765,8 @@ class JoinedLaneReconciler:
         self.ledger_probe = ledger_probe
         self.ownership_probe = ownership_probe
         self.retry_pending_operation = retry_pending_operation
+        self.usage_probe = usage_probe
+        self.amp_create_search_probe = amp_create_search_probe
         self.next_check_delay_seconds = next_check_delay_seconds
         self._now = now or (lambda: datetime.now(UTC))
 
@@ -868,15 +882,61 @@ class JoinedLaneReconciler:
             next_at = _text(_value(check, "at", "")) if check is not None else ""
         return ReconcileOutcome(record.lane_id, record.session_ref, status, allowed, reason, next_at, record)
 
+    def _amp_usage_policy_gate(
+        self, record: JoinedLaneRecord
+    ) -> tuple[ReconcileOutcome | None, AmpCreatePolicyDecision | None]:
+        """Block Amp mutation until Chitra proves launch identity and cost headroom."""
+
+        if record.provider.kind != "amp":
+            return None, None
+        problem = launch_policy_problem(record)
+        if problem is not None:
+            updated = self._save(record, status="blocked", next_check_at=self._next_check(), last_error=problem)
+            return self._outcome(updated, "blocked", False, problem), None
+        pending = record.pending_operation
+        if pending is not None and pending.kind == "create_or_resume" and record.current_update is None:
+            search = self.amp_create_search_probe(record) if self.amp_create_search_probe is not None else None
+            create_decision = evaluate_amp_create_policy(record, search, now=self._now())
+            if not create_decision.provider_reconciliation_allowed:
+                updated = self._save(
+                    record,
+                    status="blocked",
+                    next_check_at=self._next_check(),
+                    last_error=create_decision.reason,
+                )
+                return self._outcome(updated, "blocked", False, create_decision.reason), create_decision
+            return None, create_decision
+        if self.usage_probe is None:
+            reason = "Amp usage evidence probe is unavailable"
+            updated = self._save(record, status="blocked", next_check_at=self._next_check(), last_error=reason)
+            return self._outcome(updated, "blocked", False, reason), None
+        decision = evaluate_usage_policy(record, self.usage_probe(record), now=self._now())
+        if decision.mutation_allowed:
+            return None, None
+        status = "blocked"
+        reason = decision.reason
+        if decision.cancel_required:
+            status = "cancel_required"
+            reason = (
+                f"{reason}; the supervisor must schedule a canonical cancel operation and verify provider quiescence"
+            )
+        updated = self._save(record, status="blocked", next_check_at=self._next_check(), last_error=reason)
+        return self._outcome(updated, status, False, reason), None
+
     def reconcile(self, record: Any) -> ReconcileOutcome:
-        if not _record_pending(record):
-            return self._outcome(record, _record_status(record), True)
         try:
+            policy_outcome, create_decision = self._amp_usage_policy_gate(record)
+            if policy_outcome is not None:
+                return policy_outcome
+            if not _record_pending(record):
+                return self._outcome(record, _record_status(record), True)
             provider_result = self.provider_probe(record)
             provider = ProviderObservation.from_operation(provider_result) if provider_result is not None else None
             ownership = self.ownership_probe(record)
-            if provider is None:
+            if provider is None and (create_decision is None or not create_decision.create_allowed):
                 reason = "provider identity/status evidence is unavailable"
+                if create_decision is not None and create_decision.action == "adopt":
+                    reason = "one matching Amp thread exists, but the Adapter did not return adoption evidence"
                 updated = self._save(record, status="blocked", next_check_at=self._next_check(), last_error=reason)
                 return self._outcome(updated, "blocked", False, reason)
             if ownership is None:
@@ -893,6 +953,34 @@ class JoinedLaneReconciler:
             if mismatch:
                 updated = self._save(record, status="identity_mismatch", next_check_at=self._next_check(), last_error=mismatch)
                 return self._outcome(updated, "identity_mismatch", False, mismatch)
+
+            create_retry_attempted = False
+            if provider is None and create_decision is not None and create_decision.create_allowed:
+                pending = _value(record, "pending_operation", None)
+                retry_result = (
+                    self.retry_pending_operation(pending)
+                    if self.retry_pending_operation is not None and pending is not None
+                    else None
+                )
+                create_retry_attempted = True
+                if retry_result is None:
+                    reason = "zero-match create reconciliation was proved, but the exact create operation was not scheduled"
+                    updated = self._save(record, status="blocked", next_check_at=self._next_check(), last_error=reason)
+                    return self._outcome(updated, "blocked", False, reason)
+                if pending is None:
+                    raise JoinedLaneIdentityError("create retry callback was given no pending operation")
+                if (
+                    retry_result.operation_id != pending.operation_id
+                    or retry_result.idempotency_key != pending.idempotency_key
+                    or retry_result.payload_digest != pending.payload_digest
+                    or retry_result.lane_id != pending.lane_id
+                    or retry_result.provider_instance_id != pending.provider_instance_id
+                    or retry_result.provider_generation != pending.provider_generation
+                ):
+                    raise JoinedLaneIdentityError("create retry changed the pending operation envelope")
+                provider = ProviderObservation.from_operation(retry_result)
+            if provider is None:
+                raise JoinedLaneIdentityError("create reconciliation did not produce provider evidence")
 
             journal_update = self.journal_probe(record)
             journal = ProviderObservation.from_update(journal_update) if journal_update is not None else None
@@ -924,9 +1012,17 @@ class JoinedLaneReconciler:
                 provider = observed_evidence
             if provider.status in {"unknown", "lost-response"} and not evidence_observed:
                 pending = _value(record, "pending_operation", None)
-                retry_result = self.retry_pending_operation(pending) if self.retry_pending_operation and pending is not None else None
+                retry_result = (
+                    None
+                    if create_retry_attempted or (create_decision is not None and not create_decision.create_allowed)
+                    else self.retry_pending_operation(pending)
+                    if self.retry_pending_operation and pending is not None
+                    else None
+                )
                 if retry_result is None:
                     reason = f"provider result: {provider.status}; exact journal evidence did not prove consumption"
+                    if create_decision is not None and create_decision.action == "adopt":
+                        reason = "one matching Amp thread must be adopted; create retry is denied"
                     updated = self._save(record, status="blocked", next_check_at=self._next_check(), last_error=reason)
                     return self._outcome(updated, "blocked", False, reason)
                 if pending is None:
@@ -1144,6 +1240,8 @@ def reconcile_before_send(
     ledger_probe: LedgerProbe | None = None,
     ownership_probe: OwnershipProbe,
     retry_pending_operation: RetryPendingOperation | None = None,
+    usage_probe: UsageProbe | None = None,
+    amp_create_search_probe: AmpCreateSearchProbe | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> ReconcileReport:
     """Load and reconcile every unfinished lane before dispatch is allowed."""
@@ -1155,6 +1253,8 @@ def reconcile_before_send(
         ledger_probe=ledger_probe,
         ownership_probe=ownership_probe,
         retry_pending_operation=retry_pending_operation,
+        usage_probe=usage_probe,
+        amp_create_search_probe=amp_create_search_probe,
         now=now,
     ).reconcile_all()
 
@@ -1167,6 +1267,8 @@ def build_production_reconciler(
     ownership_probe: OwnershipProbe,
     ledger_probe: LedgerProbe | None = None,
     retry_pending_operation: RetryPendingOperation | None = None,
+    usage_probe: UsageProbe | None = None,
+    amp_create_search_probe: AmpCreateSearchProbe | None = None,
 ) -> JoinedLaneReconciler:
     """Build the mandatory daemon startup barrier over canonical adapters.
 
@@ -1182,6 +1284,8 @@ def build_production_reconciler(
         ledger_probe=ledger_probe,
         ownership_probe=ownership_probe,
         retry_pending_operation=retry_pending_operation,
+        usage_probe=usage_probe,
+        amp_create_search_probe=amp_create_search_probe,
     )
 
 
@@ -1381,6 +1485,8 @@ __all__ = [
     "JournalProbe",
     "LedgerProbe",
     "RetryPendingOperation",
+    "UsageProbe",
+    "AmpCreateSearchProbe",
     "OwnershipProbe",
     "ReconcileOutcome",
     "ReconcileReport",
