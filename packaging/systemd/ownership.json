@@ -1,0 +1,123 @@
+{
+  "schema": "chitra.systemd-ownership.v1",
+  "canonical_repository": "ReticleWorks/chitra",
+  "hash": "sha256-bytes",
+  "scope": "core-daemon-units-and-deployment-variants",
+  "external_repositories": {
+    "ReticleWorks/fleet-repo": {
+      "environment_variable": "CHITRA_OWNERSHIP_FLEET_ROOT"
+    },
+    "ReticleWorks/polyphony": {
+      "environment_variable": "CHITRA_OWNERSHIP_POLYPHONY_ROOT"
+    }
+  },
+  "classes": {
+    "shared-package": {
+      "owner": "ReticleWorks/chitra",
+      "root": "packaging/systemd",
+      "parameter_mode": "literal",
+      "forbidden_tokens": [
+        "%i",
+        "%n",
+        "${CHITRA_STATE_DIR}",
+        "/var/lib/polyphony-chitra-"
+      ],
+      "units": {
+        "chitra-dispatchd.service": "5e75acc73326efbf4bedfd610b8a20a9f145707fe9db57d3201451cdb06c8c2c",
+        "chitra-sweepd.service": "745bb62b968ee96595ba8f161abed9fe1d647d392327a2201dd9618a66387857",
+        "chitra-triaged.service": "e9e390dc8acfaf7a559c6f14e2b6bc0a1af9fb3aaf86fb1aa4e0a4731bdf4ca4",
+        "chitra-watchd.service": "40850fcdca1347942b8f5374f31aa4381cd7282cf6cf2b7bf87a3b32f4f040cf"
+      }
+    },
+    "package-instance": {
+      "owner": "ReticleWorks/chitra",
+      "root": "packaging/systemd",
+      "parameter_mode": "instance-template",
+      "required_tokens": ["%i"],
+      "allowed_tokens": ["%i"],
+      "units": {
+        "chitra@.service": "2b3c3333c8a109551d8297d3eb9aad7cade11ef36340809df71257426801f8ca"
+      }
+    },
+    "fleet-host": {
+      "owner": "ReticleWorks/fleet-repo",
+      "root": "packages/chitra/units",
+      "parameter_mode": "literal",
+      "intent": "legacy-host-daemons-with-fleet-failure-contract",
+      "units": {
+        "chitra-dispatchd.service": "093166f3b72da759866c60efe91850d2ad61eddc9cf1b6d1e262b3cd1f87201a",
+        "chitra-rate-limit-guard.service": "eae32b02e40e7c627b2e4e5b79347ac5d434ebef029b52f91efa84b929831815",
+        "chitra-rate-limit-guard.timer": "8d5dde03b333269e8910e61723bcf5050243f61b1f2968418846b0d9149eac39",
+        "chitra-triaged.service": "2c9c72f9e38e7b3bfaa66c676d4cf022aa700489f9b5bb04bf99313cf40091b4"
+      }
+    },
+    "fleet-instance": {
+      "owner": "ReticleWorks/fleet-repo",
+      "root": "packages/chitra/units",
+      "parameter_mode": "instance-template",
+      "required_tokens": ["%i"],
+      "allowed_tokens": ["%H", "%i", "%n", "${CHITRA_SOCKET_PATH}", "${CHITRA_STATE_DIR}"],
+      "units": {
+        "polyphony-chitra-dispatchd@.service": "ccfaa9430824cc9a44124c18cb8218ba3c6de8e2138d35abfdea15f240617d31",
+        "polyphony-chitra-sweepd@.service": "5a5d777ddd1492448ddf06808e22d7fe4ad771fcc06a4a42a4db1950eb219316",
+        "polyphony-chitra-triaged@.service": "4c6d1d345f10bb5562f5316f2e5dc95aab1a3d426f09356f081145c1bccd47ee",
+        "polyphony-chitra-watchd@.service": "bc9f3e17c63492afa24d642c66487657adabd3f85a7abd0057ab219fa43ffae0"
+      }
+    },
+    "polyphony-instance": {
+      "owner": "ReticleWorks/polyphony",
+      "root": "infra/systemd",
+      "parameter_mode": "instance-template",
+      "required_tokens": ["%i"],
+      "allowed_tokens": ["%H", "%i", "%n", "${CHITRA_SOCKET_PATH}", "${CHITRA_STATE_DIR}"],
+      "units": {
+        "polyphony-chitra-dispatchd@.service": "5ff26f3f2d1ee1b534b14281ade59baa39c10f392425ae19bb36fe22e42d69b8",
+        "polyphony-chitra-sweepd@.service": "49fd5bdbae0a77e08bd74c03f2909f1e5710868ed76a591038e43f4e54f18e9d",
+        "polyphony-chitra-triaged@.service": "6bc04049db46d8df6379e9259f9bffefa45349c78eaf0b8e256f6ecf181ae91d",
+        "polyphony-chitra-watchd@.service": "b5e9845df05336bc854cfb2eff79542e07121714e9204da9c102072fbfcdc8fe"
+      }
+    },
+    "polyphony-host": {
+      "owner": "ReticleWorks/polyphony",
+      "root": "infra/systemd",
+      "parameter_mode": "literal",
+      "intent": "concrete-monitor-daemons-retained-for-compatibility-and-board-publish",
+      "units": {
+        "polyphony-chitra-sweepd.service": "05963490a119838d31c7479d64b8e1e37cf9bafffba418eb6e8891a4bda0de2b",
+        "polyphony-chitra-watchd.service": "9ad5204a4e3d8838b5af6680e5c1e50e27f54e6df71f73cc5d82e099168c9401"
+      }
+    },
+    "polyphony-source-host": {
+      "owner": "ReticleWorks/polyphony",
+      "root": "tools/support/chitra/systemd",
+      "parameter_mode": "literal",
+      "intent": "legacy-extracted-phase-0-and-phase-1-daemons",
+      "units": {
+        "polyphony-chitra-dispatchd.service": "9a4d4e9f45fe456a5b3d26e8333eee84186639d167d5c528ecb6d3f7e42a2d15",
+        "polyphony-chitra-triaged.service": "0549fdc043a0f2faf089f0004c7f9574003fb1f451364990f3cbdd8dcbefd71a"
+      }
+    },
+    "shared-mirror": {
+      "owner": "ReticleWorks/fleet-repo",
+      "mirror": "ReticleWorks/polyphony",
+      "roots": {
+        "fleet": "packages/chitra/units",
+        "polyphony": "infra/systemd"
+      },
+      "parameter_mode": "instance-template",
+      "required_tokens": ["%i"],
+      "allowed_tokens": ["%H", "%i", "%n", "${CHITRA_STATE_DIR}"],
+      "intent": "byte-identical-rate-limit-template-and-timer",
+      "units": {
+        "chitra-rate-limit-guard@.service": {
+          "fleet": "be4366185f74c1c6eace189715d1ac3a920dac314d71c317a1c27a8a83de05f6",
+          "polyphony": "be4366185f74c1c6eace189715d1ac3a920dac314d71c317a1c27a8a83de05f6"
+        },
+        "chitra-rate-limit-guard@.timer": {
+          "fleet": "5f865947b2eb8a54927ddf2b3dd4a83039b68ba06a436d73e42551694025c0cc",
+          "polyphony": "5f865947b2eb8a54927ddf2b3dd4a83039b68ba06a436d73e42551694025c0cc"
+        }
+      }
+    }
+  }
+}
