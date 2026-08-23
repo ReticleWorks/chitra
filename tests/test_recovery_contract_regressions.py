@@ -7,11 +7,23 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from chitra.detect.detectors import Finding
-from chitra.detect.ladder import IncidentStore, ResponseLadder
+from chitra.detect.ladder import ConsumptionProof, IncidentStore, ResponseLadder
 from chitra.goals import GoalRecord
 from chitra.joined_lane import JoinedLaneReconciler, JoinedLaneStore
+from chitra.journal.models import CanonicalEvent, CanonicalType, Client, TranscriptIdentity
+from chitra.journal.store import EventJournal
+from chitra.ledger import LedgerEntry, message_hash, sign
+from chitra.provider_protocol import (
+    CreateOrResumeRequest,
+    MutationRequest,
+    ProviderName,
+    ProviderState,
+    ProviderStatus,
+    SendRequest,
+)
 from chitra.recovery import RecoveryEngine
 from chitra.session_contract import (
+    MAX_INLINE_WAKE_RECEIPTS,
     JoinedLaneRecord,
     LaneUpdate,
     NextCheck,
@@ -76,14 +88,64 @@ def lane_record(
     )
 
 
+def append_named_wake(tmp_path: Path, wake_id: str, condition: str, *, sequence: int = 1) -> None:
+    EventJournal(tmp_path, "lane-a").append(
+        (
+            CanonicalEvent(
+                event_id=wake_id,
+                instance="test",
+                lane="lane-a",
+                client=Client.CODEX,
+                client_version="test",
+                process_id="1",
+                transcript=TranscriptIdentity(path="/tmp/lane-a", device=1, inode=1),
+                session_id="tophand:lane-a:1",
+                resume_id=None,
+                observed_at=(NOW + timedelta(seconds=sequence)).isoformat(),
+                native_time=None,
+                native_type="wake_condition_changed",
+                native_join_id=None,
+                raw_byte_range=None,
+                raw_sha256=None,
+                normalized_type=CanonicalType.UNKNOWN,
+                goal_ref="goal-a",
+                item_ref=None,
+                payload_digest="a" * 64,
+                normalizer_version="test",
+                payload={"wake_condition": condition, "wake_condition_changed": True},
+                raw_record=None,
+            ),
+        )
+    )
 class ConsumedSendProvider:
     def __init__(self) -> None:
         self.operation_ids: list[str] = []
 
-    def send(self, record: JoinedLaneRecord, text: str, operation: object) -> object:
-        del record, text
-        self.operation_ids.append(operation.operation_id)  # type: ignore[attr-defined]
-        return {"status": "consumed", "evidence": "observed lane consumption"}
+    provider_name = ProviderName.TOPHAND
+    capabilities = ProviderCapabilities.from_supported(("send", "checkpoint", "create_or_resume", "read_updates", "status"))
+
+    @staticmethod
+    def result(request: MutationRequest, *, status: str = "consumed") -> ProviderOperationResult:
+        consumed = status == "consumed"
+        return ProviderOperationResult(
+            operation_id=request.operation_id,
+            kind=request.operation.kind,
+            lane_id=request.lane_id,
+            provider_handle=request.provider_handle,
+            idempotency_key=request.idempotency_key,
+            payload_digest=request.payload_digest,
+            provider_instance_id=request.provider_instance_id,
+            provider_generation=request.provider_generation,
+            status=status,  # type: ignore[arg-type]
+            accepted=True,
+            consumed=consumed,
+            observed_at=request.operation.created_at,
+            evidence="observed lane consumption" if consumed else "transport only",
+        )
+
+    def send(self, request: SendRequest) -> ProviderOperationResult:
+        self.operation_ids.append(request.operation_id)
+        return self.result(request)
 
 
 def test_progress_evidence_from_another_lane_cannot_complete_recovery(tmp_path: Path) -> None:
@@ -115,9 +177,8 @@ def test_consumed_result_with_wrong_operation_identity_cannot_advance(tmp_path: 
         def __init__(self) -> None:
             self.sent_operation_id = ""
 
-        def send(self, record: JoinedLaneRecord, text: str, operation: object) -> ProviderOperationResult:
-            del record, text
-            self.sent_operation_id = operation.operation_id  # type: ignore[attr-defined]
+        def send(self, request: SendRequest) -> ProviderOperationResult:
+            self.sent_operation_id = request.operation_id
             return ProviderOperationResult(
                 operation_id="wrong-operation",
                 kind="send",
@@ -151,13 +212,13 @@ def test_boolean_checkpoint_without_governed_receipt_cannot_enable_relaunch(tmp_
             self.checkpoint_calls = 0
             self.relaunch_calls = 0
 
-        def checkpoint(self, record: JoinedLaneRecord, operation: object) -> object:
-            del record, operation
+        def checkpoint(self, request: MutationRequest) -> object:
+            del request
             self.checkpoint_calls += 1
             return {"status": "consumed", "valid": True}
 
-        def create_or_resume(self, record: JoinedLaneRecord, operation: object) -> object:
-            del record, operation
+        def create_or_resume(self, request: MutationRequest) -> object:
+            del request
             self.relaunch_calls += 1
             return {"status": "consumed", "session_ref": "tophand:lane-a:1"}
 
@@ -179,17 +240,27 @@ def test_boolean_checkpoint_without_governed_receipt_cannot_enable_relaunch(tmp_
 
     assert checkpoint_decision is not None
     assert checkpoint_decision.record.checkpoint_reference is None
-    assert checkpoint_decision.record.recovery.stage != "relaunch"
+    assert checkpoint_decision.record.pending_operation is not None
+    assert checkpoint_decision.record.pending_operation.kind == "checkpoint"
     assert not (tmp_path / "checkpoints").exists()
     assert not (tmp_path / "rescue").exists()
     assert provider.relaunch_calls == 0
 
 
 def test_sparse_rotated_session_response_persists_same_logical_lane(tmp_path: Path) -> None:
-    class RotatingProvider:
-        def create_or_resume(self, record: JoinedLaneRecord, operation: object) -> object:
-            del record, operation
-            return {"status": "consumed", "session_ref": "tophand:lane-a:2"}
+    class RotatingProvider(ConsumedSendProvider):
+        def create_or_resume(self, request: CreateOrResumeRequest) -> ProviderOperationResult:
+            return self.result(request)
+
+        def status(self) -> ProviderStatus:
+            return ProviderStatus(
+                provider=ProviderName.TOPHAND,
+                state=ProviderState.IDLE,
+                provider_session_id="tophand:lane-a:2",
+                generation=2,
+                fresh=True,
+                provider_available=True,
+            )
 
     initial = lane_record(
         recovery=RecoveryState(
@@ -227,10 +298,9 @@ def test_sparse_rotated_session_response_persists_same_logical_lane(tmp_path: Pa
 
 
 def test_transport_acceptance_does_not_complete_diagnostic_sibling(tmp_path: Path) -> None:
-    class AcceptedDiagnosticProvider:
-        def diagnostic(self, record: JoinedLaneRecord, operation: object, max_children: int = 1) -> object:
-            del record, operation, max_children
-            return {"status": "accepted", "evidence": "transport only"}
+    class AcceptedDiagnosticProvider(ConsumedSendProvider):
+        def send(self, request: SendRequest) -> ProviderOperationResult:
+            return self.result(request, status="accepted")
 
     record = lane_record(
         recovery=RecoveryState(
@@ -286,7 +356,55 @@ def test_consumed_nudge_does_not_deadlock_against_real_response_ladder(tmp_path:
         expected_next_progress="complete the next in-scope action",
         detail="the same useful-progress stall recurred",
     )
-    ladder = ResponseLadder(IncidentStore(tmp_path, "lane-a"))
+    scheduled = RecoveryEngine(state_root=tmp_path).schedule(
+        lane_record(), "ladder-stall", now=NOW
+    )
+    cycle_id = scheduled.recovery.cycle_id
+    assert cycle_id is not None
+    marker = f"recovery-lane-a-{cycle_id}-nudge"
+    user_text = f"[C] {marker}"
+    key = b"k" * 32
+    transcript = TranscriptIdentity(path="/tmp/lane-a.jsonl", device=1, inode=1)
+    common = {
+        "instance": "test",
+        "lane": "lane-a",
+        "client": Client.CODEX,
+        "client_version": "test",
+        "process_id": "1",
+        "transcript": transcript,
+        "session_id": "tophand:lane-a:1",
+        "resume_id": None,
+        "observed_at": NOW.isoformat(),
+        "native_time": NOW.isoformat(),
+        "native_join_id": None,
+        "raw_byte_range": None,
+        "raw_sha256": None,
+        "payload_digest": "a" * 64,
+        "normalizer_version": "test",
+        "raw_record": None,
+    }
+    journal = (
+        CanonicalEvent(
+            event_id="user-nudge",
+            native_type="user",
+            normalized_type=CanonicalType.UNKNOWN,
+            goal_ref="goal-a",
+            item_ref=None,
+            payload={"text": user_text},
+            **common,  # type: ignore[arg-type]
+        ),
+        CanonicalEvent(
+            event_id="turn-nudge",
+            native_type="assistant",
+            normalized_type=CanonicalType.FINAL_RESPONSE,
+            goal_ref="goal-a",
+            item_ref=None,
+            payload={"text": "still stalled"},
+            **common,  # type: ignore[arg-type]
+        ),
+    )
+    ladder_store = IncidentStore(tmp_path, "lane-a")
+    ladder = ResponseLadder(ladder_store, journal_events=journal, ledger_key=key)
     engine = RecoveryEngine(
         provider=provider,
         state_root=tmp_path,
@@ -295,11 +413,37 @@ def test_consumed_nudge_does_not_deadlock_against_real_response_ladder(tmp_path:
         wait_interval=timedelta(0),
     )
     first = engine.run_once(
-        lane_record(),
+        scheduled,
         now=NOW,
-        failure_signature="ladder-stall",
         goal=goal(),
         finding=finding,
+    )
+    digest = message_hash(user_text)
+    sent_at = NOW.isoformat()
+    ladder_store.attach_consumption(
+        fingerprint=finding.fingerprint,
+        order_marker=marker,
+        proof=ConsumptionProof(
+            ledger_entry=LedgerEntry(
+                order_id="nudge-order",
+                session_ref="tophand:lane-a:1",
+                tag="[C]",
+                sig_v=4,
+                message_hash=digest,
+                sent_at=sent_at,
+                signature=sign(
+                    key,
+                    session_ref="tophand:lane-a:1",
+                    tag="[C]",
+                    digest=digest,
+                    sent_at=sent_at,
+                ),
+            ),
+            session_ref="tophand:lane-a:1",
+            native_session_id="tophand:lane-a:1",
+            user_event_id="user-nudge",
+            turn_event_id="turn-nudge",
+        ),
     )
     second = engine.run_once(
         first.record,
@@ -359,11 +503,13 @@ def test_wake_receipt_survives_durable_reload(tmp_path: Path) -> None:
         ownership_probe=lambda _record: None,
         now=lambda: NOW,
     )
+    append_named_wake(tmp_path, "wake-receipt-1", "a material update is observed")
 
     reconciler.wake(
         "lane-a",
         wake_id="wake-receipt-1",
         wake_condition="a material update is observed",
+        event_sequence=1,
     )
     reloaded = JoinedLaneStore(tmp_path).require("lane-a")
 
@@ -372,11 +518,55 @@ def test_wake_receipt_survives_durable_reload(tmp_path: Path) -> None:
     assert reloaded.last_intervention.consumed is True
     assert reloaded.next_check is not None
     assert reloaded.next_check.wake_condition == "a material update is observed"
+    scheduled = RecoveryEngine(state_root=tmp_path).schedule(
+        reloaded,
+        "later-recovery-action",
+        now=NOW + timedelta(minutes=1),
+    )
+    assert [receipt.wake_id for receipt in scheduled.wake_receipts] == ["wake-receipt-1"]
+    replay = reconciler.wake(
+        "lane-a",
+        wake_id="wake-receipt-1",
+        wake_condition="a material update is observed",
+        event_sequence=1,
+    )
+    assert replay.status == "wake_reused"
+
+
+def test_wake_receipts_compact_inline_and_remain_deduplicated_in_journal(tmp_path: Path) -> None:
+    condition = "a material update is observed"
+    store = JoinedLaneStore(tmp_path)
+    store.create(
+        lane_record(
+            recovery=RecoveryState(stage="waiting", failure_signature="long-wait"),
+            next_check=NextCheck(at=NOW.isoformat(), reason="wait", wake_condition=condition),
+        )
+    )
+    reconciler = JoinedLaneReconciler(
+        store,
+        provider_probe=lambda _record: None,
+        journal_probe=lambda _record: None,
+        ownership_probe=lambda _record: None,
+        now=lambda: NOW,
+    )
+    total = MAX_INLINE_WAKE_RECEIPTS + 1
+    for sequence in range(1, total + 1):
+        wake_id = f"wake-{sequence}"
+        append_named_wake(tmp_path, wake_id, condition, sequence=sequence)
+        reconciler.wake(wake_id="wake-" + str(sequence), lane_id="lane-a", wake_condition=condition, event_sequence=sequence)
+
+    reloaded = store.require("lane-a")
+    assert len(reloaded.wake_receipts) == MAX_INLINE_WAKE_RECEIPTS
+    assert reloaded.wake_archive_count == 1
+    assert reloaded.wake_archive_digest
+    assert len(EventJournal(tmp_path, "lane-a").load_wakes()) == total
+    replay = reconciler.wake(lane_id="lane-a", wake_id="wake-1", wake_condition=condition, event_sequence=1)
+    assert replay.status == "wake_reused"
 
 
 def test_a_production_module_invokes_recovery_supervision() -> None:
     source_root = Path(__file__).parents[1] / "src" / "chitra"
-    recovery_call_names = {"RecoveryEngine", "run_recovery_check", "schedule_recovery_check"}
+    recovery_call_names = {"RecoveryEngine", "run_recovery_check", "run_recovery_supervision", "schedule_recovery_check"}
     callers: list[tuple[Path, int]] = []
     for path in sorted(source_root.glob("*.py")):
         if path.name == "recovery.py":

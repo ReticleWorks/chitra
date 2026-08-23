@@ -136,6 +136,7 @@ from .joined_lane import JoinedLaneReconciler, JoinedLaneStore, ReconcileReport,
 from .journal import native_session_identity
 from .orders import DispatchOrder, DispatchResult, DispatchStatus
 from .policy_config import PolicyConfig, load_policy_config
+from .recovery import RecoverySupervisor, run_recovery_supervision
 from .routing_config import RoutingConfig, load_routing_config, resolve_route, resolve_routing_hint
 from .state_paths import default_attestation_ledger_path, default_ledger_key_path, default_ledger_path, default_queue_dir, state_dir
 
@@ -1300,6 +1301,7 @@ def run_once(
     joined_lane_root: Path | None = None,
     joined_lane_reconciler: JoinedLaneReconciler | None = None,
     reconciliation_gate: Callable[[], ReconcileReport] | None = None,
+    recovery_supervisor: RecoverySupervisor | None = None,
     _preloaded_routing_config: RoutingConfig | None | _ConfigNotPreloaded = _CONFIG_NOT_PRELOADED,
     _preloaded_policy: PolicyConfig | _ConfigNotPreloaded = _CONFIG_NOT_PRELOADED,
 ) -> list[DispatchResult]:
@@ -1349,6 +1351,12 @@ def run_once(
                 if unfinished
                 else ReconcileReport(())
             )
+    if recovery_supervisor is not None:
+        run_recovery_supervision(recovery_supervisor)
+        if reconciliation_gate is not None:
+            joined_lane_report = reconciliation_gate()
+        elif joined_lane_reconciler is not None:
+            joined_lane_report = joined_lane_reconciler.reconcile_all()
     _requeue_joined_lane_deferred(queue_dir, joined_lane_report)
     _reclaim_stale_in_flight(queue_dir)
     note_goals_schema_state(goals_root)
@@ -1422,6 +1430,7 @@ def run_forever(
     joined_lane_root: Path | None = None,
     joined_lane_reconciler: JoinedLaneReconciler | None = None,
     reconciliation_gate: Callable[[], ReconcileReport] | None = None,
+    recovery_supervisor: RecoverySupervisor | None = None,
 ) -> None:
     """Run the daemon loop: drain the queue, sleep, repeat. Runs until killed.
 
@@ -1477,6 +1486,7 @@ def run_forever(
             joined_lane_root=joined_lane_root,
             joined_lane_reconciler=joined_lane_reconciler,
             reconciliation_gate=reconciliation_gate,
+            recovery_supervisor=recovery_supervisor,
             _preloaded_routing_config=routing_config,
             _preloaded_policy=policy,
         )

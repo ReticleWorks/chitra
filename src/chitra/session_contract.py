@@ -12,6 +12,8 @@ the public persistence helpers for the two versioned documents in this module:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
@@ -26,6 +28,7 @@ LANE_RECORD_SCHEMA: Literal["chitra.lanes.v1"] = "chitra.lanes.v1"
 # string literals when checking compatibility with the adapter.
 SESSION_UPDATE_VERSION = SESSION_UPDATE_SCHEMA
 LANE_RECORD_VERSION = LANE_RECORD_SCHEMA
+MAX_INLINE_WAKE_RECEIPTS = 64
 
 Identifier = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")]
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -870,6 +873,8 @@ class RecoveryState(_ContractModel):
     """Bounded recovery ladder state that never creates a user ask."""
 
     stage: RecoveryStage = "none"
+    cycle_id: Identifier | None = None
+    event_sequence: int | None = Field(default=None, ge=1)
     failure_signature: str = ""
     attempted_remedy: str = ""
     attempt_count: int = Field(default=0, ge=0)
@@ -880,6 +885,13 @@ class RecoveryState(_ContractModel):
     def reject_bool_attempt_count(cls, value: int) -> int:
         if isinstance(value, bool):
             raise ValueError("attempt_count must be an integer")
+        return value
+
+    @field_validator("event_sequence")
+    @classmethod
+    def reject_bool_event_sequence(cls, value: int | None) -> int | None:
+        if isinstance(value, bool):
+            raise ValueError("recovery event_sequence must be an integer")
         return value
 
     @field_validator("next_allowed_attempt")
@@ -922,6 +934,37 @@ class InterventionEvidence(_ContractModel):
     @classmethod
     def validate_observed_at(cls, value: str) -> str:
         return _timestamp(value, "intervention.observed_at")
+
+
+class WakeReceipt(_ContractModel):
+    """One durable, exact-bound observation of a named wake condition."""
+
+    wake_id: Identifier
+    lane_id: Identifier
+    goal_id: Identifier
+    session_ref: Identifier
+    wake_condition: Text
+    event_sequence: int = Field(ge=1)
+    observed_at: Timestamp
+
+    @field_validator("event_sequence")
+    @classmethod
+    def reject_bool_sequence(cls, value: int) -> int:
+        if isinstance(value, bool):
+            raise ValueError("wake event_sequence must be an integer")
+        return value
+
+    @field_validator("observed_at")
+    @classmethod
+    def validate_observed_at(cls, value: str) -> str:
+        return _timestamp(value, "wake_receipt.observed_at")
+
+
+def extend_wake_archive_digest(previous: str, receipt: WakeReceipt) -> str:
+    """Chain one compacted receipt into the joined record's archive pointer."""
+
+    payload = json.dumps(receipt.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(f"{previous}\0{payload}".encode()).hexdigest()
 
 
 class UsageComponent(_ContractModel):
@@ -1136,6 +1179,12 @@ class JoinedLaneRecord(_ContractModel):
     plan_assessment: PlanAssessment = PlanAssessment()
     last_useful_progress: ProgressEvidence | None = None
     last_intervention: InterventionEvidence | None = None
+    # Keep only the newest bounded window here. EventJournal's append-only
+    # wake log retains exact IDs for replay checks; count/digest bind every
+    # compacted prefix without turning the joined record into a second log.
+    wake_receipts: tuple[WakeReceipt, ...] = ()
+    wake_archive_count: int = Field(default=0, ge=0)
+    wake_archive_digest: str = ""
     recovery: RecoveryState = RecoveryState()
     next_check: NextCheck | None = None
     pending_operation: PendingProviderOperation | None = None
@@ -1148,7 +1197,7 @@ class JoinedLaneRecord(_ContractModel):
     preserved_work_manifest: tuple[str, ...] = ()
     revision: int = Field(default=1, ge=1)
 
-    @field_validator("goal_version", "chitra_ownership_epoch", "revision")
+    @field_validator("goal_version", "chitra_ownership_epoch", "revision", "wake_archive_count")
     @classmethod
     def reject_bool_counts(cls, value: int) -> int:
         if isinstance(value, bool):
@@ -1180,6 +1229,18 @@ class JoinedLaneRecord(_ContractModel):
         history_keys = [entry.idempotency_key for entry in self.operation_history]
         if len(history_ids) != len(set(history_ids)) or len(history_keys) != len(set(history_keys)):
             raise ValueError("joined-lane operation history IDs and keys must be unique")
+        wake_ids = [receipt.wake_id for receipt in self.wake_receipts]
+        if len(wake_ids) != len(set(wake_ids)):
+            raise ValueError("joined-lane wake receipt IDs must be unique")
+        if any((receipt.lane_id, receipt.goal_id) != (self.lane_id, self.goal_id) for receipt in self.wake_receipts):
+            raise ValueError("wake receipt logical identity must match joined lane")
+        wake_times = [datetime.fromisoformat(receipt.observed_at.replace("Z", "+00:00")) for receipt in self.wake_receipts]
+        if any(left > right for left, right in zip(wake_times, wake_times[1:], strict=False)):
+            raise ValueError("wake receipt timestamps must be monotonic")
+        if len(self.wake_receipts) > MAX_INLINE_WAKE_RECEIPTS:
+            raise ValueError("joined-lane wake receipts exceed the bounded inline retention window")
+        if (self.wake_archive_count == 0) != (self.wake_archive_digest == ""):
+            raise ValueError("wake archive count and digest must be present together")
         history_times = [datetime.fromisoformat(entry.created_at.replace("Z", "+00:00")) for entry in self.operation_history]
         if any(left > right for left, right in zip(history_times, history_times[1:], strict=False)):
             raise ValueError("joined-lane operation history timestamps must be monotonic")
@@ -1407,10 +1468,29 @@ def validate_record_transition(
         or current.operation_history[: len(previous.operation_history)] != previous.operation_history
     ):
         errors.append("operation history must preserve its append-only prefix")
+    removed_count = current.wake_archive_count - previous.wake_archive_count
+    if removed_count < 0 or removed_count > len(previous.wake_receipts):
+        errors.append("wake receipt archive count cannot move backwards or skip receipts")
+    else:
+        expected_digest = previous.wake_archive_digest
+        for receipt in previous.wake_receipts[:removed_count]:
+            expected_digest = extend_wake_archive_digest(expected_digest, receipt)
+        retained = previous.wake_receipts[removed_count:]
+        if current.wake_receipts[: len(retained)] != retained:
+            errors.append("wake receipts must retain their uncompacted append-only suffix")
+        if current.wake_archive_digest != expected_digest:
+            errors.append("wake receipt archive digest does not match the compacted prefix")
+    session_rebound = False
+    if previous.current_update is not None and current.current_update is not None:
+        previous_update = previous.current_update.to_dict()
+        current_update = current.current_update.to_dict()
+        previous_update["session_ref"] = current_update["session_ref"]
+        session_rebound = previous_update == current_update
     if (
         previous.current_update is not None
         and current.current_update is not None
         and previous.current_update != current.current_update
+        and not (normalized_transition == "provider-transfer" and session_rebound)
     ):
         try:
             validate_update(previous.current_update, current.current_update)
@@ -1454,6 +1534,7 @@ __all__ = [
     "LaneRecord",
     "LANE_RECORD_SCHEMA",
     "LANE_RECORD_VERSION",
+    "MAX_INLINE_WAKE_RECEIPTS",
     "LaneIdentity",
     "LaneLifecycle",
     "LaneUpdate",
@@ -1497,7 +1578,9 @@ __all__ = [
     "UsageComponent",
     "UsageReport",
     "Usage",
+    "WakeReceipt",
     "calculate_progress",
+    "extend_wake_archive_digest",
     "is_valid_update",
     "migrate_legacy_record",
     "validate_active_owner_set",

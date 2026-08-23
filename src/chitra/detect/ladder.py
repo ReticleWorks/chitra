@@ -466,6 +466,7 @@ def _checkpoint_receipt_nonce(
         "created_at",
         "writer_identity",
         "ledger_binding",
+        "recovery_binding",
         "provenance",
         "anti_replay_nonce",
         "signature",
@@ -485,6 +486,11 @@ def _checkpoint_receipt_nonce(
     if not _checkpoint_target_identity_matches(payload.get("target_process_identity"), bundle.process_identity):
         return None
     if not _checkpoint_ledger_binding_matches(payload.get("ledger_binding"), record):
+        return None
+    bundle_binding = bundle.recovery_binding
+    if payload.get("recovery_binding") != (
+        None if bundle_binding is None else bundle_binding.model_dump(mode="json")
+    ):
         return None
     provenance = payload.get("provenance")
     if not isinstance(provenance, dict) or provenance.get("kind") != CHECKPOINT_PROVENANCE_KIND:
@@ -534,6 +540,13 @@ def _load_consumed_checkpoints(state_root: Path) -> tuple[set[str], set[str]]:
         if isinstance(stored_nonce, str) and stored_nonce:
             nonces.add(stored_nonce)
     return refs, nonces
+
+
+def consumed_checkpoint_refs(state_root: Path) -> frozenset[str]:
+    """Return checkpoint references already sealed by the incident store."""
+
+    refs, _nonces = _load_consumed_checkpoints(state_root)
+    return frozenset(refs)
 
 
 def _append_consumed_checkpoint(
@@ -651,6 +664,7 @@ def _next_final_boundary(events: tuple[CanonicalEvent, ...], start_position: int
 
 __all__ = [
     "ConsumptionProof",
+    "consumed_checkpoint_refs",
     "IncidentRecord",
     "IncidentStore",
     "LADDER_STAGES",

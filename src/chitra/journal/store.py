@@ -11,6 +11,7 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
+from ..session_contract import WakeReceipt
 from .models import (
     CanonicalEvent,
     CanonicalType,
@@ -110,6 +111,7 @@ class EventJournal:
         self.directory = state_root / "journal"
         self.path = self.directory / f"{lane}.jsonl"
         self.progress_path = self.directory / f"{lane}.progress.jsonl"
+        self.wake_path = self.directory / f"{lane}.wake.jsonl"
         self.lock_path = self.directory / f"{lane}.lock"
 
     def load(self) -> list[CanonicalEvent]:
@@ -140,6 +142,25 @@ class EventJournal:
                     raise ValueError(f"invalid progress row {self.progress_path}:{line_number}: {exc}") from exc
         return rows
 
+    def load_wakes(self) -> list[WakeReceipt]:
+        """Load the append-only wake archive used after inline compaction."""
+
+        if not self.wake_path.exists():
+            return []
+        rows: list[WakeReceipt] = []
+        with self.wake_path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                try:
+                    receipt = WakeReceipt.model_validate_json(line)
+                except ValueError as exc:
+                    raise ValueError(f"invalid wake row {self.wake_path}:{line_number}: {exc}") from exc
+                if receipt.lane_id != self.lane:
+                    raise ValueError(f"wake row lane {receipt.lane_id!r} does not match journal lane {self.lane!r}")
+                rows.append(receipt)
+        return rows
+
     def append(self, events: Iterable[CanonicalEvent]) -> tuple[CanonicalEvent, ...]:
         candidates = tuple(events)
         if not candidates:
@@ -152,7 +173,38 @@ class EventJournal:
     def append_progress(self, rows: Iterable[ProgressClassification]) -> tuple[ProgressClassification, ...]:
         return self._append_unique(self.progress_path, tuple(rows), "derivation_id")
 
-    def _append_unique[T: CanonicalEvent | ProgressClassification](
+    def append_wakes(self, rows: Iterable[WakeReceipt]) -> tuple[WakeReceipt, ...]:
+        candidates = tuple(rows)
+        for receipt in candidates:
+            if receipt.lane_id != self.lane:
+                raise ValueError(f"wake lane {receipt.lane_id!r} does not match journal lane {self.lane!r}")
+        return self._append_unique(self.wake_path, candidates, "wake_id")
+
+    def proves_named_wake(
+        self,
+        *,
+        wake_id: str,
+        event_sequence: int,
+        goal_id: str,
+        session_ref: str,
+        wake_condition: str,
+    ) -> bool:
+        """Require one exact lane event proving that a named condition changed."""
+
+        events = self.load()
+        if event_sequence < 1 or event_sequence > len(events):
+            return False
+        event = events[event_sequence - 1]
+        return (
+            event.event_id == wake_id
+            and event.lane == self.lane
+            and event.goal_ref == goal_id
+            and event.session_id == session_ref
+            and event.payload.get("wake_condition") == wake_condition
+            and event.payload.get("wake_condition_changed") is True
+        )
+
+    def _append_unique[T: CanonicalEvent | ProgressClassification | WakeReceipt](
         self,
         path: Path,
         candidates: tuple[T, ...],

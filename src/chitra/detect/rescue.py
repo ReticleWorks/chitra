@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from .ladder import IncidentRecord
 
@@ -32,6 +32,24 @@ CHECKPOINT_PROVENANCE_KIND = "governed-rescue-checkpoint"
 CHECKPOINT_WRITER = "chitra.detect.rescue.write_checkpoint_receipt"
 CHECKPOINT_SIGNATURE_SCOPE = "checkpoint receipt JSON with /signature omitted"
 CHECKPOINT_CANONICALIZATION = "json.dumps(sort_keys=True,separators=(',',':'),ensure_ascii=False)"
+
+
+class RecoveryCheckpointBinding(BaseModel):
+    """Identity envelope required when a RESCUE checkpoint gates recovery."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    lane_id: str = Field(min_length=1)
+    goal_id: str = Field(min_length=1)
+    session_ref: str = Field(min_length=1)
+    cycle_id: str = Field(min_length=1)
+    operation_id: str = Field(min_length=1)
+    provider_handle: str = Field(min_length=1)
+    provider_instance_id: str = Field(min_length=1)
+    provider_generation: int = Field(ge=1)
+    idempotency_key: str = Field(min_length=1)
+    payload_digest: str = Field(min_length=1)
+    event_sequence: int = Field(ge=1)
 
 
 class RescueBundle(BaseModel):
@@ -54,11 +72,14 @@ class RescueBundle(BaseModel):
     incident_history: tuple[str, ...]
     open_asks: tuple[str, ...]
     checkpoint_requested: bool
+    recovery_binding: RecoveryCheckpointBinding | None = None
     bundle_sha256: str = ""
 
     def compute_digest(self) -> str:
         payload = self.model_dump()
         payload.pop("bundle_sha256", None)
+        if payload.get("recovery_binding") is None:
+            payload.pop("recovery_binding", None)
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
         return hashlib.sha256(encoded).hexdigest()
 
@@ -172,6 +193,7 @@ def collect_rescue_bundle(
     incidents: Sequence[IncidentRecord] = (),
     open_asks: Sequence[str] = (),
     process_identity: dict[str, Any] | None = None,
+    recovery_binding: RecoveryCheckpointBinding | None = None,
 ) -> RescueBundle:
     """Gather the RESCUE evidence set. Read-only over the worktree."""
     if transcript_path is None:
@@ -230,6 +252,7 @@ def collect_rescue_bundle(
         incident_history=history,
         open_asks=tuple(open_asks),
         checkpoint_requested=True,
+        recovery_binding=recovery_binding,
     )
     return bundle.model_copy(update={"bundle_sha256": bundle.compute_digest()})
 
@@ -308,6 +331,7 @@ def write_checkpoint_receipt(
             "sent_at": ledger_entry.sent_at,
             "signature": ledger_entry.signature,
         },
+        "recovery_binding": None if bundle.recovery_binding is None else bundle.recovery_binding.model_dump(mode="json"),
         "provenance": {
             "kind": CHECKPOINT_PROVENANCE_KIND,
             "writer": CHECKPOINT_WRITER,
@@ -339,6 +363,70 @@ def write_checkpoint_receipt(
     finally:
         os.close(fd)
     return path
+
+
+def find_recovery_checkpoint_receipt(
+    state_root: Path,
+    binding: RecoveryCheckpointBinding,
+) -> str | None:
+    """Return the one signed, sealed receipt matching an exact recovery envelope."""
+
+    try:
+        from .ladder import IncidentStore, consumed_checkpoint_refs
+
+        consumed = consumed_checkpoint_refs(state_root)
+        incidents = IncidentStore(state_root, binding.lane_id).load()
+    except (OSError, ValueError):
+        return None
+    for path in sorted((state_root / "checkpoints").glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict) or not verify_checkpoint_receipt_signature(payload, state_root=state_root):
+            continue
+        checkpoint_ref = payload.get("checkpoint_ref")
+        if not isinstance(checkpoint_ref, str) or checkpoint_ref not in consumed:
+            continue
+        if payload.get("recovery_binding") != binding.model_dump(mode="json"):
+            continue
+        if payload.get("lane") != binding.lane_id or payload.get("session_ref") != binding.session_ref:
+            continue
+        bundle_digest = payload.get("rescue_bundle_sha256")
+        fingerprint = payload.get("incident_fingerprint")
+        if not isinstance(bundle_digest, str) or not isinstance(fingerprint, str):
+            continue
+        sealed = next(
+            (
+                record
+                for record in reversed(incidents)
+                if record.checkpoint_ref == checkpoint_ref
+                and record.rescue_bundle_sha256 == bundle_digest
+                and record.fingerprint == fingerprint
+            ),
+            None,
+        )
+        if sealed is None:
+            continue
+        bundle_valid = False
+        for bundle_path in (state_root / "rescue").glob("*.json"):
+            try:
+                bundle = RescueBundle.model_validate_json(bundle_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if (
+                bundle.bundle_sha256 == bundle_digest
+                and bundle.compute_digest() == bundle_digest
+                and bundle.recovery_binding == binding
+                and bundle.lane == binding.lane_id
+                and bundle.session_ref == binding.session_ref
+            ):
+                bundle_valid = True
+                break
+        if not bundle_valid:
+            continue
+        return checkpoint_ref
+    return None
 
 
 def generate_relaunch_brief(bundle: RescueBundle, *, tighter_instructions: Sequence[str] = ()) -> str:
@@ -395,9 +483,11 @@ __all__ = [
     "BRIEF_SCHEMA",
     "BUNDLE_SCHEMA",
     "CHECKPOINT_SCHEMA",
+    "RecoveryCheckpointBinding",
     "RescueBundle",
     "collect_rescue_bundle",
     "generate_relaunch_brief",
+    "find_recovery_checkpoint_receipt",
     "load_or_create_checkpoint_key",
     "sign_checkpoint_receipt",
     "verify_checkpoint_receipt_signature",

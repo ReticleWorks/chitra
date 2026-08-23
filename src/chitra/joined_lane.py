@@ -28,6 +28,7 @@ from .ledger import LedgerEntry, verify_entry
 from .ownership_provider import DEFAULT_SOCKET_PATH, QUERY_SCHEMA, request_json_line
 from .provider_protocol import ProviderUpdate, UpdateKind
 from .session_contract import (
+    MAX_INLINE_WAKE_RECEIPTS,
     ContractValidationError,
     InterventionEvidence,
     JoinedLaneRecord,
@@ -38,6 +39,8 @@ from .session_contract import (
     ProviderIdentity,
     ProviderOperationResult,
     RecordTransitionKind,
+    WakeReceipt,
+    extend_wake_archive_digest,
     validate_record_transition,
 )
 
@@ -591,10 +594,17 @@ def _provider_identity(record: object) -> tuple[str, str, int | None]:
 
 
 def _wake_id(record: object) -> str:
-    intervention = _value(record, "last_intervention", None)
-    if intervention is not None and _value(intervention, "action", "") == "Wake condition observed":
-        return _text(_value(intervention, "operation_id", ""))
-    return ""
+    receipts = _value(record, "wake_receipts", ())
+    if not isinstance(receipts, tuple):
+        return ""
+    return _text(_value(receipts[-1], "wake_id", "")) if receipts else ""
+
+
+def _wake_ids(record: object) -> frozenset[str]:
+    receipts = _value(record, "wake_receipts", ())
+    if not isinstance(receipts, tuple):
+        return frozenset()
+    return frozenset(_text(_value(receipt, "wake_id", "")) for receipt in receipts)
 
 
 def _canonical_next_check(record: object, at: str, reason: str, wake_condition: str | None = None) -> object:
@@ -611,10 +621,11 @@ def _canonical_recovery(record: object, *, reason: str, next_check: str, blocked
     if current is None:
         return None
     updates = {
-        "stage": "diagnostic" if blocked else "waiting",
-        "failure_signature": reason,
+        "failure_signature": _value(current, "failure_signature", "") or reason,
         "next_allowed_attempt": next_check or None,
     }
+    if blocked and _value(current, "stage", "none") in {"none", "complete"}:
+        updates["stage"] = "waiting"
     return cast(object, current.model_copy(update=updates)) if hasattr(current, "model_copy") else current
 
 
@@ -649,6 +660,7 @@ def _apply_state(record: Any, updates: Mapping[str, Any]) -> Any:
         if recovery is not None:
             applied["recovery"] = recovery
     if "wake_id" in updates and "last_intervention" in model_fields and updates["wake_id"]:
+        wake_id = _text(updates["wake_id"])
         applied["last_intervention"] = InterventionEvidence(
             operation_id=updates["wake_id"],
             action="Wake condition observed",
@@ -656,6 +668,30 @@ def _apply_state(record: Any, updates: Mapping[str, Any]) -> Any:
             useful_work_resumed=None,
             observed_at=updates["wake_observed_at"],
         )
+        if "wake_receipts" in model_fields and wake_id not in _wake_ids(record):
+            receipts = (
+                *_value(record, "wake_receipts", ()),
+                WakeReceipt(
+                    wake_id=wake_id,
+                    lane_id=_value(record, "lane_id", ""),
+                    goal_id=_value(record, "goal_id", ""),
+                    session_ref=_value(record, "session_ref", ""),
+                    wake_condition=_text(updates.get("wake_condition", "")),
+                    event_sequence=updates["wake_event_sequence"],
+                    observed_at=updates["wake_observed_at"],
+                ),
+            )
+            archive_count = _value(record, "wake_archive_count", 0)
+            archive_digest = _text(_value(record, "wake_archive_digest", ""))
+            if len(receipts) > MAX_INLINE_WAKE_RECEIPTS:
+                removed = receipts[: len(receipts) - MAX_INLINE_WAKE_RECEIPTS]
+                receipts = receipts[len(removed) :]
+                for receipt in removed:
+                    archive_digest = extend_wake_archive_digest(archive_digest, receipt)
+                archive_count += len(removed)
+            applied["wake_receipts"] = receipts
+            applied["wake_archive_count"] = archive_count
+            applied["wake_archive_digest"] = archive_digest
     return _copy_model(record, applied)
 
 
@@ -1011,23 +1047,84 @@ class JoinedLaneReconciler:
         *,
         wake_id: str = "",
         wake_condition: str = "a new safe provider fact or material lane update",
+        event_sequence: int | None = None,
     ) -> ReconcileOutcome:
         """Re-run one lane without changing its operation/order identity."""
 
         record = self.store.require(lane_id)
-        if wake_id and _wake_id(record) == wake_id:
+        journal = EventJournal(self.store.root, lane_id)
+        archived_wake_ids = {receipt.wake_id for receipt in journal.load_wakes()}
+        if wake_id and (wake_id in _wake_ids(record) or wake_id in archived_wake_ids):
             return self._outcome(record, "wake_reused", False, "wake already applied")
+        sequence = event_sequence
+        if sequence is None and record.current_update is not None:
+            sequence = record.current_update.sequence
+        if wake_id and (isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1):
+            raise JoinedLaneIdentityError("wake receipt requires an exact positive event sequence")
+        if wake_id:
+            assert sequence is not None
+            if not journal.proves_named_wake(
+                wake_id=wake_id,
+                event_sequence=sequence,
+                goal_id=record.goal_id,
+                session_ref=record.session_ref,
+                wake_condition=wake_condition,
+            ):
+                raise JoinedLaneIdentityError("wake receipt lacks exact canonical evidence that its named condition changed")
+        observed_at = self._now().astimezone(UTC).isoformat()
         if not _record_pending(record):
-            updated = self._save(record, wake_id=wake_id) if wake_id else record
+            updated = (
+                self._save(
+                    record,
+                    wake_id=wake_id,
+                    wake_condition=wake_condition,
+                    wake_event_sequence=sequence,
+                    wake_observed_at=observed_at,
+                )
+                if wake_id
+                else record
+            )
+            if wake_id:
+                assert sequence is not None
+                journal.append_wakes(
+                    (
+                        WakeReceipt(
+                            wake_id=wake_id,
+                            lane_id=record.lane_id,
+                            goal_id=record.goal_id,
+                            session_ref=record.session_ref,
+                            wake_condition=wake_condition,
+                            event_sequence=sequence,
+                            observed_at=observed_at,
+                        ),
+                    )
+                )
             return self._outcome(updated, "wake_reused", True, "lane is already complete")
         updates: dict[str, Any] = {
             "next_check_at": self._now().astimezone(UTC).isoformat() if wake_id else "",
             "wake_condition": wake_condition.strip() or "a new safe provider fact or material lane update",
         }
         if wake_id:
+            assert sequence is not None
             updates["wake_id"] = wake_id
-            updates["wake_observed_at"] = self._now().astimezone(UTC).isoformat()
+            updates["wake_observed_at"] = observed_at
+            updates["wake_event_sequence"] = sequence
         updated = self._save(record, **updates)
+        if wake_id:
+            assert sequence is not None
+            journal.append_wakes(
+                (
+                    WakeReceipt(
+                        wake_id=wake_id,
+                        lane_id=record.lane_id,
+                        goal_id=record.goal_id,
+                        session_ref=record.session_ref,
+                        wake_condition=updates["wake_condition"],
+                        event_sequence=sequence,
+                        observed_at=observed_at,
+                    ),
+                )
+            )
         return self.reconcile(updated)
 
 
@@ -1132,13 +1229,26 @@ def journal_provider_probe(root: Path) -> JournalProbe:
             return None
         for event in reversed(EventJournal(root, record.lane_id).load()):
             payload = event.payload
+            if event.lane != record.lane_id or event.goal_ref != record.goal_id or event.session_id != record.session_ref:
+                continue
             if payload.get("operation_id") != pending.operation_id:
                 continue
             if payload.get("lane_id") != record.lane_id:
                 continue
+            if payload.get("goal_id") != record.goal_id or payload.get("session_ref") != record.session_ref:
+                continue
+            if payload.get("provider_handle") != pending.provider_handle:
+                continue
             if payload.get("provider_instance_id") != provider_instance_id:
                 continue
             if payload.get("provider_generation") != provider_generation:
+                continue
+            if payload.get("idempotency_key") != pending.idempotency_key:
+                continue
+            if payload.get("payload_digest") != pending.payload_digest:
+                continue
+            recovery = record.recovery
+            if recovery.event_sequence is not None and payload.get("event_sequence") != recovery.event_sequence:
                 continue
             evidence = payload.get("result_evidence")
             if not isinstance(evidence, Mapping):
@@ -1151,7 +1261,7 @@ def journal_provider_probe(root: Path) -> JournalProbe:
                 event_id=event.event_id,
                 cursor=event.event_id,
                 kind=kind,
-                provider_session_id=event.session_id,
+                provider_session_id=pending.provider_handle,
                 observed_at=event.observed_at,
                 operation_id=pending.operation_id,
                 lane_id=record.lane_id,

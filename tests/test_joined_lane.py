@@ -23,6 +23,8 @@ from chitra.joined_lane import (
     ledger_provider_probe,
     ownership_provider_probe,
 )
+from chitra.journal.models import CanonicalEvent, CanonicalType, Client, TranscriptIdentity
+from chitra.journal.store import EventJournal
 from chitra.ledger import LedgerEntry, append_entry
 from chitra.orders import DispatchOrder, DispatchStatus
 from chitra.provider_protocol import ProviderUpdate, UpdateKind
@@ -58,6 +60,37 @@ def lane_update(*, sequence: int) -> LaneUpdate:
         observed_at="2026-08-23T14:00:00+00:00",
         plan_version=1,
         next_action="wait",
+    )
+
+
+def append_wake_event(root: Path, wake_id: str, condition: str) -> None:
+    EventJournal(root, "lane-a").append(
+        (
+            CanonicalEvent(
+                event_id=wake_id,
+                instance="test",
+                lane="lane-a",
+                client=Client.CODEX,
+                client_version="test",
+                process_id="1",
+                transcript=TranscriptIdentity(path="/tmp/lane-a", device=1, inode=1),
+                session_id="tophand:lane-a",
+                resume_id=None,
+                observed_at="2026-08-23T14:00:01+00:00",
+                native_time=None,
+                native_type="wake_condition_changed",
+                native_join_id=None,
+                raw_byte_range=None,
+                raw_sha256=None,
+                normalized_type=CanonicalType.UNKNOWN,
+                goal_ref="goal-a",
+                item_ref=None,
+                payload_digest="a" * 64,
+                normalizer_version="test",
+                payload={"wake_condition": condition, "wake_condition_changed": True},
+                raw_record=None,
+            ),
+        )
     )
 
 
@@ -530,8 +563,9 @@ def test_wake_is_idempotent_and_preserves_operation_identity(tmp_path: Path) -> 
         ownership_probe=lambda _record: ownership(),
         now=fixed_now,
     )
-    first = reconciler.wake("lane-a", wake_id="wake-1")
-    second = reconciler.wake("lane-a", wake_id="wake-1")
+    append_wake_event(tmp_path, "wake-1", "a new safe provider fact or material lane update")
+    first = reconciler.wake("lane-a", wake_id="wake-1", event_sequence=1)
+    second = reconciler.wake("lane-a", wake_id="wake-1", event_sequence=1)
     assert first.status == "sent_unobserved"
     assert second.status == "wake_reused"
     saved = store.require("lane-a")
