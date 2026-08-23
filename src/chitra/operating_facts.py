@@ -23,6 +23,7 @@ from typing import Literal
 from chitra.session_contract import FactState, OperatingFact
 
 OPERATING_FACTS_SCHEMA: Literal["chitra.operating-facts.v1"] = "chitra.operating-facts.v1"
+PRODUCTION_OPERATING_FACTS_PATH = Path("/var/lib/polyphony-chitra/operating-facts.json")
 
 FactCategory = Literal["placement", "routing", "credential-readiness", "access", "capacity"]
 
@@ -70,6 +71,19 @@ class OperatingFactsSources:
         if category == "access":
             return _as_paths(self.access)
         return _as_paths(self.capacity)
+
+
+def production_operating_facts_sources() -> OperatingFactsSources:
+    """Return the Fleet-published production snapshot location."""
+
+    path = PRODUCTION_OPERATING_FACTS_PATH
+    return OperatingFactsSources(
+        placement=path,
+        routing=path,
+        credential_readiness=path,
+        access=path,
+        capacity=path,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,7 +282,7 @@ def read_operating_facts(
     """
 
     current = _now(now)
-    configured = OperatingFactsSources() if sources is None else sources
+    configured = production_operating_facts_sources() if sources is None else sources
     candidates: dict[str, list[_Candidate]] = {}
 
     for category in _CATEGORIES:
@@ -339,5 +353,7 @@ __all__ = [
     "OPERATING_FACTS_SCHEMA",
     "OperatingFactsSnapshot",
     "OperatingFactsSources",
+    "PRODUCTION_OPERATING_FACTS_PATH",
+    "production_operating_facts_sources",
     "read_operating_facts",
 ]
