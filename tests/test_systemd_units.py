@@ -24,7 +24,10 @@ def test_shipped_systemd_environment_variables_are_consumed_by_their_entrypoints
     expected = {
         "boardd.service.example": {"BOARDD_STATE_DIR"},
         "chitra-dispatchd.service.example": {"REMOTE_DISPATCH_HOSTS", "CHITRA_LANE_LOCK_DIR"},
-        "chitra-monitord.service.example": {"CHITRA_MONITORD_SHADOW_MODE"},
+        # The single monitord example is the per-instance template fleet
+        # renders; shadow mode is consumed by the daemon, CHITRA_STATE_DIR
+        # isolates each %i instance's state root.
+        "chitra-monitord@.service.example": {"CHITRA_MONITORD_SHADOW_MODE", "CHITRA_STATE_DIR"},
         "chitra-ownership-provider.service.example": {"CHITRA_HOST_ID"},
         "chitra-petra.service.example": {"PETRA_HOST_UUID"},
         "chitra-rate-limit-guard.service.example": set(),
@@ -34,9 +37,6 @@ def test_shipped_systemd_environment_variables_are_consumed_by_their_entrypoints
         # never an inline Environment= line, so the credential cannot end up
         # in a unit file that anyone can read.
         "polyphony-chitra-merged.service.example": set(),
-        # Each fleet-style instance isolates its state root through the
-        # shared CHITRA_STATE_DIR environment convention.
-        "polyphony-chitra-monitord-at.service.example": {"CHITRA_STATE_DIR"},
     }
     actual = {unit_path.name: _environment_names(unit_path) for unit_path in sorted(SYSTEMD_DIR.glob("*.example"))}
 
@@ -64,12 +64,10 @@ def test_shipped_systemd_environment_variables_are_consumed_by_their_entrypoints
         assert f'"{env_name}"' in boardd_source
 
     monitord_source = (REPO_ROOT / "src" / "chitra" / "monitord.py").read_text(encoding="utf-8")
-    for env_name in expected["chitra-monitord.service.example"]:
-        assert f'os.environ.get("{env_name}"' in monitord_source
+    assert 'os.environ.get("CHITRA_MONITORD_SHADOW_MODE"' in monitord_source
 
     state_paths_source = (REPO_ROOT / "src" / "chitra" / "state_paths.py").read_text(encoding="utf-8")
-    for env_name in expected["polyphony-chitra-monitord-at.service.example"]:
-        assert f'"{env_name}"' in state_paths_source
+    assert '"CHITRA_STATE_DIR"' in state_paths_source
 
 
 def test_the_merge_daemon_unit_fails_rather_than_starting_without_its_token() -> None:

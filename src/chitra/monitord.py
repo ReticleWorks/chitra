@@ -225,8 +225,13 @@ def check_enrollment_and_receipts(
     if not items:
         return 0, False, []
     evidence = record_enrolled_validator_runs(config.state_dir, session_ref, items)
-    passing = {item.required_receipt for item in evidence if item.validator_result == "pass"}
-    disputed = any(item.required_receipt not in passing for item in items)
+    passing_receipts = {
+        item.required_receipt for item in items if any(
+            proof.receipt_name == item.required_receipt and proof.validator_result == "pass"
+            for proof in evidence
+        )
+    }
+    disputed = any(item.required_receipt not in passing_receipts for item in items)
     findings: list[Finding] = []
     if disputed:
         findings.extend(

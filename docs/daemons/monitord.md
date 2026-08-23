@@ -49,9 +49,9 @@ chitra-monitord --state-dir /var/lib/chitra --once
 ```
 
 Continuous operation: see
-[`packaging/systemd/chitra-monitord.service.example`](../../packaging/systemd/chitra-monitord.service.example).
-For fleet-style isolated instances, see
-[`packaging/systemd/polyphony-chitra-monitord-at.service.example`](../../packaging/systemd/polyphony-chitra-monitord-at.service.example).
+[`packaging/systemd/chitra-monitord@.service.example`](../../packaging/systemd/chitra-monitord@.service.example),
+one instance-template unit per fleet-style isolated instance
+(`systemctl enable --now chitra-monitord@<instance>.service`).
 
 Flags: `--state-dir`, `--transcript-root`, `--findings-path`,
 `--poll-seconds`, `--no-shadow-mode`, `--once`.
