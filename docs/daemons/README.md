@@ -2,6 +2,10 @@
 
 Chitra provides a set of command-line tools and daemons organized by function. Two run continuously (dispatchd, triaged). The rest are periodic, ad-hoc, or observation-only services.
 
+## The Composed Monitor
+
+- **[monitord](monitord.md)** — The single observation-plane daemon: journal ingestion, deterministic detectors and response ladder, enrollment receipts, and presence in one entrypoint. `watchd`, `triaged`, and `sweepd` are deprecated by it.
+
 ## Delivery Systems
 
 The deterministic core that handles message queuing, delivery, and ledger recording.

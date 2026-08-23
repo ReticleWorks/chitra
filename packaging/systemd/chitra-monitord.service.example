@@ -1,0 +1,22 @@
+[Unit]
+Description=chitra monitord (composed journal/detector/ladder/enrollment/presence monitor)
+Documentation=https://github.com/ReticleWorks/chitra
+After=network-online.target
+
+[Service]
+Type=simple
+# Replace with the user/group this service should run as. Do not run as root.
+User=chitra
+Group=chitra
+StateDirectory=chitra
+# Shadow mode (the default) records findings and ladder decisions without any
+# action path; remove this override only after an explicit operator review.
+Environment=CHITRA_MONITORD_SHADOW_MODE=1
+# Fill in the venv path where `pip install chitra-monitor` was run.
+ExecStart=/path/to/venv/bin/chitra-monitord --state-dir /var/lib/chitra
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target
