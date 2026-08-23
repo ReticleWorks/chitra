@@ -19,8 +19,11 @@ from chitra.queue_state import (
     LaneLockRetryTracker,
     QueueLayout,
     SendNonce,
+    StoredResult,
+    TerminalFinalization,
     read_owner_pid,
     reclaim_stale_claims,
+    requeue_deferred_to_orders,
     reserve_claim,
 )
 
@@ -267,3 +270,107 @@ def test_retry_tracker_clear_removes_the_sidecar_and_is_safe_to_repeat(tmp_path:
     assert not tracker.state_path("ord-1").exists()
     assert tracker.attempts("ord-1", retry_limit=20) == 0
     tracker.clear("ord-1")  # idempotent
+
+
+def test_stored_result_create_once_preserves_the_first_writer(tmp_path: Path) -> None:
+    stored = StoredResult("ord-1", tmp_path / "results" / "ord-1.json")
+
+    assert stored.create_once({"order_id": "ord-1", "status": "failed", "reason": "first"})
+    assert not stored.create_once({"order_id": "ord-1", "status": "sent", "reason": "loser"})
+    assert stored.read_payload() == {"order_id": "ord-1", "status": "failed", "reason": "first"}
+
+
+def test_terminal_finalization_is_idempotent_and_clears_control_markers(tmp_path: Path) -> None:
+    layout = QueueLayout(tmp_path)
+    layout.create()
+    claimed = layout.in_flight / "ord-1.json"
+    claimed.write_text("{}", encoding="utf-8")
+    nonce = layout.send_nonce("ord-1")
+    nonce.mint()
+    tracker = LaneLockRetryTracker(layout.deferred)
+    tracker.record_attempt("ord-1", retry_limit=20)
+
+    finalization = TerminalFinalization(
+        claimed_path=claimed,
+        order_id="ord-1",
+        results_dir=layout.results,
+        destination_dir=layout.processed,
+        result_payload={"order_id": "ord-1", "status": "failed"},
+        retry_state_dir=layout.deferred,
+        nonce_path=layout.send_nonce_path("ord-1"),
+    )
+
+    assert finalization.apply()
+    assert not finalization.apply()  # repeated reconciliation is a no-op
+    assert not claimed.exists()
+    assert (layout.processed / claimed.name).exists()
+    assert not nonce.exists()
+    assert not tracker.state_path("ord-1").exists()
+    assert StoredResult("ord-1", layout.result_path("ord-1")).read_payload() == {
+        "order_id": "ord-1",
+        "status": "failed",
+    }
+
+
+def test_terminal_finalization_never_replaces_an_existing_destination(tmp_path: Path) -> None:
+    layout = QueueLayout(tmp_path)
+    layout.create()
+    claimed = layout.in_flight / "ord-1.json"
+    claimed.write_text("loser", encoding="utf-8")
+    destination = layout.processed / claimed.name
+    destination.write_text("first-writer", encoding="utf-8")
+
+    finalization = TerminalFinalization(
+        claimed_path=claimed,
+        order_id="ord-1",
+        results_dir=layout.results,
+        destination_dir=layout.processed,
+        result_payload={"order_id": "ord-1", "status": "failed"},
+    )
+
+    with pytest.raises(FileExistsError):
+        finalization.apply()
+    assert destination.read_text(encoding="utf-8") == "first-writer"
+    assert claimed.read_text(encoding="utf-8") == "loser"
+
+
+def test_requeue_deferred_to_orders_is_fifo_and_does_not_reset_retry_sidecars(tmp_path: Path) -> None:
+    deferred = tmp_path / "deferred"
+    orders = tmp_path / "orders"
+    deferred.mkdir()
+    orders.mkdir()
+    older = deferred / "older.json"
+    newer = deferred / "newer.json"
+    older.write_text('{"order_id": "older"}', encoding="utf-8")
+    newer.write_text('{"order_id": "newer"}', encoding="utf-8")
+    os.utime(older, ns=(10, 10))
+    os.utime(newer, ns=(20, 20))
+    tracker = LaneLockRetryTracker(deferred)
+    tracker.record_attempt("older", retry_limit=20)
+    tracker.record_attempt("newer", retry_limit=20)
+
+    outcome = requeue_deferred_to_orders(deferred, orders)
+
+    assert [path.name for path in outcome.requeued] == ["older.json", "newer.json"]
+    assert outcome.skipped_existing_target == []
+    assert outcome.failed == []
+    assert tracker.attempts("older", retry_limit=20) == 1
+    assert tracker.attempts("newer", retry_limit=20) == 1
+
+
+def test_requeue_deferred_skips_a_target_created_after_scan_without_clobbering_it(tmp_path: Path) -> None:
+    deferred = tmp_path / "deferred"
+    orders = tmp_path / "orders"
+    deferred.mkdir()
+    orders.mkdir()
+    source = deferred / "ord-1.json"
+    target = orders / source.name
+    source.write_text("deferred", encoding="utf-8")
+    target.write_text("already-pending", encoding="utf-8")
+
+    outcome = requeue_deferred_to_orders(deferred, orders)
+
+    assert outcome.requeued == []
+    assert outcome.skipped_existing_target == [source]
+    assert target.read_text(encoding="utf-8") == "already-pending"
+    assert source.read_text(encoding="utf-8") == "deferred"

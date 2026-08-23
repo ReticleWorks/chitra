@@ -112,7 +112,6 @@ from pathlib import Path
 import structlog
 
 from . import ledger as ledger_mod
-from ._fsio import write_json_atomic
 from .completion_gate import evaluate_completion_claim, is_completion_claim
 from .dispatch import (
     DISPATCH_VERIFY_WAIT_SECONDS,
@@ -142,7 +141,10 @@ from .queue_state import (
     LaneLockRetryTracker,
     QueueLayout,
     QueueSubdir,
+    StoredResult,
+    TerminalFinalization,
     reclaim_stale_claims,
+    requeue_deferred_to_orders,
     reserve_claim,
 )
 from .routing_config import RoutingConfig, load_routing_config, resolve_route, resolve_routing_hint
@@ -242,18 +244,27 @@ def session_scope_violation(
     return None
 
 
-def _write_result_atomic(results_dir: Path, result: DispatchResult) -> Path:
-    """Write a result JSON atomically (write to temp, rename)."""
-    target = results_dir / f"{result.order_id}.json"
-    write_json_atomic(
-        target,
-        result.model_dump(mode="json"),
-        temporary_path=results_dir / f".{result.order_id}.json.tmp",
-        trailing_newline=False,
-        sort_keys=False,
-        cleanup_on_error=False,
-    )
-    return target
+def _write_result_atomic(
+    results_dir: Path,
+    result: DispatchResult,
+    *,
+    overwrite: bool = False,
+) -> Path:
+    """Publish one result without clobbering a prior writer by default.
+
+    The first durable result is the queue's idempotency record. The only
+    allowed replacement is the later ``delivery_ledger_verified`` proof-bit
+    update after dispatchd has validated the existing result. Keeping those
+    operations explicit prevents the pre-ledger SENT write from undoing the
+    single-writer guarantee in ``TerminalFinalization``.
+    """
+    stored = StoredResult(order_id=result.order_id, path=results_dir / f"{result.order_id}.json")
+    payload = result.model_dump(mode="json")
+    if overwrite:
+        stored.overwrite(payload)
+    elif not stored.create_once(payload):
+        raise FileExistsError(stored.path)
+    return stored.path
 
 
 def _finalize_claimed_order(
@@ -266,16 +277,27 @@ def _finalize_claimed_order(
     retry_state_dir: Path | None = None,
     retry_order_id: str | None = None,
 ) -> DispatchResult:
-    """Persist one terminal result and move its claimed order exactly once."""
-    _write_result_atomic(results_dir, result)
-    destination_dir.mkdir(parents=True, exist_ok=True)
-    if suppress_move_errors:
-        with contextlib.suppress(OSError):
-            claimed_path.replace(destination_dir / claimed_path.name)
-    else:
-        claimed_path.replace(destination_dir / claimed_path.name)
-    if retry_state_dir is not None:
-        LaneLockRetryTracker(retry_state_dir).clear(retry_order_id or claimed_path.stem)
+    """Persist one terminal result and move its claimed order exactly once.
+
+    Thin composition over ``chitra.queue_state.TerminalFinalization``, which
+    owns the single-writer semantics: a result that already exists is never
+    overwritten (the first writer's record stands), the order-file move
+    completes exactly once however often the transition runs, and the stale
+    control markers (retry sidecar, send nonce) are cleared missing-safe.
+    """
+    order_key = retry_order_id or claimed_path.stem
+    TerminalFinalization(
+        claimed_path=claimed_path,
+        order_id=order_key,
+        results_dir=results_dir,
+        destination_dir=destination_dir,
+        result_payload=result.model_dump(mode="json"),
+        retry_state_dir=retry_state_dir,
+        # ``QueueLayout`` is rooted at the queue directory, while a claimed
+        # path is rooted one level below it in ``in_flight/``.
+        nonce_path=QueueLayout(claimed_path.parent.parent).send_nonce_path(order_key),
+        suppress_move_errors=suppress_move_errors,
+    ).apply()
     return result
 
 
@@ -382,7 +404,7 @@ def _complete_existing_result(
                 ledger_key_path=ledger_key_path,
             )
             stored_result.delivery_ledger_verified = True
-            _write_result_atomic(results_dir, stored_result)
+            _write_result_atomic(results_dir, stored_result, overwrite=True)
         except Exception as exc:  # noqa: BLE001 -- retry on the next daemon pass
             logger.error(
                 "dispatchd_delivery_ledger_pending",
@@ -392,9 +414,19 @@ def _complete_existing_result(
             )
             return
 
-    processed_dir.mkdir(parents=True, exist_ok=True)
-    claimed_path.replace(processed_dir / claimed_path.name)
-    LaneLockRetryTracker(deferred_dir).clear(order.order_id)
+    # The result is durable (and, for SENT, ledger-proven above); only the
+    # acknowledgment remains. The finalization moves the order exactly once,
+    # however many passes repeat this recovery, and clears the stale control
+    # markers missing-safe.
+    TerminalFinalization(
+        claimed_path=claimed_path,
+        order_id=order.order_id,
+        results_dir=results_dir,
+        destination_dir=processed_dir,
+        result_payload=None,
+        retry_state_dir=deferred_dir,
+        nonce_path=QueueLayout(claimed_path.parent.parent).send_nonce_path(order.order_id),
+    ).apply()
 
 
 def _reclaim_stale_in_flight(queue_dir: Path) -> None:
@@ -423,29 +455,20 @@ def requeue_deferred_for_session(queue_dir: Path, session_ref: str) -> list[str]
     """
     orders_dir, _, _ = _ensure_queue_dirs(queue_dir)
     deferred_dir = QueueLayout(queue_dir).deferred
-    dated: list[tuple[int, int, Path]] = []
-    for path in deferred_dir.glob("*.json"):
+
+    def held_for_session(path: Path) -> bool:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            continue
-        if not isinstance(payload, dict) or payload.get("session_ref") != session_ref:
-            continue
-        try:
-            stat = path.stat()
-            dated.append((stat.st_mtime_ns, stat.st_ino, path))
-        except FileNotFoundError:
-            continue
-    dated.sort(key=lambda item: item[:2])
-    requeued: list[str] = []
-    for _, _, path in dated:
-        target = orders_dir / path.name
-        try:
-            path.replace(target)
-        except OSError:
-            logger.warning("dispatchd_deferred_requeue_failed", session_ref=session_ref, path=str(path))
-            continue
-        requeued.append(path.stem)
+            return False
+        return isinstance(payload, dict) and payload.get("session_ref") == session_ref
+
+    outcome = requeue_deferred_to_orders(deferred_dir, orders_dir, eligible=held_for_session)
+    for path in outcome.skipped_existing_target:
+        logger.error("dispatchd_deferred_requeue_target_exists", source=str(path), target=str(orders_dir / path.name))
+    for path in outcome.failed:
+        logger.warning("dispatchd_deferred_requeue_failed", session_ref=session_ref, path=str(path))
+    requeued = [path.stem for path in outcome.requeued]
     if requeued:
         logger.info("dispatchd_deferred_requeued", session_ref=session_ref, order_ids=requeued)
     return requeued
@@ -478,36 +501,23 @@ def _requeue_lane_lock_deferred(queue_dir: Path, orders_dir: Path) -> list[Path]
     they remain parked until ``requeue_deferred_for_session`` is called after
     the hold clears. A lane-lock timeout first writes its sidecar and only
     then moves the order, so a crash at either point leaves a recoverable
-    order plus an accurate retry count.
+    order plus an accurate retry count. Sidecars are not part of the move:
+    each requeued order keeps its durable attempt count for its next attempt.
     """
     deferred_dir = QueueLayout(queue_dir).deferred
     retry_tracker = LaneLockRetryTracker(deferred_dir)
-    dated: list[tuple[int, int, Path]] = []
-    for path in deferred_dir.glob("*.json"):
-        if not retry_tracker.state_path(path.stem).exists():
-            continue
-        try:
-            stat = path.stat()
-            dated.append((stat.st_mtime_ns, stat.st_ino, path))
-        except FileNotFoundError:
-            continue
-    dated.sort(key=lambda item: item[:2])
-
-    requeued: list[Path] = []
-    for _, _, path in dated:
-        target = orders_dir / path.name
-        if target.exists():
-            logger.error("dispatchd_lane_lock_deferred_target_exists", source=str(path), target=str(target))
-            continue
-        try:
-            path.replace(target)
-        except OSError as exc:
-            logger.error("dispatchd_lane_lock_deferred_requeue_failed", path=str(path), error=str(exc))
-            continue
-        requeued.append(target)
-    if requeued:
-        logger.info("dispatchd_lane_lock_deferred_requeued", order_ids=[path.stem for path in requeued])
-    return requeued
+    outcome = requeue_deferred_to_orders(
+        deferred_dir,
+        orders_dir,
+        eligible=lambda path: retry_tracker.state_path(path.stem).exists(),
+    )
+    for path in outcome.skipped_existing_target:
+        logger.error("dispatchd_lane_lock_deferred_target_exists", source=str(path), target=str(orders_dir / path.name))
+    for path in outcome.failed:
+        logger.error("dispatchd_lane_lock_deferred_requeue_failed", path=str(path))
+    if outcome.requeued:
+        logger.info("dispatchd_lane_lock_deferred_requeued", order_ids=[path.stem for path in outcome.requeued])
+    return outcome.requeued
 
 
 def process_one_order(
@@ -1091,7 +1101,6 @@ def _process_claimed_order(
             )
             result.status = DispatchStatus.FAILED
             result.reason = "retry-exhausted"
-            layout.send_nonce(order.order_id).clear()
             return _finalize_claimed_order(
                 claimed_path,
                 results_dir=results_dir,
@@ -1117,7 +1126,7 @@ def _process_claimed_order(
                 ledger_key_path=ledger_key_path,
             )
             result.delivery_ledger_verified = True
-            _write_result_atomic(results_dir, result)
+            _write_result_atomic(results_dir, result, overwrite=True)
         except Exception as exc:  # noqa: BLE001 -- keep the order pending for the next pass
             logger.error(
                 "dispatchd_delivery_ledger_pending",
@@ -1134,7 +1143,6 @@ def _process_claimed_order(
         retry_state_dir=deferred_dir,
         retry_order_id=order.order_id,
     )
-    layout.send_nonce(order.order_id).clear()
     return result
 
 
