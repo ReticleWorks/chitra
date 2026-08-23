@@ -487,8 +487,23 @@ _AMP_CAPABILITY_NAMES = (
     "parent_child_usage",
 )
 
-_AMP_RUNTIME_FACT_NAMES = frozenset(("fleet.provider-capabilities", "fleet.versions"))
+# Fleet publishes the reviewed Amp executable under this exact category.  The
+# ORB lane surface remains the policy/adapter declaration; it is not a second
+# runtime source.
+_AMP_RUNTIME_FACT_NAMES = frozenset(("fleet.provider-capabilities",))
 _TWINRIDGE_AMP_BINARY = "/usr/local/bin/amp"
+_TWINRIDGE_AMP_ORB_SIZE = "a1.tiny"
+
+
+@dataclass(frozen=True, slots=True)
+class _AmpRuntimeConfig:
+    """One complete Amp declaration projected by Fleet for Chitra."""
+
+    binary: str
+    version: str
+    orb_size: str
+    visibility: str
+    fleet_enabled: bool
 
 
 def _amp_runtime_config(
@@ -497,18 +512,18 @@ def _amp_runtime_config(
     expected_project_ref: str,
     expected_profile_digest: str,
     expected_version: str,
-) -> tuple[str, str] | None:
+) -> _AmpRuntimeConfig | None:
     """Return the reviewed Amp binary and version from current Fleet facts.
 
     The packaged ``AmpCliTransport`` has a macOS development default.  A
     production lane must never inherit it.  Fleet therefore publishes the
-    exact Linux wrapper and its reviewed version under the explicit ``amp``
-    record in either the versions or provider-capabilities fact.  Missing,
+    exact Linux wrapper and its reviewed version under the explicit
+    ``provider-capabilities.amp`` record.  Missing,
     stale, conflicting, malformed, or policy-mismatched data leaves the lane
     unavailable instead of selecting a path or version by convention.
     """
 
-    candidates: set[tuple[str, str]] = set()
+    candidates: set[_AmpRuntimeConfig] = set()
     for fact in operating_facts:
         if fact.name not in _AMP_RUNTIME_FACT_NAMES:
             continue
@@ -519,21 +534,40 @@ def _amp_runtime_config(
         value = fact.value
         if not isinstance(value, Mapping):
             continue
-        # Fleet publishes the lane-specific runtime surface beneath this
-        # explicit namespace.  Do not fall back to a top-level or inferred
-        # provider record.
-        surface = value.get("orb_lane_surface")
-        if not isinstance(surface, Mapping) or surface.get("provider") != "amp":
+        # Fleet's authoritative shape has the runtime pin in the top-level
+        # ``provider-capabilities.amp`` record and the fixed ORB launch inputs
+        # in the nested surface.  Both are required for a production lane.
+        # They are one fact, not two fallbacks: a disagreement is unsafe and
+        # must not be resolved by choosing one source silently.
+        surface_value = value.get("orb_lane_surface")
+        runtime_value = value.get("amp")
+        if surface_value is None and runtime_value is None:
             continue
+        if runtime_value is None or surface_value is None:
+            return None
+        if not isinstance(surface_value, Mapping):
+            return None
+        if not isinstance(runtime_value, Mapping):
+            return None
+        surface = cast(Mapping[str, object], surface_value)
+        runtime = cast(Mapping[str, object], runtime_value)
+        if surface.get("provider") != "amp":
+            return None
         if not fact.is_current():
             return None
-        binary = surface.get("amp_binary_path")
-        version = surface.get("amp_version")
+        binary = runtime.get("binary")
+        version = runtime.get("version")
+        nested_binary = surface.get("amp_binary_path")
+        nested_version = surface.get("amp_version")
         if (
             not isinstance(binary, str)
             or binary != _TWINRIDGE_AMP_BINARY
             or not isinstance(version, str)
             or not version.strip()
+            or not isinstance(nested_binary, str)
+            or not isinstance(nested_version, str)
+            or not nested_version.strip()
+            or (nested_binary, nested_version) != (binary, version)
         ):
             return None
         project_ref = surface.get("project_ref")
@@ -544,7 +578,26 @@ def _amp_runtime_config(
             return None
         if version != expected_version:
             return None
-        candidates.add((binary, version))
+        orb_size = surface.get("orb_size")
+        visibility = surface.get("visibility")
+        fleet_enabled = surface.get("enabled")
+        if (
+            orb_size != _TWINRIDGE_AMP_ORB_SIZE
+            or visibility != "private"
+            or type(fleet_enabled) is not bool
+            or fleet_enabled is not False
+            or surface.get("no_archive_after_execute") is not True
+        ):
+            return None
+        candidates.add(
+            _AmpRuntimeConfig(
+                binary=binary,
+                version=version,
+                orb_size=orb_size,
+                visibility=visibility,
+                fleet_enabled=fleet_enabled,
+            )
+        )
     if len(candidates) != 1:
         return None
     return next(iter(candidates))
@@ -840,6 +893,7 @@ class _PackagedAmpProvider:
                     payload_digest=cast(str, item["payload_digest"]),
                     provider_instance_id=cast(str, item["provider_instance_id"]),
                     provider_generation=generation,
+                    provider_handle=cast(str, item["provider_handle"]),
                     payload=cast(Mapping[str, object], payload),
                 )
             )
@@ -1002,7 +1056,8 @@ def _canonical_amp_factory(
     )
     if runtime is None:
         return None
-    amp_binary, amp_version = runtime
+    amp_binary = runtime.binary
+    amp_version = runtime.version
 
     store = JoinedLaneStore(state_root)
     initial_facts = tuple(operating_facts)
@@ -1040,13 +1095,14 @@ def _canonical_amp_factory(
         return context
 
     try:
-        # The project and private visibility are fixed Chitra policy inputs.
-        # The Amp flag remains disabled unless this explicit lane policy passed.
+        # Fleet supplies the fixed ORB size and private visibility.  Fleet's
+        # declaration remains disabled; the explicit Chitra launch-policy gate
+        # is the only point that enables this already-reviewed surface.
         profile = _packaged_amp_profile(
             project_ref=policy.project_ref,
-            orb_size="a1.tiny",
+            orb_size=runtime.orb_size,
             profile_digest=policy.profile_digest,
-            visibility="private",
+            visibility=runtime.visibility,
         )
         transport = _packaged_amp_transport(
             profile,
@@ -1056,8 +1112,8 @@ def _canonical_amp_factory(
         adapter = _packaged_amp_adapter(
             transport=transport,
             project_ref=policy.project_ref,
-            visibility="private",
-            enabled=True,
+            visibility=runtime.visibility,
+            enabled=not runtime.fleet_enabled,
             profile_digest=policy.profile_digest,
             anchor_thread_id=identity.parent_thread_ref,
             lane_reader=lane_reader,
@@ -1084,6 +1140,7 @@ def _canonical_recovery_bindings(
 
     results_path = lane.state_dir / "provider-results" / f"{lane.identifier}.jsonl"
     journal = EventJournal(lane.state_dir, lane.identifier)
+    store = JoinedLaneStore(lane.state_dir)
 
     def pending_sink(value: object) -> None:
         # RecoveryEngine persists the pending envelope before invoking the
@@ -1094,10 +1151,18 @@ def _canonical_recovery_bindings(
     def cursor_sink(value: object) -> None:
         if value is not None and not isinstance(value, str):
             raise TypeError("provider cursor must be text or null")
+        cursor = "" if value is None else value
+
+        def apply(current: JoinedLaneRecord) -> JoinedLaneRecord:
+            if current.update_cursor == cursor:
+                return current
+            return current.model_copy(update={"update_cursor": cursor})
+
+        store.update(lane.identifier, apply)
 
     def result_sink(value: object) -> None:
         raw = dict(_mapping(value, "provider result"))
-        current = JoinedLaneStore(lane.state_dir).load(lane.identifier)
+        current = store.load(lane.identifier)
         operation_id = raw.get("operation_id")
         if current is None or not isinstance(operation_id, str):
             raise ValueError("provider result has no matching Chitra pending operation")
@@ -1148,7 +1213,7 @@ def _canonical_recovery_bindings(
         journal.append((event,))
 
     def checkpoint_verifier(value: object) -> bool:
-        current = JoinedLaneStore(lane.state_dir).load(lane.identifier)
+        current = store.load(lane.identifier)
         if current is None or current.pending_operation is None:
             return False
         operation = current.pending_operation

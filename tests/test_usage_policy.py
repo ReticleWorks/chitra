@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -188,13 +193,14 @@ def with_pending_send(record: JoinedLaneRecord) -> JoinedLaneRecord:
 def create_search(record: JoinedLaneRecord, matches: int, *, complete: bool = True) -> AmpCreateSearchEvidence:
     pending = record.pending_operation
     assert pending is not None
+    anchor = record.provider.parent_thread_ref
     return AmpCreateSearchEvidence(
         operation_id=pending.operation_id,
         create_tag=expected_amp_create_tag(record),
-        anchor_thread_ref="thread-anchor-a",
+        anchor_thread_ref=anchor,
         match_count=matches,
         complete=complete,
-        visibility_watermark="anchor:thread-anchor-a:cursor-42",
+        visibility_watermark=("root" if anchor is None else f"anchor:{anchor}:cursor-42"),
         observed_at="2026-08-23T14:59:30+00:00",
         evidence=f"evidence:create-search:{matches}",
     )
@@ -318,7 +324,7 @@ def test_reserve_blocks_overshoot_but_allows_exact_reserved_headroom() -> None:
 def test_pre_create_policy_uses_exact_tag_cardinality_without_invented_usage() -> None:
     record = pre_create_record()
 
-    assert expected_amp_create_tag(record) == "chitra-a4a35d0bcf13446027b54db6292c3deb"
+    assert expected_amp_create_tag(record) == "chitra-3ec2c4d266b3d4618e5f67093d3ae928"
     zero = evaluate_amp_create_policy(record, create_search(record, 0), now=NOW)
     one = evaluate_amp_create_policy(record, create_search(record, 1), now=NOW)
     many = evaluate_amp_create_policy(record, create_search(record, 2), now=NOW)
@@ -330,6 +336,61 @@ def test_pre_create_policy_uses_exact_tag_cardinality_without_invented_usage() -
     assert (many.action, many.provider_reconciliation_allowed) == ("ambiguous-and-hold", False)
     assert (incomplete.action, incomplete.provider_reconciliation_allowed) == ("unknown-and-hold", False)
     assert "complete anchor visibility window" in incomplete.reason
+
+
+def test_root_pre_create_search_uses_exact_root_label_without_parent_anchor() -> None:
+    record = pre_create_record().model_copy(
+        update={"provider": provider().model_copy(update={"parent_thread_ref": None})}
+    )
+
+    search = create_search(record, 0)
+    decision = evaluate_amp_create_policy(record, search, now=NOW)
+
+    assert search.anchor_thread_ref is None
+    assert search.visibility_watermark == "root"
+    assert (decision.action, decision.create_allowed) == ("create-once", True)
+
+    wrong_label = replace(search, create_tag="chitra-not-the-exact-root-label")
+    held = evaluate_amp_create_policy(record, wrong_label, now=NOW)
+    assert held.action == "unknown-and-hold"
+    assert not held.create_allowed
+
+
+def test_amp_create_tag_matches_polyphony_evidence_boundary() -> None:
+    """Execute Polyphony's source-controlled tag function and compare bytes."""
+    polyphony_root = Path(
+        os.environ.get(
+            "POLYPHONY_SOURCE_ROOT",
+            "/Users/roundtop/chitra-autonomy/worktrees/tophand-bootstrap-identity-polyphony",
+        )
+    )
+    evidence_source = polyphony_root / "tools/support/chitra_adapter/amp_evidence.py"
+    if not evidence_source.is_file():
+        pytest.skip("the sibling Polyphony source worktree is not available")
+    record = pre_create_record()
+    pending = record.pending_operation
+    assert pending is not None
+    process = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, sys; "
+                "from tools.support.chitra_adapter.amp_evidence import create_tag; "
+                "print(create_tag(json.load(sys.stdin), sys.argv[1]))"
+            ),
+            PROFILE_DIGEST,
+        ],
+        input=json.dumps(pending.model_dump(mode="json")),
+        text=True,
+        capture_output=True,
+        check=False,
+        cwd=polyphony_root,
+        env={**os.environ, "PYTHONPATH": str(polyphony_root)},
+    )
+
+    assert process.returncode == 0, process.stderr
+    assert process.stdout.strip() == expected_amp_create_tag(record)
 
 
 def test_zero_match_pre_create_search_allows_one_exact_retry_before_usage_exists(tmp_path: Path) -> None:

@@ -26,7 +26,11 @@ from chitra.provider_protocol import (
     ProviderName,
     ProviderOperationResult,
 )
-from chitra.recovery_provider import _PackagedAmpProvider, build_recovery_provider_resolver
+from chitra.recovery_provider import (
+    _canonical_recovery_bindings,
+    _PackagedAmpProvider,
+    build_recovery_provider_resolver,
+)
 from chitra.session_contract import (
     CapabilityName,
     JoinedLaneRecord,
@@ -145,13 +149,21 @@ def _amp_facts(record: JoinedLaneRecord) -> tuple[OperatingFact, ...]:
         OperatingFact(
             name="fleet.provider-capabilities",
             value={
+                "amp": {
+                    "binary": "/usr/local/bin/amp",
+                    "version": record.provider.provider_version,
+                },
                 "orb_lane_surface": {
                     "provider": "amp",
                     "amp_binary_path": "/usr/local/bin/amp",
                     "amp_version": record.provider.provider_version,
                     "project_ref": record.provider.project_ref,
                     "profile_digest": record.provider.profile_digest,
-                }
+                    "enabled": False,
+                    "visibility": "private",
+                    "orb_size": "a1.tiny",
+                    "no_archive_after_execute": True,
+                },
             },
             state="known",
             source="fleet-authority",
@@ -354,6 +366,54 @@ def test_amp_factory_rejects_missing_or_mismatched_twinridge_runtime_fact(
     assert _AmpAdapter.calls == []
 
 
+def test_amp_factory_rejects_conflicting_amp_runtime_fact_shapes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nested ORB and top-level Amp runtime pins cannot disagree."""
+    _install_amp_fakes(monkeypatch)
+    lane = _lane(tmp_path)
+    record = _record(lane)
+    source = _amp_facts(record)[0]
+    value = cast(dict[str, object], source.value)
+    surface = cast(dict[str, object], value["orb_lane_surface"])
+    value["orb_lane_surface"] = {**surface, "amp_version": "different-reviewed-pin"}
+    conflicting_fact = source.model_copy(update={"value": value})
+
+    resolver = build_recovery_provider_resolver(
+        lane,
+        facts_reader=lambda _record: (conflicting_fact,),
+    )
+
+    assert resolver(record) is None
+    assert _AmpProfile.calls == []
+    assert _AmpTransport.calls == []
+    assert _AmpAdapter.calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("orb_size", "a1.large"), ("visibility", "public"), ("enabled", True)),
+)
+def test_amp_factory_requires_authoritative_fleet_orb_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, value: object
+) -> None:
+    _install_amp_fakes(monkeypatch)
+    lane = _lane(tmp_path)
+    record = _record(lane)
+    source = _amp_facts(record)[0]
+    fact_value = cast(dict[str, object], source.value)
+    surface = cast(dict[str, object], fact_value["orb_lane_surface"])
+    fact_value["orb_lane_surface"] = {**surface, field: value}
+
+    resolver = build_recovery_provider_resolver(
+        lane,
+        facts_reader=lambda _record: (source.model_copy(update={"value": fact_value}),),
+    )
+
+    assert resolver(record) is None
+    assert _AmpProfile.calls == []
+
+
 def test_amp_goal_bootstrap_requires_and_persists_authoritative_policy_inputs(tmp_path: Path) -> None:
     """Amp enrollment stores measured capabilities and the exact Chitra policy."""
     lane = _lane(tmp_path)
@@ -460,6 +520,57 @@ def test_amp_facade_preserves_exact_pending_create_envelope_without_replay(
     calls = [request for name, request in _AmpAdapter.calls if name == "create_or_resume"]
     assert len(calls) == 1
     assert calls[0]["operation"] == operation.model_dump(mode="json")
+
+
+def test_amp_facade_preserves_provider_handle_on_updates() -> None:
+    """Update reconciliation retains the exact provider operation handle."""
+
+    class UpdatesAmp(_AmpAdapter):
+        def read_updates(self, _cursor: str | None = None) -> dict[str, object]:
+            return {
+                "updates": [
+                    {
+                        "operation_id": "operation-1",
+                        "event_id": "event-1",
+                        "cursor": "cursor-1",
+                        "kind": "steer_consumed",
+                        "provider_session_id": "amp-session-a",
+                        "lane_id": "amp-lane",
+                        "provider_handle": "amp-handle-a",
+                        "idempotency_key": "idem-operation-1",
+                        "payload_digest": "digest-operation-1",
+                        "provider_instance_id": "amp-instance-a",
+                        "provider_generation": 1,
+                        "payload": {},
+                    }
+                ],
+                "next_cursor": "cursor-1",
+            }
+
+    provider = _PackagedAmpProvider(
+        UpdatesAmp(),
+        result_sink=lambda _value: None,
+        cursor_sink=lambda _value: None,
+        lane_reader=lambda: {},
+    )
+
+    result = provider.read_updates()
+
+    assert len(result.updates) == 1
+    assert result.updates[0].provider_handle == "amp-handle-a"
+    assert result.updates[0].provider_session_id == "amp-session-a"
+
+
+def test_recovery_cursor_sink_persists_into_joined_lane_store(tmp_path: Path) -> None:
+    lane = _lane(tmp_path)
+    record = _record(lane)
+    store = JoinedLaneStore(lane.state_dir)
+    store.create(record)
+    _pending_sink, cursor_sink, *_rest = _canonical_recovery_bindings(lane)
+
+    cursor_sink("amp-cursor-7")
+
+    assert store.require(lane.identifier).update_cursor == "amp-cursor-7"
 
 
 def test_amp_close_requires_chitra_checkpoint_and_maps_same_thread_archive(

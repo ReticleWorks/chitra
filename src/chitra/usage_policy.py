@@ -36,7 +36,7 @@ class AmpCreateSearchEvidence:
 
     operation_id: str
     create_tag: str
-    anchor_thread_ref: str
+    anchor_thread_ref: str | None
     match_count: int
     complete: bool
     visibility_watermark: str
@@ -47,11 +47,12 @@ class AmpCreateSearchEvidence:
         if (
             not self.operation_id.strip()
             or not self.create_tag.strip()
-            or not self.anchor_thread_ref.strip()
             or not self.visibility_watermark.strip()
             or not self.evidence.strip()
         ):
             raise ValueError("create search evidence fields must be non-empty")
+        if self.anchor_thread_ref is not None and not self.anchor_thread_ref.strip():
+            raise ValueError("create search anchor_thread_ref must be non-empty when present")
         if isinstance(self.match_count, bool) or not isinstance(self.match_count, int) or self.match_count < 0:
             raise ValueError("create search match_count must be a non-negative integer")
         if not isinstance(self.complete, bool):
@@ -128,7 +129,12 @@ def expected_amp_create_tag(record: JoinedLaneRecord) -> str:
     pending = record.pending_operation
     if policy is None or pending is None or pending.kind != "create_or_resume":
         raise ValueError("Amp create tag requires a launch policy and pending create operation")
-    material = f"{policy.profile_digest}{pending.operation_id}{pending.idempotency_key}{pending.payload_digest}"
+    # Polyphony's Amp evidence boundary uses this exact delimiter-separated
+    # material.  Keep the Chitra-side tag byte-for-byte identical so recovery
+    # searches the label the provider actually emitted.
+    material = "|".join(
+        (policy.profile_digest, pending.operation_id, pending.idempotency_key, pending.payload_digest)
+    )
     return f"chitra-{hashlib.sha256(material.encode()).hexdigest()[:32]}"
 
 
