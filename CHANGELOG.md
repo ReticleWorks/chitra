@@ -20,6 +20,24 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.16.0] - 2026-08-23
+
+### Added
+
+- Compose journal ingestion, detectors and ladder, enrollment receipts, and
+  presence into one `monitord` entrypoint with shadow-mode findings on by
+  default.
+- Register `monitord` in the capability manifest so its command surface is
+  declared like every other daemon.
+- Ship a single chitra-monitord@ .service.example instance-template unit
+  alongside the kept dispatchd units.
+
+### Deprecated
+
+- Mark `watchd`, `triaged`, and `sweepd` as deprecated by the composed
+  `monitord` entrypoint. They remain installed for existing declarations; no
+  new daemon beyond `monitord` and `dispatchd` will be added.
+
 ## [0.15.0] - 2026-08-22
 
 ### Added

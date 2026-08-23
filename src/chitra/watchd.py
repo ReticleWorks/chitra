@@ -25,6 +25,7 @@ import signal
 import subprocess
 import threading
 import time
+import warnings
 from collections import Counter
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -1523,6 +1524,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    warnings.warn(
+        "watchd is deprecated by chitra-monitord and will be removed "
+        "in a future release; declare one monitord instance instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     args = build_arg_parser().parse_args(argv)
     panes_override = tuple(item.strip() for item in args.panes.split(",") if item.strip()) if args.panes is not None else None
     config = resolve_config(

@@ -10,3 +10,4 @@ htmlcov/
 dist/
 build/
 .venv-ws4/
+.venv-w5e/
