@@ -125,11 +125,19 @@ def resolve_config(
 
 
 def _lane_roots(state_dir: Path) -> list[Path]:
-    """Return one directory per journaled lane under the shared state root."""
+    """Return one journal path per journaled lane under the state root.
+
+    ``EventJournal`` writes flat at ``journal/<lane>.jsonl``; discovery
+    mirrors that layout and the caller recovers the lane from the stem.
+    """
     journal_root = state_dir / "journal"
     if not journal_root.is_dir():
         return []
-    return sorted(path.parent for path in journal_root.glob("*/*.jsonl"))
+    return sorted(
+        path
+        for path in journal_root.glob("*.jsonl")
+        if not path.name.endswith(".progress.jsonl")
+    )
 
 
 def ingest_lane_transcripts(
@@ -273,8 +281,8 @@ def append_finding_records(config: MonitordConfig, lane: str, findings: list[Fin
 def run_once(config: MonitordConfig) -> dict[str, Any]:
     """Run one full observe-classify-record-publish pass and return its summary."""
     results: list[LanePassResult] = []
-    for lane_root in _lane_roots(config.state_dir):
-        lane = lane_root.name
+    for lane_path in _lane_roots(config.state_dir):
+        lane = lane_path.stem
         events = load_lane_events(config, lane)
         if not events:
             continue

@@ -11,6 +11,7 @@ from _goal_fixtures import enrollment_fields
 
 from chitra.goals import GoalRecord, GoalStatus, upsert_goal
 from chitra.journal import ByteRange, CanonicalEvent, CanonicalType, Client, TranscriptIdentity
+from chitra.journal.store import EventJournal
 from chitra.monitord import (
     MonitordConfig,
     append_finding_records,
@@ -22,6 +23,7 @@ from chitra.monitord import (
 )
 
 LANE = "lane-a:0.0"
+SEEDED_LANE = "lane-a.0.0"
 
 
 def _config(tmp_path: Path) -> MonitordConfig:
@@ -112,12 +114,29 @@ def test_append_finding_records_writes_schema_stamped_jsonl(tmp_path: Path) -> N
     assert record["detector"] == "drift"
     assert record["shadow_mode"] is True
 
-def test_run_once_reports_empty_state_without_touching_anything(tmp_path: Path) -> None:
-    summary = run_once(_config(tmp_path))
-    assert summary["lanes_observed"] == 0
-    assert summary["findings_opened"] == 0
-    assert summary["completion_disputed"] is False
-    assert summary["shadow_mode"] is True
+def test_run_once_observes_real_journal_and_composes_outputs(tmp_path: Path) -> None:
+    journal = EventJournal(tmp_path, SEEDED_LANE)
+    journal.append(tuple(_event(f"e{i}", CanonicalType.TOOL_CALL, lane=SEEDED_LANE) for i in range(1, 4)))
+    config = resolve_config(state_dir=tmp_path)
+    summary = run_once(config)
+    assert summary["lanes_observed"] == 1
+    assert [result["lane"] for result in summary["results"]] == [SEEDED_LANE]
+    assert summary["findings_opened"] == 1
+    findings_lines = config.findings_path.read_text(encoding="utf-8").splitlines()
+    assert len(findings_lines) == 1
+    finding_record = json.loads(findings_lines[0])
+    assert finding_record["schema"] == "chitra.monitord.pass.v1"
+    assert finding_record["lane"] == SEEDED_LANE
+    assert finding_record["detector"] == "unnecessary_steps"
+    incident_lines = (tmp_path / "incidents" / f"{SEEDED_LANE}.jsonl").read_text(encoding="utf-8").splitlines()
+    incident_record = json.loads(incident_lines[-1])
+    assert incident_record["lane"] == SEEDED_LANE
+    assert incident_record["detector"] == "unnecessary_steps"
+    assert incident_record["stage"] == "nudge"
+    presence_lines = (tmp_path / "presence" / "chitra-monitord.jsonl").read_text(encoding="utf-8").splitlines()
+    presence_record = json.loads(presence_lines[-1])
+    assert presence_record["instance"] == "chitra-monitord"
+    assert presence_record["lanes"] == [SEEDED_LANE]
 
 def _goal(session_ref: str, *, status: GoalStatus = "working") -> GoalRecord:
     return GoalRecord(
