@@ -29,6 +29,7 @@ adding unvalidated timestamp parsing.
 
 from __future__ import annotations
 
+import warnings
 import argparse
 import hashlib
 import json
@@ -425,6 +426,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    warnings.warn(
+        "triaged is deprecated by chitra-monitord and will be removed "
+        "in a future release; declare one monitord instance instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     args = build_arg_parser().parse_args(argv)
     if args.lanes_file is not None:
         if args.once:

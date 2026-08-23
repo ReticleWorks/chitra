@@ -160,3 +160,17 @@ def test_check_enrollment_disputes_when_the_validator_fails(tmp_path: Path, monk
 def test_check_enrollment_is_silent_for_unenrolled_sessions(tmp_path: Path) -> None:
     recorded, disputed, findings = check_enrollment_and_receipts(_config(tmp_path), "no-such-session")
     assert (recorded, disputed, findings) == (0, False, [])
+
+def test_deprecated_daemon_entrypoints_warn_toward_monitord() -> None:
+    import warnings
+
+    import chitra.sweepd as sweepd
+    import chitra.triaged as triaged
+    import chitra.watchd as watchd
+
+    for module in (watchd, triaged, sweepd):
+        with pytest.warns(DeprecationWarning, match="deprecated by chitra-monitord"):
+            try:
+                module.main(["--help"])
+            except SystemExit:
+                pass
