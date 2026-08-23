@@ -39,6 +39,7 @@ FactFreshness = Literal["current", "fresh", "stale", "unknown"]
 ProviderKind = Literal["tophand", "amp"]
 OwnerRole = Literal["chitra", "lane-manager", "provider"]
 ProblemHistoryKind = Literal["resolved", "reopened"]
+RecordTransitionKind = Literal["steady", "provider-transfer", "provider_transfer", "resume"]
 LaneLifecycle = Literal["active", "inactive", "closed", "archived"]
 OperationKind = Literal[
     "create_or_resume",
@@ -637,6 +638,19 @@ class ProviderIdentity(_ContractModel):
         return bool(getattr(self.capabilities, capability))
 
 
+def _provider_identity_key(provider: ProviderIdentity) -> tuple[object, ...]:
+    """Return identity fields; capability changes do not change identity."""
+
+    return (
+        provider.kind,
+        provider.handle,
+        provider.instance_id,
+        provider.generation,
+        provider.parent_thread_ref,
+        provider.project_ref,
+    )
+
+
 def validate_pending_operation(provider: ProviderIdentity, operation: PendingProviderOperation) -> None:
     """Reject operations the observed provider cannot perform safely."""
 
@@ -845,7 +859,11 @@ class OperatingFact(_ContractModel):
         current = datetime.now(UTC) if now is None else now
         if current.tzinfo is None:
             raise ValueError("now must be timezone-aware")
-        return datetime.fromisoformat(self.fresh_until.replace("Z", "+00:00")) >= current.astimezone(UTC)
+        current_utc = current.astimezone(UTC)
+        observed_at = datetime.fromisoformat(self.observed_at.replace("Z", "+00:00"))
+        if observed_at > current_utc:
+            return False
+        return datetime.fromisoformat(self.fresh_until.replace("Z", "+00:00")) >= current_utc
 
 
 class RecoveryState(_ContractModel):
@@ -1202,11 +1220,7 @@ class JoinedLaneRecord(_ContractModel):
                 or close_result.provider_generation != self.provider.generation
             ):
                 raise ValueError("close evidence does not belong to joined lane provider generation")
-            if (
-                close_result.state in ("closed", "archived")
-                and self.lifecycle != "inactive"
-                and not (self.lifecycle == "active" and close_result.later_resume_supported is True)
-            ):
+            if close_result.state in ("closed", "archived") and self.lifecycle != "inactive":
                 raise ValueError("logical close must make the joined lane inactive")
             if self.provider.kind == "amp" and close_result.state == "closed":
                 raise ValueError("Amp close must be represented as archived")
@@ -1227,13 +1241,8 @@ class JoinedLaneRecord(_ContractModel):
                 raise ValueError("close result predates its operation history entry")
         if self.lifecycle in ("closed", "archived"):
             raise ValueError("logical close lifecycle must be inactive; provider state stays in close evidence")
-        if (
-            self.lifecycle == "active"
-            and self.last_close_result is not None
-            and self.last_close_result.state in ("closed", "archived")
-            and self.last_close_result.later_resume_supported is not True
-        ):
-            raise ValueError("active lane cannot carry terminal close evidence")
+        if self.lifecycle == "active" and not self.owner.active:
+            raise ValueError("active lane requires an active owner")
         if self.current_update is not None and self.current_update.operation_id is not None:
             result = self.last_operation_result
             if result is None or (
@@ -1285,8 +1294,24 @@ def validate_record_transition(
     current: JoinedLaneRecord,
     *,
     active_owners: Iterable[OwnerIdentity] | None = None,
+    transition: RecordTransitionKind = "steady",
+    transition_kind: RecordTransitionKind | None = None,
 ) -> None:
-    """Validate one atomic joined-lane record transition under ownership fencing."""
+    """Validate one atomic joined-lane record transition under ownership fencing.
+
+    A provider transfer or a resume is an explicit state-machine transition,
+    not an incidental change to a snapshot.  The alias ``transition_kind`` is
+    accepted for callers that use the longer name; supplying both names with
+    different values is rejected.
+    """
+
+    if transition_kind is not None:
+        if transition != "steady" and transition != transition_kind:
+            raise ContractValidationError("transition and transition_kind disagree")
+        transition = transition_kind
+    normalized_transition = "provider-transfer" if transition == "provider_transfer" else transition
+    if normalized_transition not in ("steady", "provider-transfer", "resume"):
+        raise ContractValidationError(f"unknown record transition: {transition}")
 
     try:
         previous = JoinedLaneRecord.model_validate(_immutable_json(previous.to_dict()), strict=True)
@@ -1298,23 +1323,71 @@ def validate_record_transition(
         errors.append("lane_id is immutable")
     if previous.goal_id != current.goal_id:
         errors.append("goal_id is immutable")
+    if current.goal_version < previous.goal_version:
+        errors.append("goal_version must not roll back")
+    if current.session_ref != previous.session_ref and normalized_transition not in ("provider-transfer", "resume"):
+        errors.append("session_ref changes require an explicit provider-transfer or resume transition")
     if current.revision <= previous.revision:
         errors.append("revision must increase")
     if current.chitra_ownership_epoch < previous.chitra_ownership_epoch:
         errors.append("ownership epoch must not decrease")
     if current.owner != previous.owner and current.chitra_ownership_epoch <= previous.chitra_ownership_epoch:
         errors.append("owner changes require a new ownership epoch")
+
+    provider_changed = _provider_identity_key(previous.provider) != _provider_identity_key(current.provider)
+    physical_generation_advanced = (
+        previous.physical_session_generation is not None
+        and current.physical_session_generation is not None
+        and current.physical_session_generation > previous.physical_session_generation
+    )
+    if provider_changed:
+        if normalized_transition != "provider-transfer":
+            errors.append("provider identity swap requires an explicit provider-transfer transition")
+        if current.chitra_ownership_epoch <= previous.chitra_ownership_epoch:
+            errors.append("provider identity swap requires ownership epoch advance")
+        if not physical_generation_advanced:
+            errors.append("provider identity swap requires physical session generation advance")
+    if normalized_transition == "provider-transfer":
+        if current.chitra_ownership_epoch <= previous.chitra_ownership_epoch:
+            errors.append("provider transfer requires ownership epoch advance")
+        if not physical_generation_advanced:
+            errors.append("provider transfer requires physical session generation advance")
+
     prior_close = previous.last_close_result
-    if (
+    close_identity_matches = (
         prior_close is not None
-        and prior_close.later_resume_supported is True
-        and (
-            current.provider.handle != prior_close.provider_thread_ref
-            or current.provider.instance_id != prior_close.provider_instance_id
-            or current.provider.generation != prior_close.provider_generation
-        )
-    ):
+        and current.provider.handle == prior_close.provider_thread_ref
+        and current.provider.instance_id == prior_close.provider_instance_id
+        and current.provider.generation == prior_close.provider_generation
+    )
+    if prior_close is not None and prior_close.later_resume_supported is True and not close_identity_matches:
         errors.append("later resume must restore the same provider thread identity")
+    if normalized_transition == "resume":
+        if prior_close is None or prior_close.later_resume_supported is not True:
+            errors.append("resume requires close evidence with later resume support")
+        if not close_identity_matches:
+            errors.append("resume must preserve the exact provider thread identity")
+        if not current.provider.capabilities.resume_after_close:
+            errors.append("resume requires resume_after_close capability")
+        if current.lifecycle != "active":
+            errors.append("resume must explicitly restore an active logical lane")
+        if current.last_close_result is not None:
+            errors.append("resume must clear prior close evidence from the active snapshot")
+    elif prior_close is not None and prior_close.later_resume_supported is True and current.lifecycle == "active":
+        errors.append("later resume requires an explicit resume transition")
+
+    if (
+        previous.goal_version != current.goal_version
+        and current.current_update is not None
+        and current.current_update.goal_version != current.goal_version
+    ):
+        errors.append("current update goal_version must match joined lane")
+    if previous.lifecycle == "active" and current.lifecycle == "active":
+        if previous.current_update is not None and current.current_update is None:
+            errors.append("current_update cannot be cleared on an active unfinished lane")
+        if previous.current_update is not None and current.current_update is not None and previous.problems and not current.problems:
+            errors.append("problem history cannot be cleared on an active unfinished lane")
+
     owner_values = tuple(active_owners) if active_owners is not None else (current.owner,)
     validate_active_owner_set(owner_values)
     if active_owners is not None and current.owner not in owner_values:
@@ -1395,6 +1468,7 @@ __all__ = [
     "OwnerRole",
     "ProblemHistoryEvent",
     "ProblemHistoryKind",
+    "RecordTransitionKind",
     "RecoveryStage",
     "RecoveryState",
     "Recovery",

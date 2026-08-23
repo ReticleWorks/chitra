@@ -350,6 +350,7 @@ def test_operating_fact_requires_current_authority_and_freshness_for_action() ->
     assert not fact.model_copy(update={"state": "conflicting"}).is_current(now=now)
     assert not fact.model_copy(update={"within_authority": False}).is_current(now=now)
     assert not fact.model_copy(update={"fresh_until": (now - timedelta(seconds=1)).isoformat()}).is_current(now=now)
+    assert not fact.model_copy(update={"observed_at": "2026-08-23T14:01:00+00:00"}).is_current(now=now)
 
 
 def test_usage_fixture_keeps_ceiling_unknown_and_incomplete_report_non_compliant() -> None:
@@ -530,6 +531,79 @@ def test_record_transition_fences_owner_revision_identity_and_active_owner_set()
         validate_record_transition(previous, current.model_copy(update={"revision": 3, "lane_id": "other"}))
 
 
+def test_record_transition_requires_explicit_transfer_for_session_and_provider_swap() -> None:
+    provider_a = ProviderIdentity(
+        kind="tophand",
+        handle="thread-a",
+        instance_id="instance-a",
+        generation=1,
+        capabilities=ProviderCapabilities.from_supported(("create_or_resume",)),
+    )
+    provider_b = provider_a.model_copy(update={"handle": "thread-b", "instance_id": "instance-b", "generation": 2})
+    previous = JoinedLaneRecord(
+        lane_id="lane-a",
+        goal_id="goal-123",
+        goal_version=2,
+        session_ref="tophand:lane-a-1",
+        physical_session_generation=1,
+        provider=provider_a,
+    )
+    changed = previous.model_copy(
+        update={"revision": 2, "session_ref": "tophand:lane-a-2", "provider": provider_b}
+    )
+    with pytest.raises(ContractValidationError, match="session_ref"):
+        validate_record_transition(previous, previous.model_copy(update={"revision": 2, "session_ref": "tophand:lane-a-2"}))
+    with pytest.raises(ContractValidationError, match="explicit provider-transfer"):
+        validate_record_transition(previous, changed)
+    with pytest.raises(ContractValidationError, match="ownership epoch"):
+        validate_record_transition(previous, changed, transition="provider-transfer")
+    transferred = changed.model_copy(update={"chitra_ownership_epoch": 2, "physical_session_generation": 2})
+    validate_record_transition(previous, transferred, transition="provider-transfer")
+    with pytest.raises(ContractValidationError, match="physical session generation"):
+        validate_record_transition(
+            previous,
+            transferred.model_copy(update={"physical_session_generation": 1}),
+            transition="provider-transfer",
+        )
+
+
+def test_record_transition_rejects_goal_rollback_and_destructive_active_clears() -> None:
+    problem = Problem(
+        id="p1",
+        summary="Provider is unavailable",
+        owner="chitra",
+        state="open",
+    )
+    previous_update = _update().model_copy(update={"problems": (problem,)})
+    previous = JoinedLaneRecord(
+        lane_id="lane-a",
+        goal_id="goal-123",
+        goal_version=2,
+        session_ref="tophand:lane-a-1",
+        provider=ProviderIdentity(kind="tophand", handle="thread-a", capabilities=ProviderCapabilities()),
+        current_update=previous_update,
+    )
+    with pytest.raises(ContractValidationError, match="goal_version"):
+        validate_record_transition(previous, previous.model_copy(update={"revision": 2, "goal_version": 1, "current_update": None}))
+    with pytest.raises(ContractValidationError, match="current_update"):
+        validate_record_transition(previous, previous.model_copy(update={"revision": 2, "current_update": None}))
+    cleared_problems = previous_update.model_copy(update={"sequence": 2, "problems": ()})
+    with pytest.raises(ContractValidationError, match="problem"):
+        validate_record_transition(
+            previous,
+            previous.model_copy(update={"revision": 2, "current_update": cleared_problems}),
+        )
+    with pytest.raises(ValueError, match="active owner"):
+        JoinedLaneRecord(
+            lane_id="lane-a",
+            goal_id="goal-123",
+            goal_version=2,
+            session_ref="tophand:lane-a-1",
+            owner=OwnerIdentity(owner_id="chitra", active=False),
+            provider=previous.provider,
+        )
+
+
 def test_usage_must_match_update_roster_and_parent_ancestry() -> None:
     child = ChildRosterEntry(
         child_id="child-a",
@@ -581,6 +655,78 @@ def test_provider_fences_unknown_identity_and_capability_bound_operations() -> N
         validate_pending_operation(provider, close)
 
 
+def test_historical_operation_evidence_survives_capability_changes_but_new_pending_does_not() -> None:
+    provider_with_send = ProviderIdentity(
+        kind="tophand",
+        handle="thread-a",
+        instance_id="instance-a",
+        generation=1,
+        capabilities=ProviderCapabilities.from_supported(("send",)),
+    )
+    reference = OperationReference(
+        operation_id="send-1",
+        idempotency_key="idem-send-1",
+        payload_digest="digest-send-1",
+        kind="send",
+        created_at="2026-08-23T14:00:00+00:00",
+    )
+    result = ProviderOperationResult(
+        operation_id="send-1",
+        kind="send",
+        lane_id="lane-a",
+        provider_handle="thread-a",
+        provider_instance_id="instance-a",
+        provider_generation=1,
+        idempotency_key="idem-send-1",
+        payload_digest="digest-send-1",
+        status="consumed",
+        accepted=True,
+        consumed=True,
+        observed_at="2026-08-23T14:00:01+00:00",
+    )
+    previous = JoinedLaneRecord(
+        lane_id="lane-a",
+        goal_id="goal-123",
+        goal_version=2,
+        session_ref="tophand:lane-a-1",
+        provider=provider_with_send,
+        operation_history=(reference,),
+        last_operation_result=result,
+    )
+    provider_without_send = provider_with_send.model_copy(
+        update={"capabilities": ProviderCapabilities.from_supported(())}
+    )
+    current = previous.model_copy(update={"revision": 2, "provider": provider_without_send})
+    validate_record_transition(previous, current)
+    pending = PendingProviderOperation(
+        operation_id="send-2",
+        kind="send",
+        lane_id="lane-a",
+        provider_handle="thread-a",
+        provider_instance_id="instance-a",
+        provider_generation=1,
+        idempotency_key="idem-send-2",
+        payload_digest="digest-send-2",
+        created_at="2026-08-23T14:01:00+00:00",
+    )
+    with pytest.raises((ContractValidationError, ValueError), match="does not support"):
+        JoinedLaneRecord(
+            lane_id="lane-a",
+            goal_id="goal-123",
+            goal_version=2,
+            session_ref="tophand:lane-a-1",
+            provider=provider_without_send,
+            pending_operation=pending,
+            operation_history=(reference, OperationReference(
+                operation_id="send-2",
+                idempotency_key="idem-send-2",
+                payload_digest="digest-send-2",
+                kind="send",
+                created_at="2026-08-23T14:01:00+00:00",
+            )),
+        )
+
+
 def test_close_evidence_preserves_provider_state_and_same_thread_resume() -> None:
     close = CloseResult.model_validate(json.loads((FIXTURES / "close-amp-later-resume.json").read_text()), strict=True)
     operation_history = (
@@ -597,7 +743,7 @@ def test_close_evidence_preserves_provider_state_and_same_thread_resume() -> Non
         handle="amp-thread-a",
         instance_id="amp-instance-1",
         generation=1,
-        capabilities=ProviderCapabilities.from_supported(("close", "checkpoint", "create_or_resume")),
+        capabilities=ProviderCapabilities.from_supported(("close", "checkpoint", "create_or_resume", "resume_after_close")),
     )
     inactive = JoinedLaneRecord(
         lane_id="lane-a",
@@ -609,10 +755,30 @@ def test_close_evidence_preserves_provider_state_and_same_thread_resume() -> Non
         operation_history=operation_history,
         last_close_result=close,
     )
-    resumed = inactive.model_copy(update={"revision": 2, "lifecycle": "active"})
-    validate_record_transition(inactive, resumed)
-    with pytest.raises(ContractValidationError, match="close evidence"):
-        validate_record_transition(inactive, resumed.model_copy(update={"provider": provider.model_copy(update={"handle": "other"})}))
+    resumed = inactive.model_copy(update={"revision": 2, "lifecycle": "active", "last_close_result": None})
+    validate_record_transition(inactive, resumed, transition="resume")
+    with pytest.raises(ContractValidationError, match="provider identity"):
+        validate_record_transition(
+            inactive,
+            resumed.model_copy(update={"provider": provider.model_copy(update={"handle": "other"})}),
+            transition="resume",
+        )
+    with pytest.raises(ContractValidationError, match="resume_after_close"):
+        validate_record_transition(
+            inactive,
+            resumed.model_copy(
+                update={
+                    "provider": provider.model_copy(
+                        update={
+                            "capabilities": ProviderCapabilities.from_supported(
+                                ("close", "checkpoint", "create_or_resume")
+                            )
+                        }
+                    )
+                },
+            ),
+            transition="resume",
+        )
     native = CloseResult.model_validate(json.loads((FIXTURES / "close-native.json").read_text()), strict=True)
     assert native.closed and not native.archived
     amp_native = native.model_copy(
