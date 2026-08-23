@@ -1501,12 +1501,27 @@ def run_lanes_once(
     invalid_dir_name: str = "invalid",
     tuning: DispatchTuning | None = None,
     dispatch_runner: TmuxRunner | None = None,
+    ownership_socket_path: Path | None = None,
 ) -> dict[str, list[DispatchResult]]:
-    """Drain every enabled lane from one rendered declaration."""
+    """Drain every enabled lane from one rendered declaration.
+
+    The shared ``--lanes-file`` entrypoint is the production path used by the
+    systemd package.  Each lane has its own joined-lane store and delivery
+    ledger, so each invocation must build and pass that lane's reconciler to
+    ``run_once``.  This keeps the restart barrier in front of every queue
+    claim, regardless of whether the daemon was started for one queue or for
+    the rendered multi-lane declaration.
+    """
     from chitra.lane_config import enabled_lanes
 
     results: dict[str, list[DispatchResult]] = {}
     for lane in enabled_lanes(lanes_file):
+        lane_reconciler = build_filesystem_reconciler(
+            lane.state_dir,
+            ledger_path=lane.state_dir / "ledger.jsonl",
+            ledger_key_path=lane.state_dir / "ledger.key",
+            ownership_socket_path=ownership_socket_path or Path("/run/chitra-ownership/provider.sock"),
+        )
         results[lane.identifier] = run_once(
             lane.queue_dir,
             lock_dir=lane.state_dir / "locks",
@@ -1521,6 +1536,8 @@ def run_lanes_once(
             dispatch_runner=dispatch_runner,
             projects_root=lane.config_dir / "projects",
             tmux_socket=lane.tmux_socket,
+            joined_lane_root=lane.state_dir,
+            joined_lane_reconciler=lane_reconciler,
         )
     return results
 
@@ -1532,6 +1549,7 @@ def run_lanes_forever(
     routing_config_path: Path | None = None,
     policy_config_path: Path | None = None,
     tuning: DispatchTuning | None = None,
+    ownership_socket_path: Path | None = None,
 ) -> None:
     """Run one shared dispatchd process over all enabled lane queues."""
     while True:
@@ -1540,6 +1558,7 @@ def run_lanes_forever(
             routing_config_path=routing_config_path,
             policy_config_path=policy_config_path,
             tuning=tuning,
+            ownership_socket_path=ownership_socket_path,
         )
         time.sleep(poll_seconds)
 
@@ -1618,13 +1637,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     queue_dir = args.queue_dir or default_queue_dir()
-    joined_lane_root = args.joined_lane_root or state_dir()
-    joined_lane_reconciler = build_filesystem_reconciler(
-        joined_lane_root,
-        ledger_path=args.ledger_path or default_ledger_path(),
-        ledger_key_path=args.ledger_key_path or default_ledger_key_path(),
-        ownership_socket_path=args.ownership_socket_path or Path("/run/chitra-ownership/provider.sock"),
-    )
     allowed_session_prefixes = resolve_session_prefixes(args.allow_session_prefix, env_var=SESSION_ALLOW_PREFIXES_ENV_VAR)
     denied_session_prefixes = resolve_session_prefixes(args.deny_session_prefix, env_var=SESSION_DENY_PREFIXES_ENV_VAR)
     tuning = DispatchTuning(
@@ -1640,6 +1652,7 @@ def main(argv: list[str] | None = None) -> int:
                 routing_config_path=args.routing_config_path,
                 policy_config_path=args.policy_config_path,
                 tuning=tuning,
+                ownership_socket_path=args.ownership_socket_path,
             )
             print(json.dumps({key: [item.model_dump(mode="json") for item in value] for key, value in lane_results.items()}, indent=2))
             return 0
@@ -1649,8 +1662,16 @@ def main(argv: list[str] | None = None) -> int:
             routing_config_path=args.routing_config_path,
             policy_config_path=args.policy_config_path,
             tuning=tuning,
+            ownership_socket_path=args.ownership_socket_path,
         )
         return 0
+    joined_lane_root = args.joined_lane_root or state_dir()
+    joined_lane_reconciler = build_filesystem_reconciler(
+        joined_lane_root,
+        ledger_path=args.ledger_path or default_ledger_path(),
+        ledger_key_path=args.ledger_key_path or default_ledger_key_path(),
+        ownership_socket_path=args.ownership_socket_path or Path("/run/chitra-ownership/provider.sock"),
+    )
     if args.once:
         results = run_once(
             queue_dir,

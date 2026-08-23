@@ -24,6 +24,7 @@ from chitra.orders import DispatchResult, DispatchStatus
 from chitra.triaged import ReceivingOutputs, parse_event_line, run_once
 from chitra.watchd import (
     Pane,
+    ReviewFailure,
     Watchd,
     WatchdConfig,
     _pane_backend,
@@ -269,6 +270,13 @@ class _DeferringReviewer:
         )
 
 
+class _UnavailableReviewer:
+    """An isolated reviewer that fails like the shipped process wrapper."""
+
+    def review(self, goal, behavior, reviewer_id: str) -> ReviewerVerdict:
+        raise RuntimeError("reviewer process exited before returning a verdict")
+
+
 def _tracked_goal(root: Path) -> GoalRecord:
     goal = upsert_goal(
         root,
@@ -406,6 +414,68 @@ def test_poll_once_does_not_block_on_a_slow_reviewer_and_later_drains_it(tmp_pat
         assert drained.status == "done-pending-close"
     finally:
         reviewer.release.set()
+        watcher.shutdown()
+
+
+def test_isolated_review_failure_reaches_recovery_without_user_ask(tmp_path: Path) -> None:
+    """A routine reviewer outage stays open and reaches canonical recovery."""
+    goal = _tracked_goal(tmp_path)
+    captures = iter(
+        [
+            "working on the implementation\nesc to interrupt\n❯\n",
+            _DEFERRAL_QUESTION_TURN,
+        ]
+    )
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures, _DEFERRAL_QUESTION_TURN))
+        raise AssertionError(f"unexpected command: {command}")
+
+    recovery_findings: list[ReviewFailure] = []
+
+    def recover(finding: ReviewFailure) -> str:
+        recovery_findings.append(finding)
+        return "canonical recovery scheduled; waiting for a material lane update"
+
+    watcher = Watchd(
+        WatchdConfig(
+            state_dir=tmp_path,
+            events_log=tmp_path / "events.log",
+            review_recovery_hook=recover,
+        ),
+        runner=runner,
+        reviewer=_UnavailableReviewer(),
+    )
+    try:
+        watcher.poll_once()
+        watcher.poll_once()
+        review_log = tmp_path / "completion_reviews.jsonl"
+        for _ in range(100):
+            if review_log.exists() and not watcher.pending_reviews:
+                break
+            threading.Event().wait(0.01)
+            watcher.poll_once()
+
+        stored = get_goal(tmp_path, goal.session_ref)
+        assert stored is not None
+        assert stored.status == "turn-finished-unverified"
+        assert stored.open_asks == ()
+        assert "canonical recovery scheduled" in stored.now
+        assert len(recovery_findings) == 1
+        assert recovery_findings[0].session_ref == goal.session_ref
+        assert recovery_findings[0].pane_id == "%1"
+        assert len(recovery_findings[0].behavior_sha256) == 64
+        assert "reviewer process exited" in recovery_findings[0].error
+
+        review = json.loads(review_log.read_text(encoding="utf-8"))
+        assert review["review_verdict"] == "unavailable"
+        assert review["status"] == "turn-finished-unverified"
+        assert "waiting for a material lane update" in review["summary"]
+        assert not (tmp_path / "queue" / "orders").exists()
+    finally:
         watcher.shutdown()
 
 

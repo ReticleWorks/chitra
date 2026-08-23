@@ -185,6 +185,19 @@ class Pane:
 
 
 @dataclass(frozen=True, slots=True)
+class ReviewFailure:
+    """The finding handed to canonical joined-lane recovery."""
+
+    session_ref: str
+    pane_id: str
+    behavior_sha256: str
+    error: str
+
+
+ReviewRecoveryHook = Callable[[ReviewFailure], str | None]
+
+
+@dataclass(frozen=True, slots=True)
 class WatchdConfig:
     state_dir: Path
     events_log: Path
@@ -201,6 +214,7 @@ class WatchdConfig:
     reviewer_count: int = DEFAULT_REVIEWER_COUNT
     reviewer_command: str = DEFAULT_REVIEWER_COMMAND
     reviewer_model: str | None = DEFAULT_REVIEWER_MODEL
+    review_recovery_hook: ReviewRecoveryHook | None = None
     queue_dir: Path | None = None
     reasoned_dispatch_enabled: bool = DEFAULT_REASONED_DISPATCH_ENABLED
     manifest_dir: Path | None = None
@@ -567,6 +581,37 @@ class Watchd:
             logger.warning("watchd_ambiguous_goal_mapping", pane_id=pane.pane_id, target=pane.target, matches=matches)
         return None
 
+    def _request_review_recovery(self, pending: PendingCompletionReview, review_error: str) -> str:
+        """Hand an unavailable reviewer to the canonical recovery owner."""
+        hook = self.config.review_recovery_hook
+        if hook is None:
+            logger.warning(
+                "watchd_review_recovery_hook_unconfigured",
+                session_ref=pending.session_ref,
+                pane_id=pending.pane_id,
+                behavior_sha256=pending.behavior_sha256,
+            )
+            return "canonical recovery hook is not configured; lane remains open"
+        finding = ReviewFailure(
+            session_ref=pending.session_ref,
+            pane_id=pending.pane_id,
+            behavior_sha256=pending.behavior_sha256,
+            error=review_error,
+        )
+        try:
+            recovery_summary = hook(finding)
+        except Exception as exc:  # noqa: BLE001 - recovery must not block the watcher
+            logger.warning(
+                "watchd_review_recovery_hook_failed",
+                session_ref=pending.session_ref,
+                pane_id=pending.pane_id,
+                error=str(exc),
+            )
+            return "canonical recovery hook failed; lane remains open"
+        if recovery_summary and recovery_summary.strip():
+            return recovery_summary.strip()
+        return "canonical recovery scheduled; lane remains open"
+
     def _finalize_turn_review(
         self,
         pending: PendingCompletionReview,
@@ -585,9 +630,9 @@ class Watchd:
             summary = f"{pending.turn_audit.summary}; isolated review was not run for this turn end"
             review_verdict: Literal["accept", "reject", "unavailable"] = "unavailable"
         elif review_signal is None:
-            status = "blocked"
-            summary = f"turn-end review unavailable: {review_error}"
-            ask = "Review the lane manually because isolated watched-session review could not complete."
+            status = "turn-finished-unverified"
+            recovery = self._request_review_recovery(pending, review_error)
+            summary = f"turn-end review unavailable: {review_error}; {recovery}"
             review_verdict = "unavailable"
         elif review_signal.verdict == "reject":
             status = "blocked"
