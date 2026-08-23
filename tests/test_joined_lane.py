@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from chitra.joined_lane import (
     ReconcileReport,
     filesystem_provider_probe,
     ledger_provider_probe,
+    ownership_provider_probe,
 )
 from chitra.ledger import LedgerEntry, append_entry
 from chitra.orders import DispatchOrder, DispatchStatus
@@ -316,6 +318,47 @@ def test_filesystem_provider_and_verified_ledger_adapters_fence_exact_operation(
     )
     entry = ledger_provider_probe(ledger_path, key_path)(current)
     assert entry is not None and entry.order_id == pending.operation_id
+
+
+def test_ownership_adapter_uses_local_socket_for_twinridge_lane(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seen: dict[str, object] = {}
+
+    def local_request(socket_path: Path, query: object) -> object:
+        seen["socket"] = socket_path
+        seen["query"] = query
+        return {"status": "owned", "authoritative": True, "host_id": "twinridge", "boot_id": "boot-local"}
+
+    monkeypatch.setattr("chitra.joined_lane.request_json_line", local_request)
+    boot_id_path = tmp_path / "boot_id"
+    boot_id_path.write_text("boot-local\n", encoding="utf-8")
+    probe = ownership_provider_probe(local_extra={"twinridge"}, boot_id_path=boot_id_path)
+    response = probe(record(session_ref="twinridge:lane-a"))
+    assert response is not None
+    assert seen["query"]["host_id"] == "twinridge"
+    assert seen["query"]["session_ref"] == "twinridge:lane-a"
+
+
+def test_ownership_adapter_uses_batchmode_ssh_for_remote_tophand_lane() -> None:
+    seen: list[list[str]] = []
+
+    def remote_runner(command: list[str]) -> object:
+        seen.append(command)
+        return type("Completed", (), {
+            "returncode": 0,
+            "stdout": json.dumps(
+                {
+                    "host_id": "tophand",
+                    "boot_id": "boot-remote",
+                    "result": {"session_ref": "tophand:lane-a", "status": "owned"},
+                }
+            ),
+        })()
+
+    probe = ownership_provider_probe(local_extra={"twinridge"}, remote_runner=remote_runner)
+    assert probe(record(session_ref="tophand:lane-a")) is not None
+    assert seen and seen[0][0] == "ssh"
+    assert "BatchMode=yes" in seen[0]
+    assert seen[0][-1] == "chitra-ownership-query --session-ref tophand:lane-a"
 
 
 def test_legacy_wire_schema_is_rejected_without_migration(tmp_path: Path) -> None:

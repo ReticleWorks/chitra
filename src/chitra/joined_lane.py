@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -1181,24 +1182,53 @@ def ledger_provider_probe(ledger_path: Path, ledger_key_path: Path) -> LedgerPro
     return probe
 
 
-def ownership_provider_probe(*, socket_path: Path = DEFAULT_SOCKET_PATH) -> OwnershipProbe:
-    """Query the live ownership authority with host and boot identity fences."""
+def ownership_provider_probe(
+    *,
+    socket_path: Path = DEFAULT_SOCKET_PATH,
+    local_extra: set[str] | None = None,
+    remote_runner: Callable[[list[str]], object] | None = None,
+    boot_id_path: Path = Path("/proc/sys/kernel/random/boot_id"),
+) -> OwnershipProbe:
+    """Query local or remote ownership authority with host and boot fences.
+
+    Local lanes use the Unix ownership socket.  Remote lanes use the existing
+    BatchMode SSH/forced-command read boundary; this adapter never discovers
+    hosts, opens a shell, or performs login.
+    """
 
     def probe(record: JoinedLaneRecord) -> object | None:
         host_id = record.session_ref.split(":", 1)[0]
-        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
-        if not host_id or not boot_id:
+        if not host_id:
             return None
-        query = {
-            "schema": QUERY_SCHEMA,
-            "request_id": str(uuid.uuid4()),
-            "host_id": host_id,
-            "boot_id": boot_id,
-            "session_ref": record.session_ref,
-        }
         try:
-            return request_json_line(socket_path, query)
-        except (OSError, ValueError):
+            from .dispatch import is_local_host, run_cmd, ssh_command
+
+            if is_local_host(host_id, local_extra):
+                boot_id = boot_id_path.read_text(encoding="utf-8").strip()
+                if not boot_id:
+                    return None
+                query = {
+                    "schema": QUERY_SCHEMA,
+                    "request_id": str(uuid.uuid4()),
+                    "host_id": host_id,
+                    "boot_id": boot_id,
+                    "session_ref": record.session_ref,
+                }
+                return request_json_line(socket_path, query)
+            command = ssh_command(host_id, f"chitra-ownership-query --session-ref {shlex.quote(record.session_ref)}")
+            completed = (remote_runner or (lambda argv: run_cmd(argv, timeout=8)))(command)
+            if getattr(completed, "returncode", 1) != 0:
+                return None
+            response = json.loads(getattr(completed, "stdout", ""))
+            if not isinstance(response, Mapping):
+                return None
+            if response.get("host_id") != host_id or not isinstance(response.get("boot_id"), str):
+                return None
+            nested = response.get("result")
+            if not isinstance(nested, Mapping) or nested.get("session_ref") != record.session_ref:
+                return None
+            return response
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return None
 
     return probe
