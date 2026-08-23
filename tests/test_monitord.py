@@ -11,7 +11,7 @@ from _goal_fixtures import enrollment_fields
 
 from chitra.goals import GoalRecord, GoalStatus, upsert_goal
 from chitra.journal import ByteRange, CanonicalEvent, CanonicalType, Client, TranscriptIdentity
-from chitra.journal.store import EventJournal
+from chitra.journal.store import EventJournal, classify_progress
 from chitra.monitord import (
     MonitordConfig,
     append_finding_records,
@@ -137,6 +137,22 @@ def test_run_once_observes_real_journal_and_composes_outputs(tmp_path: Path) -> 
     presence_record = json.loads(presence_lines[-1])
     assert presence_record["instance"] == "chitra-monitord"
     assert presence_record["lanes"] == [SEEDED_LANE]
+
+def test_run_once_excludes_per_lane_progress_journal_from_lane_discovery(tmp_path: Path) -> None:
+    journal = EventJournal(tmp_path, SEEDED_LANE)
+    events = tuple(_event(f"e{i}", CanonicalType.TOOL_CALL, lane=SEEDED_LANE) for i in range(1, 4))
+    journal.append(events)
+    journal.append_progress(tuple(classify_progress(event, goal_version="0") for event in events))
+    assert journal.progress_path.is_file()
+    config = resolve_config(state_dir=tmp_path)
+    summary = run_once(config)
+    assert summary["lanes_observed"] == 1
+    assert [result["lane"] for result in summary["results"]] == [SEEDED_LANE]
+    finding_records = [json.loads(line) for line in config.findings_path.read_text(encoding="utf-8").splitlines()]
+    assert [record["lane"] for record in finding_records] == [SEEDED_LANE]
+    presence_lines = (tmp_path / "presence" / "chitra-monitord.jsonl").read_text(encoding="utf-8").splitlines()
+    assert all(json.loads(line)["lanes"] == [SEEDED_LANE] for line in presence_lines)
+
 
 def _goal(session_ref: str, *, status: GoalStatus = "working") -> GoalRecord:
     return GoalRecord(
