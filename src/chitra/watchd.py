@@ -16,7 +16,6 @@ Review metadata is written only to Chitra-owned ledgers and never to pane text.
 
 from __future__ import annotations
 
-import warnings
 import argparse
 import fcntl
 import hashlib
@@ -26,6 +25,7 @@ import signal
 import subprocess
 import threading
 import time
+import warnings
 from collections import Counter
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor

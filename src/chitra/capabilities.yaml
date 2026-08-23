@@ -60,6 +60,27 @@ capabilities:
         params: []
         mutates: true
 
+  - name: monitord
+    kind: daemon
+    purpose: Compose journal ingestion, failure-mode detectors and response ladder, enrollment receipts, and presence into one supervised observation daemon.
+    when_to_use: Declare one monitord process per instance instead of the deprecated watchd/triaged/sweepd chain.
+    authority:
+      level: record
+      grants:
+        - Ingest lane transcripts into durable journals and run deterministic detectors over observed events.
+        - Read enrolled goal contracts, execute registered completion validators, verify receipts, and write incident records.
+        - Publish advisory presence records.
+      excludes:
+        - Capture tmux pane content itself, dispatch orders, restart or steer lanes.
+        - Merge, approve, or modify pull requests.
+    default_enabled: true
+    commands:
+      - name: monitord
+        description: Start the composed Chitra monitor daemon.
+        argv: [monitord]
+        params: []
+        mutates: true
+
   - name: draft-scanner
     kind: daemon
     purpose: Detect unsubmitted drafts in configured tmux input boxes.

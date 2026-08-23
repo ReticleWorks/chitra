@@ -29,12 +29,12 @@ adding unvalidated timestamp parsing.
 
 from __future__ import annotations
 
-import warnings
 import argparse
 import hashlib
 import json
 import re
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 

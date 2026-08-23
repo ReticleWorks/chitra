@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 
@@ -162,15 +163,10 @@ def test_check_enrollment_is_silent_for_unenrolled_sessions(tmp_path: Path) -> N
     assert (recorded, disputed, findings) == (0, False, [])
 
 def test_deprecated_daemon_entrypoints_warn_toward_monitord() -> None:
-    import warnings
-
     import chitra.sweepd as sweepd
     import chitra.triaged as triaged
     import chitra.watchd as watchd
 
     for module in (watchd, triaged, sweepd):
-        with pytest.warns(DeprecationWarning, match="deprecated by chitra-monitord"):
-            try:
-                module.main(["--help"])
-            except SystemExit:
-                pass
+        with pytest.warns(DeprecationWarning, match="deprecated by chitra-monitord"), contextlib.suppress(SystemExit):
+            module.main(["--help"])

@@ -27,7 +27,9 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 - Compose journal ingestion, detectors and ladder, enrollment receipts, and
   presence into one `monitord` entrypoint with shadow-mode findings on by
   default.
-- Ship a single chitra-monitord@.service.example instance-template unit
+- Register `monitord` in the capability manifest so its command surface is
+  declared like every other daemon.
+- Ship a single chitra-monitord@ .service.example instance-template unit
   alongside the kept dispatchd units.
 
 ### Deprecated
