@@ -845,7 +845,7 @@ def _session_update_payload(item: Mapping[str, object]) -> object | None:
         for key in ("session_update", "lane_update"):
             value = payload.get(key)
             if value is not None:
-                return value
+                return cast(object, value)
     return None
 
 
