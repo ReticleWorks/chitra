@@ -514,12 +514,103 @@ def _tophand_operation_dict(operation: object) -> dict[str, object]:
             "attempt": operation.attempt,
             "attempted": operation.attempted,
         }
-        if operation.kind == "create_or_resume":
+        if operation.kind == "close":
+            _tophand_close_payload(operation)
+        if operation.kind in {"create_or_resume", "close"}:
             wire["payload"] = operation.payload
         return wire
     if isinstance(operation, Mapping):
         return {str(key): value for key, value in operation.items()}
     raise TypeError("provider operation must be a canonical mapping")
+
+
+def _tophand_close_payload(
+    operation: PendingProviderOperation,
+) -> dict[str, object]:
+    """Validate and return Chitra's exact durable governed-close payload."""
+
+    if operation.kind != "close":
+        raise ValueError("governed close requires a close operation")
+    try:
+        value = json.loads(operation.payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError("close operation payload is not valid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError("close operation payload must be an object")
+    canonical = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    if canonical != operation.payload:
+        raise ValueError("close operation payload is not canonical JSON")
+    expected_fields = {
+        "archive",
+        "checkpoint_ref",
+        "checkpoint_receipt_sha256",
+        "close_token",
+        "goal_id",
+        "goal_version",
+        "lane_id",
+        "process_start_token",
+        "provider_generation",
+        "provider_handle",
+        "provider_instance_id",
+        "provider_session_id",
+        "session_ref",
+    }
+    if set(value) != expected_fields:
+        raise ValueError("close operation payload fields are not exact")
+    identity = {
+        "lane_id": value["lane_id"],
+        "goal_id": value["goal_id"],
+        "goal_version": value["goal_version"],
+        "session_ref": value["session_ref"],
+        "provider_handle": value["provider_handle"],
+        "provider_session_id": value["provider_session_id"],
+        "provider_instance_id": value["provider_instance_id"],
+        "provider_generation": value["provider_generation"],
+        "payload": canonical,
+    }
+    if canonical_digest(identity) != operation.payload_digest:
+        raise ValueError("close operation payload digest changed")
+    if any(
+        value[field] != expected
+        for field, expected in (
+            ("lane_id", operation.lane_id),
+            ("provider_handle", operation.provider_handle),
+            ("provider_session_id", operation.provider_session_id),
+            ("provider_instance_id", operation.provider_instance_id),
+            ("provider_generation", operation.provider_generation),
+            ("process_start_token", operation.process_start_token),
+        )
+    ):
+        raise ValueError("close operation payload identity changed")
+    if value["archive"] is not True:
+        raise ValueError("governed close must archive the provider session")
+    for field in (
+        "checkpoint_ref",
+        "checkpoint_receipt_sha256",
+        "close_token",
+        "goal_id",
+        "lane_id",
+        "provider_handle",
+        "provider_instance_id",
+        "provider_session_id",
+        "session_ref",
+    ):
+        if not isinstance(value[field], str) or not value[field]:
+            raise ValueError(f"close operation {field} is missing")
+    process_start_token = value["process_start_token"]
+    if process_start_token is not None and (
+        not isinstance(process_start_token, str) or not process_start_token
+    ):
+        raise ValueError("close operation process_start_token is invalid")
+    if (
+        isinstance(value["goal_version"], bool)
+        or not isinstance(value["goal_version"], int)
+        or value["goal_version"] < 1
+    ):
+        raise ValueError("close operation goal_version is invalid")
+    return cast(dict[str, object], value)
 
 
 def _mapping(value: object, name: str) -> Mapping[str, object]:
@@ -826,7 +917,7 @@ class _PackagedTophandProvider:
         if not _facts_binding_current(self._operating_facts_binding):
             raise RuntimeError("Fleet operating-facts binding expired; recovery will retry")
 
-    def _verify_close_checkpoint(self, request: CloseRequest) -> None:
+    def _verify_close_checkpoint(self, request: CloseRequest) -> dict[str, object]:
         receipt = request.checkpoint_receipt
         if self._state_root is None or not isinstance(receipt, Mapping):
             raise ValueError("Chitra close requires a local signed checkpoint verifier")
@@ -836,11 +927,10 @@ class _PackagedTophandProvider:
             raise ValueError("close checkpoint digest does not match the supplied receipt")
         if not verify_checkpoint_receipt_signature(dict(receipt), state_root=self._state_root):
             raise ValueError("close checkpoint HMAC is invalid")
-        payload = json.loads(request.operation.payload)
-        if not isinstance(payload, Mapping):
-            raise ValueError("close payload must be an object")
+        payload = _tophand_close_payload(request.operation)
         if (
-            not isinstance(request.close_token, str)
+            request.archive is not payload.get("archive")
+            or not isinstance(request.close_token, str)
             or not request.close_token
             or payload.get("close_token") != request.close_token
             or payload.get("checkpoint_receipt_sha256")
@@ -870,6 +960,7 @@ class _PackagedTophandProvider:
             )
         ):
             raise ValueError("close checkpoint provider binding changed")
+        return payload
 
     @property
     def provider_name(self) -> ProviderName:
@@ -943,9 +1034,25 @@ class _PackagedTophandProvider:
         elif isinstance(request, CancelCurrentTurnRequest):
             payload["reason"] = request.reason
         elif isinstance(request, CloseRequest):
-            self._verify_close_checkpoint(request)
-            payload["archive"] = request.archive
-            payload["close_token"] = request.close_token
+            close_payload = self._verify_close_checkpoint(request)
+            payload.update(
+                {
+                    "archive": close_payload["archive"],
+                    "payload": close_payload,
+                    "goal_id": close_payload["goal_id"],
+                    "goal_version": close_payload["goal_version"],
+                    "lane_id": close_payload["lane_id"],
+                    "session_ref": close_payload["session_ref"],
+                    "provider_session_id": close_payload["provider_session_id"],
+                    "checkpoint_ref": close_payload["checkpoint_ref"],
+                    "checkpoint_receipt": dict(request.checkpoint_receipt or {}),
+                    "checkpoint_receipt_sha256": close_payload[
+                        "checkpoint_receipt_sha256"
+                    ],
+                    "checkpoint_verifier": request.checkpoint_verifier,
+                    "close_token": close_payload["close_token"],
+                }
+            )
         raw = getattr(self._adapter, method)(payload)
         self._require_current_facts()
         result = _provider_result(raw, operation)
@@ -1080,24 +1187,24 @@ class _PackagedTophandProvider:
         # Validate before entering the provider-outage fallback. A forged
         # checkpoint must be rejected as an invalid boundary, not converted
         # into an apparently ordinary provider-unknown response.
-        self._verify_close_checkpoint(request)
+        close_payload = self._verify_close_checkpoint(request)
         try:
-            payload = json.loads(operation.payload)
-            if not isinstance(payload, Mapping):
-                raise ValueError("Chitra close payload must be an object")
             wire_request = {
-                "operation": operation.model_dump(mode="json"),
-                "archive": request.archive,
-                "payload": dict(payload),
-                "goal_id": payload.get("goal_id"),
-                "lane_id": operation.lane_id,
-                "session_ref": payload.get("session_ref"),
-                "provider_session_id": operation.provider_session_id,
-                "checkpoint_ref": payload.get("checkpoint_ref"),
-                "checkpoint_receipt": request.checkpoint_receipt,
-                "checkpoint_receipt_sha256": request.checkpoint_receipt_sha256,
+                "operation": _tophand_operation_dict(operation),
+                "archive": close_payload["archive"],
+                "payload": close_payload,
+                "goal_id": close_payload["goal_id"],
+                "goal_version": close_payload["goal_version"],
+                "lane_id": close_payload["lane_id"],
+                "session_ref": close_payload["session_ref"],
+                "provider_session_id": close_payload["provider_session_id"],
+                "checkpoint_ref": close_payload["checkpoint_ref"],
+                "checkpoint_receipt": dict(request.checkpoint_receipt or {}),
+                "checkpoint_receipt_sha256": close_payload[
+                    "checkpoint_receipt_sha256"
+                ],
                 "checkpoint_verifier": request.checkpoint_verifier,
-                "close_token": request.close_token,
+                "close_token": close_payload["close_token"],
             }
             raw = cast(Any, self._adapter).close(wire_request)
             self._result_sink(raw)
