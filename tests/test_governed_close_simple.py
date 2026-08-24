@@ -244,6 +244,7 @@ def test_close_persists_chitra_checkpoint_and_archives_once(tmp_path: Path) -> N
     assert close_payload["checkpoint_ref"] == first.record.checkpoint_reference
     assert close_payload["checkpoint_receipt_sha256"]
     assert len(close_payload["close_token"]) == 64
+    assert first.operation.process_start_token == OLD_OWNER.start_token
     assert provider.archive_calls == 1
     assert provider.calls == 1
 
@@ -296,6 +297,33 @@ def test_forged_fleet_close_hmac_keeps_the_lane_active(tmp_path: Path) -> None:
     assert decision.record.lifecycle == "active"
     assert decision.record.pending_operation is not None
     assert decision.record.last_close_result is None
+
+
+def test_authenticated_close_with_wrong_prior_owner_keeps_the_lane_active(
+    tmp_path: Path,
+) -> None:
+    class WrongOwnerProvider(FakeProvider):
+        def close(self, request: Any) -> CloseArchiveResult:
+            result = super().close(request).model_copy(
+                update={"owner_process": NEW_OWNER}
+            )
+            token = json.loads(request.operation.payload)["close_token"]
+            return result.model_copy(
+                update={"close_receipt_hmac": _close_receipt_hmac(result.to_dict(), token)}
+            )
+
+    record = _record()
+    JoinedLaneStore(tmp_path).create(record)
+    _completion_gate(tmp_path, record)
+
+    decision = RecoveryEngine(
+        provider=WrongOwnerProvider(),
+        state_root=tmp_path,
+        goal_root=tmp_path,
+    ).governed_close(record, now=NOW)
+
+    assert decision.action == "waiting"
+    assert decision.record.lifecycle == "active"
 
 
 def test_supervisor_routes_done_goal_to_close_and_reconciles_after_restart(

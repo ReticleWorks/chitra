@@ -446,6 +446,7 @@ class RecoveryStateStore:
                 ("provider_session_id", record.provider.provider_session_id),
                 ("provider_instance_id", record.provider.instance_id),
                 ("provider_generation", record.provider.generation),
+                ("process_start_token", record.provider.process_start_token),
             )
         ):
             return False
@@ -467,6 +468,7 @@ class RecoveryStateStore:
                 ("provider_session_id", record.provider.provider_session_id),
                 ("provider_instance_id", record.provider.instance_id),
                 ("provider_generation", record.provider.generation),
+                ("process_start_token", record.provider.process_start_token),
             )
         ):
             return False
@@ -474,11 +476,11 @@ class RecoveryStateStore:
             return False
         if not _verify_mapping_signature(result.to_dict(), self.root):
             return False
-        return (
-            result.provider_thread_ref == record.provider.handle
-            and result.provider_session_id == record.provider.provider_session_id
-            and result.checkpoint_ref == record.checkpoint_reference
-        )
+        try:
+            operation = PendingProviderOperation.from_dict(operation_payload)
+        except (TypeError, ValueError):
+            return False
+        return _close_receipt_matches(record, operation, result, self.root)
 
     def write_close_evidence(
         self, operation: PendingProviderOperation, result: CloseArchiveResult
@@ -772,8 +774,52 @@ def _close_receipt_matches(
         if isinstance(checkpoint_mapping, Mapping)
         else None
     )
+    owner = result.owner_process
+    observed = record.provider.observed_process
+    observed_pid = None
+    if isinstance(observed, Mapping):
+        for field in ("pid", "provider_pid", "owner_pid"):
+            candidate_pid = observed.get(field)
+            if isinstance(candidate_pid, int) and not isinstance(candidate_pid, bool):
+                observed_pid = candidate_pid
+                break
     if (
-        not isinstance(close_token, str)
+        not isinstance(payload, Mapping)
+        or set(payload)
+        != {
+            "archive",
+            "checkpoint_ref",
+            "checkpoint_receipt_sha256",
+            "close_token",
+            "goal_id",
+            "goal_version",
+            "lane_id",
+            "process_start_token",
+            "provider_generation",
+            "provider_handle",
+            "provider_instance_id",
+            "provider_session_id",
+            "session_ref",
+        }
+        or any(
+            payload.get(field) != expected
+            for field, expected in (
+                ("archive", True),
+                ("checkpoint_ref", record.checkpoint_reference),
+                ("checkpoint_receipt_sha256", result.checkpoint_receipt_sha256),
+                ("goal_id", record.goal_id),
+                ("goal_version", record.goal_version),
+                ("lane_id", record.lane_id),
+                ("process_start_token", record.provider.process_start_token),
+                ("provider_generation", record.provider.generation),
+                ("provider_handle", record.provider.handle),
+                ("provider_instance_id", record.provider.instance_id),
+                ("provider_session_id", record.provider.provider_session_id),
+                ("session_ref", record.session_ref),
+            )
+        )
+        or operation.process_start_token != record.provider.process_start_token
+        or not isinstance(close_token, str)
         or not close_token
         or state_root is None
         or close_token
@@ -818,6 +864,10 @@ def _close_receipt_matches(
         or result.target_checkpoint_ref is None
         or result.target_transcript_sha256 is None
         or result.target_checkpoint_ref != result.target_transcript_sha256
+        or owner is None
+        or owner.start_token != operation.process_start_token
+        or owner.start_token != record.provider.process_start_token
+        or (observed_pid is not None and owner.pid != observed_pid)
     ):
         return False
     return (
@@ -1926,6 +1976,7 @@ class RecoveryEngine:
                 payload=payload,
                 provider_instance_id=provider.instance_id,
                 provider_generation=provider.generation,
+                process_start_token=provider.process_start_token,
                 created_at=current.isoformat(),
             )
             try:
