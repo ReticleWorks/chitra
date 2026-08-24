@@ -15,7 +15,17 @@ from collections.abc import Mapping
 TOPHAND_OPERATION_SCHEMA = "chitra.tophand.operation.v1"
 
 _REQUEST_FIELDS: dict[str, tuple[str, ...]] = {
-    "create_or_resume": ("session_ref", "provider_session_id", "context_ref"),
+    "create_or_resume": (
+        "session_ref",
+        "provider_session_id",
+        "context_ref",
+        "goal_id",
+        "goal_version",
+        "resume_after_close",
+        "close_operation_id",
+        "owner_process",
+        "resume_token",
+    ),
     "send": ("text",),
     "checkpoint": ("label",),
     "cancel_current_turn": ("reason",),

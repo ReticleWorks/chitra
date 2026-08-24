@@ -339,9 +339,6 @@ class ProviderStatus:
     generation: int
     fresh: bool
     provider_available: bool
-    # The provider instance is distinct from the physical session and keeps
-    # status observations on the same restart fence as mutations.
-    provider_instance_id: str | None = None
     context_available: bool | None = None
     current_turn_id: str | None = None
     last_event_id: str | None = None

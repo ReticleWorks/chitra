@@ -14,3 +14,22 @@ def test_operation_fixture_freezes_the_shared_create_projection() -> None:
     assert fixture["schema"] == TOPHAND_OPERATION_SCHEMA
     assert request_payload("create_or_resume", {**request, "operation_id": "private"}) == request
     assert fixture["payload_digest"] == request_digest("create_or_resume", request)
+
+
+def test_create_projection_binds_the_full_resume_envelope() -> None:
+    request = {
+        "session_ref": "tophand:lane-a",
+        "provider_session_id": "tophand:lane-a:4",
+        "context_ref": "completion-checkpoint",
+        "goal_id": "goal-a",
+        "goal_version": 3,
+        "resume_after_close": True,
+        "close_operation_id": "close-1",
+        "owner_process": {"target_pid": 10, "target_start_token": "start-10"},
+        "resume_token": "resume-token",
+    }
+
+    assert request_payload("create_or_resume", request) == request
+    assert request_digest("create_or_resume", request) != request_digest(
+        "create_or_resume", {key: request[key] for key in ("session_ref", "provider_session_id", "context_ref")}
+    )

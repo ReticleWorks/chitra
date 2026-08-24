@@ -1751,6 +1751,12 @@ class RecoveryEngine:
                 "session_ref": record.session_ref,
                 "provider_session_id": record.provider.provider_session_id or record.session_ref,
                 "context_ref": record.checkpoint_reference,
+                "goal_id": record.goal_id,
+                "goal_version": record.goal_version,
+                "resume_after_close": False,
+                "close_operation_id": None,
+                "owner_process": None,
+                "resume_token": None,
             }
         else:
             kind = "send"
@@ -1758,7 +1764,7 @@ class RecoveryEngine:
         return request_digest(kind, request)
 
     def _operation(self, record: JoinedLaneRecord, action: str, payload: str, current: datetime) -> PendingProviderOperation:
-        if action in {"close", "resume"}:
+        if action == "close":
             provider = record.provider
             session = _close_session(record)
             if provider.instance_id is None or provider.generation is None:
@@ -1788,6 +1794,50 @@ class RecoveryEngine:
                 provider_generation=provider.generation,
                 created_at=current.isoformat(),
             )
+        if action == "resume":
+            provider = record.provider
+            close = record.last_close_result
+            session = _close_session(record)
+            if close is None or provider.instance_id is None or provider.generation is None:
+                raise RecoveryStateError("resume operation lacks close or provider identity")
+            identity = {
+                "lane_id": record.lane_id,
+                "goal_id": record.goal_id,
+                "goal_version": record.goal_version,
+                "session_ref": record.session_ref,
+                "provider_handle": provider.handle,
+                "provider_session_id": session,
+                "provider_instance_id": provider.instance_id,
+                "provider_generation": provider.generation,
+                "payload": payload,
+            }
+            operation_id = f"resume-" + canonical_digest(identity)[:32]
+            provisional = PendingProviderOperation(
+                operation_id=operation_id,
+                kind="create_or_resume",
+                lane_id=record.lane_id,
+                provider_handle=provider.handle,
+                provider_session_id=session,
+                idempotency_key=f"{operation_id}-idem",
+                payload_digest="resume-payload-placeholder",
+                payload=payload,
+                provider_instance_id=provider.instance_id,
+                provider_generation=provider.generation,
+                created_at=current.isoformat(),
+            )
+            resume_token = _resume_auth_token(record, close, provisional, state_root=self.state_root)
+            request = {
+                "session_ref": record.session_ref,
+                "provider_session_id": session,
+                "context_ref": record.checkpoint_reference,
+                "goal_id": record.goal_id,
+                "goal_version": record.goal_version,
+                "resume_after_close": True,
+                "close_operation_id": close.operation_id,
+                "owner_process": close.owner_process.model_dump(mode="json") if close.owner_process is not None else None,
+                "resume_token": resume_token,
+            }
+            return provisional.model_copy(update={"payload_digest": request_digest("create_or_resume", request)})
         cycle_id = record.recovery.cycle_id
         if cycle_id is None:
             raise RecoveryStateError("recovery cycle identity is missing")

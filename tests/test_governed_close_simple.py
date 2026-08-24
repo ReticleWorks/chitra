@@ -11,7 +11,7 @@ from typing import Any
 from chitra.goals import GoalRecord
 from chitra.joined_lane import JoinedLaneStore
 from chitra.provider_protocol import ProviderState, ProviderStatus
-from chitra.recovery import RecoveryEngine, RecoverySupervisor, _resume_receipt_hmac
+from chitra.recovery import RecoveryEngine, RecoverySupervisor, _resume_auth_token, _resume_receipt_hmac
 from chitra.session_contract import (
     CloseArchiveResult,
     JoinedLaneRecord,
@@ -21,6 +21,7 @@ from chitra.session_contract import (
     ProviderOperationResult,
     ReopenReceipt,
 )
+from chitra.tophand_wire import request_digest
 
 NOW = datetime(2026, 8, 23, 14, tzinfo=UTC)
 OLD_OWNER = OwnerProcessIdentity(
@@ -423,6 +424,23 @@ def test_resume_after_close_restores_the_same_provider_session(tmp_path: Path) -
     assert resumed.record.last_close_result is None
     assert resumed.record.provider.provider_session_id == "physical-session-a"
     assert resumed.operation is not None and resumed.operation.kind == "create_or_resume"
+    assert closed.record.last_close_result is not None
+    assert resumed.operation.payload_digest == request_digest(
+        "create_or_resume",
+        {
+            "session_ref": "logical-session-a",
+            "provider_session_id": "physical-session-a",
+            "context_ref": closed.record.checkpoint_reference,
+            "goal_id": "goal-a",
+            "goal_version": 1,
+            "resume_after_close": True,
+            "close_operation_id": closed.record.last_close_result.operation_id,
+            "owner_process": OLD_OWNER.model_dump(mode="json"),
+            "resume_token": _resume_auth_token(
+                closed.record, closed.record.last_close_result, resumed.operation, state_root=tmp_path
+            ),
+        },
+    )
     assert provider.resume_calls == 1
 
 
