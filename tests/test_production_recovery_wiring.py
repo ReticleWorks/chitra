@@ -9,6 +9,8 @@ message instead of silently falling back to a local policy.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -112,6 +114,66 @@ def _lane(identifier: str, root: Path) -> LaneSpec:
             ssh_dispatch_key=root / f"{identifier}-dispatch.key",
         ),
     )
+
+
+def _write_tophand_production_facts(tmp_path: Path) -> Path:
+    """Write a complete, publisher-shaped facts snapshot for the entrypoint test."""
+    common = {
+        "state": "known",
+        "source": "fleet-authority:test",
+        "revision": "tophand-production-fixture-1",
+        "observed_at": NOW.isoformat(),
+        "freshness": "current",
+        "fresh_until": (NOW + timedelta(days=3)).isoformat(),
+        "within_authority": True,
+    }
+    facts = [
+        OperatingFact(name="fleet.placement", value={"host": "twinridge", "account": "ubuntu"}, **common),
+        OperatingFact(
+            name="fleet.routing",
+            value={"dispatch_target": {"host": "tophand", "user": "ubuntu"}},
+            **common,
+        ),
+        OperatingFact(name="fleet.credential-readiness", value={"dispatch": {"ready": True}}, **common),
+        OperatingFact(name="fleet.access", value={"dispatch": {"ready": True}}, **common),
+        OperatingFact(name="fleet.capacity", value={"slots": 2}, **common),
+        OperatingFact(name="fleet.versions", value={"chitra": "0.16.0"}, **common),
+        OperatingFact(name="fleet.provider-capabilities", value={"tophand": {"send": True}}, **common),
+    ]
+    core = {
+        "schema": "chitra.operating-facts.v1",
+        "observed_at": NOW.isoformat(),
+        "facts": [fact.to_dict() for fact in facts],
+    }
+    source_path = tmp_path / "approved-operating-facts-inputs.json"
+    source_bytes = json.dumps(
+        {"fixture": "tophand-production", "facts": core["facts"]}, sort_keys=True, separators=(",", ":")
+    ).encode()
+    source_path.write_bytes(source_bytes)
+    path = tmp_path / "operating-facts.json"
+    path.write_bytes(
+        json.dumps(
+            {
+                **core,
+                "provenance": {
+                    "schema": "chitra.operating-facts-provenance.v1",
+                    "source_path": str(source_path),
+                    "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+                    "source_mode": 0o644,
+                    "snapshot_sha256": hashlib.sha256(
+                        json.dumps(core, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                    "snapshot_mode": 0o644,
+                    "readback_verified": True,
+                    "readback_at": NOW.isoformat(),
+                },
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    )
+    path.chmod(0o644)
+    return path
 
 
 class _AcceptedReplyProvider:
@@ -905,6 +967,16 @@ def test_lanes_file_once_activates_packaged_tophand_before_queue_dispatch(
         dispatchd,
         "process_one_order",
         lambda *_args, **_kwargs: events.append("queue-dispatch") or None,
+    )
+    monkeypatch.setattr(
+        "chitra.operating_facts.PRODUCTION_OPERATING_FACTS_PATH",
+        _write_tophand_production_facts(tmp_path),
+        raising=True,
+    )
+    monkeypatch.setattr(
+        "chitra.operating_facts.PRODUCTION_OPERATING_FACTS_INPUTS_PATH",
+        tmp_path / "approved-operating-facts-inputs.json",
+        raising=True,
     )
 
     assert dispatchd.main(["--lanes-file", str(manifest), "--once"]) == 0

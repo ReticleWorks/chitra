@@ -59,9 +59,10 @@ class DispatchOrder(BaseModel):
     with no relay in between may use a different tag, but the ledger records
     whatever tag is asserted so it can be audited later. ``routing_hint`` is
     an opaque, caller-supplied string recording a routing/model-preference
-    decision already made upstream — chitra never reads, validates, or acts
-    on its contents; it is only carried through to ``DispatchResult`` and
-    the ledger for audit purposes, exactly like ``tag``. ``task_type`` is a
+    decision already made upstream. Chitra does not interpret its contents,
+    but production dispatch binds any selected hint to the current Fleet
+    facts receipt before it acts. It is carried through to ``DispatchResult``
+    and the ledger for audit purposes, exactly like ``tag``. ``task_type`` is a
     separate, optional caller-supplied classification string (e.g.
     ``"code-review"``) — chitra does not decide what a task type IS or
     evaluate content to classify one; the caller states it. If the caller
@@ -149,6 +150,13 @@ class DispatchResult(BaseModel):
     routing_hint: str | None = None
     task_type: str | None = None
     resolved_zdr: bool = False
+    # A route is actionable only with a current Fleet facts receipt. These
+    # fields make the binding visible in the user-facing result and survive
+    # process restarts without treating routing config as authority.
+    routing_facts_digest: str | None = None
+    routing_facts_deadline: str | None = None
+    routing_target_host: str | None = None
+    routing_target_account: str | None = None
     # The adapter-native session identity normalized from the confirmed lane
     # transcript (chitra.journal.native_session_identity). Derived by
     # dispatchd when the delivery ledger proof is signed; never taken from

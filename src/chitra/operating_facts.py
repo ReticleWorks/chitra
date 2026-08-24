@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -24,6 +26,9 @@ from chitra.session_contract import FactState, OperatingFact
 
 OPERATING_FACTS_SCHEMA: Literal["chitra.operating-facts.v1"] = "chitra.operating-facts.v1"
 PRODUCTION_OPERATING_FACTS_PATH = Path("/var/lib/polyphony-chitra/operating-facts.json")
+PRODUCTION_OPERATING_FACTS_INPUTS_PATH = Path(
+    "/var/lib/polyphony-chitra/approved-operating-facts-inputs.json"
+)
 
 FactCategory = Literal["placement", "routing", "credential-readiness", "access", "capacity", "versions", "provider-capabilities"]
 
@@ -37,7 +42,9 @@ _CATEGORY_PREFIX: dict[FactCategory, str] = {
     "provider-capabilities": "fleet.provider-capabilities",
 }
 _CATEGORIES: tuple[FactCategory, ...] = tuple(_CATEGORY_PREFIX)
-_SNAPSHOT_KEYS = frozenset(("schema", "observed_at", "facts"))
+_SNAPSHOT_KEYS = frozenset(("schema", "observed_at", "facts", "provenance"))
+_BASE_SNAPSHOT_KEYS = frozenset(("schema", "observed_at", "facts"))
+PROVENANCE_SCHEMA = "chitra.operating-facts-provenance.v1"
 
 
 def _as_paths(value: Path | Sequence[Path]) -> tuple[Path, ...]:
@@ -64,6 +71,12 @@ class OperatingFactsSources:
     capacity: Path | Sequence[Path] = ()
     versions: Path | Sequence[Path] = ()
     provider_capabilities: Path | Sequence[Path] = ()
+    # Production output includes a publisher receipt. Test and migration
+    # sources may omit it until they are upgraded; production never does.
+    require_provenance: bool = False
+    # Production receipt paths are not self-authenticating. This independent
+    # Fleet-owned path is the only source the production reader will accept.
+    trusted_source: Path | None = None
 
     def paths(self, category: FactCategory) -> tuple[Path, ...]:
         if category == "placement":
@@ -93,7 +106,134 @@ def production_operating_facts_sources() -> OperatingFactsSources:
         capacity=path,
         versions=path,
         provider_capabilities=path,
+        require_provenance=True,
+        trusted_source=PRODUCTION_OPERATING_FACTS_INPUTS_PATH,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class OperatingFactsProvenance:
+    """Publisher evidence for one facts snapshot.
+
+    ``snapshot_sha256`` covers only the schema, observation time, and facts.
+    Excluding this receipt avoids a self-referential hash while still binding
+    every selected route to the exact facts content.
+    """
+
+    source_path: str
+    source_sha256: str
+    source_mode: int
+    snapshot_sha256: str
+    snapshot_mode: int
+    readback_verified: bool
+    readback_at: str
+    schema: Literal["chitra.operating-facts-provenance.v1"] = PROVENANCE_SCHEMA
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema": self.schema,
+            "source_path": self.source_path,
+            "source_sha256": self.source_sha256,
+            "source_mode": self.source_mode,
+            "snapshot_sha256": self.snapshot_sha256,
+            "snapshot_mode": self.snapshot_mode,
+            "readback_verified": self.readback_verified,
+            "readback_at": self.readback_at,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> OperatingFactsProvenance:
+        if not isinstance(payload, Mapping) or payload.get("schema") != PROVENANCE_SCHEMA:
+            raise ValueError("operating facts provenance has the wrong schema")
+        text_fields = ("source_path", "source_sha256", "snapshot_sha256", "readback_at")
+        if any(not isinstance(payload.get(field), str) or not str(payload[field]).strip() for field in text_fields):
+            raise ValueError("operating facts provenance text fields are required")
+        for field in ("source_sha256", "snapshot_sha256"):
+            value = str(payload[field])
+            if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+                raise ValueError(f"operating facts provenance {field} must be a SHA-256 hex digest")
+        for field in ("source_mode", "snapshot_mode"):
+            value = payload.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"operating facts provenance {field} must be a positive mode")
+        if not isinstance(payload.get("readback_verified"), bool) or not payload["readback_verified"]:
+            raise ValueError("operating facts provenance readback must be verified")
+        _parse_timestamp(str(payload["readback_at"]), "operating_facts.provenance.readback_at")
+        return cls(
+            source_path=str(payload["source_path"]),
+            source_sha256=str(payload["source_sha256"]),
+            source_mode=int(payload["source_mode"]),
+            snapshot_sha256=str(payload["snapshot_sha256"]),
+            snapshot_mode=int(payload["snapshot_mode"]),
+            readback_verified=True,
+            readback_at=str(payload["readback_at"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OperatingFactsBinding:
+    """Immutable receipt attached to a provider or route selection."""
+
+    digest: str
+    deadline: str
+    source_path: str
+    source_sha256: str
+    source_mode: int
+    snapshot_mode: int
+    target_host: str | None = None
+    target_account: str | None = None
+
+
+def bind_current_operating_facts(
+    snapshot: OperatingFactsSnapshot,
+    *,
+    now: datetime | None = None,
+    provider_kind: str | None = None,
+) -> OperatingFactsBinding | None:
+    """Return a binding only when every Fleet category is actionable.
+
+    Chitra does not fill gaps from host names, environment variables, or
+    routing configuration. A category with a missing, stale, conflicting,
+    inaccessible, unauthorized, or incomplete value fails closed.
+    """
+
+    current = _now(now)
+    for category in _CATEGORIES:
+        records = snapshot.by_category(category)
+        if not records or any(not record.is_current(now=current) for record in records):
+            return None
+        if any(not isinstance(record.value, Mapping) or not record.value for record in records):
+            return None
+    binding = snapshot.binding(now=current, provider_kind=provider_kind)
+    if binding is None or not binding.target_host or not binding.target_account:
+        return None
+
+    placement = snapshot.get("fleet.placement")
+    routing = snapshot.get("fleet.routing")
+    placement_value = placement.value if placement is not None and isinstance(placement.value, Mapping) else {}
+    routing_value = routing.value if routing is not None and isinstance(routing.value, Mapping) else {}
+    dispatch_target = routing_value.get("dispatch_target")
+    dispatch_target = dispatch_target if isinstance(dispatch_target, Mapping) else {}
+    placement_host = placement_value.get("host")
+    routing_host = dispatch_target.get("host")
+    if provider_kind == "amp":
+        orb_surface = (
+            snapshot.get("fleet.provider-capabilities").value
+            if snapshot.get("fleet.provider-capabilities") is not None
+            and isinstance(snapshot.get("fleet.provider-capabilities").value, Mapping)
+            else {}
+        )
+        orb = orb_surface.get("orb_lane_surface")
+        orb_target = orb.get("target_machine") if isinstance(orb, Mapping) else None
+        if isinstance(placement_host, str) and isinstance(orb_target, str) and placement_host != orb_target:
+            return None
+    elif not isinstance(routing_host, str) or not routing_host:
+        return None
+    return binding
+
+
+def _core_payload(schema: str, observed_at: str, facts: Sequence[OperatingFact]) -> dict[str, object]:
+    return {"schema": schema, "observed_at": observed_at, "facts": [fact.to_dict() for fact in facts]}
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,19 +243,70 @@ class OperatingFactsSnapshot:
     observed_at: str
     facts: tuple[OperatingFact, ...]
     schema: Literal["chitra.operating-facts.v1"] = OPERATING_FACTS_SCHEMA
+    provenance: OperatingFactsProvenance | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
-            "schema": self.schema,
-            "observed_at": self.observed_at,
-            "facts": [fact.to_dict() for fact in self.facts],
-        }
+        payload = _core_payload(self.schema, self.observed_at, self.facts)
+        if self.provenance is not None:
+            payload["provenance"] = self.provenance.to_dict()
+        return payload
+
+    @property
+    def content_digest(self) -> str:
+        """Digest of the facts content, excluding publisher provenance."""
+
+        return hashlib.sha256(
+            _canonical(_core_payload(self.schema, self.observed_at, self.facts)).encode("utf-8")
+        ).hexdigest()
+
+    def binding(self, *, now: datetime | None = None, provider_kind: str | None = None) -> OperatingFactsBinding | None:
+        """Return the receipt required to bind a route or provider action."""
+
+        provenance = self.provenance
+        if provenance is None:
+            return None
+        current = _now(now)
+        deadlines = [
+            _parse_timestamp(fact.fresh_until, "fact.fresh_until")
+            for fact in self.facts
+            if fact.fresh_until is not None and fact.is_current(now=current)
+        ]
+        if not deadlines:
+            return None
+        placement = self.get("fleet.placement")
+        routing = self.get("fleet.routing")
+        placement_value = placement.value if placement is not None and isinstance(placement.value, Mapping) else {}
+        routing_value = routing.value if routing is not None and isinstance(routing.value, Mapping) else {}
+        target = routing_value.get("dispatch_target")
+        target_map = target if isinstance(target, Mapping) else {}
+        if provider_kind == "amp":
+            host = placement_value.get("host")
+            account = placement_value.get("account")
+            if not isinstance(account, str) or not account:
+                account = target_map.get("user") if isinstance(target_map.get("user"), str) else None
+        else:
+            host = target_map.get("host")
+            account = target_map.get("user")
+            if not isinstance(host, str) or not host:
+                host = placement_value.get("host") if isinstance(placement_value.get("host"), str) else None
+            if not isinstance(account, str) or not account:
+                account = placement_value.get("account") if isinstance(placement_value.get("account"), str) else None
+        return OperatingFactsBinding(
+            digest=f"sha256:{provenance.snapshot_sha256}",
+            deadline=_iso(min(deadlines)),
+            source_path=provenance.source_path,
+            source_sha256=provenance.source_sha256,
+            source_mode=provenance.source_mode,
+            snapshot_mode=provenance.snapshot_mode,
+            target_host=host if isinstance(host, str) else None,
+            target_account=account if isinstance(account, str) else None,
+        )
 
     @classmethod
     def from_dict(cls, payload: object) -> OperatingFactsSnapshot:
         if not isinstance(payload, Mapping):
             raise ValueError("operating facts document must be an object")
-        if set(payload) != _SNAPSHOT_KEYS:
+        if set(payload) not in (_BASE_SNAPSHOT_KEYS, _SNAPSHOT_KEYS):
             raise ValueError("operating facts document has unexpected or missing fields")
         if payload.get("schema") != OPERATING_FACTS_SCHEMA:
             raise ValueError(f"document is not a {OPERATING_FACTS_SCHEMA} document")
@@ -130,7 +321,12 @@ class OperatingFactsSnapshot:
         names = [fact.name for fact in facts]
         if len(names) != len(set(names)):
             raise ValueError("operating facts names must be unique")
-        return cls(observed_at=observed_at, facts=facts)
+        provenance_payload = payload.get("provenance")
+        provenance = None if provenance_payload is None else OperatingFactsProvenance.from_dict(provenance_payload)
+        snapshot = cls(observed_at=observed_at, facts=facts, provenance=provenance)
+        if provenance is not None and provenance.snapshot_sha256 != snapshot.content_digest:
+            raise ValueError("operating facts provenance does not match snapshot content")
+        return snapshot
 
     def get(self, name: str) -> OperatingFact | None:
         """Return one named fact, or ``None`` when it is absent."""
@@ -153,6 +349,7 @@ class _SourceResult:
     facts: tuple[OperatingFact, ...] | None
     state: FactState
     reason: str = ""
+    provenance: OperatingFactsProvenance | None = None
 
 
 def _parse_timestamp(value: str, field_name: str) -> datetime:
@@ -229,9 +426,47 @@ def _failure_fact(
     )
 
 
-def _read_source(path: Path, category: FactCategory) -> _SourceResult:
+def _read_nofollow_regular(path: Path) -> tuple[bytes, int]:
+    """Read one regular file without following a symlink replacement."""
+
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise OSError("source must be a regular, non-symlink file")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
     try:
-        raw = path.read_bytes()
+        opened = os.fstat(descriptor)
+        if stat.S_ISLNK(opened.st_mode) or not stat.S_ISREG(opened.st_mode):
+            raise OSError("opened source is not a regular, non-symlink file")
+        if opened.st_dev != info.st_dev or opened.st_ino != info.st_ino:
+            raise OSError("source changed before it was opened")
+        opened_mode = stat.S_IMODE(opened.st_mode)
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            data = handle.read()
+            after = os.fstat(handle.fileno())
+        if (
+            opened.st_dev != after.st_dev
+            or opened.st_ino != after.st_ino
+            or opened.st_size != after.st_size
+            or stat.S_IMODE(after.st_mode) != opened_mode
+        ):
+            raise OSError("source changed while it was read")
+        return data, opened_mode
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+
+
+def _read_source(
+    path: Path,
+    category: FactCategory,
+    *,
+    require_provenance: bool = False,
+    trusted_source: Path | None = None,
+) -> _SourceResult:
+    try:
+        raw, snapshot_mode = _read_nofollow_regular(path)
     except FileNotFoundError:
         return _SourceResult(None, "missing", "source file does not exist")
     except OSError as exc:
@@ -242,6 +477,27 @@ def _read_source(path: Path, category: FactCategory) -> _SourceResult:
         snapshot = OperatingFactsSnapshot.from_dict(payload)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         return _SourceResult(None, "inaccessible", f"invalid operating-facts snapshot: {exc}")
+
+    if require_provenance and snapshot.provenance is None:
+        return _SourceResult(None, "inaccessible", "production facts lack publisher provenance")
+    if snapshot.provenance is not None and snapshot.provenance.snapshot_mode != snapshot_mode:
+        return _SourceResult(None, "inaccessible", "facts snapshot mode differs from its publisher receipt")
+    if snapshot.provenance is not None:
+        provenance = snapshot.provenance
+        source_path = Path(provenance.source_path)
+        if trusted_source is not None:
+            if source_path.absolute() != trusted_source.absolute():
+                return _SourceResult(None, "inaccessible", "facts provenance names an untrusted Fleet source")
+        try:
+            source_raw, source_mode = _read_nofollow_regular(source_path)
+        except FileNotFoundError:
+            return _SourceResult(None, "inaccessible", "facts provenance source file does not exist")
+        except OSError as exc:
+            return _SourceResult(None, "inaccessible", f"cannot read facts provenance source: {exc}")
+        if source_mode != provenance.source_mode:
+            return _SourceResult(None, "inaccessible", "facts source mode differs from its publisher receipt")
+        if hashlib.sha256(source_raw).hexdigest() != provenance.source_sha256:
+            return _SourceResult(None, "inaccessible", "facts source bytes differ from its publisher receipt")
 
     prefix = _CATEGORY_PREFIX[category]
     selected = tuple(
@@ -255,7 +511,7 @@ def _read_source(path: Path, category: FactCategory) -> _SourceResult:
     )
     if not selected and not recognized:
         return _SourceResult(None, "inaccessible", f"facts do not belong to {category}")
-    return _SourceResult(selected, "known")
+    return _SourceResult(selected, "known", provenance=snapshot.provenance)
 
 
 def _merge(name: str, candidates: Sequence[_Candidate]) -> OperatingFact:
@@ -302,6 +558,7 @@ def read_operating_facts(
     current = _now(now)
     configured = production_operating_facts_sources() if sources is None else sources
     candidates: dict[str, list[_Candidate]] = {}
+    provenance: OperatingFactsProvenance | None = None
 
     for category in _CATEGORIES:
         paths = configured.paths(category)
@@ -318,7 +575,12 @@ def read_operating_facts(
                 )
             )
         for index, path in enumerate(paths):
-            result = _read_source(path, category)
+            result = _read_source(
+                path,
+                category,
+                require_provenance=configured.require_provenance,
+                trusted_source=configured.trusted_source,
+            )
             if result.facts is None:
                 health.append(
                     _failure_fact(
@@ -344,6 +606,8 @@ def read_operating_facts(
                 )
                 continue
             valid_document = True
+            if provenance is None:
+                provenance = result.provenance
             for fact in result.facts:
                 current_fact = _freshen(fact, now=current)
                 candidates.setdefault(current_fact.name, []).append(_Candidate(current_fact, path))
@@ -363,15 +627,19 @@ def read_operating_facts(
             candidates.setdefault(fact.name, []).append(_Candidate(fact, Path(fact.source)))
 
     facts = tuple(_merge(name, candidates[name]) for name in sorted(candidates))
-    return OperatingFactsSnapshot(observed_at=_iso(current), facts=facts)
+    return OperatingFactsSnapshot(observed_at=_iso(current), facts=facts, provenance=provenance)
 
 
 __all__ = [
     "FactCategory",
     "OPERATING_FACTS_SCHEMA",
+    "OperatingFactsBinding",
+    "OperatingFactsProvenance",
     "OperatingFactsSnapshot",
     "OperatingFactsSources",
     "PRODUCTION_OPERATING_FACTS_PATH",
+    "PRODUCTION_OPERATING_FACTS_INPUTS_PATH",
+    "bind_current_operating_facts",
     "production_operating_facts_sources",
     "read_operating_facts",
 ]

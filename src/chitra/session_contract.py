@@ -640,6 +640,13 @@ class ProviderIdentity(_ContractModel):
     project_ref: str | None = None
     profile_digest: Sha256Digest | None = None
     provider_version: str = ""
+    # These fields bind a provider session to the Fleet facts snapshot that
+    # authorized its target. They remain optional for legacy records; the
+    # production resolver refuses to act until it can populate them.
+    target_host: Identifier | None = None
+    target_account: Identifier | None = None
+    operating_facts_digest: Sha256Digest | None = None
+    operating_facts_deadline: Timestamp | None = None
 
     @field_validator("generation")
     @classmethod
@@ -647,6 +654,11 @@ class ProviderIdentity(_ContractModel):
         if isinstance(value, bool):
             raise ValueError("provider generation must be an integer")
         return value
+
+    @field_validator("operating_facts_deadline")
+    @classmethod
+    def validate_operating_facts_deadline(cls, value: str | None) -> str | None:
+        return _timestamp_or_none(value, "provider.operating_facts_deadline")
 
     def supports(self, capability: CapabilityName | OperationKind) -> bool:
         return bool(getattr(self.capabilities, capability))
@@ -665,6 +677,10 @@ def _provider_identity_key(provider: ProviderIdentity) -> tuple[object, ...]:
         provider.project_ref,
         provider.profile_digest,
         provider.provider_version,
+        provider.target_host,
+        provider.target_account,
+        provider.operating_facts_digest,
+        provider.operating_facts_deadline,
     )
 
 

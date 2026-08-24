@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import os
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,7 @@ import chitra.ledger as ledger_mod
 from chitra.dispatch import DISPATCH_VERIFY_WAIT_SECONDS, DispatchOrder, DispatchResult, DispatchStatus, LaneLock, LaneLockError
 from chitra.dispatchd import build_arg_parser, main, process_one_order, requeue_deferred_for_session, resolve_session_prefixes, run_once
 from chitra.goals import GOALS_SCHEMA_NEWER_MESSAGE, GoalRecord, hold_goal, upsert_goal
+from chitra.operating_facts import OperatingFactsSources
 from chitra.policy_config import PolicyConfig
 from chitra.reasoning import DecisionAttestation
 from chitra.routing_config import ROUTING_CONFIG_ENV_VAR, RoutingConfig
@@ -41,6 +44,75 @@ def _write_order(orders_dir: Path, order: DispatchOrder) -> Path:
     path = orders_dir / f"{order.order_id}.json"
     path.write_text(order.model_dump_json(), encoding="utf-8")
     return path
+
+
+def _write_current_operating_facts(tmp_path: Path) -> OperatingFactsSources:
+    """Create the publisher-shaped facts receipt used by positive dispatch tests."""
+    now = datetime.now(UTC)
+    observed_at = (now - timedelta(seconds=1)).isoformat()
+    fresh_until = (now + timedelta(hours=1)).isoformat()
+    values = {
+        "fleet.placement": {"host": "twinridge", "account": "ubuntu"},
+        "fleet.routing": {"dispatch_target": {"host": "twinridge", "user": "ubuntu"}},
+        "fleet.credential-readiness": {"dispatch": {"ready": True}},
+        "fleet.access": {"dispatch": {"ready": True}},
+        "fleet.capacity": {"slots": 2},
+        "fleet.versions": {"chitra": "0.16.0"},
+        "fleet.provider-capabilities": {"tophand": {"send": True}},
+    }
+    facts = [
+        {
+            "name": name,
+            "value": value,
+            "state": "known",
+            "source": "fleet-authority:test",
+            "revision": "dispatch-fixture-1",
+            "observed_at": observed_at,
+            "freshness": "current",
+            "fresh_until": fresh_until,
+            "within_authority": True,
+        }
+        for name, value in values.items()
+    ]
+    core = {"schema": "chitra.operating-facts.v1", "observed_at": observed_at, "facts": facts}
+    source_path = tmp_path / "approved-operating-facts-inputs.json"
+    source_bytes = json.dumps(
+        {"fixture": "dispatch", "facts": facts}, sort_keys=True, separators=(",", ":")
+    ).encode()
+    source_path.write_bytes(source_bytes)
+    facts_path = tmp_path / "operating-facts.json"
+    facts_path.write_bytes(
+        json.dumps(
+            {
+                **core,
+                "provenance": {
+                    "schema": "chitra.operating-facts-provenance.v1",
+                    "source_path": str(source_path),
+                    "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+                    "source_mode": 0o644,
+                    "snapshot_sha256": hashlib.sha256(
+                        json.dumps(core, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                    "snapshot_mode": 0o644,
+                    "readback_verified": True,
+                    "readback_at": now.isoformat(),
+                },
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    )
+    facts_path.chmod(0o644)
+    return OperatingFactsSources(
+        placement=facts_path,
+        routing=facts_path,
+        credential_readiness=facts_path,
+        access=facts_path,
+        capacity=facts_path,
+        versions=facts_path,
+        provider_capabilities=facts_path,
+        require_provenance=True,
+    )
 
 
 def test_run_once_processes_pending_orders_and_moves_them(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -169,6 +241,7 @@ def test_remote_delivery_writes_a_ledger_entry_same_as_local(tmp_path: Path, mon
         lock_dir=tmp_path / "locks",
         ledger_path=ledger_path,
         ledger_key_path=tmp_path / "ledger.key",
+        operating_facts_sources=_write_current_operating_facts(tmp_path),
     )
 
     assert len(results) == 1
@@ -1205,6 +1278,7 @@ def test_routing_hint_flows_from_order_through_result_and_ledger(tmp_path: Path,
         lock_dir=tmp_path / "locks",
         ledger_path=ledger_path,
         ledger_key_path=tmp_path / "ledger.key",
+        operating_facts_sources=_write_current_operating_facts(tmp_path),
     )
 
     assert len(results) == 1
@@ -1496,6 +1570,7 @@ def test_routing_provenance_is_stamped_on_result_and_signed_ledger(tmp_path: Pat
         ledger_path=ledger_path,
         ledger_key_path=tmp_path / "ledger.key",
         routing_config_path=config_path,
+        operating_facts_sources=_write_current_operating_facts(tmp_path),
     )[0]
 
     assert result.task_type == "code-review"
@@ -1524,6 +1599,7 @@ def test_routes_entry_resolves_hint_and_zdr_into_result_and_signed_ledger(tmp_pa
         ledger_path=ledger_path,
         ledger_key_path=tmp_path / "ledger.key",
         routing_config_path=config_path,
+        operating_facts_sources=_write_current_operating_facts(tmp_path),
     )[0]
 
     assert result.routing_hint == "opus-4.8@claude-code+zdr"
@@ -1534,6 +1610,84 @@ def test_routes_entry_resolves_hint_and_zdr_into_result_and_signed_ledger(tmp_pa
     assert entry.resolved_zdr is True
     assert entry.sig_v == 4
     assert ledger_mod.verify_entry(entry, key=key) is True
+
+
+def test_configured_route_without_current_facts_is_a_durable_chitra_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Missing Fleet facts park the order without provider or user escalation."""
+    monkeypatch.setattr(
+        dispatchd_mod,
+        "dispatch_to_tmux",
+        lambda *_args, **_kwargs: pytest.fail("provider dispatch must not run without current facts"),
+    )
+    config_path = tmp_path / "routing.yaml"
+    config_path.write_text(yaml.safe_dump({"defaults": {"code-review": "sonnet"}}), encoding="utf-8")
+    queue_dir = tmp_path / "queue"
+    _write_order(
+        queue_dir / "orders",
+        DispatchOrder(order_id="facts-wait", session_ref="localhost:s:0.0", nudge="hi", task_type="code-review"),
+    )
+
+    results = run_once(
+        queue_dir,
+        lock_dir=tmp_path / "locks",
+        ledger_path=tmp_path / "ledger.jsonl",
+        ledger_key_path=tmp_path / "ledger.key",
+        routing_config_path=config_path,
+    )
+
+    assert len(results) == 1
+    assert results[0].status == DispatchStatus.DEFERRED
+    assert "authoritative Fleet operating facts" in results[0].reason
+    assert (queue_dir / "deferred" / "facts-wait.json").exists()
+    assert (queue_dir / "deferred" / ".facts-wait.operating-facts.json").exists()
+    assert not (queue_dir / "results" / "facts-wait.json").exists()
+    assert not (tmp_path / "ledger.jsonl").exists()
+
+
+def test_explicit_route_without_config_is_deferred_then_requeued_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restart cannot send an explicit target until Fleet facts return."""
+    sent: list[str] = []
+
+    def fake_dispatch(order: DispatchOrder, **kwargs: Any) -> DispatchResult:
+        sent.append(order.routing_hint or "")
+        return DispatchResult(order_id=order.order_id, session_ref=order.session_ref, status=DispatchStatus.SENT)
+
+    monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", fake_dispatch)
+    queue_dir = tmp_path / "queue"
+    _write_order(
+        queue_dir / "orders",
+        DispatchOrder(
+            order_id="explicit-facts-wait",
+            session_ref="localhost:s:0.0",
+            nudge="continue",
+            routing_hint="twinridge-orb",
+        ),
+    )
+
+    first = run_once(
+        queue_dir,
+        lock_dir=tmp_path / "locks",
+        ledger_path=tmp_path / "ledger.jsonl",
+        ledger_key_path=tmp_path / "ledger.key",
+    )
+    assert first[0].status == DispatchStatus.DEFERRED
+    assert sent == []
+    assert (queue_dir / "deferred" / "explicit-facts-wait.json").exists()
+
+    second = run_once(
+        queue_dir,
+        lock_dir=tmp_path / "locks",
+        ledger_path=tmp_path / "ledger.jsonl",
+        ledger_key_path=tmp_path / "ledger.key",
+        operating_facts_sources=_write_current_operating_facts(tmp_path),
+    )
+    assert second[0].status == DispatchStatus.SENT
+    assert sent == ["twinridge-orb"]
+    assert (queue_dir / "processed" / "explicit-facts-wait.json").exists()
 
 
 def test_routes_entry_wins_over_a_defaults_entry_for_same_task_type(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

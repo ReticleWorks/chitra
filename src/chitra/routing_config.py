@@ -25,6 +25,8 @@ import structlog
 import yaml
 from pydantic import BaseModel
 
+from .operating_facts import OperatingFactsBinding
+
 logger = structlog.get_logger(__name__)
 
 ROUTING_CONFIG_ENV_VAR = "CHITRA_ROUTING_CONFIG"
@@ -59,6 +61,40 @@ class ResolvedRoute(BaseModel):
     harness: str
     zdr: bool
     routing_hint: str
+
+
+class FactsBoundRoute(BaseModel):
+    """A mechanical route selection bound to the Fleet facts receipt."""
+
+    route: ResolvedRoute
+    facts_digest: str
+    facts_deadline: str
+    target_host: str
+    target_account: str
+
+
+def bind_route_to_facts(
+    route: ResolvedRoute,
+    binding: OperatingFactsBinding | None,
+    *,
+    expected_host: str | None = None,
+    expected_account: str | None = None,
+) -> FactsBoundRoute | None:
+    """Bind a route selection or return ``None`` for a durable retry."""
+
+    if binding is None or not binding.target_host or not binding.target_account:
+        return None
+    if expected_host is not None and expected_host != binding.target_host:
+        return None
+    if expected_account is not None and expected_account != binding.target_account:
+        return None
+    return FactsBoundRoute(
+        route=route,
+        facts_digest=binding.digest,
+        facts_deadline=binding.deadline,
+        target_host=binding.target_host,
+        target_account=binding.target_account,
+    )
 
 
 class RoutingConfig(BaseModel):

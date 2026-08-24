@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from chitra.operating_facts import OperatingFactsSnapshot, OperatingFactsSources, read_operating_facts
+from chitra.operating_facts import (
+    OperatingFactsSnapshot,
+    OperatingFactsSources,
+    bind_current_operating_facts,
+    read_operating_facts,
+)
 
 NOW = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
 OBSERVED = "2026-08-23T11:55:00Z"
@@ -86,6 +92,70 @@ def test_reads_named_records_for_all_operating_categories(tmp_path: Path) -> Non
         "fleet.placement.tophand", "fleet.routing.build", "fleet.credential-readiness.tophand",
         "fleet.access.tophand", "fleet.capacity.tophand",
     ))
+
+
+def test_production_binding_requires_receipt_and_binds_target(tmp_path: Path) -> None:
+    values = {
+        "fleet.placement": {"host": "twinridge", "account": "chitra"},
+        "fleet.routing": {"dispatch_target": {"host": "twinridge", "user": "chitra"}},
+        "fleet.credential-readiness": {"dispatch": {"ready": True}},
+        "fleet.access": {"dispatch": {"ready": True}},
+        "fleet.capacity": {"slots": 2},
+        "fleet.versions": {"chitra": "0.15.0"},
+        "fleet.provider-capabilities": {"tophand": {"send": True}},
+    }
+    facts = [_fact(name, value, source="fleet-authority") for name, value in values.items()]
+    source = tmp_path / "operating-facts.json"
+    base = OperatingFactsSnapshot.from_dict(
+        {"schema": "chitra.operating-facts.v1", "observed_at": OBSERVED, "facts": facts}
+    )
+    payload = base.to_dict()
+    approved_inputs = tmp_path / "approved-inputs.json"
+    approved_bytes = json.dumps(
+        {"fixture": "operating-facts", "facts": facts}, sort_keys=True, separators=(",", ":")
+    ).encode()
+    approved_inputs.write_bytes(approved_bytes)
+    payload["provenance"] = {
+        "schema": "chitra.operating-facts-provenance.v1",
+        "source_path": str(approved_inputs),
+        "source_sha256": hashlib.sha256(approved_bytes).hexdigest(),
+        "source_mode": 420,
+        "snapshot_sha256": base.content_digest,
+        "snapshot_mode": 420,
+        "readback_verified": True,
+        "readback_at": OBSERVED,
+    }
+    source.write_text(json.dumps(payload), encoding="utf-8")
+    snapshot = read_operating_facts(
+        OperatingFactsSources(
+            placement=source,
+            routing=source,
+            credential_readiness=source,
+            access=source,
+            capacity=source,
+            versions=source,
+            provider_capabilities=source,
+            require_provenance=True,
+        ),
+        now=NOW,
+    )
+    binding = bind_current_operating_facts(snapshot, now=NOW)
+    assert binding is not None
+    assert binding.target_host == "twinridge"
+    assert binding.target_account == "chitra"
+    assert binding.digest == f"sha256:{base.content_digest}"
+
+
+def test_required_provenance_fails_closed(tmp_path: Path) -> None:
+    source = _write_snapshot(
+        tmp_path / "legacy.json",
+        [_fact("fleet.placement", {"host": "twinridge"}, source="legacy")],
+    )
+    snapshot = read_operating_facts(
+        OperatingFactsSources(placement=source, require_provenance=True),
+        now=NOW,
+    )
+    assert snapshot.get("fleet.placement").state == "inaccessible"  # type: ignore[union-attr]
 
 
 def test_arbitrary_fleet_shape_is_not_parsed_or_inferred(tmp_path: Path) -> None:
@@ -202,3 +272,97 @@ def test_snapshot_round_trip_preserves_contract_records(tmp_path: Path) -> None:
     restored = OperatingFactsSnapshot.from_dict(original.to_dict())
 
     assert restored == original
+
+
+def _write_verified_production_snapshot(tmp_path: Path) -> tuple[Path, Path]:
+    values = {
+        "fleet.placement": {"host": "twinridge", "account": "chitra"},
+        "fleet.routing": {"dispatch_target": {"host": "tophand", "user": "chitra"}},
+        "fleet.credential-readiness": {"dispatch": {"ready": True}},
+        "fleet.access": {"dispatch": {"ready": True}},
+        "fleet.capacity": {"slots": 2},
+        "fleet.versions": {"chitra": "0.16.0"},
+        "fleet.provider-capabilities": {"tophand": {"send": True}},
+    }
+    facts = [_fact(name, value, source="fleet-authority") for name, value in values.items()]
+    snapshot = tmp_path / "operating-facts.json"
+    source = tmp_path / "approved-operating-facts-inputs.json"
+    source_bytes = json.dumps(
+        {"fixture": "security", "facts": facts}, sort_keys=True, separators=(",", ":")
+    ).encode()
+    source.write_bytes(source_bytes)
+    core = {"schema": "chitra.operating-facts.v1", "observed_at": OBSERVED, "facts": facts}
+    payload = {
+        **core,
+        "provenance": {
+            "schema": "chitra.operating-facts-provenance.v1",
+            "source_path": str(source),
+            "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+            "source_mode": 0o644,
+            "snapshot_sha256": hashlib.sha256(
+                json.dumps(core, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "snapshot_mode": 0o644,
+            "readback_verified": True,
+            "readback_at": OBSERVED,
+        },
+    }
+    snapshot.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    snapshot.chmod(0o644)
+    return snapshot, source
+
+
+def test_provenance_is_verified_against_trusted_source_bytes_and_mode(tmp_path: Path) -> None:
+    snapshot, source = _write_verified_production_snapshot(tmp_path)
+    sources = OperatingFactsSources(
+        placement=snapshot,
+        routing=snapshot,
+        credential_readiness=snapshot,
+        access=snapshot,
+        capacity=snapshot,
+        versions=snapshot,
+        provider_capabilities=snapshot,
+        require_provenance=True,
+        trusted_source=source,
+    )
+    assert bind_current_operating_facts(read_operating_facts(sources, now=NOW), now=NOW) is not None
+
+    source.chmod(0o600)
+    mode_mismatch = read_operating_facts(sources, now=NOW)
+    assert mode_mismatch.get("fleet.placement").state == "inaccessible"  # type: ignore[union-attr]
+    source.chmod(0o644)
+    source.write_bytes(source.read_bytes() + b" forged")
+    forged = read_operating_facts(sources, now=NOW)
+    assert forged.get("fleet.placement").state == "inaccessible"  # type: ignore[union-attr]
+
+
+def test_provenance_rejects_untrusted_source_and_symlink_snapshots(tmp_path: Path) -> None:
+    snapshot, source = _write_verified_production_snapshot(tmp_path)
+    decoy = tmp_path / "decoy-inputs.json"
+    decoy.write_bytes(source.read_bytes())
+    strict = OperatingFactsSources(
+        placement=snapshot,
+        require_provenance=True,
+        trusted_source=decoy,
+    )
+    untrusted = read_operating_facts(strict, now=NOW)
+    assert untrusted.get("fleet.placement").state == "inaccessible"  # type: ignore[union-attr]
+
+    symlink = tmp_path / "operating-facts-link.json"
+    symlink.symlink_to(snapshot)
+    linked = read_operating_facts(
+        OperatingFactsSources(placement=symlink, require_provenance=True, trusted_source=source),
+        now=NOW,
+    )
+    assert linked.get("fleet.placement").state == "inaccessible"  # type: ignore[union-attr]
+
+    source_link = tmp_path / "approved-inputs-link.json"
+    source_link.symlink_to(source)
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    payload["provenance"]["source_path"] = str(source_link)
+    snapshot.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    linked_source = read_operating_facts(
+        OperatingFactsSources(placement=snapshot, require_provenance=True),
+        now=NOW,
+    )
+    assert linked_source.get("fleet.placement").state == "inaccessible"  # type: ignore[union-attr]

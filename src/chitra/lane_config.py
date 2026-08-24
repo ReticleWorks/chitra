@@ -41,6 +41,10 @@ class LaneSpec:
     tmux_session: str
     credentials: LaneCredentials
     enabled: bool = True
+    # Optional only for legacy manifests. Production dispatch populates and
+    # validates these against the current Fleet facts snapshot before action.
+    target_host: str | None = None
+    target_account: str | None = None
 
     @property
     def queue_dir(self) -> Path:
@@ -118,6 +122,8 @@ def _lane(value: Any, *, index: int) -> LaneSpec:
         "tmux_session",
         "credentials",
         "enabled",
+        "target_host",
+        "target_account",
     }
     unknown = sorted(set(raw) - expected)
     if unknown:
@@ -148,6 +154,11 @@ def _lane(value: Any, *, index: int) -> LaneSpec:
     enabled = raw.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ValueError(f"{path}.enabled must be boolean")
+    target_host = raw.get("target_host")
+    target_account = raw.get("target_account")
+    for key, value in (("target_host", target_host), ("target_account", target_account)):
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError(f"{path}.{key} must be a non-empty string when supplied")
     return LaneSpec(
         identifier=identifier,
         account=account,
@@ -160,6 +171,8 @@ def _lane(value: Any, *, index: int) -> LaneSpec:
         tmux_session=tmux_session,
         credentials=credentials,
         enabled=enabled,
+        target_host=target_host.strip() if isinstance(target_host, str) else None,
+        target_account=target_account.strip() if isinstance(target_account, str) else None,
     )
 
 

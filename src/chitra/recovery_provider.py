@@ -30,7 +30,12 @@ from .joined_lane import JoinedLaneStore
 from .journal import EventJournal
 from .journal.models import CanonicalEvent
 from .lane_config import LaneSpec
-from .operating_facts import OperatingFactsSources, read_operating_facts
+from .operating_facts import (
+    OperatingFactsBinding,
+    OperatingFactsSources,
+    bind_current_operating_facts,
+    read_operating_facts,
+)
 from .provider_protocol import (
     CancelCurrentTurnRequest,
     CheckpointRequest,
@@ -125,6 +130,7 @@ class RecoveryProviderFactory(Protocol):
         cancel_verifier: RecoveryVerifier,
         facts_reader: RecoveryFactsReader,
         operating_facts: tuple[OperatingFact, ...],
+        operating_facts_binding: OperatingFactsBinding | None,
     ) -> Provider | None: ...
 
 
@@ -175,6 +181,18 @@ def build_recovery_facts_reader(
 # Keep the public name used by the production dispatch seam.  The longer name
 # above remains for callers that adopted the initial integration spelling.
 default_operating_facts_reader = build_recovery_facts_reader
+
+
+def _facts_binding_current(binding: OperatingFactsBinding | None) -> bool:
+    """Keep provider I/O behind the immutable facts deadline."""
+
+    if binding is None:
+        return True
+    try:
+        deadline = datetime.fromisoformat(binding.deadline.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return deadline >= datetime.now(UTC)
 
 
 def _now() -> str:
@@ -377,10 +395,16 @@ class _PackagedTophandProvider:
         *,
         result_sink: RecoverySink,
         reconcile_before_call: bool = False,
+        operating_facts_binding: OperatingFactsBinding | None = None,
     ) -> None:
         self._adapter = adapter
         self._result_sink = result_sink
         self._reconcile_before_call = reconcile_before_call
+        self._operating_facts_binding = operating_facts_binding
+
+    def _require_current_facts(self) -> None:
+        if not _facts_binding_current(self._operating_facts_binding):
+            raise RuntimeError("Fleet operating-facts binding expired; recovery will retry")
 
     @property
     def provider_name(self) -> ProviderName:
@@ -413,6 +437,7 @@ class _PackagedTophandProvider:
         request: object,
         operation: PendingProviderOperation,
     ) -> ProviderOperationResult:
+        self._require_current_facts()
         if self._reconcile_before_call and operation.attempted:
             reconcile = getattr(self._adapter, "reconcile", None)
             if callable(reconcile):
@@ -441,6 +466,7 @@ class _PackagedTophandProvider:
         elif isinstance(request, CloseRequest):
             payload["archive"] = request.archive
         raw = getattr(self._adapter, method)(payload)
+        self._require_current_facts()
         result = _provider_result(raw, operation)
         self._result_sink(raw)
         return result
@@ -449,8 +475,10 @@ class _PackagedTophandProvider:
         return self._call("create_or_resume", request, request.operation)
 
     def status(self) -> ProviderStatus:
+        self._require_current_facts()
         adapter = cast(Any, self._adapter)
         raw = _mapping(adapter.status(), "Tophand status")
+        self._require_current_facts()
         state = _provider_state(raw.get("state", "unknown"))
         provider_session_id = raw.get("provider_session_id")
         generation = raw.get("generation", 0)
@@ -477,8 +505,10 @@ class _PackagedTophandProvider:
         return self._call("send", request, request.operation)
 
     def read_updates(self, cursor: str | None = None) -> ReadUpdatesResult:
+        self._require_current_facts()
         adapter = cast(Any, self._adapter)
         raw = _mapping(adapter.read_updates(cursor), "Tophand update batch")
+        self._require_current_facts()
         values = raw.get("updates", ())
         if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
             raise TypeError("Tophand updates must be a sequence")
@@ -852,11 +882,17 @@ class _PackagedAmpProvider:
         result_sink: RecoverySink,
         cursor_sink: RecoverySink,
         lane_reader: Callable[[], object],
+        operating_facts_binding: OperatingFactsBinding | None = None,
     ) -> None:
         self._adapter = adapter
         self._result_sink = result_sink
         self._cursor_sink = cursor_sink
         self._lane_reader = lane_reader
+        self._operating_facts_binding = operating_facts_binding
+
+    def _require_current_facts(self) -> None:
+        if not _facts_binding_current(self._operating_facts_binding):
+            raise RuntimeError("Fleet operating-facts binding expired; recovery will retry")
 
     @property
     def provider_name(self) -> ProviderName:
@@ -894,7 +930,9 @@ class _PackagedAmpProvider:
         request: object,
         operation: PendingProviderOperation,
     ) -> ProviderOperationResult:
+        self._require_current_facts()
         raw = getattr(self._adapter, method)(self._payload(request, operation))
+        self._require_current_facts()
         result = _provider_result(raw, operation, provider_label="Amp")
         self._result_sink(raw)
         return result
@@ -905,8 +943,10 @@ class _PackagedAmpProvider:
         return self._call("create_or_resume", request, request.operation)
 
     def status(self) -> ProviderStatus:
+        self._require_current_facts()
         adapter = cast(Any, self._adapter)
         raw = _mapping(adapter.status(None), "Amp status")
+        self._require_current_facts()
         state = _provider_state(raw.get("state", "unknown"))
         generation = raw.get("generation", 0)
         if isinstance(generation, bool) or not isinstance(generation, int):
@@ -933,8 +973,10 @@ class _PackagedAmpProvider:
         return self._call("send", request, request.operation)
 
     def read_updates(self, cursor: str | None = None) -> ReadUpdatesResult:
+        self._require_current_facts()
         adapter = cast(Any, self._adapter)
         raw = _mapping(adapter.read_updates(cursor), "Amp update batch")
+        self._require_current_facts()
         values = raw.get("updates", ())
         if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
             raise TypeError("Amp updates must be a sequence")
@@ -1005,14 +1047,17 @@ class _PackagedAmpProvider:
         )
 
     def usage(self) -> UsageReport:
+        self._require_current_facts()
         adapter = cast(Any, self._adapter)
         raw = adapter.usage(None)
+        self._require_current_facts()
         return _amp_usage_report(raw, self._lane_reader)
 
     def cancel_current_turn(self, request: CancelCurrentTurnRequest) -> ProviderOperationResult:
         return self._call("cancel_current_turn", request, request.operation)
 
     def close(self, request: CloseRequest) -> CloseArchiveResult:
+        self._require_current_facts()
         if not request.archive:
             return _unknown_close_result(request.operation, "Amp close is archive-only")
         try:
@@ -1027,6 +1072,7 @@ class _PackagedAmpProvider:
             # reference plus archive evidence from the transport.
             adapter = cast(Any, self._adapter)
             raw = adapter.close(self._payload(request, request.operation))
+            self._require_current_facts()
             return _amp_close_result(
                 raw,
                 request.operation,
@@ -1050,6 +1096,7 @@ def _canonical_tophand_factory(
     cancel_verifier: RecoveryVerifier,
     facts_reader: RecoveryFactsReader,
     operating_facts: tuple[OperatingFact, ...],
+    operating_facts_binding: OperatingFactsBinding | None,
 ) -> Provider | None:
     """Construct the only packaged production provider route.
 
@@ -1059,12 +1106,18 @@ def _canonical_tophand_factory(
     an explicit availability gate; the adapter cannot infer a route from it.
     """
 
-    del facts_reader
+    del facts_reader, operating_facts
     if identity.kind != "tophand" or _packaged_tophand_builder is None:
+        return None
+    if operating_facts_binding is not None and (
+        identity.operating_facts_digest != operating_facts_binding.digest
+        or identity.operating_facts_deadline != operating_facts_binding.deadline
+        or identity.target_host != operating_facts_binding.target_host
+        or identity.target_account != operating_facts_binding.target_account
+    ):
         return None
     if identity.instance_id is None or identity.generation is None:
         return None
-    del operating_facts
     pending = () if record.pending_operation is None else (_tophand_operation_dict(record.pending_operation),)
     completed = () if record.last_operation_result is None else (record.last_operation_result.model_dump(mode="json"),)
     journal = EventJournal(state_root, lane.identifier)
@@ -1101,6 +1154,7 @@ def _canonical_tophand_factory(
         adapter,
         result_sink=result_sink,
         reconcile_before_call=(record.pending_operation is not None and record.pending_operation.attempted),
+        operating_facts_binding=operating_facts_binding,
     )
     return provider if isinstance(provider, Provider) else None
 
@@ -1119,10 +1173,18 @@ def _canonical_amp_factory(
     cancel_verifier: RecoveryVerifier,
     facts_reader: RecoveryFactsReader,
     operating_facts: tuple[OperatingFact, ...],
+    operating_facts_binding: OperatingFactsBinding | None,
 ) -> Provider | None:
     """Build the one static Amp route after Chitra's launch-policy gate."""
 
     del pending_sink, event_sink, checkpoint_verifier, cancel_verifier
+    if operating_facts_binding is not None and (
+        identity.operating_facts_digest != operating_facts_binding.digest
+        or identity.operating_facts_deadline != operating_facts_binding.deadline
+        or identity.target_host != operating_facts_binding.target_host
+        or identity.target_account != operating_facts_binding.target_account
+    ):
+        return None
     if identity.kind != "amp":
         return None
     if (
@@ -1225,6 +1287,7 @@ def _canonical_amp_factory(
         result_sink=result_sink,
         cursor_sink=cursor_sink,
         lane_reader=lane_reader,
+        operating_facts_binding=operating_facts_binding,
     )
     return provider if isinstance(provider, Provider) else None
 
@@ -1449,6 +1512,7 @@ def build_recovery_provider_resolver(
         if facts_reader is not None
         else _default_facts_reader(operating_facts_sources)
     )
+    strict_production_facts = production_defaults and facts_reader is None and operating_facts_reader is None
     bindings = RecoveryProviderBindings(
         lane=lane,
         state_root=lane.state_dir,
@@ -1484,9 +1548,39 @@ def build_recovery_provider_resolver(
         if not boundaries_complete:
             return None
         try:
-            operating_facts = tuple(bindings.facts_reader(record))
+            operating_facts_binding: OperatingFactsBinding | None = None
+            if strict_production_facts:
+                snapshot = read_operating_facts(operating_facts_sources)
+                operating_facts_binding = bind_current_operating_facts(snapshot, provider_kind=kind)
+                if operating_facts_binding is None:
+                    logger.info(
+                        "recovery_waiting_for_current_operating_facts",
+                        lane_id=record.lane_id,
+                        provider_kind=kind,
+                    )
+                    return None
+                operating_facts = tuple(snapshot.facts)
+                if lane.target_host is not None and lane.target_host != operating_facts_binding.target_host:
+                    return None
+                if lane.target_account is not None and lane.target_account != operating_facts_binding.target_account:
+                    return None
+                if record.provider.target_host is not None and record.provider.target_host != operating_facts_binding.target_host:
+                    return None
+                if record.provider.target_account is not None and record.provider.target_account != operating_facts_binding.target_account:
+                    return None
+                identity = record.provider.model_copy(
+                    update={
+                        "target_host": operating_facts_binding.target_host,
+                        "target_account": operating_facts_binding.target_account,
+                        "operating_facts_digest": operating_facts_binding.digest,
+                        "operating_facts_deadline": operating_facts_binding.deadline,
+                    }
+                )
+            else:
+                operating_facts = tuple(bindings.facts_reader(record))
+                identity = record.provider
             provider = factory(
-                identity=record.provider,
+                identity=identity,
                 lane=lane,
                 record=record,
                 state_root=bindings.state_root,
@@ -1498,6 +1592,7 @@ def build_recovery_provider_resolver(
                 cancel_verifier=bindings.cancel_verifier,
                 facts_reader=bindings.facts_reader,
                 operating_facts=operating_facts,
+                operating_facts_binding=operating_facts_binding,
             )
             if provider is None or not isinstance(provider, Provider):
                 return None

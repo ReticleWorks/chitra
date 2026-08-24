@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -25,12 +26,15 @@ from chitra.provider_protocol import (
     CreateOrResumeRequest,
     ProviderName,
     ProviderOperationResult,
+    SendRequest,
 )
 from chitra.recovery_provider import (
     _canonical_recovery_bindings,
     _PackagedAmpProvider,
+    _PackagedTophandProvider,
     build_recovery_provider_resolver,
 )
+from chitra.operating_facts import OperatingFactsBinding
 from chitra.session_contract import (
     CapabilityName,
     JoinedLaneRecord,
@@ -174,6 +178,65 @@ def _amp_facts(record: JoinedLaneRecord) -> tuple[OperatingFact, ...]:
             within_authority=True,
         ),
     )
+
+
+def _production_facts(record: JoinedLaneRecord) -> tuple[OperatingFact, ...]:
+    """Return all seven Fleet categories for a positive production fixture."""
+    common = {
+        "state": "known",
+        "source": "fleet-authority:test",
+        "revision": "amp-production-fixture-1",
+        "observed_at": NOW.isoformat(),
+        "freshness": "current",
+        "fresh_until": (NOW + timedelta(days=3)).isoformat(),
+        "within_authority": True,
+    }
+    return (
+        OperatingFact(name="fleet.placement", value={"host": "twinridge", "account": "ubuntu"}, **common),
+        OperatingFact(
+            name="fleet.routing",
+            value={"dispatch_target": {"host": "tophand", "user": "ubuntu"}},
+            **common,
+        ),
+        OperatingFact(name="fleet.credential-readiness", value={"dispatch": {"ready": True}}, **common),
+        OperatingFact(name="fleet.access", value={"dispatch": {"ready": True}}, **common),
+        OperatingFact(name="fleet.capacity", value={"slots": 2}, **common),
+        OperatingFact(name="fleet.versions", value={"chitra": "0.16.0"}, **common),
+        _amp_facts(record)[0],
+    )
+
+
+def _write_production_facts(path: Path, facts: tuple[OperatingFact, ...]) -> None:
+    """Write a byte- and mode-verifiable Fleet publisher receipt."""
+    source_path = path.with_name("approved-operating-facts-inputs.json")
+    source_bytes = json.dumps(
+        {"fixture": "amp-production", "facts": [fact.to_dict() for fact in facts]},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    source_path.write_bytes(source_bytes)
+    core = {
+        "schema": "chitra.operating-facts.v1",
+        "observed_at": NOW.isoformat(),
+        "facts": [fact.to_dict() for fact in facts],
+    }
+    payload = {
+        **core,
+        "provenance": {
+            "schema": "chitra.operating-facts-provenance.v1",
+            "source_path": str(source_path),
+            "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+            "source_mode": 0o644,
+            "snapshot_sha256": hashlib.sha256(
+                json.dumps(core, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "snapshot_mode": 0o644,
+            "readback_verified": True,
+            "readback_at": NOW.isoformat(),
+        },
+    }
+    path.write_bytes(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
+    path.chmod(0o644)
 
 
 def _resolver(lane: LaneSpec, record: JoinedLaneRecord) -> recovery.RecoveryProviderResolver:
@@ -523,6 +586,74 @@ def test_amp_facade_exposes_eight_operations_and_keeps_checkpoint_in_chitra(
     assert not any(name == "checkpoint" for name, _request in _AmpAdapter.calls)
 
 
+@pytest.mark.parametrize("provider_kind", ("tophand", "amp"))
+def test_expired_facts_binding_blocks_every_provider_facade_before_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider_kind: str
+) -> None:
+    """A stale route cannot reach either provider adapter after restart or wake."""
+    _install_amp_fakes(monkeypatch)
+    expired = OperatingFactsBinding(
+        digest="sha256:" + "b" * 64,
+        deadline="2020-01-01T00:00:00Z",
+        source_path=str(tmp_path / "approved-inputs.json"),
+        source_sha256="c" * 64,
+        source_mode=0o644,
+        snapshot_mode=0o644,
+        target_host="twinridge",
+        target_account="ubuntu",
+    )
+    adapter = _AmpAdapter()
+    if provider_kind == "tophand":
+        provider = _PackagedTophandProvider(
+            adapter,
+            result_sink=lambda _value: None,
+            operating_facts_binding=expired,
+        )
+    else:
+        provider = _PackagedAmpProvider(
+            adapter,
+            result_sink=lambda _value: None,
+            cursor_sink=lambda _value: None,
+            lane_reader=lambda: {},
+            operating_facts_binding=expired,
+        )
+
+    with pytest.raises(RuntimeError, match="operating-facts binding expired"):
+        provider.status()
+    assert _AmpAdapter.calls == []
+
+
+@pytest.mark.parametrize("provider_kind", ("tophand", "amp"))
+def test_provider_rechecks_facts_deadline_after_adapter_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider_kind: str
+) -> None:
+    """A route that expires during provider I/O cannot accept the response."""
+    import chitra.recovery_provider as recovery_provider
+
+    _AmpAdapter.calls.clear()
+    checks = iter((True, False))
+    monkeypatch.setattr(
+        recovery_provider,
+        "_facts_binding_current",
+        lambda _binding: next(checks),
+        raising=True,
+    )
+    operation = _operation("send", operation_id=f"post-io-{provider_kind}")
+    request = SendRequest(operation=operation, text="continue")
+    if provider_kind == "tophand":
+        provider = _PackagedTophandProvider(_AmpAdapter(), result_sink=lambda _value: None)
+    else:
+        provider = _PackagedAmpProvider(
+            _AmpAdapter(),
+            result_sink=lambda _value: None,
+            cursor_sink=lambda _value: None,
+            lane_reader=lambda: {},
+        )
+    with pytest.raises(RuntimeError, match="operating-facts binding expired"):
+        provider.send(request)
+    assert any(name == "send" for name, _request in _AmpAdapter.calls)
+
+
 def test_amp_facade_preserves_exact_pending_create_envelope_without_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -790,19 +921,15 @@ def test_lanes_file_uses_static_amp_factory_before_queue_dispatch(
     (orders / "amp-order.json").write_text(order.model_dump_json(), encoding="utf-8")
 
     facts_path = tmp_path / "operating-facts.json"
-    facts_path.write_text(
-        json.dumps(
-            {
-                "schema": "chitra.operating-facts.v1",
-                "observed_at": NOW.isoformat(),
-                "facts": [fact.to_dict() for fact in _amp_facts(record)],
-            }
-        ),
-        encoding="utf-8",
-    )
+    _write_production_facts(facts_path, _production_facts(record))
     monkeypatch.setattr(
         "chitra.operating_facts.PRODUCTION_OPERATING_FACTS_PATH",
         facts_path,
+        raising=True,
+    )
+    monkeypatch.setattr(
+        "chitra.operating_facts.PRODUCTION_OPERATING_FACTS_INPUTS_PATH",
+        facts_path.with_name("approved-operating-facts-inputs.json"),
         raising=True,
     )
 

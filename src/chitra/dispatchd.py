@@ -137,7 +137,12 @@ from .goals import (
 from .joined_lane import JoinedLaneReconciler, JoinedLaneStore, ReconcileReport, build_filesystem_reconciler
 from .journal import native_session_identity
 from .lane_config import LaneCredentials, LaneSpec
-from .operating_facts import OperatingFactsSources, read_operating_facts
+from .operating_facts import (
+    OperatingFactsBinding,
+    OperatingFactsSources,
+    bind_current_operating_facts,
+    read_operating_facts,
+)
 from .orders import DispatchOrder, DispatchResult, DispatchStatus
 from .policy_config import PolicyConfig, load_policy_config
 from .provider_protocol import Provider
@@ -151,7 +156,15 @@ from .recovery_provider import (
     build_recovery_provider_resolver,
     default_operating_facts_reader,
 )
-from .routing_config import RoutingConfig, load_routing_config, resolve_route, resolve_routing_hint
+from .routing_config import (
+    FactsBoundRoute,
+    ResolvedRoute,
+    RoutingConfig,
+    bind_route_to_facts,
+    load_routing_config,
+    resolve_route,
+    resolve_routing_hint,
+)
 from .session_contract import JoinedLaneRecord
 from .state_paths import default_attestation_ledger_path, default_ledger_key_path, default_ledger_path, default_queue_dir, state_dir
 
@@ -580,6 +593,49 @@ def _joined_lane_deferred_marker_path(deferred_dir: Path, order_id: str) -> Path
     return deferred_dir / f".{order_id}.joined-lane.json"
 
 
+def _operating_facts_deferred_marker_path(deferred_dir: Path, order_id: str) -> Path:
+    """Return the durable marker for a route held on Fleet facts."""
+
+    return deferred_dir / f".{order_id}.operating-facts.json"
+
+
+def _requeue_operating_facts_deferred(
+    queue_dir: Path,
+    binding: OperatingFactsBinding | None,
+) -> list[Path]:
+    """Return route orders once a fresh facts snapshot is available."""
+
+    if binding is None:
+        return []
+    orders_dir = queue_dir / "orders"
+    deferred_dir = queue_dir / "deferred"
+    requeued: list[Path] = []
+    for marker in sorted(deferred_dir.glob(".*.operating-facts.json")):
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            order_id = payload["order_id"]
+            session_ref = payload["session_ref"]
+            source = deferred_dir / f"{order_id}.json"
+            target = orders_dir / source.name
+            order = DispatchOrder.model_validate_json(source.read_text(encoding="utf-8"))
+            if (
+                not isinstance(order_id, str)
+                or not isinstance(session_ref, str)
+                or order.order_id != order_id
+                or order.session_ref != session_ref
+                or target.exists()
+            ):
+                continue
+            source.replace(target)
+            marker.unlink()
+            requeued.append(target)
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            logger.error("dispatchd_operating_facts_requeue_failed", marker=str(marker), error=str(exc))
+    if requeued:
+        logger.info("dispatchd_operating_facts_requeued", order_ids=[path.stem for path in requeued])
+    return requeued
+
+
 def _requeue_joined_lane_deferred(queue_dir: Path, report: ReconcileReport) -> list[Path]:
     """Return only joined-lane deferred orders whose barrier now allows them."""
 
@@ -675,6 +731,8 @@ def process_one_order(
     denied_session_prefixes: tuple[str, ...] = (),
     lane_lock_retry_attempts: int = DEFAULT_LANE_LOCK_RETRY_ATTEMPTS,
     joined_lane_report: ReconcileReport | None = None,
+    operating_facts_binding: OperatingFactsBinding | None = None,
+    require_operating_facts_binding: bool = False,
 ) -> DispatchResult | None:
     """Process a single order file. Returns the result, or None if skipped
     (already processed, claimed elsewhere, or deferred by a rate-limit freeze
@@ -768,6 +826,8 @@ def process_one_order(
             denied_session_prefixes=denied_session_prefixes,
             lane_lock_retry_attempts=lane_lock_retry_attempts,
             joined_lane_report=joined_lane_report,
+            operating_facts_binding=operating_facts_binding,
+            require_operating_facts_binding=require_operating_facts_binding,
         )
     finally:
         with contextlib.suppress(OSError):
@@ -798,6 +858,8 @@ def _process_claimed_order(
     denied_session_prefixes: tuple[str, ...],
     lane_lock_retry_attempts: int,
     joined_lane_report: ReconcileReport | None,
+    operating_facts_binding: OperatingFactsBinding | None,
+    require_operating_facts_binding: bool,
 ) -> DispatchResult | None:
     """The rest of order processing, once an order file is safely claimed
     (renamed into ``in_flight/`` with a live owner marker). Split out of
@@ -854,6 +916,7 @@ def _process_claimed_order(
         )
 
     resolved_zdr = False
+    bound_route: FactsBoundRoute | None = None
     if order.routing_hint is None and order.task_type is not None:
         # A structured ``routes`` entry wins over a flat ``defaults`` hint:
         # chitra resolves model+harness (+zdr) into an opaque routing hint.
@@ -861,10 +924,58 @@ def _process_claimed_order(
         if route is not None:
             order.routing_hint = route.routing_hint
             resolved_zdr = route.zdr
+            if require_operating_facts_binding:
+                bound_route = bind_route_to_facts(route, operating_facts_binding)
         else:
             resolved_hint = resolve_routing_hint(order.task_type, routing_config)
             if resolved_hint is not None:
                 order.routing_hint = resolved_hint
+                if require_operating_facts_binding:
+                    hint_route = ResolvedRoute(
+                        task_type=order.task_type,
+                        model="lookup",
+                        harness="lookup",
+                        zdr=False,
+                        routing_hint=resolved_hint,
+                    )
+                    bound_route = bind_route_to_facts(hint_route, operating_facts_binding)
+    elif require_operating_facts_binding and order.routing_hint is not None:
+        hint_route = ResolvedRoute(
+            task_type=order.task_type or "explicit",
+            model="explicit",
+            harness="explicit",
+            zdr=False,
+            routing_hint=order.routing_hint,
+        )
+        bound_route = bind_route_to_facts(hint_route, operating_facts_binding)
+
+    if require_operating_facts_binding and order.routing_hint is not None and bound_route is None:
+        deferred_dir.mkdir(parents=True, exist_ok=True)
+        reason = "current authoritative Fleet operating facts are unavailable"
+        try:
+            write_json_atomic(
+                _operating_facts_deferred_marker_path(deferred_dir, order.order_id),
+                {
+                    "order_id": order.order_id,
+                    "session_ref": order.session_ref,
+                    "reason": reason,
+                    "facts_digest": operating_facts_binding.digest if operating_facts_binding else None,
+                },
+            )
+            claimed_path.replace(deferred_dir / claimed_path.name)
+        except OSError as exc:
+            logger.error("dispatchd_operating_facts_defer_failed", order_id=order.order_id, error=str(exc))
+            return None
+        logger.info("dispatchd_operating_facts_deferred", order_id=order.order_id, session_ref=order.session_ref)
+        return DispatchResult(
+            order_id=order.order_id,
+            session_ref=order.session_ref,
+            status=DispatchStatus.DEFERRED,
+            reason=reason,
+            routing_hint=order.routing_hint,
+            task_type=order.task_type,
+            resolved_zdr=resolved_zdr,
+        )
 
     existing_result = results_dir / f"{order.order_id}.json"
     if existing_result.exists():
@@ -1215,6 +1326,11 @@ def _process_claimed_order(
     result.task_type = order.task_type
     result.routing_hint = order.routing_hint
     result.resolved_zdr = resolved_zdr
+    if bound_route is not None:
+        result.routing_facts_digest = bound_route.facts_digest
+        result.routing_facts_deadline = bound_route.facts_deadline
+        result.routing_target_host = bound_route.target_host
+        result.routing_target_account = bound_route.target_account
     result.decision_attestation_id = attestation_id
     logger.info(
         "dispatchd_order_processed",
@@ -1333,6 +1449,7 @@ def run_once(
     joined_lane_reconciler: JoinedLaneReconciler | None = None,
     reconciliation_gate: Callable[[], ReconcileReport] | None = None,
     recovery_supervisor: RecoverySupervisor | None = None,
+    operating_facts_sources: OperatingFactsSources | None = None,
     _preloaded_routing_config: RoutingConfig | None | _ConfigNotPreloaded = _CONFIG_NOT_PRELOADED,
     _preloaded_policy: PolicyConfig | _ConfigNotPreloaded = _CONFIG_NOT_PRELOADED,
 ) -> list[DispatchResult]:
@@ -1400,6 +1517,16 @@ def run_once(
         routing_config = load_routing_config(routing_config_path)
     else:
         routing_config = _preloaded_routing_config
+    # An explicit route is still a real Fleet action when no routing file is
+    # configured. Read the authoritative snapshot on every pass and let
+    # process_one_order apply the binding only to routed orders. This keeps
+    # route-free legacy orders compatible while preventing an explicit
+    # caller-provided target from bypassing the facts boundary.
+    require_operating_facts_binding = True
+    operating_facts_binding = bind_current_operating_facts(
+        read_operating_facts(operating_facts_sources)
+    )
+    _requeue_operating_facts_deferred(queue_dir, operating_facts_binding)
     policy = load_policy_config(policy_config_path) if isinstance(_preloaded_policy, _ConfigNotPreloaded) else _preloaded_policy
     dated: list[tuple[int, int, Path]] = []
     for order_path in orders_dir.glob("*.json"):
@@ -1440,6 +1567,8 @@ def run_once(
             denied_session_prefixes=denied_session_prefixes,
             lane_lock_retry_attempts=lane_lock_retry_attempts,
             joined_lane_report=joined_lane_report,
+            operating_facts_binding=operating_facts_binding,
+            require_operating_facts_binding=require_operating_facts_binding,
         )
         if result is not None:
             out.append(result)
@@ -1467,6 +1596,7 @@ def run_forever(
     joined_lane_reconciler: JoinedLaneReconciler | None = None,
     reconciliation_gate: Callable[[], ReconcileReport] | None = None,
     recovery_supervisor: RecoverySupervisor | None = None,
+    operating_facts_sources: OperatingFactsSources | None = None,
 ) -> None:
     """Run the daemon loop: drain the queue, sleep, repeat. Runs until killed.
 
@@ -1525,6 +1655,7 @@ def run_forever(
             joined_lane_reconciler=joined_lane_reconciler,
             reconciliation_gate=reconciliation_gate,
             recovery_supervisor=recovery_supervisor,
+            operating_facts_sources=operating_facts_sources,
             _preloaded_routing_config=routing_config,
             _preloaded_policy=policy,
         )
@@ -1637,6 +1768,7 @@ def run_lanes_once(
             tmux_socket=lane.tmux_socket,
             joined_lane_root=lane.state_dir,
             recovery_supervisor=recovery_supervisor,
+            operating_facts_sources=operating_facts_sources,
         )
     return results
 
