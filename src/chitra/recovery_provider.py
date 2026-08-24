@@ -833,6 +833,22 @@ def _amp_close_result(
     )
 
 
+def _session_update_payload(item: Mapping[str, object]) -> object | None:
+    """Return one lane snapshot nested in a normalized Amp event, if any."""
+
+    for key in ("session_update", "update", "lane_update"):
+        value = item.get(key)
+        if value is not None:
+            return value
+    payload = item.get("payload")
+    if isinstance(payload, Mapping):
+        for key in ("session_update", "lane_update"):
+            value = payload.get(key)
+            if value is not None:
+                return value
+    return None
+
+
 class _PackagedAmpProvider:
     """Typed Chitra facade over the single allowlisted Amp adapter.
 
@@ -849,11 +865,13 @@ class _PackagedAmpProvider:
         result_sink: RecoverySink,
         cursor_sink: RecoverySink,
         lane_reader: Callable[[], object],
+        update_batch_sink: Callable[[Sequence[object], str], object | None] | None = None,
     ) -> None:
         self._adapter = adapter
         self._result_sink = result_sink
         self._cursor_sink = cursor_sink
         self._lane_reader = lane_reader
+        self._update_batch_sink = update_batch_sink
 
     @property
     def provider_name(self) -> ProviderName:
@@ -936,13 +954,19 @@ class _PackagedAmpProvider:
         if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
             raise TypeError("Amp updates must be a sequence")
         updates: list[ProviderUpdate] = []
+        session_updates: list[object] = []
         for value in values:
             item = _mapping(value, "Amp update")
+            session_update = _session_update_payload(item)
             required = tuple(item.get(name) for name in ("operation_id", "event_id", "cursor"))
             if not all(isinstance(field, str) and field for field in required):
+                if session_update is not None:
+                    raise ValueError("Amp session update envelope is malformed")
                 continue
             generation = item.get("provider_generation", 0)
             if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+                if session_update is not None:
+                    raise ValueError("Amp session update envelope is malformed")
                 continue
             identity = tuple(
                 item.get(name)
@@ -955,10 +979,14 @@ class _PackagedAmpProvider:
                 )
             )
             if not all(isinstance(field, str) and field for field in identity):
+                if session_update is not None:
+                    raise ValueError("Amp session update envelope is malformed")
                 continue
             payload = item.get("payload", {})
             if not isinstance(payload, Mapping):
                 payload = {}
+            if session_update is not None:
+                session_updates.append(session_update)
             observed_at = item.get("observed_at")
             if not isinstance(observed_at, str) or not observed_at:
                 observed_at = _now()
@@ -982,7 +1010,14 @@ class _PackagedAmpProvider:
             )
         next_cursor = raw.get("next_cursor", raw.get("cursor"))
         next_cursor_text = next_cursor if isinstance(next_cursor, str) else cursor or ""
-        self._cursor_sink(next_cursor_text)
+        if self._update_batch_sink is not None:
+            # Chitra commits every lane snapshot and the cursor as one state
+            # transition.  The adapter callback is intentionally not used on
+            # this production route: a malformed later snapshot must not
+            # leave an earlier snapshot durable with the old cursor.
+            self._update_batch_sink(tuple(session_updates), next_cursor_text)
+        else:
+            self._cursor_sink(next_cursor_text)
         reason = raw.get("reason")
         return ReadUpdatesResult(
             requested_cursor=cursor,
@@ -1206,7 +1241,6 @@ def _canonical_amp_factory(
             anchor_thread_id=identity.parent_thread_ref,
             lane_reader=lane_reader,
             amp_version=amp_version,
-            update_sink=_canonical_update_sink(lane),
         )
     except Exception as exc:  # noqa: BLE001 - unavailable provider is canonical unknown
         logger.warning("packaged_amp_unavailable", lane_id=record.lane_id, error=str(exc))
@@ -1218,6 +1252,7 @@ def _canonical_amp_factory(
         result_sink=result_sink,
         cursor_sink=cursor_sink,
         lane_reader=lane_reader,
+        update_batch_sink=_canonical_update_batch_sink(lane),
     )
     return provider if isinstance(provider, Provider) else None
 
@@ -1345,8 +1380,7 @@ def _canonical_update_sink(lane: LaneSpec) -> RecoverySink:
         update = LaneUpdate.from_dict(value)
 
         def apply(current: JoinedLaneRecord) -> JoinedLaneRecord:
-            if update.lane_id != current.lane_id or update.goal_id != current.goal_id:
-                raise ValueError("provider session update identity changed")
+            _validate_lane_update_identity(current, update)
             if current.current_update is not None:
                 validate_update(current.current_update, update)
             return current.model_copy(update={"current_update": update})
@@ -1354,6 +1388,42 @@ def _canonical_update_sink(lane: LaneSpec) -> RecoverySink:
         store.update(lane.identifier, apply)
 
     return update_sink
+
+
+def _validate_lane_update_identity(current: JoinedLaneRecord, update: LaneUpdate) -> None:
+    expected = (current.lane_id, current.goal_id, current.session_ref, current.goal_version)
+    observed = (update.lane_id, update.goal_id, update.session_ref, update.goal_version)
+    if observed != expected:
+        raise ValueError("provider session update identity changed")
+
+
+def _canonical_update_batch_sink(lane: LaneSpec) -> Callable[[Sequence[object], str], None]:
+    """Atomically persist a complete Amp snapshot batch and its cursor."""
+
+    store = JoinedLaneStore(lane.state_dir)
+
+    def update_batch_sink(values: Sequence[object], cursor: str) -> None:
+        if not isinstance(cursor, str):
+            raise TypeError("provider cursor must be text")
+        # Parse every snapshot before opening the state transition.  A later
+        # malformed snapshot therefore cannot leave an earlier one durable.
+        updates = tuple(LaneUpdate.from_dict(value) for value in values)
+
+        def apply(current: JoinedLaneRecord) -> JoinedLaneRecord:
+            previous = current.current_update
+            for update in updates:
+                _validate_lane_update_identity(current, update)
+                if previous is not None:
+                    validate_update(previous, update)
+                previous = update
+            changes: dict[str, object] = {"update_cursor": cursor}
+            if updates:
+                changes["current_update"] = updates[-1]
+            return current.model_copy(update=changes)
+
+        store.update(lane.identifier, apply)
+
+    return update_batch_sink
 
 
 def _factory_map(

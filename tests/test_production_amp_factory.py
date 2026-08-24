@@ -28,6 +28,7 @@ from chitra.provider_protocol import (
 )
 from chitra.recovery_provider import (
     _canonical_recovery_bindings,
+    _canonical_update_batch_sink,
     _PackagedAmpProvider,
     build_recovery_provider_resolver,
 )
@@ -587,10 +588,10 @@ def test_amp_facade_preserves_provider_handle_on_updates() -> None:
     assert result.updates[0].provider_session_id == "amp-session-a"
 
 
-def test_amp_factory_binds_chitra_lane_update_sink_for_roadmap_reporting(
+def test_amp_factory_binds_atomic_chitra_lane_update_batch_sink_for_roadmap_reporting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The production ORB route persists the same lane snapshot as Tophand."""
+    """The production ORB route persists snapshots and cursor atomically."""
 
     _install_amp_fakes(monkeypatch)
     lane = _lane(tmp_path)
@@ -601,7 +602,8 @@ def test_amp_factory_binds_chitra_lane_update_sink_for_roadmap_reporting(
     provider = _resolver(lane, record)(record)
 
     assert provider is not None
-    sink = _AmpAdapter.instances[-1].get("update_sink")
+    assert "update_sink" not in _AmpAdapter.instances[-1]
+    sink = provider._update_batch_sink  # type: ignore[attr-defined]
     assert callable(sink)
     assert record.current_update is not None
     next_update = record.current_update.model_copy(
@@ -611,12 +613,124 @@ def test_amp_factory_binds_chitra_lane_update_sink_for_roadmap_reporting(
             "next_action": "Run the focused ORB acceptance check",
         }
     )
-    sink(next_update.to_dict())
+    sink((next_update.to_dict(),), "amp-cursor-2")
 
     saved = store.require(lane.identifier)
     assert saved.current_update == next_update
     assert saved.current_update.steps[0].owner == "lane-manager"
     assert saved.provider.kind == "amp"
+    assert saved.update_cursor == "amp-cursor-2"
+
+
+def test_amp_batch_validates_before_persisting_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    """A malformed later snapshot cannot wedge the cursor or partial state."""
+
+    lane = _lane(tmp_path)
+    record = _record(lane)
+    assert record.current_update is not None
+    first = record.current_update.model_copy(
+        update={
+            "sequence": 2,
+            "current_action": "Review the ORB roadmap snapshot",
+            "next_action": "Run the focused ORB acceptance check",
+        }
+    )
+    second = first.model_copy(
+        update={
+            "sequence": 3,
+            "current_action": "Run the focused ORB acceptance check",
+            "next_action": "Record the acceptance evidence",
+        }
+    )
+
+    def event(number: int, update: object) -> dict[str, object]:
+        return {
+            "operation_id": f"operation-{number}",
+            "event_id": f"event-{number}",
+            "cursor": f"cursor-{number}",
+            "kind": "progress_claim",
+            "provider_session_id": "amp-session-a",
+            "lane_id": lane.identifier,
+            "provider_handle": "amp-thread-a",
+            "idempotency_key": f"idem-operation-{number}",
+            "payload_digest": f"digest-operation-{number}",
+            "provider_instance_id": "amp-instance-a",
+            "provider_generation": 1,
+            "payload": {},
+            "session_update": update,
+        }
+
+    class BatchAmp(_AmpAdapter):
+        def __init__(self, batch: list[dict[str, object]], next_cursor: str) -> None:
+            super().__init__()
+            self.batch = batch
+            self.next_cursor = next_cursor
+
+        def read_updates(self, _cursor: str | None = None) -> dict[str, object]:
+            return {
+                "updates": self.batch,
+                "next_cursor": self.next_cursor,
+                "provider_available": True,
+                "complete": True,
+            }
+
+    store = JoinedLaneStore(lane.state_dir)
+    store.create(record)
+    malformed = event(2, {"schema": "chitra.session-update.v1"})
+    bad_provider = _PackagedAmpProvider(
+        BatchAmp([event(1, first.to_dict()), malformed], "cursor-2"),
+        result_sink=lambda _value: None,
+        cursor_sink=lambda _value: pytest.fail("atomic batch path must not call cursor sink"),
+        lane_reader=lambda: {},
+        update_batch_sink=_canonical_update_batch_sink(lane),
+    )
+
+    with pytest.raises((TypeError, ValueError)):
+        bad_provider.read_updates("cursor-0")
+
+    after_failure = JoinedLaneStore(lane.state_dir).require(lane.identifier)
+    assert after_failure.current_update == record.current_update
+    assert after_failure.update_cursor == ""
+
+    # A restart may retry the same bad batch without replaying the valid first
+    # item.  The record remains at its original cursor and sequence.
+    with pytest.raises((TypeError, ValueError)):
+        _PackagedAmpProvider(
+            BatchAmp([event(1, first.to_dict()), malformed], "cursor-2"),
+            result_sink=lambda _value: None,
+            cursor_sink=lambda _value: pytest.fail("atomic batch path must not call cursor sink"),
+            lane_reader=lambda: {},
+            update_batch_sink=_canonical_update_batch_sink(lane),
+        ).read_updates("cursor-0")
+    assert JoinedLaneStore(lane.state_dir).require(lane.identifier).current_update == record.current_update
+
+    accepted = _PackagedAmpProvider(
+        BatchAmp([event(1, first.to_dict()), event(2, second.to_dict())], "cursor-2"),
+        result_sink=lambda _value: None,
+        cursor_sink=lambda _value: pytest.fail("atomic batch path must not call cursor sink"),
+        lane_reader=lambda: {},
+        update_batch_sink=_canonical_update_batch_sink(lane),
+    )
+    result = accepted.read_updates("cursor-0")
+    assert len(result.updates) == 2
+    persisted = JoinedLaneStore(lane.state_dir).require(lane.identifier)
+    assert persisted.current_update == second
+    assert persisted.update_cursor == "cursor-2"
+
+    # The original batch cannot replay after the atomic commit.
+    with pytest.raises((TypeError, ValueError)):
+        _PackagedAmpProvider(
+            BatchAmp([event(1, first.to_dict()), event(2, second.to_dict())], "cursor-2"),
+            result_sink=lambda _value: None,
+            cursor_sink=lambda _value: pytest.fail("atomic batch path must not call cursor sink"),
+            lane_reader=lambda: {},
+            update_batch_sink=_canonical_update_batch_sink(lane),
+        ).read_updates("cursor-0")
+    replayed = JoinedLaneStore(lane.state_dir).require(lane.identifier)
+    assert replayed.current_update == second
+    assert replayed.update_cursor == "cursor-2"
 
 
 def test_recovery_cursor_sink_persists_into_joined_lane_store(tmp_path: Path) -> None:
