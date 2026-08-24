@@ -1910,6 +1910,8 @@ def validate_record_transition(
             else:
                 resume_payload = candidate_payload
         result = current.last_operation_result
+        if previous.last_operation_result != result:
+            errors.append("resume must preserve the already signed provider result")
         if pending_resume is not None and result is not None:
             try:
                 validate_operation_result(pending_resume, result)

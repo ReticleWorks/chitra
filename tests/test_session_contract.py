@@ -976,6 +976,7 @@ def test_close_evidence_preserves_provider_state_and_same_thread_resume() -> Non
     validate_record_transition(inactive, resumed, transition="resume")
     for forged_receipt in (
         reopen.model_copy(update={"signature": None}),
+        reopen.model_copy(update={"signature": "b" * 64}),
         reopen.model_copy(update={"receipt_hmac": "0" * 64}),
         reopen.model_copy(update={"close_operation_id": "other-close"}),
         reopen.model_copy(update={"provider_session_id": "other-session"}),
