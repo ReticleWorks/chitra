@@ -775,14 +775,7 @@ def test_lanes_file_constructs_per_lane_provider_resolver_and_supervisor(
     assert dispatchd.main(["--lanes-file", str(tmp_path / "lanes.yaml"), "--once"]) == 0
     assert resolver_calls == ["alpha", "beta"]
     assert [root for root, _resolver in supervisor_calls] == [lane.state_dir for lane in lanes]
-    assert events == [
-        ("alpha", "reconcile"),
-        ("alpha", "recovery"),
-        ("alpha", "reconcile"),
-        ("beta", "reconcile"),
-        ("beta", "recovery"),
-        ("beta", "reconcile"),
-    ]
+    assert events == [("alpha", "recovery"), ("beta", "recovery")]
     assert len(supervisor_instances) == 2
 
 
@@ -924,4 +917,4 @@ def test_lanes_file_once_activates_packaged_tophand_before_queue_dispatch(
             "text": sent_payloads[0]["text"],
         }
     ]
-    assert events == ["reconcile", "recovery-send", "reconcile", "queue-dispatch"]
+    assert events == ["recovery-send", "queue-dispatch"]

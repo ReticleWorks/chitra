@@ -104,7 +104,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import structlog
 
@@ -136,7 +136,7 @@ from .goals import (
 from .joined_lane import JoinedLaneReconciler, JoinedLaneStore, ReconcileReport, build_filesystem_reconciler
 from .journal import native_session_identity
 from .lane_config import LaneCredentials, LaneSpec
-from .operating_facts import OperatingFactsSources
+from .operating_facts import OperatingFactsSources, read_operating_facts
 from .orders import DispatchOrder, DispatchResult, DispatchStatus
 from .policy_config import PolicyConfig, load_policy_config
 from .provider_protocol import Provider
@@ -1347,8 +1347,13 @@ def run_once(
     # therefore cannot reach provider I/O until a later wake/requeue pass.
     if reconciliation_gate is not None:
         joined_lane_report = reconciliation_gate()
-    elif joined_lane_reconciler is not None:
+    elif joined_lane_reconciler is not None and recovery_supervisor is None:
         joined_lane_report = joined_lane_reconciler.reconcile_all()
+    elif recovery_supervisor is not None and joined_lane_root is not None:
+        # RecoverySupervisor owns the lane lock and canonical state transition.
+        # There is no separate mutable reconciler barrier in this production
+        # path; it would be a second state machine.
+        joined_lane_report = ReconcileReport(())
     elif joined_lane_root is not None:
         joined_lane_report = ReconcileReport((), ("joined-lane reconciler is required when joined_lane_root is set",))
     else:
@@ -1369,7 +1374,7 @@ def run_once(
         run_recovery_supervision(recovery_supervisor)
         if reconciliation_gate is not None:
             joined_lane_report = reconciliation_gate()
-        elif joined_lane_reconciler is not None:
+        elif joined_lane_reconciler is not None and recovery_supervisor is None:
             joined_lane_report = joined_lane_reconciler.reconcile_all()
     _requeue_joined_lane_deferred(queue_dir, joined_lane_report)
     _reclaim_stale_in_flight(queue_dir)
@@ -1529,15 +1534,14 @@ def run_lanes_once(
     cancel_verifier: RecoveryVerifier | None = None,
     facts_reader: RecoveryFactsReader | None = None,
     operating_facts_sources: OperatingFactsSources | None = None,
+    top_hand_identity_resolver: Callable[[object, Sequence[object]], object | None] | None = None,
 ) -> dict[str, list[DispatchResult]]:
     """Drain every enabled lane from one rendered declaration.
 
     The shared ``--lanes-file`` entrypoint is the production path used by the
     systemd package.  Each lane has its own joined-lane store and delivery
-    ledger, so each invocation must build and pass that lane's reconciler to
-    ``run_once``.  This keeps the restart barrier in front of every queue
-    claim, regardless of whether the daemon was started for one queue or for
-    the rendered multi-lane declaration.
+    ledger.  RecoverySupervisor is the sole joined-lane mutation owner and
+    holds the per-lane lock across reread, provider I/O, and persistence.
     """
     from chitra.lane_config import enabled_lanes
 
@@ -1588,18 +1592,17 @@ def run_lanes_once(
                 facts_reader=facts_reader,
                 operating_facts_sources=operating_facts_sources,
             )
-        lane_reconciler = build_filesystem_reconciler(
-            lane.state_dir,
-            ledger_path=lane.state_dir / "ledger.jsonl",
-            ledger_key_path=lane.state_dir / "ledger.key",
-            ownership_socket_path=ownership_socket_path or Path("/run/chitra-ownership/provider.sock"),
-        )
         recovery_supervisor = RecoverySupervisor(
             lane.state_dir,
             provider_resolver,
             goal_root=lane.state_dir,
             ledger_key_path=lane.state_dir / "ledger.key",
             facts_reader=cast(EngineRecoveryFactsReader, resolved_facts_reader),
+            lane_id=lane.identifier,
+            identity_resolver=cast(Any, top_hand_identity_resolver),
+            operating_facts_reader=lambda sources=operating_facts_sources: tuple(
+                read_operating_facts(sources).facts
+            ),
         )
         results[lane.identifier] = run_once(
             lane.queue_dir,
@@ -1616,7 +1619,6 @@ def run_lanes_once(
             projects_root=lane.config_dir / "projects",
             tmux_socket=lane.tmux_socket,
             joined_lane_root=lane.state_dir,
-            joined_lane_reconciler=lane_reconciler,
             recovery_supervisor=recovery_supervisor,
         )
     return results
@@ -1684,6 +1686,7 @@ def run_lanes_forever(
     cancel_verifier: RecoveryVerifier | None = None,
     facts_reader: RecoveryFactsReader | None = None,
     operating_facts_sources: OperatingFactsSources | None = None,
+    top_hand_identity_resolver: Callable[[object, Sequence[object]], object | None] | None = None,
 ) -> None:
     """Run one shared dispatchd process over all enabled lane queues."""
     while True:
@@ -1704,6 +1707,7 @@ def run_lanes_forever(
             cancel_verifier=cancel_verifier,
             facts_reader=facts_reader,
             operating_facts_sources=operating_facts_sources,
+            top_hand_identity_resolver=top_hand_identity_resolver,
         )
         time.sleep(poll_seconds)
 

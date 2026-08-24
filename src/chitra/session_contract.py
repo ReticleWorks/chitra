@@ -745,10 +745,18 @@ class ProviderOperationResult(_ContractModel):
     kind: OperationKind
     lane_id: Identifier
     provider_handle: Identifier
+    # The physical provider session is separate from the operation handle.
+    # It is optional on legacy observations, but a new launch result must
+    # carry it so Chitra can prove that the returned lane is the enrolled one.
+    provider_session_id: Identifier | None = None
     idempotency_key: Identifier
     payload_digest: Text
     provider_instance_id: Identifier | None = None
     provider_generation: int | None = Field(default=None, ge=1)
+    provider_pid: int | None = Field(default=None, ge=1)
+    owner_pid: int | None = Field(default=None, ge=1)
+    observed_process: dict[str, object] | None = None
+    ownership: dict[str, object] | None = None
     status: OperationStatus
     accepted: bool | None = None
     consumed: bool | None = None
@@ -767,6 +775,13 @@ class ProviderOperationResult(_ContractModel):
             raise ValueError("provider generation must be an integer")
         return value
 
+    @field_validator("provider_pid", "owner_pid")
+    @classmethod
+    def reject_bool_pid(cls, value: int | None) -> int | None:
+        if isinstance(value, bool):
+            raise ValueError("provider PID must be an integer")
+        return value
+
     @model_validator(mode="after")
     def validate_disposition(self) -> Self:
         if self.status == "consumed" and (self.accepted is not True or self.consumed is not True):
@@ -777,6 +792,39 @@ class ProviderOperationResult(_ContractModel):
             raise ValueError("rejected result requires accepted=false and no observed consumption")
         if self.status in ("unknown", "lost-response") and (self.accepted is not None or self.consumed is not None):
             raise ValueError("unknown or lost response cannot claim transport acceptance or consumption")
+        if self.ownership is not None:
+            for field, expected in (
+                ("operation_id", self.operation_id),
+                ("lane_id", self.lane_id),
+                ("session_ref", self.provider_session_id),
+                ("provider_handle", self.provider_handle),
+                ("provider_instance_id", self.provider_instance_id),
+                ("provider_generation", self.provider_generation),
+            ):
+                if field in self.ownership and expected is not None and self.ownership[field] != expected:
+                    raise ValueError(f"ownership {field} does not match provider result")
+            provider_pid = self.ownership.get("provider_pid")
+            owner_pid = self.ownership.get("owner_pid")
+            if provider_pid is not None and (
+                isinstance(provider_pid, bool) or not isinstance(provider_pid, int) or provider_pid < 1
+            ):
+                raise ValueError("ownership provider_pid must be a positive integer")
+            if owner_pid is not None and owner_pid != provider_pid:
+                raise ValueError("ownership owner_pid must match provider_pid")
+            if self.provider_pid is not None and provider_pid is not None and self.provider_pid != provider_pid:
+                raise ValueError("provider result PID does not match ownership")
+            if self.owner_pid is not None and owner_pid is not None and self.owner_pid != owner_pid:
+                raise ValueError("provider result owner_pid does not match ownership")
+            observed_process = self.ownership.get("observed_process")
+            if not isinstance(observed_process, dict):
+                raise ValueError("ownership observed_process must be an object")
+            observed_pid = observed_process.get("pid")
+            if isinstance(observed_pid, bool) or not isinstance(observed_pid, int) or observed_pid < 1:
+                raise ValueError("ownership observed_process.pid must be a positive integer")
+            if observed_pid != provider_pid:
+                raise ValueError("ownership observed_process.pid must match provider_pid")
+            if self.observed_process is not None and self.observed_process != observed_process:
+                raise ValueError("provider result observed_process does not match ownership")
         return self
 
     @property

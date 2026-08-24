@@ -238,6 +238,9 @@ def _provider_result(
         expected = getattr(operation, field)
         if observed is not None and observed != expected:
             raise ValueError(f"{provider_label} provider result {field} changed")
+    observed_session = raw.get("provider_session_id")
+    if observed_session is not None and observed_session != operation.provider_session_id:
+        raise ValueError(f"{provider_label} provider result provider_session_id changed")
     status = raw.get("status")
     if status not in {"accepted", "consumed", "rejected", "unknown", "lost-response"}:
         status = "unknown"
@@ -255,15 +258,44 @@ def _provider_result(
     if not isinstance(observed_at, str) or not observed_at.strip():
         observed_at = _now()
     evidence = raw.get("evidence")
+    ownership = dict(raw["ownership"]) if isinstance(raw.get("ownership"), Mapping) else None
+    observed_process = raw.get("observed_process")
+    if observed_process is not None and not isinstance(observed_process, Mapping):
+        raise ValueError(f"{provider_label} provider result observed_process is invalid")
+    if ownership is not None:
+        for field, expected in (
+            ("lane_id", operation.lane_id),
+            ("provider_session_id", operation.provider_session_id),
+            ("provider_handle", operation.provider_handle),
+            ("provider_instance_id", operation.provider_instance_id),
+            ("provider_generation", operation.provider_generation),
+        ):
+            if field in ownership and ownership[field] != expected:
+                raise ValueError(f"{provider_label} provider ownership {field} changed")
+        nested_process = ownership.get("observed_process")
+        if not isinstance(nested_process, Mapping):
+            raise ValueError(f"{provider_label} provider ownership lacks observed_process")
+        if observed_process is not None and dict(nested_process) != dict(observed_process):
+            raise ValueError(f"{provider_label} provider result observed_process changed")
+        observed_process = nested_process
     return ProviderOperationResult(
         operation_id=operation.operation_id,
         kind=operation.kind,
         lane_id=operation.lane_id,
         provider_handle=operation.provider_handle,
+        provider_session_id=(
+            raw.get("provider_session_id")
+            if isinstance(raw.get("provider_session_id"), str)
+            else None
+        ),
         idempotency_key=operation.idempotency_key,
         payload_digest=operation.payload_digest,
         provider_instance_id=operation.provider_instance_id,
         provider_generation=operation.provider_generation,
+        provider_pid=raw.get("provider_pid") if isinstance(raw.get("provider_pid"), int) and not isinstance(raw.get("provider_pid"), bool) else None,
+        owner_pid=raw.get("owner_pid") if isinstance(raw.get("owner_pid"), int) and not isinstance(raw.get("owner_pid"), bool) else None,
+        observed_process=dict(observed_process) if isinstance(observed_process, Mapping) else None,
+        ownership=ownership,
         status=cast(Any, status),
         accepted=accepted,
         consumed=consumed,
@@ -283,6 +315,7 @@ def _unknown_provider_result(
         kind=operation.kind,
         lane_id=operation.lane_id,
         provider_handle=operation.provider_handle,
+        provider_session_id=operation.provider_session_id,
         idempotency_key=operation.idempotency_key,
         payload_digest=operation.payload_digest,
         provider_instance_id=operation.provider_instance_id,

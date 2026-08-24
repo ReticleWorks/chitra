@@ -726,8 +726,8 @@ def test_main_wires_startup_reconciler_before_run_once(tmp_path: Path, monkeypat
     assert captured["joined_lane_reconciler"] is sentinel
 
 
-def test_lanes_file_entrypoint_reconciles_before_claim_and_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The shipped multi-lane mode cannot bypass the restart send barrier."""
+def test_lanes_file_entrypoint_uses_recovery_supervisor_as_mutation_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shipped multi-lane mode has no second mutable reconciler."""
     state_root = tmp_path / "lane-state"
     lane = LaneSpec(
         identifier="alpha",
@@ -750,7 +750,6 @@ def test_lanes_file_entrypoint_reconciles_before_claim_and_fails_closed(tmp_path
     order = DispatchOrder(order_id="op-lane-entrypoint", session_ref="tophand:alpha:0.0", nudge="continue")
     order_path = queue_orders / f"{order.order_id}.json"
     order_path.write_text(order.model_dump_json(), encoding="utf-8")
-    barrier = ReconcileReport((ReconcileOutcome("alpha", order.session_ref, "blocked", False, "unreconciled"),))
     reconciler_calls = 0
     built_roots: list[Path] = []
 
@@ -759,7 +758,7 @@ def test_lanes_file_entrypoint_reconciles_before_claim_and_fails_closed(tmp_path
             nonlocal reconciler_calls
             reconciler_calls += 1
             assert order_path.exists()
-            return barrier
+            return ReconcileReport(())
 
     monkeypatch.setattr("chitra.lane_config.enabled_lanes", lambda _path: (lane,))
 
@@ -770,16 +769,14 @@ def test_lanes_file_entrypoint_reconciles_before_claim_and_fails_closed(tmp_path
     monkeypatch.setattr(dispatchd, "build_filesystem_reconciler", build)
     monkeypatch.setattr(
         dispatchd,
-        "dispatch_to_tmux",
-        lambda *_args, **_kwargs: pytest.fail("blocked lane reached provider dispatch"),
+        "process_one_order",
+        lambda *_args, **_kwargs: None,
     )
 
     assert dispatchd.main(["--lanes-file", str(tmp_path / "lanes.yaml"), "--once"]) == 0
-    assert built_roots == [state_root]
-    assert reconciler_calls == 2
-    assert not order_path.exists()
-    assert (queue / "deferred" / order_path.name).exists()
-    assert not (queue / "results" / order_path.name).exists()
+    assert built_roots == []
+    assert reconciler_calls == 0
+    assert order_path.exists()
 
 
 def test_dispatchd_without_reconciler_fails_closed_when_unfinished_lane_exists(tmp_path: Path) -> None:

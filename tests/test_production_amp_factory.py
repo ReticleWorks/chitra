@@ -849,7 +849,7 @@ def test_lanes_file_uses_static_amp_factory_before_queue_dispatch(
     sent = [request for name, request in _AmpAdapter.calls if name == "send"]
     assert len(sent) == 1
     assert sent[0]["operation"] == persisted.pending_operation.model_dump(mode="json")
-    assert events == ["reconcile", "recovery-send", "reconcile", "queue-dispatch"]
+    assert events == ["recovery-send", "queue-dispatch"]
     assert _AmpProfile.calls == [
         {
             "project_ref": "amp-project-a",

@@ -7,11 +7,11 @@ import fcntl
 import hashlib
 import json
 import os
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Callable, Literal, Protocol, cast
 
 import structlog
 
@@ -19,18 +19,18 @@ from ._fsio import write_json_atomic
 from .detect.detectors import Finding
 from .detect.ladder import IncidentStore, ResponseLadder
 from .detect.rescue import RecoveryCheckpointBinding, find_recovery_checkpoint_receipt
-from .goals import LOAD_SHED_HOLD_REASON_PREFIX, GoalRecord, done_when_with_delta, get_goal, load_goals
-from .joined_lane import (
-    JoinedLaneCorruptError,
-    JoinedLaneReconciler,
-    OwnershipProbe,
-    journal_provider_probe,
-    ledger_provider_probe,
-    ownership_provider_probe,
+from .goals import DONE_STATUSES, LOAD_SHED_HOLD_REASON_PREFIX, GoalRecord, done_when_with_delta, get_goal, load_goals
+from .dispatch import LaneLock, LaneLockError
+from .initial_launch import (
+    top_hand_bootstrap_record,
+    top_hand_create_operation,
+    top_hand_identity_from_facts,
 )
+from .joined_lane import JoinedLaneCorruptError
 from .joined_lane import JoinedLaneStore as CanonicalJoinedLaneStore
 from .journal.models import CanonicalEvent, ProgressClass, ProgressClassification
 from .journal.store import EventJournal
+from .operating_facts import read_operating_facts
 from .provider_protocol import (
     CheckpointRequest,
     CreateOrResumeRequest,
@@ -52,6 +52,7 @@ from .session_contract import (
     PendingProviderOperation,
     ProgressEvidence,
     ProviderOperationResult,
+    ProviderIdentity,
     RecordTransitionKind,
     RecoveryState,
     WakeReceipt,
@@ -284,8 +285,11 @@ class RecoveryEngine:
         journal: EventJournal | None = None,
         facts_reader: RecoveryFactsReader | None = None,
         response_ladder: ResponseLadder | None = None,
-        reconciler: JoinedLaneReconciler | None = None,
-        ownership_probe: OwnershipProbe | None = None,
+        # Retained as compatibility-only arguments for callers that still
+        # construct the engine directly.  RecoveryEngine is the sole
+        # production mutation owner; neither collaborator is invoked.
+        reconciler: object | None = None,
+        ownership_probe: object | None = None,
         check_interval: timedelta = timedelta(minutes=5),
         wait_interval: timedelta = timedelta(minutes=30),
     ) -> None:
@@ -827,6 +831,7 @@ class RecoveryEngine:
             kind=operation.kind,
             lane_id=operation.lane_id,
             provider_handle=operation.provider_handle,
+            provider_session_id=operation.provider_session_id,
             idempotency_key=operation.idempotency_key,
             payload_digest=operation.payload_digest,
             provider_instance_id=operation.provider_instance_id,
@@ -942,6 +947,100 @@ class RecoveryEngine:
             payload_digest=operation.payload_digest,
             event_sequence=sequence,
         )
+
+    @staticmethod
+    def _is_initial_create(record: JoinedLaneRecord) -> bool:
+        """Return true for the one pending operation created before joining."""
+
+        return bool(
+            record.provider.kind == "tophand"
+            and record.current_update is None
+            and record.pending_operation is not None
+            and record.pending_operation.kind == "create_or_resume"
+            and record.recovery.attempted_remedy == "bootstrap"
+        )
+
+    @staticmethod
+    def _initial_ownership_failure(
+        record: JoinedLaneRecord,
+        operation: PendingProviderOperation,
+        result: ProviderOperationResult,
+    ) -> str | None:
+        """Check the complete receipt returned by the restricted Tophand call.
+
+        A handle, session string, or PID alone is not an ownership proof.  The
+        receipt must echo the entire pending envelope and the observed process
+        identity.  The instance and generation fence PID reuse.
+        """
+
+        try:
+            validate_operation_result(operation, result)
+        except ContractValidationError as exc:
+            return str(exc)
+        if result.provider_session_id != record.session_ref:
+            return "initial Tophand result provider_session_id does not match the enrolled session"
+        ownership = result.ownership
+        if not isinstance(ownership, Mapping):
+            return "initial Tophand result lacks canonical ownership evidence"
+        if ownership.get("authoritative") is not True:
+            return "initial Tophand ownership is not authoritative"
+        if ownership.get("status") not in {"owned", "authoritative", "ok"}:
+            return "initial Tophand ownership is not owned"
+        expected_fields: tuple[tuple[str, object], ...] = (
+            ("operation_id", operation.operation_id),
+            ("lane_id", record.lane_id),
+            ("provider_handle", operation.provider_handle),
+            ("provider_instance_id", operation.provider_instance_id),
+            ("provider_generation", operation.provider_generation),
+        )
+        for field, expected in expected_fields:
+            if ownership.get(field) != expected:
+                return f"initial Tophand ownership {field} does not match the pending envelope"
+        session_value = ownership.get("session_ref", ownership.get("provider_session_id"))
+        if session_value != record.session_ref or ownership.get("session_ref") not in (None, record.session_ref):
+            return "initial Tophand ownership session_ref does not match the enrolled session"
+        if ownership.get("provider_session_id") not in (None, record.session_ref):
+            return "initial Tophand ownership provider_session_id does not match the enrolled session"
+
+        provider_pid = result.provider_pid
+        owner_pid = result.owner_pid
+        if isinstance(provider_pid, bool) or not isinstance(provider_pid, int) or provider_pid < 1:
+            return "initial Tophand result lacks a positive provider_pid"
+        if isinstance(owner_pid, bool) or owner_pid != provider_pid:
+            return "initial Tophand owner_pid does not match provider_pid"
+        if ownership.get("provider_pid") != provider_pid or ownership.get("owner_pid") != owner_pid:
+            return "initial Tophand ownership PID does not match the result"
+        observed_process = ownership.get("observed_process")
+        if not isinstance(observed_process, Mapping) or observed_process.get("pid") != provider_pid:
+            return "initial Tophand ownership lacks matching observed process evidence"
+        if result.observed_process is not None and dict(result.observed_process) != dict(observed_process):
+            return "initial Tophand observed process changed between result and ownership"
+        return None
+
+    def _finish_initial_create(
+        self,
+        record: JoinedLaneRecord,
+        current: datetime,
+        facts: tuple[OperatingFact, ...],
+        persist: bool,
+    ) -> RecoveryDecision:
+        operation, result = record.pending_operation, record.last_operation_result
+        if operation is None or result is None:
+            raise RecoveryStateError("initial create result has no pending operation")
+        if result.status not in {"accepted", "consumed"}:
+            return self._pending(record, current, "initial Tophand create has no accepted ownership receipt", persist)
+        failure = self._initial_ownership_failure(record, operation, result)
+        if failure is not None:
+            return self._pending(record, current, failure, persist)
+        check = self._check(current, "Continue the enrolled Tophand goal", "a material Tophand lane update")
+        recovery = record.recovery.model_copy(
+            update={"stage": "diagnostic", "next_allowed_attempt": check.at, "pending_payload": None}
+        )
+        candidate = self._persist(
+            record.model_copy(update={"pending_operation": None, "recovery": recovery, "next_check": check}),
+            persist=persist,
+        )
+        return self._decision("relaunch", candidate, "exact Tophand launch ownership is proven", operation, facts=facts)
 
     def _finish_consumed(
         self,
@@ -1127,6 +1226,7 @@ class RecoveryEngine:
                 kind=pending.kind,
                 lane_id=pending.lane_id,
                 provider_handle=pending.provider_handle,
+                provider_session_id=expected_session_id,
                 idempotency_key=pending.idempotency_key,
                 payload_digest=pending.payload_digest,
                 provider_instance_id=pending.provider_instance_id,
@@ -1139,20 +1239,6 @@ class RecoveryEngine:
             )
         return stored
 
-    def _reconciler_for(self) -> JoinedLaneReconciler | None:
-        if self.reconciler is not None:
-            return self.reconciler
-        if self.state_root is None:
-            return None
-        key_path = self.state_root / "ledger.key"
-        return JoinedLaneReconciler(
-            CanonicalJoinedLaneStore(self.state_root),
-            provider_probe=self._provider_probe,
-            journal_probe=journal_provider_probe(self.state_root),
-            ledger_probe=ledger_provider_probe(self.state_root / "ledger.jsonl", key_path) if key_path.exists() else None,
-            ownership_probe=self.ownership_probe or ownership_provider_probe(),
-        )
-
     def _reconcile_pending(
         self,
         record: JoinedLaneRecord,
@@ -1161,6 +1247,22 @@ class RecoveryEngine:
         facts: tuple[OperatingFact, ...],
         persist: bool,
     ) -> RecoveryDecision:
+        if self._is_initial_create(record):
+            # The pending envelope was allocated before any provider call.  A
+            # stored accepted/consumed result is a crash-window recovery, not
+            # permission to allocate a new operation.  Keep it pending until
+            # the same receipt proves ownership exactly.
+            stored = record.last_operation_result
+            if stored is not None and stored.status in {"accepted", "consumed", "rejected"}:
+                return self._finish_initial_create(record, current, facts, persist)
+            pending = record.pending_operation
+            if pending is None:
+                raise RecoveryStateError("initial Tophand create is missing its pending operation")
+            payload = pending.payload or record.recovery.pending_payload or ""
+            retried = self._invoke(record, pending, "relaunch", payload, current)
+            recorded = self._persist(record.model_copy(update={"last_operation_result": retried}), persist=persist)
+            return self._finish_initial_create(recorded, current, facts, persist)
+
         if record.last_operation_result is not None and record.last_operation_result.status == "consumed":
             return self._finish_consumed(record, current, facts, persist)
         observed = self._provider_probe(record)
@@ -1202,14 +1304,11 @@ class RecoveryEngine:
                 record = self._persist(record.model_copy(update={"last_operation_result": retried}), persist=persist)
                 if retried.status == "consumed":
                     return self._finish_consumed(record, current, facts, persist)
-        reconciler = self._reconciler_for()
-        if reconciler is None:
-            return self._pending(record, current, "pending operation requires canonical reconciliation", persist)
-        outcome = reconciler.reconcile(record)
-        reconciled = cast(JoinedLaneRecord, outcome.record or record)
-        if reconciled.last_operation_result is not None and reconciled.last_operation_result.status == "consumed":
-            return self._finish_consumed(reconciled, current, facts, persist)
-        return self._pending(reconciled, current, outcome.reason or "pending operation is not consumed", persist)
+        # RecoveryEngine owns the complete mutation path.  A legacy mutable
+        # JoinedLaneReconciler may still be passed by an old direct caller, but
+        # it is deliberately not consulted here: doing so would create a
+        # second recovery state machine and could replay a provider call.
+        return self._pending(record, current, "pending operation lacks exact provider evidence", persist)
 
     def run_for_lane(self, lane_id: str, **kwargs: Any) -> RecoveryDecision:
         record = self.load(lane_id)
@@ -1229,12 +1328,22 @@ class RecoverySupervisor:
         goal_root: Path | None = None,
         ledger_key_path: Path | None = None,
         facts_reader: RecoveryFactsReader | None = None,
+        lane_id: str | None = None,
+        identity_resolver: Callable[[GoalRecord, Sequence[OperatingFact]], ProviderIdentity | None] | None = None,
+        operating_facts_reader: Callable[[], Sequence[OperatingFact]] | None = None,
+        lane_lock_timeout_seconds: float = 5.0,
     ) -> None:
+        if lane_lock_timeout_seconds <= 0:
+            raise ValueError("lane_lock_timeout_seconds must be positive")
         self.state_root = state_root
         self.provider_resolver = provider_resolver
         self.goal_root = goal_root or state_root
         self.ledger_key_path = ledger_key_path or state_root / "ledger.key"
         self.facts_reader = facts_reader
+        self.lane_id = lane_id
+        self.identity_resolver = identity_resolver or top_hand_identity_from_facts
+        self.operating_facts_reader = operating_facts_reader or (lambda: read_operating_facts().facts)
+        self.lane_lock_timeout_seconds = lane_lock_timeout_seconds
 
     @staticmethod
     def _named_wake(
@@ -1264,34 +1373,78 @@ class RecoverySupervisor:
                 return event.event_id, condition, sequence
         return None
 
-    def run_once(self, *, now: datetime | None = None) -> tuple[RecoveryDecision, ...]:
+    def _facts_for_bootstrap(self) -> tuple[OperatingFact, ...]:
+        try:
+            return tuple(self.operating_facts_reader())
+        except Exception as exc:  # noqa: BLE001 - unavailable facts are a wait, not a guess
+            logger.warning("recovery_bootstrap_facts_unavailable", error=str(exc))
+            return ()
+
+    def _bootstrap_goals(
+        self,
+        store: CanonicalJoinedLaneStore,
+        *,
+        now: datetime | None,
+    ) -> tuple[tuple[RecoveryDecision, ...], set[str]]:
+        """Persist a pending Tophand create before any provider call.
+
+        The returned lane set prevents the new row from being processed again
+        in the same pass.  A second supervisor wins or loses the same lane
+        lock and always rereads the canonical row before making a decision.
+        """
+
         decisions: list[RecoveryDecision] = []
-        store = CanonicalJoinedLaneStore(self.state_root)
-        for value in store.unfinished():
-            record = cast(JoinedLaneRecord, value)
-            if record.recovery.stage in {"none", "complete"}:
+        created_lanes: set[str] = set()
+        try:
+            goals = tuple(load_goals(self.goal_root))
+        except Exception as exc:  # noqa: BLE001 - goal store outage is fail closed
+            logger.warning("recovery_bootstrap_goals_unavailable", error=str(exc))
+            return (), created_lanes
+        for goal in goals:
+            if (
+                not goal.goal_id.strip()
+                or not goal.enrolled_done_when.strip()
+                or goal.status in DONE_STATUSES
+                or goal.status == "held"
+                or not goal.session_ref.startswith("tophand:")
+                or (self.lane_id is not None and goal.lane_id != self.lane_id)
+            ):
                 continue
+            lock = LaneLock(goal.session_ref, lock_dir=self.state_root / "locks")
+            acquired = False
             try:
-                provider = self.provider_resolver(record)
-                journal = EventJournal(self.state_root, record.lane_id)
+                acquired = lock.acquire(blocking=True, timeout_seconds=self.lane_lock_timeout_seconds)
+                if not acquired:
+                    continue
+                if store.load(goal.lane_id) is not None:
+                    continue
+                facts = self._facts_for_bootstrap()
+                if not facts:
+                    continue
+                identity = self.identity_resolver(goal, facts)
+                if identity is None:
+                    continue
+                operation = top_hand_create_operation(goal, identity, now=now)
+                pending = top_hand_bootstrap_record(goal, identity, operation, now=now)
+                try:
+                    stored = cast(JoinedLaneRecord, store.create(pending))
+                except Exception as exc:  # noqa: BLE001 - a concurrent winner is harmless
+                    if store.load(goal.lane_id) is not None:
+                        continue
+                    raise exc
+                created_lanes.add(stored.lane_id)
+                provider = self.provider_resolver(stored)
+                journal = EventJournal(self.state_root, stored.lane_id)
                 journal_events = tuple(journal.load())
                 try:
                     key = self.ledger_key_path.read_bytes()
                 except OSError:
                     key = None
                 ladder = ResponseLadder(
-                    IncidentStore(self.state_root, record.lane_id),
+                    IncidentStore(self.state_root, stored.lane_id),
                     journal_events=journal_events,
                     ledger_key=key,
                 )
-                wake = self._named_wake(record, journal, journal_events)
-                kwargs: dict[str, Any] = {"now": now}
-                if wake is not None:
-                    kwargs.update(
-                        wake_id=wake[0],
-                        observed_wake_condition=wake[1],
-                        wake_event_sequence=wake[2],
-                    )
                 decisions.append(
                     RecoveryEngine(
                         provider=provider,
@@ -1300,23 +1453,107 @@ class RecoverySupervisor:
                         journal=journal,
                         response_ladder=ladder,
                     ).run_once(
-                        record,
-                        **kwargs,
-                        facts=tuple(self.facts_reader(record)) if self.facts_reader is not None else (),
+                        stored,
+                        now=now,
+                        goal=goal,
+                        facts=facts,
                     )
                 )
+            except LaneLockError as exc:
+                logger.warning("recovery_bootstrap_lane_lock_unavailable", lane_id=goal.lane_id, error=str(exc))
+            except Exception as exc:  # noqa: BLE001 - one goal must not abort the pass
+                logger.warning(
+                    "recovery_bootstrap_failed_closed",
+                    lane_id=goal.lane_id,
+                    session_ref=goal.session_ref,
+                    error=str(exc),
+                )
+            finally:
+                if acquired:
+                    lock.release()
+        return tuple(decisions), created_lanes
+
+    def _run_record_locked(
+        self,
+        store: CanonicalJoinedLaneStore,
+        snapshot: JoinedLaneRecord,
+        *,
+        now: datetime | None,
+    ) -> RecoveryDecision:
+        lock = LaneLock(snapshot.session_ref, lock_dir=self.state_root / "locks")
+        acquired = False
+        try:
+            acquired = lock.acquire(blocking=True, timeout_seconds=self.lane_lock_timeout_seconds)
+            if not acquired:
+                raise LaneLockError(f"lane lock unavailable for {snapshot.session_ref}")
+            record = cast(JoinedLaneRecord, store.require(snapshot.lane_id))
+            if record.recovery.stage in {"none", "complete"}:
+                return self._decision_for(record, "lane is no longer unfinished")
+            provider = self.provider_resolver(record)
+            journal = EventJournal(self.state_root, record.lane_id)
+            journal_events = tuple(journal.load())
+            try:
+                key = self.ledger_key_path.read_bytes()
+            except OSError:
+                key = None
+            ladder = ResponseLadder(
+                IncidentStore(self.state_root, record.lane_id),
+                journal_events=journal_events,
+                ledger_key=key,
+            )
+            wake = self._named_wake(record, journal, journal_events)
+            kwargs: dict[str, Any] = {"now": now}
+            if wake is not None:
+                kwargs.update(wake_id=wake[0], observed_wake_condition=wake[1], wake_event_sequence=wake[2])
+            return RecoveryEngine(
+                provider=provider,
+                state_root=self.state_root,
+                goal_root=self.goal_root,
+                journal=journal,
+                response_ladder=ladder,
+            ).run_once(
+                record,
+                **kwargs,
+                facts=tuple(self.facts_reader(record)) if self.facts_reader is not None else (),
+            )
+        finally:
+            if acquired:
+                lock.release()
+
+    @staticmethod
+    def _decision_for(record: JoinedLaneRecord, reason: str) -> RecoveryDecision:
+        return RecoveryDecision("noop", record.recovery.stage, record, reason)
+
+    def run_once(self, *, now: datetime | None = None) -> tuple[RecoveryDecision, ...]:
+        decisions, created_lanes = self._bootstrap_goals(CanonicalJoinedLaneStore(self.state_root), now=now)
+        store = CanonicalJoinedLaneStore(self.state_root)
+        decisions = list(decisions)
+        for value in store.unfinished():
+            snapshot = cast(JoinedLaneRecord, value)
+            if snapshot.lane_id in created_lanes or snapshot.recovery.stage in {"none", "complete"}:
+                continue
+            try:
+                decisions.append(self._run_record_locked(store, snapshot, now=now))
+            except LaneLockError as exc:
+                logger.warning(
+                    "recovery_supervision_lane_lock_unavailable",
+                    lane_id=snapshot.lane_id,
+                    session_ref=snapshot.session_ref,
+                    error=str(exc),
+                )
+                decisions.append(RecoveryDecision("waiting", snapshot.recovery.stage, snapshot, f"recovery lane lock unavailable: {exc}"))
             except Exception as exc:  # noqa: BLE001 - one lane must not abort the pass
                 logger.warning(
                     "recovery_supervision_lane_failed_closed",
-                    lane_id=record.lane_id,
-                    session_ref=record.session_ref,
+                    lane_id=snapshot.lane_id,
+                    session_ref=snapshot.session_ref,
                     error=str(exc),
                 )
                 decisions.append(
                     RecoveryDecision(
                         "waiting",
-                        record.recovery.stage,
-                        record,
+                        snapshot.recovery.stage,
+                        snapshot,
                         f"recovery supervision failed closed for this lane: {exc}",
                     )
                 )
