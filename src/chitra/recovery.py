@@ -43,6 +43,7 @@ from .provider_protocol import (
 from .rate_limit_state import Transaction
 from .session_contract import (
     MAX_INLINE_WAKE_RECEIPTS,
+    CloseArchiveResult,
     ContractValidationError,
     InterventionEvidence,
     JoinedLaneRecord,
@@ -199,6 +200,25 @@ class RecoveryDecision:
     message: str = ""
     facts: tuple[OperatingFact, ...] = ()
     wake_condition: str | None = None
+    user_ask: None = None
+
+    @property
+    def asks_user(self) -> bool:
+        return False
+
+
+GovernedCloseAction = Literal["closed", "waiting"]
+
+
+@dataclass(frozen=True, slots=True)
+class GovernedCloseDecision:
+    """Result of one restart-safe, provider close attempt."""
+
+    action: GovernedCloseAction
+    record: JoinedLaneRecord
+    reason: str
+    operation: PendingProviderOperation | None = None
+    close_result: CloseArchiveResult | None = None
     user_ask: None = None
 
     @property
@@ -1211,6 +1231,31 @@ class RecoveryEngine:
             return self._finish_consumed(reconciled, current, facts, persist)
         return self._pending(reconciled, current, outcome.reason or "pending operation is not consumed", persist)
 
+    def governed_close(
+        self,
+        record: JoinedLaneRecord | None = None,
+        *,
+        lane_id: str | None = None,
+        now: datetime | None = None,
+        persist: bool = True,
+    ) -> GovernedCloseDecision:
+        """Delegate close to the small close seam without duplicating recovery."""
+
+        from .governed_close import governed_close
+
+        return governed_close(
+            provider=self.provider,
+            state_root=self.state_root,
+            goal_root=self.goal_root,
+            record=record,
+            lane_id=lane_id,
+            now=now,
+            persist=persist,
+            state_store=self._state_store,
+        )
+
+    close = governed_close
+
     def run_for_lane(self, lane_id: str, **kwargs: Any) -> RecoveryDecision:
         record = self.load(lane_id)
         if record is None:
@@ -1386,6 +1431,8 @@ __all__ = [
     "RecoveryStateError",
     "RecoveryStateStore",
     "RecoverySupervisor",
+    "GovernedCloseAction",
+    "GovernedCloseDecision",
     "confirm_useful_progress",
     "load_recovery_records",
     "record_pause_recovery",

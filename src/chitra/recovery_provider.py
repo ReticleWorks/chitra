@@ -678,6 +678,7 @@ def _unknown_close_result(operation: PendingProviderOperation, evidence: str) ->
         payload_digest=operation.payload_digest,
         state="unknown",
         provider_thread_ref=operation.provider_handle,
+        provider_session_id=operation.provider_session_id,
         same_provider_thread=None,
         later_resume_supported=None,
         checkpoint_ref=None,
@@ -714,6 +715,9 @@ def _amp_close_result(
     state = raw.get("state")
     if state not in {"closed", "archived", "unknown", "failed"}:
         return _unknown_close_result(operation, "Amp close result state is unknown")
+    provider_session_id = raw.get("provider_session_id")
+    if state in {"closed", "archived"} and provider_session_id != operation.provider_session_id:
+        return _unknown_close_result(operation, "Amp close result physical session changed")
     provider_thread_ref = raw.get("provider_thread_ref")
     if not isinstance(provider_thread_ref, str) or not provider_thread_ref:
         return _unknown_close_result(operation, "Amp close result has no provider thread evidence")
@@ -748,6 +752,7 @@ def _amp_close_result(
         payload_digest=operation.payload_digest,
         state=cast(Any, state),
         provider_thread_ref=provider_thread_ref,
+        provider_session_id=cast(str | None, provider_session_id),
         same_provider_thread=same_provider_thread if isinstance(same_provider_thread, bool) else None,
         later_resume_supported=later_resume_supported if isinstance(later_resume_supported, bool) else None,
         checkpoint_ref=checkpoint_ref,

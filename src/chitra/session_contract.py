@@ -832,6 +832,8 @@ def validate_close_result(pending: PendingProviderOperation, result: CloseArchiv
     for field in fields:
         if getattr(pending, field) != getattr(result, field):
             errors.append(f"{field} changed")
+    if result.provider_session_id is not None and pending.provider_session_id != result.provider_session_id:
+        errors.append("provider session changed")
     pending_time = datetime.fromisoformat(pending.created_at.replace("Z", "+00:00"))
     result_time = datetime.fromisoformat(result.observed_at.replace("Z", "+00:00"))
     if result_time < pending_time:
@@ -1172,6 +1174,10 @@ class CloseArchiveResult(_ContractModel):
     payload_digest: Text
     state: CloseState
     provider_thread_ref: Identifier
+    # The operation/thread handle above is not necessarily the physical
+    # provider session. New adapters return this after observing the provider;
+    # old close receipts may omit it during migration.
+    provider_session_id: Identifier | None = None
     same_provider_thread: bool | None = None
     later_resume_supported: bool | None = None
     checkpoint_ref: Identifier | None = None
@@ -1388,6 +1394,10 @@ class JoinedLaneRecord(_ContractModel):
                 or close_result.provider_handle != self.provider.handle
                 or close_result.provider_instance_id != self.provider.instance_id
                 or close_result.provider_generation != self.provider.generation
+                or (
+                    close_result.provider_session_id is not None
+                    and close_result.provider_session_id != self.provider.provider_session_id
+                )
             ):
                 raise ValueError("close evidence does not belong to joined lane provider generation")
             if close_result.state in ("closed", "archived") and self.lifecycle != "inactive":
