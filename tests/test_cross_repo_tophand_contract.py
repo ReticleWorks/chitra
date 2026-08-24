@@ -28,7 +28,12 @@ from test_amp_capability import _payload as capability_payload
 from chitra.amp_capability import verify_amp_capability_receipt
 from chitra.provider_protocol import SendRequest
 from chitra.recovery_provider import _PackagedTophandProvider, _provider_result, _tophand_operation_dict
-from chitra.session_contract import PendingProviderOperation
+from chitra.session_contract import (
+    ContractValidationError,
+    PendingProviderOperation,
+    ProviderOperationResult,
+    validate_operation_result,
+)
 from chitra.tophand_wire import request_digest as chitra_request_digest
 from chitra.tophand_wire import request_payload as chitra_request_payload
 
@@ -304,6 +309,55 @@ def test_orb_result_digest_is_bound_to_material_result() -> None:
         signature_verifier=hmac_capability_verifier(AMP_KEY),
     )
     assert verified is None
+
+
+def test_orb_result_digest_rejects_an_arbitrary_nonzero_signed_digest() -> None:
+    material = b'{"child_id":"inline:child-test","status":"consumed"}'
+    expected = "sha256:" + hashlib.sha256(material).hexdigest()
+    forged = "sha256:" + "1" * 64
+    receipt = sign_amp_capability_receipt(
+        capability_payload(result_digest=forged),
+        signature_key_id="fleet-key-1",
+        key=AMP_KEY,
+    )
+    assert forged != expected
+
+    verified = verify_amp_capability_receipt(
+        receipt,
+        expected_binary="/usr/local/bin/amp",
+        expected_version="0.0.1787505256-gdf42f4",
+        expected_project_ref="amp-project",
+        expected_profile_digest="sha256:" + "a" * 64,
+        expected_orb_size="a1.tiny",
+        now=datetime.now(UTC),
+        signature_verifier=hmac_capability_verifier(AMP_KEY),
+    )
+
+    assert verified is None
+
+
+def test_typed_consumed_result_requires_raw_physical_identity() -> None:
+    operation = _send_operation()
+    result = ProviderOperationResult(
+        operation_id=operation.operation_id,
+        kind=operation.kind,
+        lane_id=operation.lane_id,
+        provider_handle=operation.provider_handle,
+        provider_session_id=None,
+        process_start_token=None,
+        idempotency_key=operation.idempotency_key,
+        payload_digest=operation.payload_digest,
+        provider_instance_id=None,
+        provider_generation=None,
+        status="consumed",
+        accepted=True,
+        consumed=True,
+        observed_at=NOW,
+        evidence="typed provider omitted raw physical identity",
+    )
+
+    with pytest.raises(ContractValidationError):
+        validate_operation_result(operation, result)
 
 
 def test_real_fleet_adapter_through_chitra_emits_one_result_sink_callback(
