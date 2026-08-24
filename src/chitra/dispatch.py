@@ -257,6 +257,41 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def process_start_token(pid: int | None = None) -> str | None:
+    """Return an immutable boot/process-start token when the OS exposes one."""
+
+    value = os.getpid() if pid is None else pid
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    try:
+        stat = Path(f"/proc/{value}/stat").read_text(encoding="utf-8")
+        end = stat.rfind(")")
+        if end < 0:
+            return None
+        fields = stat[end + 2 :].split()
+        # The suffix starts at /proc/<pid>/stat field 3. Field 22
+        # (starttime) is therefore offset 19.
+        start_ticks = fields[19]
+        boot_path = Path("/proc/sys/kernel/random/boot_id")
+        boot_id = boot_path.read_text(encoding="utf-8").strip() if boot_path.exists() else ""
+    except (OSError, IndexError):
+        return None
+    if not start_ticks:
+        return None
+    return f"{boot_id}:{start_ticks}" if boot_id else f"start:{start_ticks}"
+
+
+def owner_alive(pid: int, token: str | None) -> bool:
+    """Return true only when PID and, when available, its start token match."""
+
+    if not _pid_alive(pid):
+        return False
+    if not token:
+        return True
+    current = process_start_token(pid)
+    # If this platform cannot expose the token, retain the safe live-owner
+    # behavior rather than stealing a lock from a process we cannot identify.
+    return current is None or current == token
 # ---------------------------------------------------------------------------
 # Host allowlist + local-host detection
 # ---------------------------------------------------------------------------
@@ -1426,7 +1461,14 @@ class LaneLock:
                     raise LaneLockError(f"lane lock held for {self.session_ref}: {self.lock_path}") from None
                 time.sleep(poll_seconds)
                 continue
-            payload = json.dumps({"pid": os.getpid(), "session_ref": self.session_ref, "at": datetime.now(UTC).isoformat()})
+            payload = json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "process_start_token": process_start_token(),
+                    "session_ref": self.session_ref,
+                    "at": datetime.now(UTC).isoformat(),
+                }
+            )
             os.write(fd, payload.encode("utf-8"))
             os.close(fd)
             self._acquired = True
@@ -1440,14 +1482,22 @@ class LaneLock:
             pid = int(data.get("pid", 0))
         except (OSError, ValueError, json.JSONDecodeError):
             return False
-        if _pid_alive(pid):
+        token = data.get("process_start_token") if isinstance(data.get("process_start_token"), str) else None
+        if owner_alive(pid, token):
             return False
         try:
             self.lock_path.unlink()
         except OSError:
             return False
         fd = os.open(str(self.lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        payload = json.dumps({"pid": os.getpid(), "session_ref": self.session_ref, "at": datetime.now(UTC).isoformat()})
+        payload = json.dumps(
+            {
+                "pid": os.getpid(),
+                "process_start_token": process_start_token(),
+                "session_ref": self.session_ref,
+                "at": datetime.now(UTC).isoformat(),
+            }
+        )
         os.write(fd, payload.encode("utf-8"))
         os.close(fd)
         return True

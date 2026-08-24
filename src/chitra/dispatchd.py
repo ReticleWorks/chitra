@@ -117,7 +117,8 @@ from .dispatch import (
     LaneLock,
     LaneLockError,
     TmuxRunner,
-    _pid_alive,
+    owner_alive,
+    process_start_token,
     dispatch_to_tmux,
     nudge_confirmation_marker,
     transcript_confirms_nudge,
@@ -418,7 +419,15 @@ def _reserve_owner_marker(in_flight_dir: Path, order_id: str) -> Path | None:
     owner_path = in_flight_dir / f".{order_id}.owner"
     try:
         with owner_path.open("x", encoding="utf-8") as handle:
-            handle.write(str(os.getpid()))
+            handle.write(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "process_start_token": process_start_token(),
+                    },
+                    sort_keys=True,
+                )
+            )
     except FileExistsError:
         return None
     return owner_path
@@ -445,10 +454,14 @@ def _reclaim_stale_in_flight(queue_dir: Path) -> None:
     for claimed in in_flight_dir.glob("*.json"):
         owner_path = in_flight_dir / f".{claimed.stem}.owner"
         try:
-            pid = int(owner_path.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
+            marker = owner_path.read_text(encoding="utf-8").strip()
+            parsed = json.loads(marker)
+            pid = int(parsed.get("pid", 0)) if isinstance(parsed, Mapping) else int(marker)
+            token = parsed.get("process_start_token") if isinstance(parsed, Mapping) and isinstance(parsed.get("process_start_token"), str) else None
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pid = 0  # no/corrupt owner marker -- treat as abandoned, safe to reclaim
-        if pid and _pid_alive(pid):
+            token = None
+        if pid and owner_alive(pid, token):
             continue
         logger.warning("dispatchd_reclaiming_stale_in_flight_order", path=str(claimed), owner_pid=pid)
         with contextlib.suppress(OSError):
@@ -465,10 +478,14 @@ def _reclaim_stale_in_flight(queue_dir: Path) -> None:
         if not order_id or (in_flight_dir / f"{order_id}.json").exists():
             continue
         try:
-            pid = int(owner_path.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
+            marker = owner_path.read_text(encoding="utf-8").strip()
+            parsed = json.loads(marker)
+            pid = int(parsed.get("pid", 0)) if isinstance(parsed, Mapping) else int(marker)
+            token = parsed.get("process_start_token") if isinstance(parsed, Mapping) and isinstance(parsed.get("process_start_token"), str) else None
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pid = 0
-        if pid and _pid_alive(pid):
+            token = None
+        if pid and owner_alive(pid, token):
             continue
         logger.warning("dispatchd_reclaiming_stale_reservation", path=str(owner_path), owner_pid=pid)
         with contextlib.suppress(OSError):
@@ -1815,12 +1832,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     joined_lane_root = args.joined_lane_root or state_dir()
-    joined_lane_reconciler = build_filesystem_reconciler(
-        joined_lane_root,
-        ledger_path=args.ledger_path or default_ledger_path(),
-        ledger_key_path=args.ledger_key_path or default_ledger_key_path(),
-        ownership_socket_path=args.ownership_socket_path or Path("/run/chitra-ownership/provider.sock"),
-    )
+    # RecoverySupervisor is the only production joined-lane mutator.  The
+    # legacy JoinedLaneReconciler remains available only through explicit
+    # test/compatibility injection into ``run_once``.
     recovery_supervisor = build_single_queue_recovery_supervisor(joined_lane_root)
     if args.once:
         results = run_once(
@@ -1838,7 +1852,6 @@ def main(argv: list[str] | None = None) -> int:
             denied_session_prefixes=denied_session_prefixes,
             lane_lock_retry_attempts=args.lane_lock_retry_attempts,
             joined_lane_root=joined_lane_root,
-            joined_lane_reconciler=joined_lane_reconciler,
             recovery_supervisor=recovery_supervisor,
         )
         print(json.dumps([r.model_dump(mode="json") for r in results], indent=2))
@@ -1859,7 +1872,6 @@ def main(argv: list[str] | None = None) -> int:
         denied_session_prefixes=denied_session_prefixes,
         lane_lock_retry_attempts=args.lane_lock_retry_attempts,
         joined_lane_root=joined_lane_root,
-        joined_lane_reconciler=joined_lane_reconciler,
         recovery_supervisor=recovery_supervisor,
     )
     return 0

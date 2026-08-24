@@ -911,10 +911,12 @@ def test_lanes_file_once_activates_packaged_tophand_before_queue_dispatch(
 
     persisted = store.require(lane.identifier)
     assert persisted.pending_operation is not None
-    assert sent_payloads == [
-        {
-            "operation": persisted.pending_operation.model_dump(mode="json"),
-            "text": sent_payloads[0]["text"],
-        }
-    ]
+    sent_operation = sent_payloads[0]["operation"]
+    assert isinstance(sent_operation, dict)
+    assert sent_operation["schema"] == "chitra.tophand.operation.v1"
+    assert sent_operation["operation_id"] == persisted.pending_operation.operation_id
+    assert sent_operation["payload_digest"] == persisted.pending_operation.payload_digest
+    assert sent_operation["attempted"] is True
+    assert "payload" not in sent_operation
+    assert sent_payloads[0]["text"]
     assert events == ["recovery-send", "queue-dispatch"]

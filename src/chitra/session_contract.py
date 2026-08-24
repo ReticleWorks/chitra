@@ -629,6 +629,9 @@ class ProviderIdentity(_ContractModel):
     # operation/thread handle.  Keep both values typed instead of relying on
     # a provider-specific string format.
     provider_session_id: Identifier | None = None
+    # Immutable OS/process identity.  Logical instance and generation values
+    # do not fence PID reuse on their own.
+    process_start_token: Identifier | None = None
     # Unknown restart-fence values stay null.  The contract never invents a
     # provider instance or generation from a durable handle alone.
     instance_id: Identifier | None = None
@@ -657,6 +660,7 @@ def _provider_identity_key(provider: ProviderIdentity) -> tuple[object, ...]:
         provider.handle,
         provider.instance_id,
         provider.generation,
+        provider.process_start_token,
         provider.parent_thread_ref,
         provider.project_ref,
         provider.profile_digest,
@@ -681,6 +685,12 @@ def validate_pending_operation(provider: ProviderIdentity, operation: PendingPro
         and provider.generation != operation.provider_generation
     ):
         raise ContractValidationError("pending operation provider generation does not match provider identity")
+    if (
+        provider.process_start_token is not None
+        and operation.process_start_token is not None
+        and provider.process_start_token != operation.process_start_token
+    ):
+        raise ContractValidationError("pending operation process start token does not match provider identity")
     if not provider.supports(operation.kind):
         raise ContractValidationError(f"provider does not support operation {operation.kind}")
     # Amp archive close is governed by Chitra's durable checkpoint reference;
@@ -704,6 +714,7 @@ class PendingProviderOperation(_ContractModel):
     # omit it and are migrated by recovery from the joined lane's
     # ``session_ref``.
     provider_session_id: Identifier | None = None
+    process_start_token: Identifier | None = None
     # Retain the exact provider payload so a lost reply can be retried after
     # the lane's current update changes. An empty value is accepted only for
     # legacy records written before this field existed.
@@ -712,6 +723,10 @@ class PendingProviderOperation(_ContractModel):
     provider_generation: int | None = Field(default=None, ge=1)
     created_at: Timestamp
     attempt: int = Field(default=1, ge=1)
+    # Chitra persists the intent first, then flips this bit in a second
+    # durable write immediately before provider I/O.  A restart must never
+    # post an operation marked attempted; it must reconcile it first.
+    attempted: bool = False
 
     @field_validator("created_at")
     @classmethod
@@ -723,6 +738,13 @@ class PendingProviderOperation(_ContractModel):
     def reject_bool_attempt(cls, value: int) -> int:
         if isinstance(value, bool):
             raise ValueError("attempt must be an integer")
+        return value
+
+    @field_validator("attempted")
+    @classmethod
+    def reject_non_boolean_attempted(cls, value: bool) -> bool:
+        if not isinstance(value, bool):
+            raise ValueError("attempted must be boolean")
         return value
 
     @field_validator("provider_generation")
@@ -749,6 +771,7 @@ class ProviderOperationResult(_ContractModel):
     # It is optional on legacy observations, but a new launch result must
     # carry it so Chitra can prove that the returned lane is the enrolled one.
     provider_session_id: Identifier | None = None
+    process_start_token: Identifier | None = None
     idempotency_key: Identifier
     payload_digest: Text
     provider_instance_id: Identifier | None = None
@@ -800,6 +823,7 @@ class ProviderOperationResult(_ContractModel):
                 ("provider_handle", self.provider_handle),
                 ("provider_instance_id", self.provider_instance_id),
                 ("provider_generation", self.provider_generation),
+                ("process_start_token", self.process_start_token),
             ):
                 if field in self.ownership and expected is not None and self.ownership[field] != expected:
                     raise ValueError(f"ownership {field} does not match provider result")
@@ -823,6 +847,9 @@ class ProviderOperationResult(_ContractModel):
                 raise ValueError("ownership observed_process.pid must be a positive integer")
             if observed_pid != provider_pid:
                 raise ValueError("ownership observed_process.pid must match provider_pid")
+            observed_token = observed_process.get("process_start_token")
+            if self.process_start_token is not None and observed_token != self.process_start_token:
+                raise ValueError("ownership observed_process.process_start_token must match process_start_token")
             if self.observed_process is not None and self.observed_process != observed_process:
                 raise ValueError("provider result observed_process does not match ownership")
         return self
@@ -854,6 +881,8 @@ def validate_operation_result(pending: PendingProviderOperation, result: Provide
         errors.append("provider instance changed")
     if pending.provider_generation != result.provider_generation:
         errors.append("provider generation changed")
+    if pending.process_start_token != result.process_start_token:
+        errors.append("process start token changed")
     pending_time = datetime.fromisoformat(pending.created_at.replace("Z", "+00:00"))
     result_time = datetime.fromisoformat(result.observed_at.replace("Z", "+00:00"))
     if result_time < pending_time:

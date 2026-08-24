@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import fcntl
+import json
+import multiprocessing
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -52,6 +55,7 @@ def _fact(goal: GoalRecord, **changes: object) -> OperatingFact:
         "provider_handle": f"tophand-{goal.lane_id}",
         "provider_instance_id": f"instance-{goal.lane_id}",
         "provider_generation": 1,
+        "process_start_token": f"boot-a:{goal.lane_id}",
         "capabilities": ["create_or_resume"],
     }
     value.update(changes)
@@ -78,9 +82,10 @@ def _ownership(operation: object, *, provider_pid: int = 4321, **changes: object
         "provider_handle": operation.provider_handle,
         "provider_instance_id": operation.provider_instance_id,
         "provider_generation": operation.provider_generation,
+        "process_start_token": operation.process_start_token,
         "provider_pid": provider_pid,
         "owner_pid": provider_pid,
-        "observed_process": {"pid": provider_pid},
+        "observed_process": {"pid": provider_pid, "process_start_token": operation.process_start_token},
         "authoritative": True,
         "status": "owned",
     }
@@ -120,9 +125,10 @@ class _LaunchProvider:
             payload_digest=operation.payload_digest,
             provider_instance_id=operation.provider_instance_id,
             provider_generation=operation.provider_generation,
+            process_start_token=operation.process_start_token,
             provider_pid=4321,
             owner_pid=4321,
-            observed_process={"pid": 4321},
+            observed_process={"pid": 4321, "process_start_token": operation.process_start_token},
             ownership=_ownership(operation, **self.ownership_changes),
             status="consumed",
             accepted=True,
@@ -130,6 +136,65 @@ class _LaunchProvider:
             observed_at=NOW.isoformat(),
             evidence="exact Tophand ownership receipt",
         )
+
+
+class _CrossProcessLaunchProvider:
+    """Provider surface whose call count is shared by separate supervisors."""
+
+    provider_name = ProviderName.TOPHAND
+    capabilities = ProviderCapabilities.from_supported(("create_or_resume",))
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def create_or_resume(self, request: CreateOrResumeRequest) -> ProviderOperationResult:
+        operation = request.operation
+        calls_path = self.root / "provider-calls.jsonl"
+        calls_path.parent.mkdir(parents=True, exist_ok=True)
+        with calls_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            handle.write(json.dumps({"operation_id": operation.operation_id}) + "\n")
+            handle.flush()
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        ownership = _ownership(
+            operation,
+            provider_pid=4321,
+            observed_process={"pid": 4321, "process_start_token": operation.process_start_token},
+        )
+        return ProviderOperationResult(
+            operation_id=operation.operation_id,
+            kind=operation.kind,
+            lane_id=operation.lane_id,
+            provider_handle=operation.provider_handle,
+            provider_session_id=operation.provider_session_id,
+            process_start_token=operation.process_start_token,
+            idempotency_key=operation.idempotency_key,
+            payload_digest=operation.payload_digest,
+            provider_instance_id=operation.provider_instance_id,
+            provider_generation=operation.provider_generation,
+            provider_pid=4321,
+            owner_pid=4321,
+            observed_process=ownership["observed_process"],
+            ownership=ownership,
+            status="consumed",
+            accepted=True,
+            consumed=True,
+            observed_at=NOW.isoformat(),
+            evidence="cross-process exact ownership receipt",
+        )
+
+
+def _run_cross_process_supervisor(root_text: str, facts: tuple[OperatingFact, ...]) -> None:
+    root = Path(root_text)
+    provider = _CrossProcessLaunchProvider(root)
+    supervisor = RecoverySupervisor(
+        root,
+        lambda _record: provider,
+        goal_root=root,
+        lane_id="lane-a",
+        operating_facts_reader=lambda: facts,
+    )
+    supervisor.run_once(now=NOW)
 
 
 def _supervisor(root: Path, provider: _LaunchProvider, facts: tuple[OperatingFact, ...]) -> RecoverySupervisor:
@@ -256,6 +321,24 @@ def test_two_supervisors_serialize_one_initial_create(tmp_path: Path) -> None:
     assert len(decisions) == 2
     assert len(provider.root_creates) == 1
     assert provider.calls.count(next(iter(provider.root_creates))) == 1
+    assert JoinedLaneStore(tmp_path).require(goal.lane_id).pending_operation is None
+
+
+def test_separate_supervisor_processes_create_one_initial_operation(tmp_path: Path) -> None:
+    goal = _goal(tmp_path)
+    facts = (_fact(goal),)
+    context = multiprocessing.get_context("fork")
+    processes = [
+        context.Process(target=_run_cross_process_supervisor, args=(str(tmp_path), facts))
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+        assert process.exitcode == 0
+    calls = (tmp_path / "provider-calls.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 1
     assert JoinedLaneStore(tmp_path).require(goal.lane_id).pending_operation is None
 
 

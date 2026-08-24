@@ -1,0 +1,10 @@
+{
+  "schema": "chitra.tophand.operation.v1",
+  "kind": "create_or_resume",
+  "request": {
+    "context_ref": null,
+    "provider_session_id": "tophand:lane-a:1",
+    "session_ref": "tophand:lane-a:1"
+  },
+  "payload_digest": "83459d9dc4fd3252368ec77a8071c023112973680fc5ffd1f695ef2fbc83b544"
+}

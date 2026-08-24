@@ -21,6 +21,8 @@ from chitra.dispatch import (
     DispatchStatus,
     LaneLock,
     LaneLockError,
+    owner_alive,
+    process_start_token,
     _detect_tui_backend,
     _remote_transcript_grep_command,
     cancel_copy_mode,
@@ -537,6 +539,22 @@ def test_lane_lock_reclaims_stale_lock_from_dead_pid(tmp_path: Path) -> None:
     lock = LaneLock("examplehost:f3:0.0", lock_dir=lock_dir)
     assert lock.acquire(blocking=False) is True
     lock.release()
+
+
+def test_owner_alive_fences_pid_reuse_with_process_start_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("chitra.dispatch._pid_alive", lambda _pid: True)
+    monkeypatch.setattr("chitra.dispatch.process_start_token", lambda _pid=None: "boot:new")
+
+    assert owner_alive(1234, "boot:new") is True
+    assert owner_alive(1234, "boot:old") is False
+    # A missing token retains the legacy live-owner rule for old markers.
+    assert owner_alive(1234, None) is True
+
+
+def test_process_start_token_is_stable_for_current_process() -> None:
+    token = process_start_token()
+    if token is not None:
+        assert token == process_start_token(os.getpid())
 
 
 def test_lane_lock_context_manager_releases_on_exit(tmp_path: Path) -> None:

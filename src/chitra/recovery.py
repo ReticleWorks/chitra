@@ -60,6 +60,7 @@ from .session_contract import (
     validate_operation_result,
 )
 from .state_paths import state_dir
+from .tophand_wire import request_digest
 
 logger = structlog.get_logger(__name__)
 SCHEMA = "chitra.pause_recovery.v1"
@@ -556,6 +557,15 @@ class RecoveryEngine:
         )
         return self._decision(cast(RecoveryAction, record.recovery.attempted_remedy), candidate, reason, operation)
 
+    def _mark_attempted(self, record: JoinedLaneRecord, *, persist: bool) -> JoinedLaneRecord:
+        """Persist the provider-attempt fence before invoking any transport."""
+
+        pending = record.pending_operation
+        if pending is None or pending.attempted:
+            return record
+        marked = pending.model_copy(update={"attempted": True})
+        return self._persist(record.model_copy(update={"pending_operation": marked}), persist=persist)
+
     def _named_wake(
         self,
         record: JoinedLaneRecord,
@@ -745,21 +755,21 @@ class RecoveryEngine:
 
     @staticmethod
     def _payload_digest(record: JoinedLaneRecord, action: str, payload: str, sequence: int) -> str:
-        return _digest(
-            {
-                "lane_id": record.lane_id,
-                "goal_id": record.goal_id,
-                "goal_version": record.goal_version,
+        del sequence
+        if action == "checkpoint":
+            kind = "checkpoint"
+            request = {"label": payload}
+        elif action == "relaunch":
+            kind = "create_or_resume"
+            request = {
                 "session_ref": record.session_ref,
-                "cycle_id": record.recovery.cycle_id,
-                "action": action,
-                "provider_handle": record.provider.handle,
-                "provider_instance_id": record.provider.instance_id,
-                "provider_generation": record.provider.generation,
-                "event_sequence": sequence,
-                "payload": payload,
+                "provider_session_id": record.provider.provider_session_id or record.session_ref,
+                "context_ref": record.checkpoint_reference,
             }
-        )
+        else:
+            kind = "send"
+            request = {"text": payload}
+        return request_digest(kind, request)
 
     def _operation(self, record: JoinedLaneRecord, action: str, payload: str, current: datetime) -> PendingProviderOperation:
         cycle_id = record.recovery.cycle_id
@@ -773,9 +783,10 @@ class RecoveryEngine:
             kind="checkpoint" if action == "checkpoint" else "create_or_resume" if action == "relaunch" else "send",
             lane_id=record.lane_id,
             provider_handle=record.provider.handle,
+            provider_session_id=record.provider.provider_session_id or record.session_ref,
+            process_start_token=record.provider.process_start_token,
             idempotency_key=f"{operation_id}-idem",
             payload_digest=digest,
-            provider_session_id=record.provider.provider_session_id or record.session_ref,
             payload=payload,
             provider_instance_id=record.provider.instance_id,
             provider_generation=record.provider.generation,
@@ -832,6 +843,7 @@ class RecoveryEngine:
             lane_id=operation.lane_id,
             provider_handle=operation.provider_handle,
             provider_session_id=operation.provider_session_id,
+            process_start_token=operation.process_start_token,
             idempotency_key=operation.idempotency_key,
             payload_digest=operation.payload_digest,
             provider_instance_id=operation.provider_instance_id,
@@ -887,8 +899,19 @@ class RecoveryEngine:
         if not persist or self.store_for(record.lane_id) is None:
             raise RecoveryStateError("provider recovery actions require durable joined-lane storage")
         pending_record, operation = self._begin(record, action, payload, current, persist)
-        result = self._invoke(pending_record, operation, action, payload, current)
-        observed = self._persist(pending_record.model_copy(update={"last_operation_result": result}), persist=persist)
+        # The intent and the fact that it may have reached the provider are
+        # separate durable states.  Mark attempted before any provider I/O so
+        # a crash after the send cannot be mistaken for a never-started intent.
+        attempted = operation.model_copy(update={"attempted": True})
+        pending_record = self._persist(
+            pending_record.model_copy(update={"pending_operation": attempted}),
+            persist=persist,
+        )
+        result = self._invoke(pending_record, attempted, action, payload, current)
+        observed = self._persist(
+            pending_record.model_copy(update={"last_operation_result": result}),
+            persist=persist,
+        )
         if result.status == "consumed":
             return self._finish_consumed(observed, current, facts, persist)
         return self._pending(observed, current, f"{action} is not backed by exact consumption evidence", persist)
@@ -992,6 +1015,7 @@ class RecoveryEngine:
             ("provider_handle", operation.provider_handle),
             ("provider_instance_id", operation.provider_instance_id),
             ("provider_generation", operation.provider_generation),
+            ("process_start_token", operation.process_start_token),
         )
         for field, expected in expected_fields:
             if ownership.get(field) != expected:
@@ -1002,6 +1026,14 @@ class RecoveryEngine:
         if ownership.get("provider_session_id") not in (None, record.session_ref):
             return "initial Tophand ownership provider_session_id does not match the enrolled session"
 
+        expected_process_token = record.provider.process_start_token
+        if not isinstance(expected_process_token, str) or not expected_process_token:
+            return "initial Tophand enrolled identity lacks a process start token"
+        if result.process_start_token != expected_process_token:
+            return "initial Tophand result process start token does not match the enrolled process"
+        if ownership.get("process_start_token") != expected_process_token:
+            return "initial Tophand ownership process start token does not match the enrolled process"
+
         provider_pid = result.provider_pid
         owner_pid = result.owner_pid
         if isinstance(provider_pid, bool) or not isinstance(provider_pid, int) or provider_pid < 1:
@@ -1011,7 +1043,11 @@ class RecoveryEngine:
         if ownership.get("provider_pid") != provider_pid or ownership.get("owner_pid") != owner_pid:
             return "initial Tophand ownership PID does not match the result"
         observed_process = ownership.get("observed_process")
-        if not isinstance(observed_process, Mapping) or observed_process.get("pid") != provider_pid:
+        if (
+            not isinstance(observed_process, Mapping)
+            or observed_process.get("pid") != provider_pid
+            or observed_process.get("process_start_token") != expected_process_token
+        ):
             return "initial Tophand ownership lacks matching observed process evidence"
         if result.observed_process is not None and dict(result.observed_process) != dict(observed_process):
             return "initial Tophand observed process changed between result and ownership"
@@ -1227,6 +1263,7 @@ class RecoveryEngine:
                 lane_id=pending.lane_id,
                 provider_handle=pending.provider_handle,
                 provider_session_id=expected_session_id,
+                process_start_token=pending.process_start_token,
                 idempotency_key=pending.idempotency_key,
                 payload_digest=pending.payload_digest,
                 provider_instance_id=pending.provider_instance_id,
@@ -1259,6 +1296,9 @@ class RecoveryEngine:
             if pending is None:
                 raise RecoveryStateError("initial Tophand create is missing its pending operation")
             payload = pending.payload or record.recovery.pending_payload or ""
+            record = self._mark_attempted(record, persist=persist)
+            pending = record.pending_operation
+            assert pending is not None
             retried = self._invoke(record, pending, "relaunch", payload, current)
             recorded = self._persist(record.model_copy(update={"last_operation_result": retried}), persist=persist)
             return self._finish_initial_create(recorded, current, facts, persist)
@@ -1300,6 +1340,9 @@ class RecoveryEngine:
                 and sequence is not None
                 and pending.payload_digest == self._payload_digest(record, action, payload, sequence)
             ):
+                record = self._mark_attempted(record, persist=persist)
+                pending = record.pending_operation
+                assert pending is not None
                 retried = self._invoke(record, pending, action, payload, current)
                 record = self._persist(record.model_copy(update={"last_operation_result": retried}), persist=persist)
                 if retried.status == "consumed":

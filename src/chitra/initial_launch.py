@@ -25,6 +25,7 @@ from .session_contract import (
     ProviderIdentity,
     RecoveryState,
 )
+from .tophand_wire import request_digest
 
 TOPHAND_IDENTITY_FACT = "fleet.provider-capabilities.tophand"
 
@@ -141,6 +142,7 @@ def top_hand_identity_from_facts(
         raise InitialLaunchError("Tophand identity fact session does not match the enrolled physical session")
     handle = _required_text(payload, "provider_handle", "handle")
     instance_id = _required_text(payload, "provider_instance_id", "instance_id")
+    process_start_token = _required_text(payload, "process_start_token", "process_start", "start_token")
     generation = _required_generation(payload)
     provider_version = payload.get("provider_version", "")
     if not isinstance(provider_version, str):
@@ -150,6 +152,7 @@ def top_hand_identity_from_facts(
         handle=handle,
         provider_session_id=provider_session_id,
         instance_id=instance_id,
+        process_start_token=process_start_token,
         generation=generation,
         capabilities=_capabilities(payload),
         parent_thread_ref=payload.get("parent_thread_ref") if isinstance(payload.get("parent_thread_ref"), str) else None,
@@ -181,25 +184,28 @@ def top_hand_create_operation(
         "provider_session_id": identity.provider_session_id,
         "provider_instance_id": identity.instance_id,
         "provider_generation": identity.generation,
+        "process_start_token": identity.process_start_token,
     }
     operation_id = "bootstrap-" + hashlib.sha256(
         json.dumps(seed, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:32]
-    payload = json.dumps(
-        {"goal_id": goal.goal_id, "goal_version": goal.goal_version, "session_ref": goal.session_ref},
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    payload_fields = {
+        "session_ref": goal.session_ref,
+        "provider_session_id": identity.provider_session_id,
+        "context_ref": None,
+    }
+    payload = json.dumps(payload_fields, sort_keys=True, separators=(",", ":"))
     return PendingProviderOperation(
         operation_id=operation_id,
         kind="create_or_resume",
         lane_id=goal.lane_id,
         provider_handle=identity.handle,
         provider_session_id=identity.provider_session_id,
+        process_start_token=identity.process_start_token,
         provider_instance_id=identity.instance_id,
         provider_generation=identity.generation,
         idempotency_key=operation_id + "-idem",
-        payload_digest=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        payload_digest=request_digest("create_or_resume", payload_fields),
         payload=payload,
         created_at=created_at,
     )

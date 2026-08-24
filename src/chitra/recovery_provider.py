@@ -58,6 +58,7 @@ from .session_contract import (
     ProviderIdentity,
     validate_update,
 )
+from .tophand_wire import TOPHAND_OPERATION_SCHEMA
 from .usage_policy import launch_policy_problem
 
 try:
@@ -192,8 +193,33 @@ def _provider_state(value: object) -> ProviderState:
 
 
 def _operation_dict(operation: object) -> dict[str, object]:
+    """Serialize the generic Chitra operation used by non-Tophand adapters."""
+
     if isinstance(operation, PendingProviderOperation):
         return cast(dict[str, object], operation.model_dump(mode="json"))
+    if isinstance(operation, Mapping):
+        return {str(key): value for key, value in operation.items()}
+    raise TypeError("provider operation must be a canonical mapping")
+
+
+def _tophand_operation_dict(operation: object) -> dict[str, object]:
+    if isinstance(operation, PendingProviderOperation):
+        return {
+            "schema": TOPHAND_OPERATION_SCHEMA,
+            "operation_id": operation.operation_id,
+            "kind": operation.kind,
+            "lane_id": operation.lane_id,
+            "provider_handle": operation.provider_handle,
+            "provider_session_id": operation.provider_session_id,
+            "idempotency_key": operation.idempotency_key,
+            "payload_digest": operation.payload_digest,
+            "provider_instance_id": operation.provider_instance_id,
+            "provider_generation": operation.provider_generation,
+            "process_start_token": operation.process_start_token,
+            "created_at": operation.created_at,
+            "attempt": operation.attempt,
+            "attempted": operation.attempted,
+        }
     if isinstance(operation, Mapping):
         return {str(key): value for key, value in operation.items()}
     raise TypeError("provider operation must be a canonical mapping")
@@ -233,6 +259,7 @@ def _provider_result(
         "payload_digest",
         "provider_instance_id",
         "provider_generation",
+        "process_start_token",
     ):
         observed = raw.get(field)
         expected = getattr(operation, field)
@@ -269,6 +296,7 @@ def _provider_result(
             ("provider_handle", operation.provider_handle),
             ("provider_instance_id", operation.provider_instance_id),
             ("provider_generation", operation.provider_generation),
+            ("process_start_token", operation.process_start_token),
         ):
             if field in ownership and ownership[field] != expected:
                 raise ValueError(f"{provider_label} provider ownership {field} changed")
@@ -286,12 +314,17 @@ def _provider_result(
         provider_session_id=(
             raw.get("provider_session_id")
             if isinstance(raw.get("provider_session_id"), str)
-            else None
+            else operation.provider_session_id
         ),
         idempotency_key=operation.idempotency_key,
         payload_digest=operation.payload_digest,
         provider_instance_id=operation.provider_instance_id,
         provider_generation=operation.provider_generation,
+        process_start_token=(
+            raw.get("process_start_token")
+            if isinstance(raw.get("process_start_token"), str)
+            else operation.process_start_token
+        ),
         provider_pid=raw.get("provider_pid") if isinstance(raw.get("provider_pid"), int) and not isinstance(raw.get("provider_pid"), bool) else None,
         owner_pid=raw.get("owner_pid") if isinstance(raw.get("owner_pid"), int) and not isinstance(raw.get("owner_pid"), bool) else None,
         observed_process=dict(observed_process) if isinstance(observed_process, Mapping) else None,
@@ -320,6 +353,7 @@ def _unknown_provider_result(
         payload_digest=operation.payload_digest,
         provider_instance_id=operation.provider_instance_id,
         provider_generation=operation.provider_generation,
+        process_start_token=operation.process_start_token,
         status="unknown",
         accepted=None,
         consumed=None,
@@ -342,9 +376,11 @@ class _PackagedTophandProvider:
         adapter: object,
         *,
         result_sink: RecoverySink,
+        reconcile_before_call: bool = False,
     ) -> None:
         self._adapter = adapter
         self._result_sink = result_sink
+        self._reconcile_before_call = reconcile_before_call
 
     @property
     def provider_name(self) -> ProviderName:
@@ -377,7 +413,17 @@ class _PackagedTophandProvider:
         request: object,
         operation: PendingProviderOperation,
     ) -> ProviderOperationResult:
-        payload: dict[str, object] = {"operation": _operation_dict(operation)}
+        if self._reconcile_before_call and operation.attempted:
+            reconcile = getattr(self._adapter, "reconcile", None)
+            if callable(reconcile):
+                recovered = reconcile(_tophand_operation_dict(operation))
+                if isinstance(recovered, Mapping):
+                    candidate = recovered.get(operation.operation_id)
+                    if candidate is not None:
+                        result = _provider_result(candidate, operation)
+                        self._result_sink(candidate)
+                        return result
+        payload: dict[str, object] = {"operation": _tophand_operation_dict(operation)}
         if isinstance(request, SendRequest):
             payload["text"] = request.text
         elif isinstance(request, CheckpointRequest):
@@ -1019,7 +1065,7 @@ def _canonical_tophand_factory(
     if identity.instance_id is None or identity.generation is None:
         return None
     del operating_facts
-    pending = () if record.pending_operation is None else (record.pending_operation.model_dump(mode="json"),)
+    pending = () if record.pending_operation is None else (_tophand_operation_dict(record.pending_operation),)
     completed = () if record.last_operation_result is None else (record.last_operation_result.model_dump(mode="json"),)
     journal = EventJournal(state_root, lane.identifier)
     seen_event_ids = tuple(event.event_id for event in journal.load())
@@ -1051,7 +1097,11 @@ def _canonical_tophand_factory(
         return None
     if adapter is None:
         return None
-    provider = _PackagedTophandProvider(adapter, result_sink=result_sink)
+    provider = _PackagedTophandProvider(
+        adapter,
+        result_sink=result_sink,
+        reconcile_before_call=(record.pending_operation is not None and record.pending_operation.attempted),
+    )
     return provider if isinstance(provider, Provider) else None
 
 
@@ -1227,11 +1277,13 @@ def _canonical_recovery_bindings(
                 lane_id=prior.lane_id,
                 provider_handle=prior.provider_handle,
                 provider_session_id=current.provider.provider_session_id or current.session_ref,
+                process_start_token=current.provider.process_start_token,
                 idempotency_key=prior.idempotency_key,
                 payload_digest=prior.payload_digest,
                 provider_instance_id=prior.provider_instance_id,
                 provider_generation=prior.provider_generation,
                 created_at=reference.created_at,
+                attempted=True,
             )
         elif operation.operation_id != operation_id:
             raise ValueError("provider result has no matching Chitra pending operation")

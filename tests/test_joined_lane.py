@@ -714,8 +714,11 @@ def test_dispatchd_requeues_matching_joined_lane_defer_when_barrier_clears(tmp_p
 
 def test_main_wires_startup_reconciler_before_run_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
-    sentinel = object()
-    monkeypatch.setattr(dispatchd, "build_filesystem_reconciler", lambda root, **kwargs: sentinel)
+
+    def legacy_builder_must_not_run(*args: object, **kwargs: object) -> object:
+        raise AssertionError("the production entry point must not construct the legacy reconciler")
+
+    monkeypatch.setattr(dispatchd, "build_filesystem_reconciler", legacy_builder_must_not_run)
 
     def fake_run_once(queue_dir: Path, **kwargs: object) -> list[object]:
         captured.update(kwargs)
@@ -723,7 +726,7 @@ def test_main_wires_startup_reconciler_before_run_once(tmp_path: Path, monkeypat
 
     monkeypatch.setattr(dispatchd, "run_once", fake_run_once)
     assert dispatchd.main(["--once", "--queue-dir", str(tmp_path / "queue")]) == 0
-    assert captured["joined_lane_reconciler"] is sentinel
+    assert "joined_lane_reconciler" not in captured
 
 
 def test_lanes_file_entrypoint_uses_recovery_supervisor_as_mutation_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
