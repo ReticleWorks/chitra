@@ -374,14 +374,10 @@ def _provider_result(
         idempotency_key=operation.idempotency_key,
         payload_digest=operation.payload_digest,
         provider_session_id=raw_provider_session_id if isinstance(raw_provider_session_id, str) else None,
-        provider_instance_id=(
-            raw_instance_id if isinstance(raw_instance_id, str) else operation.provider_instance_id
-        ),
-        provider_generation=operation.provider_generation,
+        provider_instance_id=raw_instance_id if isinstance(raw_instance_id, str) else None,
+        provider_generation=raw_generation if isinstance(raw_generation, int) and not isinstance(raw_generation, bool) else None,
         process_start_token=(
-            raw.get("process_start_token")
-            if isinstance(raw.get("process_start_token"), str)
-            else operation.process_start_token
+            raw.get("process_start_token") if isinstance(raw.get("process_start_token"), str) else None
         ),
         provider_pid=raw.get("provider_pid") if isinstance(raw.get("provider_pid"), int) and not isinstance(raw.get("provider_pid"), bool) else None,
         owner_pid=raw.get("owner_pid") if isinstance(raw.get("owner_pid"), int) and not isinstance(raw.get("owner_pid"), bool) else None,

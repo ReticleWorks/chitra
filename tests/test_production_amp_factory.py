@@ -439,6 +439,29 @@ def test_packaged_result_never_fabricates_physical_identity_or_observation_time(
         _provider_result(raw, operation, provider_label="Amp")
 
 
+def test_unknown_packaged_result_preserves_missing_raw_identity() -> None:
+    operation = _operation("send")
+    raw = {
+        "operation_id": operation.operation_id,
+        "kind": operation.kind,
+        "lane_id": operation.lane_id,
+        "provider_handle": operation.provider_handle,
+        "idempotency_key": operation.idempotency_key,
+        "payload_digest": operation.payload_digest,
+        "status": "lost-response",
+        "accepted": None,
+        "consumed": None,
+        "observed_at": NOW.isoformat(),
+        "evidence": "provider response was lost before identity was observed",
+    }
+
+    result = _provider_result(raw, operation, provider_label="Amp")
+
+    assert result.provider_instance_id is None
+    assert result.provider_generation is None
+    assert result.process_start_token is None
+
+
 def test_amp_close_does_not_fabricate_provider_observation_time() -> None:
     operation = _operation("close")
     raw = {

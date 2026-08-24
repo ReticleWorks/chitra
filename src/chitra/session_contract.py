@@ -1000,11 +1000,11 @@ def validate_operation_result(pending: PendingProviderOperation, result: Provide
         errors.append("payload digest changed")
     if result.provider_session_id is not None and pending.provider_session_id != result.provider_session_id:
         errors.append("provider session changed")
-    if pending.provider_instance_id != result.provider_instance_id:
+    if result.provider_instance_id is not None and pending.provider_instance_id != result.provider_instance_id:
         errors.append("provider instance changed")
-    if pending.provider_generation != result.provider_generation:
+    if result.provider_generation is not None and pending.provider_generation != result.provider_generation:
         errors.append("provider generation changed")
-    if pending.process_start_token != result.process_start_token:
+    if result.process_start_token is not None and pending.process_start_token != result.process_start_token:
         errors.append("process start token changed")
     pending_time = datetime.fromisoformat(pending.created_at.replace("Z", "+00:00"))
     result_time = datetime.fromisoformat(result.observed_at.replace("Z", "+00:00"))
