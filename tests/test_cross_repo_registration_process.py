@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -46,7 +47,7 @@ def _adapter_cli(tmp_path: Path) -> Path:
     )
 
 
-def _binding() -> dict[str, object]:
+def _binding(*, goal_id: str = "goal-a") -> dict[str, object]:
     return {
         "schema": "chitra.tophand.operation.v1",
         "operation_id": "create-1",
@@ -62,12 +63,14 @@ def _binding() -> dict[str, object]:
         "created_at": "2026-08-24T12:00:00+00:00",
         "attempt": 1,
         "attempted": False,
-        "goal_id": "goal-a",
+        "goal_id": goal_id,
         "session_ref": SESSION_REF,
     }
 
 
-def _reconcile_script(path: Path, *, adapter_cli: Path, state_root: Path, count_path: Path) -> Path:
+def _reconcile_script(
+    path: Path, *, adapter_cli: Path, state_root: Path, count_path: Path, goal_id: str
+) -> Path:
     return _executable(
         path,
         textwrap.dedent(
@@ -84,14 +87,17 @@ def _reconcile_script(path: Path, *, adapter_cli: Path, state_root: Path, count_
             sys.modules[spec.name] = module
             spec.loader.exec_module(module)
             module.REPO = fleet
+            module.LANE_REGISTRATION_INTERVAL_SECONDS = 10
             module.LANE_STATE_ROOT = Path({str(state_root)!r})
             module.BOOMTOWN_LANE_STATE_ROOT = Path({str(state_root)!r})
             module.LANE_RUNTIME_ROOT = Path({str(state_root)!r}) / "run"
             module.LANE_REGISTRATION_COMMAND = Path({str(adapter_cli)!r})
             module.os.uname = lambda: type("U", (), {{"nodename": "tophand"}})()
             paths = module._lane_paths({LANE!r})
-            binding = json.loads({json.dumps(_binding())!r})
+            binding = json.loads({json.dumps(_binding(goal_id=goal_id))!r})
             authority = {{
+                "host": "tophand",
+                "account": "ubuntu",
                 "facts_revision": "facts-a",
                 "target_uuid": "target-a",
                 "route": "chitra-dispatch-grant",
@@ -116,6 +122,38 @@ def _reconcile_script(path: Path, *, adapter_cli: Path, state_root: Path, count_
                 now=datetime.now(UTC),
             )
             print(json.dumps(result, sort_keys=True))
+            """
+        ),
+    )
+
+
+def _enroll_script(path: Path, *, chitra_state: Path) -> Path:
+    return _executable(
+        path,
+        textwrap.dedent(
+            f"""
+            import sys
+            from datetime import UTC, datetime
+            from pathlib import Path
+
+            chitra_root = Path({str(ROOT)!r})
+            sys.path[:0] = [str(chitra_root / "src"), str(chitra_root / "tests")]
+            from chitra.goals import GoalRecord, upsert_goal
+            from _goal_fixtures import enrollment_fields
+
+            now_text = datetime.now(UTC).isoformat()
+            stored = upsert_goal(
+                Path({str(chitra_state)!r}),
+                GoalRecord(
+                    session_ref={SESSION_REF!r}, lane_id={LANE!r},
+                    intent="Run the enrolled lane goal safely", goal="Run the enrolled lane goal safely",
+                    done_when="The enrolled lane records a successful run",
+                    source="separate-process-contract", status="working",
+                    enrolled_at=now_text, **enrollment_fields("The enrolled lane records a successful run"),
+                    now="Run the lane", last_verified="", created_at=now_text, updated_at=now_text,
+                ),
+            )
+            print(stored.goal_id)
             """
         ),
     )
@@ -181,6 +219,7 @@ def _chitra_script(
             import chitra.recovery_provider as recovery_provider
             from chitra.goals import GoalRecord, load_goals, upsert_goal
             from chitra.provider_protocol import ProviderName
+            from chitra.operating_facts import OperatingFactsProvenance, OperatingFactsSnapshot
             from chitra.session_contract import OperatingFact, ProviderCapabilities, ProviderOperationResult
             from _goal_fixtures import enrollment_fields
             from tools.support.chitra_adapter.tophand_adapter import TophandCommandTransport
@@ -215,8 +254,50 @@ def _chitra_script(
                     observed_at=now.isoformat(), freshness="current",
                     fresh_until=(now + timedelta(minutes=5)).isoformat(), within_authority=True,
                 ),
+                OperatingFact(
+                    name="fleet.credential-readiness",
+                    value={{"ready": True}},
+                    state="known", source="fleet", revision="facts-a",
+                    observed_at=now.isoformat(), freshness="current",
+                    fresh_until=(now + timedelta(minutes=5)).isoformat(), within_authority=True,
+                ),
+                OperatingFact(
+                    name="fleet.access",
+                    value={{"dispatch": True}},
+                    state="known", source="fleet", revision="facts-a",
+                    observed_at=now.isoformat(), freshness="current",
+                    fresh_until=(now + timedelta(minutes=5)).isoformat(), within_authority=True,
+                ),
+                OperatingFact(
+                    name="fleet.capacity",
+                    value={{"available": True}},
+                    state="known", source="fleet", revision="facts-a",
+                    observed_at=now.isoformat(), freshness="current",
+                    fresh_until=(now + timedelta(minutes=5)).isoformat(), within_authority=True,
+                ),
+                OperatingFact(
+                    name="fleet.versions",
+                    value={{"chitra": "test"}},
+                    state="known", source="fleet", revision="facts-a",
+                    observed_at=now.isoformat(), freshness="current",
+                    fresh_until=(now + timedelta(minutes=5)).isoformat(), within_authority=True,
+                ),
             )
-            dispatchd.read_operating_facts = lambda _sources=None: SimpleNamespace(facts=facts)
+            facts_snapshot = OperatingFactsSnapshot(observed_at=now.isoformat(), facts=facts)
+            facts_snapshot = OperatingFactsSnapshot(
+                observed_at=facts_snapshot.observed_at,
+                facts=facts_snapshot.facts,
+                provenance=OperatingFactsProvenance(
+                    source_path="/tmp/synthetic-operating-facts.json",
+                    source_sha256="a" * 64,
+                    source_mode=0o600,
+                    snapshot_sha256=facts_snapshot.content_digest,
+                    snapshot_mode=0o600,
+                    readback_verified=True,
+                    readback_at=now.isoformat(),
+                ),
+            )
+            dispatchd.read_operating_facts = lambda _sources=None: facts_snapshot
 
             class RegistrationTransport:
                 @classmethod
@@ -281,7 +362,7 @@ def _chitra_script(
                 pending_sink=noop, cursor_sink=noop, result_sink=noop, event_sink=noop,
                 checkpoint_verifier=lambda *_args: True,
                 cancel_verifier=lambda *_args: True,
-                facts_reader=lambda _record: facts,
+                facts_reader=lambda _record: facts_snapshot.facts,
             )
             print(json.dumps({{"lanes": sorted(result), "provider_create_count": Path({str(count_path)!r}).with_name("provider-create-count").read_text() if Path({str(count_path)!r}).with_name("provider-create-count").exists() else "0"}}))
             """
@@ -298,11 +379,40 @@ def test_separate_process_dispatch_registration_restart_heartbeat_and_expiry(tmp
     adapter_cli = _adapter_cli(tmp_path)
     fleet_state = tmp_path / "fleet-state"
     start_count = tmp_path / "fleet-start-count"
+    lanes_file = tmp_path / "lanes.yaml"
+    chitra_state = tmp_path / "chitra-state"
+    lanes_file.write_text(
+        "lanes:\n"
+        f"  - id: {LANE}\n"
+        "    account: chitra\n"
+        "    uid: 1000\n"
+        f"    home: {tmp_path / 'home'}\n"
+        f"    workdir: {tmp_path}\n"
+        f"    config_dir: {tmp_path / 'config'}\n"
+        f"    state_dir: {chitra_state}\n"
+        f"    tmux_socket: {tmp_path / 'tmux.sock'}\n"
+        f"    tmux_session: {LANE}\n"
+        "    credentials:\n"
+        f"      claude_credentials: {tmp_path / 'credentials.json'}\n"
+        f"      ssh_dispatch_key: {tmp_path / 'id_ed25519'}\n"
+        "    enabled: true\n"
+        "    target_host: tophand\n"
+        "    target_account: ubuntu\n",
+        encoding="utf-8",
+    )
+    enrolled = _run([
+        sys.executable,
+        str(_enroll_script(tmp_path / "enroll.py", chitra_state=chitra_state)),
+    ])
+    assert enrolled.returncode == 0, enrolled.stderr + enrolled.stdout
+    goal_id = enrolled.stdout.strip().splitlines()[-1]
+    assert goal_id.startswith("goal-")
     reconcile = _reconcile_script(
         tmp_path / "reconcile.py",
         adapter_cli=adapter_cli,
         state_root=fleet_state,
         count_path=start_count,
+        goal_id=goal_id,
     )
     for _ in range(2):
         completed = _run([sys.executable, str(reconcile)])
@@ -331,27 +441,6 @@ def test_separate_process_dispatch_registration_restart_heartbeat_and_expiry(tmp
     assert verified.returncode == 0, verified.stderr + verified.stdout
     assert json.loads(verified.stdout)["registration"]["registration_sha256"]
 
-    lanes_file = tmp_path / "lanes.yaml"
-    chitra_state = tmp_path / "chitra-state"
-    lanes_file.write_text(
-        "lanes:\n"
-        f"  - id: {LANE}\n"
-        "    account: chitra\n"
-        "    uid: 1000\n"
-        f"    home: {tmp_path / 'home'}\n"
-        f"    workdir: {tmp_path}\n"
-        f"    config_dir: {tmp_path / 'config'}\n"
-        f"    state_dir: {chitra_state}\n"
-        f"    tmux_socket: {tmp_path / 'tmux.sock'}\n"
-        f"    tmux_session: {LANE}\n"
-        "    credentials:\n"
-        f"      claude_credentials: {tmp_path / 'credentials.json'}\n"
-        f"      ssh_dispatch_key: {tmp_path / 'id_ed25519'}\n"
-        "    enabled: true\n"
-        "    target_host: tophand\n"
-        "    target_account: ubuntu\n",
-        encoding="utf-8",
-    )
     chitra_child = _chitra_script(
         tmp_path / "chitra-dispatch.py",
         lanes_file=lanes_file,
@@ -379,12 +468,13 @@ def test_separate_process_dispatch_registration_restart_heartbeat_and_expiry(tmp
         "--heartbeat", "--process", str(process_input), "--output", str(registration_path),
     ])
     assert heartbeat.returncode == 0, heartbeat.stderr + heartbeat.stdout
+    time.sleep(11)
     expire = _run([
         sys.executable, "-c",
-        "from datetime import UTC, datetime, timedelta; "
+        "from datetime import UTC; "
         f"import sys; sys.path.insert(0, {str(ADAPTER_ROOT / 'tools/support/chitra_adapter')!r}); "
         "import lane_registration as r; "
-        f"r.expire(__import__('pathlib').Path({str(registration_path)!r}), now=datetime.now(UTC)+timedelta(minutes=2))",
+        f"r.expire(__import__('pathlib').Path({str(registration_path)!r}))",
     ])
     assert expire.returncode == 0, expire.stderr + expire.stdout
     expired = json.loads(registration_path.read_text())

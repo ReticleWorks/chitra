@@ -230,7 +230,7 @@ def _current_fact(facts: Sequence[OperatingFact], name: str, *, now: datetime) -
 
 def _tophand_registration_facts(
     lane: LaneSpec, facts: Sequence[OperatingFact], *, now: datetime
-) -> tuple[ProviderCapabilities, str, str, str | None]:
+) -> tuple[ProviderCapabilities, str, str, str | None, str]:
     """Resolve only current routing and capability facts.
 
     Physical provider identity comes from the target-owned registration below.
@@ -291,7 +291,14 @@ def _tophand_registration_facts(
         raise ValueError("lane target account does not match current facts")
     fact_revision = capability_candidates[0].revision
     revision = str(fact_revision) if isinstance(fact_revision, (str, int)) else None
-    return capabilities, host, account, revision
+    provider_version = top_value.get("provider_version")
+    return (
+        capabilities,
+        host,
+        account,
+        revision,
+        provider_version.strip() if isinstance(provider_version, str) else "",
+    )
 
 
 def _verified_tophand_registration(
@@ -314,7 +321,7 @@ def _verified_tophand_registration(
     registration = raw.get("registration")
     if not isinstance(registration, Mapping):
         raise ValueError("Fleet registration response has no full registration")
-    capabilities, target_host, target_account, fact_revision = _tophand_registration_facts(
+    capabilities, target_host, target_account, fact_revision, provider_version = _tophand_registration_facts(
         lane, facts, now=now
     )
     required = (
@@ -408,12 +415,7 @@ def _verified_tophand_registration(
         target_host=target_host,
         target_account=target_account,
         capabilities=capabilities,
-        provider_version=(
-            str(capability_candidates[0].value.get("provider_version"))
-            if isinstance(capability_candidates[0].value, Mapping)
-            and isinstance(capability_candidates[0].value.get("provider_version"), str)
-            else ""
-        ),
+        provider_version=provider_version,
     )
 
 
