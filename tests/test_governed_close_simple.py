@@ -255,6 +255,8 @@ def test_supervisor_routes_done_goal_to_close_and_reconciles_after_restart(
     assert len(first) == len(second) == 1
     assert first[0].action == "waiting"
     assert second[0].action == "closed"
+    assert first[0].asks_user is False
+    assert second[0].asks_user is False
     assert provider.archive_calls == 1
     assert closed_goals == [record.session_ref]
 
@@ -448,6 +450,30 @@ def test_resume_lost_reply_reuses_the_durable_operation_after_restart(tmp_path: 
     assert provider.resume_calls == 2
 
 
+def test_forged_resume_receipt_hmac_keeps_the_lane_inactive(tmp_path: Path) -> None:
+    class ForgedResume(FakeProvider):
+        def create_or_resume(self, request: Any) -> Any:
+            result = super().create_or_resume(request)
+            if result.status == "consumed" and result.reopen_receipt is not None:
+                receipt = result.reopen_receipt.model_copy(update={"receipt_hmac": "0" * 64})
+                return result.model_copy(update={"reopen_receipt": receipt})
+            return result
+
+    record = _record()
+    JoinedLaneStore(tmp_path).create(record)
+    _completion_gate(tmp_path, record)
+    provider = ForgedResume()
+    closed = RecoveryEngine(provider=provider, state_root=tmp_path, goal_root=tmp_path).governed_close(
+        record, now=NOW
+    )
+    resumed = RecoveryEngine(provider=provider, state_root=tmp_path).resume_after_close(
+        closed.record, now=NOW.replace(minute=1)
+    )
+
+    assert resumed.action == "waiting"
+    assert resumed.record.lifecycle == "inactive"
+    assert "authenticated reopen evidence" in resumed.reason
+
 def test_concurrent_supervisors_issue_one_physical_close(tmp_path: Path) -> None:
     record = _record()
     JoinedLaneStore(tmp_path).create(record)
@@ -465,6 +491,45 @@ def test_concurrent_supervisors_issue_one_physical_close(tmp_path: Path) -> None
     assert actions == ("closed", "closed")
     assert provider.archive_calls == 1
 
+
+def test_completion_close_does_not_ask_the_user_for_permission(tmp_path: Path) -> None:
+    record = _record()
+    JoinedLaneStore(tmp_path).create(record)
+    _completion_gate(tmp_path, record)
+    decision = RecoveryEngine(provider=FakeProvider(), state_root=tmp_path, goal_root=tmp_path).governed_close(
+        record, now=NOW
+    )
+
+    assert decision.asks_user is False
+
+
+def test_handoff_snapshot_contains_the_full_authoritative_goal_record(tmp_path: Path) -> None:
+    record = _record()
+    goal = GoalRecord(
+        session_ref=record.session_ref,
+        lane_id=record.lane_id,
+        goal_id=record.goal_id,
+        goal_version=record.goal_version,
+        goal="finish the lane",
+        done_when="the provider receipt is durable",
+        source="task-file:close-contract",
+        status="done-pending-close",
+        enrolled_done_when="the provider receipt is durable",
+        enrolled_at=NOW.isoformat(),
+        intent="Keep the exact provider session moving through close and resume.",
+        scope="One lane and its one physical provider session.",
+        created_at=NOW.isoformat(),
+        updated_at=NOW.isoformat(),
+        needs="none",
+    )
+    payload = RecoveryEngine._immutable_goal_payload(goal)
+
+    assert payload == goal.to_dict()
+    assert payload["goal_id"] == goal.goal_id
+    assert payload["goal_version"] == goal.goal_version
+    assert payload["intent"] == goal.intent
+    assert payload["scope"] == goal.scope
+    assert payload["needs"] == goal.needs
 
 def test_consumed_resume_does_not_activate_an_archived_provider(tmp_path: Path) -> None:
     record = _record()

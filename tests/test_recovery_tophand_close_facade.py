@@ -6,7 +6,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-
 from chitra.governed_close import _close_payload, _write_checkpoint
 from chitra.provider_protocol import CloseRequest
 from chitra.recovery import RecoveryEngine
