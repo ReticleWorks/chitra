@@ -1465,6 +1465,7 @@ class CloseArchiveResult(_ContractModel):
     checkpoint_receipt: Mapping[str, object] | None = None
     checkpoint_receipt_sha256: EvidenceSignature | None = None
     checkpoint_verifier: Identifier | None = None
+    checkpoint_mapping: Mapping[str, object] | None = None
     target_checkpoint_ref: Identifier | None = None
     target_transcript_sha256: EvidenceSignature | None = None
     close_token: Text | None = None

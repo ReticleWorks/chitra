@@ -766,6 +766,12 @@ def _close_receipt_matches(
     except (UnicodeDecodeError, json.JSONDecodeError):
         return False
     close_token = payload.get("close_token") if isinstance(payload, Mapping) else None
+    checkpoint_mapping = result.checkpoint_mapping
+    target_transcript = (
+        checkpoint_mapping.get("target_transcript")
+        if isinstance(checkpoint_mapping, Mapping)
+        else None
+    )
     if (
         not isinstance(close_token, str)
         or not close_token
@@ -785,6 +791,30 @@ def _close_receipt_matches(
         != record.checkpoint_reference
         or result.checkpoint_verifier
         != "chitra.detect.rescue.verify_checkpoint_receipt_signature"
+        or not isinstance(checkpoint_mapping, Mapping)
+        or set(checkpoint_mapping)
+        != {
+            "schema",
+            "lane_id",
+            "session_ref",
+            "chitra_checkpoint_ref",
+            "chitra_checkpoint_receipt_sha256",
+            "target_transcript",
+        }
+        or checkpoint_mapping.get("schema")
+        != "chitra.cross-host-checkpoint.v1"
+        or checkpoint_mapping.get("lane_id") != record.lane_id
+        or checkpoint_mapping.get("session_ref") != _close_session(record)
+        or checkpoint_mapping.get("chitra_checkpoint_ref")
+        != record.checkpoint_reference
+        or checkpoint_mapping.get("chitra_checkpoint_receipt_sha256")
+        != result.checkpoint_receipt_sha256
+        or not isinstance(target_transcript, Mapping)
+        or set(target_transcript) != {"sha256", "size"}
+        or target_transcript.get("sha256") != result.target_transcript_sha256
+        or isinstance(target_transcript.get("size"), bool)
+        or not isinstance(target_transcript.get("size"), int)
+        or target_transcript["size"] < 0
         or result.target_checkpoint_ref is None
         or result.target_transcript_sha256 is None
         or result.target_checkpoint_ref != result.target_transcript_sha256
