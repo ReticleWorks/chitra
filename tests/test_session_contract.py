@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,6 +18,7 @@ from chitra.session_contract import (
     OperatingFact,
     OperationReference,
     OwnerIdentity,
+    OwnerProcessIdentity,
     PendingProviderOperation,
     Problem,
     ProblemHistoryEvent,
@@ -24,10 +26,12 @@ from chitra.session_contract import (
     ProviderIdentity,
     ProviderOperationResult,
     RecoveryState,
+    ReopenReceipt,
     RoadmapMilestone,
     RoadmapStep,
     UsageReport,
     calculate_progress,
+    canonical_digest,
     is_valid_update,
     migrate_legacy_record,
     validate_active_owner_set,
@@ -801,6 +805,18 @@ def test_historical_operation_evidence_survives_capability_changes_but_new_pendi
 
 def test_close_evidence_preserves_provider_state_and_same_thread_resume() -> None:
     close = CloseResult.model_validate(json.loads((FIXTURES / "close-amp-later-resume.json").read_text()), strict=True)
+    old_owner = OwnerProcessIdentity(
+        pid=101,
+        uid=1000,
+        gid=1000,
+        start_token="old-process",
+        comm="amp",
+        exe="/usr/local/bin/amp",
+    )
+    new_owner = old_owner.model_copy(update={"pid": 202, "start_token": "new-process"})
+    close = close.model_copy(
+        update={"owner_process": old_owner, "provider_session_id": "amp-session-a"}
+    )
     operation_history = (
         OperationReference(
             operation_id=close.operation_id,
@@ -813,8 +829,14 @@ def test_close_evidence_preserves_provider_state_and_same_thread_resume() -> Non
     provider = ProviderIdentity(
         kind="amp",
         handle="amp-thread-a",
+        provider_session_id="amp-session-a",
         instance_id="amp-instance-1",
         generation=1,
+        process_start_token=old_owner.start_token,
+        observed_process={
+            **old_owner.model_dump(mode="json"),
+            "process_start_token": old_owner.start_token,
+        },
         capabilities=ProviderCapabilities.from_supported(("close", "checkpoint", "create_or_resume", "resume_after_close")),
     )
     inactive = JoinedLaneRecord(
@@ -828,9 +850,148 @@ def test_close_evidence_preserves_provider_state_and_same_thread_resume() -> Non
         last_close_result=close,
         checkpoint_reference=close.checkpoint_ref,
     )
-    resumed = inactive.model_copy(update={"revision": 2, "lifecycle": "active", "last_close_result": None})
+    resume_request = {
+        "session_ref": inactive.session_ref,
+        "provider_session_id": "amp-session-a",
+        "context_ref": close.checkpoint_ref,
+        "goal_id": inactive.goal_id,
+        "goal_version": inactive.goal_version,
+        "resume_after_close": True,
+        "close_operation_id": close.operation_id,
+        "owner_process": old_owner.model_dump(mode="json"),
+        "resume_token": "resume-token-amp-1",
+    }
+    resume_payload = json.dumps(
+        resume_request, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    pending_resume = PendingProviderOperation(
+        operation_id="resume-amp-1",
+        kind="create_or_resume",
+        lane_id=inactive.lane_id,
+        provider_handle=provider.handle,
+        provider_session_id="amp-session-a",
+        idempotency_key="resume-amp-idem-1",
+        payload_digest=canonical_digest(resume_request),
+        payload=resume_payload,
+        provider_instance_id="amp-instance-1",
+        provider_generation=1,
+        created_at="2026-08-23T14:01:00+00:00",
+        attempted=True,
+    )
+    reopen = ReopenReceipt(
+        operation_id=pending_resume.operation_id,
+        close_operation_id=close.operation_id,
+        lane_id=inactive.lane_id,
+        goal_id=inactive.goal_id,
+        goal_version=inactive.goal_version,
+        session_ref=inactive.session_ref,
+        provider_session_id="amp-session-a",
+        provider_handle=provider.handle,
+        provider_instance_id="amp-instance-1",
+        provider_generation=1,
+        checkpoint_ref=close.checkpoint_ref,
+        prior_owner_process=old_owner,
+        owner_process=new_owner,
+        created_new_lane=False,
+        created_new_session=False,
+        auth_token="resume-token-amp-1",
+        observed_at="2026-08-23T14:01:00+00:00",
+        evidence="same provider thread reopened under a fresh process",
+    )
+    reopen_unsigned = {
+        key: value
+        for key, value in reopen.to_dict().items()
+        if key not in {"receipt_hmac", "signature"}
+    }
+    reopen = reopen.model_copy(
+        update={
+            "receipt_hmac": hmac.new(
+                b"resume-token-amp-1",
+                json.dumps(
+                    reopen_unsigned,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode(),
+                "sha256",
+            ).hexdigest(),
+            "signature": "a" * 64,
+        }
+    )
+    resume_result = ProviderOperationResult(
+        operation_id=reopen.operation_id,
+        kind="create_or_resume",
+        lane_id=inactive.lane_id,
+        provider_handle=provider.handle,
+        provider_session_id=reopen.provider_session_id,
+        process_start_token=new_owner.start_token,
+        idempotency_key=pending_resume.idempotency_key,
+        payload_digest=pending_resume.payload_digest,
+        provider_instance_id="amp-instance-1",
+        provider_generation=1,
+        status="consumed",
+        accepted=True,
+        consumed=True,
+        observed_at=reopen.observed_at,
+        evidence=reopen.evidence,
+        reopen_receipt=reopen,
+    )
+    resumed_provider = provider.model_copy(
+        update={
+            "process_start_token": new_owner.start_token,
+            "observed_process": {
+                **new_owner.model_dump(mode="json"),
+                "process_start_token": new_owner.start_token,
+            },
+            "registration_observed_at": reopen.observed_at,
+        }
+    )
+    resume_history = (
+        *operation_history,
+        OperationReference(
+            operation_id=resume_result.operation_id,
+            idempotency_key=resume_result.idempotency_key,
+            payload_digest=resume_result.payload_digest,
+            kind=resume_result.kind,
+            created_at=reopen.observed_at,
+        ),
+    )
+    inactive = inactive.model_copy(
+        update={
+            "pending_operation": pending_resume,
+            "last_operation_result": resume_result,
+            "operation_history": resume_history,
+        }
+    )
+    resumed = inactive.model_copy(
+        update={
+            "revision": 2,
+            "lifecycle": "active",
+            "provider": resumed_provider,
+            "pending_operation": None,
+            "last_operation_result": resume_result,
+            "last_close_result": None,
+        }
+    )
     validate_record_transition(inactive, resumed, transition="resume")
-    with pytest.raises(ContractValidationError, match="provider identity"):
+    for forged_receipt in (
+        reopen.model_copy(update={"signature": None}),
+        reopen.model_copy(update={"signature": "b" * 64}),
+        reopen.model_copy(update={"receipt_hmac": "0" * 64}),
+        reopen.model_copy(update={"close_operation_id": "other-close"}),
+        reopen.model_copy(update={"provider_session_id": "other-session"}),
+        reopen.model_copy(update={"created_new_session": True}),
+    ):
+        forged_result = resume_result.model_copy(
+            update={"reopen_receipt": forged_receipt}
+        )
+        with pytest.raises(ContractValidationError):
+            validate_record_transition(
+                inactive,
+                resumed.model_copy(update={"last_operation_result": forged_result}),
+                transition="resume",
+            )
+    with pytest.raises(ContractValidationError, match="provider"):
         validate_record_transition(
             inactive,
             resumed.model_copy(update={"provider": provider.model_copy(update={"handle": "other"})}),
@@ -857,6 +1018,7 @@ def test_close_evidence_preserves_provider_state_and_same_thread_resume() -> Non
     amp_native = native.model_copy(
         update={
             "provider_handle": "amp-thread-a",
+            "provider_session_id": "amp-session-a",
             "provider_instance_id": "amp-instance-1",
             "provider_thread_ref": "amp-thread-a",
         }

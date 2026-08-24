@@ -11,7 +11,13 @@ from typing import Any
 from chitra.goals import GoalRecord
 from chitra.joined_lane import JoinedLaneStore
 from chitra.provider_protocol import ProviderState, ProviderStatus
-from chitra.recovery import RecoveryEngine, RecoverySupervisor, _resume_auth_token, _resume_receipt_hmac
+from chitra.recovery import (
+    RecoveryEngine,
+    RecoverySupervisor,
+    _close_receipt_hmac,
+    _resume_auth_token,
+    _resume_receipt_hmac,
+)
 from chitra.session_contract import (
     CloseArchiveResult,
     JoinedLaneRecord,
@@ -42,6 +48,11 @@ def _record() -> JoinedLaneRecord:
             kind="tophand",
             handle="remote-handle-a",
             provider_session_id="physical-session-a",
+            process_start_token=OLD_OWNER.start_token,
+            observed_process={
+                **OLD_OWNER.model_dump(mode="json"),
+                "process_start_token": OLD_OWNER.start_token,
+            },
             instance_id="tophand-instance-a",
             generation=3,
             capabilities=ProviderCapabilities(
@@ -90,7 +101,9 @@ class FakeProvider:
         self.calls = 0
         self.archive_calls = 0
         self.resume_calls = 0
+        self.close_tokens: list[str] = []
         self.archived = False
+        self.process_start_token = OLD_OWNER.start_token
 
     def status(self) -> ProviderStatus:
         return ProviderStatus(
@@ -101,6 +114,7 @@ class FakeProvider:
             fresh=True,
             provider_available=True,
             provider_instance_id="tophand-instance-a",
+            process_start_token=self.process_start_token,
             current_turn_id=None,
         )
 
@@ -110,6 +124,8 @@ class FakeProvider:
         if not self.archived:
             self.archive_calls += 1
             self.archived = True
+        close_token = payload["close_token"]
+        self.close_tokens.append(close_token)
         result = CloseArchiveResult(
             operation_id=request.operation_id,
             lane_id=request.lane_id,
@@ -125,9 +141,30 @@ class FakeProvider:
             later_resume_supported=True,
             checkpoint_ref=payload["checkpoint_ref"],
             quiescent=True,
+            checkpoint_receipt=request.checkpoint_receipt,
+            checkpoint_receipt_sha256=request.checkpoint_receipt_sha256,
+            checkpoint_verifier=request.checkpoint_verifier,
+            checkpoint_mapping={
+                "schema": "chitra.cross-host-checkpoint.v1",
+                "lane_id": request.lane_id,
+                "session_ref": "physical-session-a",
+                "chitra_checkpoint_ref": payload["checkpoint_ref"],
+                "chitra_checkpoint_receipt_sha256": request.checkpoint_receipt_sha256,
+                "target_transcript": {"sha256": "1" * 64, "size": 1},
+            },
+            target_checkpoint_ref="1" * 64,
+            target_transcript_sha256="1" * 64,
+            close_token=close_token,
             owner_process=OLD_OWNER,
             observed_at=NOW.isoformat(),
             evidence="same physical session; archive receipt",
+        )
+        result = result.model_copy(
+            update={
+                "close_receipt_hmac": _close_receipt_hmac(
+                    result.to_dict(), close_token
+                )
+            }
         )
         if self.lose_first_reply and self.calls == 1:
             raise OSError("response lost after provider committed close")
@@ -136,6 +173,7 @@ class FakeProvider:
     def create_or_resume(self, request: Any) -> Any:
         self.resume_calls += 1
         self.archived = False
+        self.process_start_token = NEW_OWNER.start_token
         receipt = {
             "schema": "chitra.lane-reopen.v1",
             "operation_id": request.operation_id,
@@ -167,6 +205,11 @@ class FakeProvider:
             payload_digest=request.payload_digest,
             provider_instance_id=request.provider_instance_id,
             provider_generation=request.provider_generation,
+            process_start_token=NEW_OWNER.start_token,
+            observed_process={
+                **NEW_OWNER.model_dump(mode="json"),
+                "process_start_token": NEW_OWNER.start_token,
+            },
             status="consumed",
             accepted=True,
             consumed=True,
@@ -196,6 +239,12 @@ def test_close_persists_chitra_checkpoint_and_archives_once(tmp_path: Path) -> N
     payload = json.loads(checkpoint.read_text(encoding="utf-8"))
     assert payload["provenance"] == {"kind": "governed-completion-checkpoint", "owner": "chitra"}
     assert payload["provider_binding"]["provider_session_id"] == "physical-session-a"
+    assert first.operation is not None
+    close_payload = json.loads(first.operation.payload)
+    assert close_payload["checkpoint_ref"] == first.record.checkpoint_reference
+    assert close_payload["checkpoint_receipt_sha256"]
+    assert len(close_payload["close_token"]) == 64
+    assert first.operation.process_start_token == OLD_OWNER.start_token
     assert provider.archive_calls == 1
     assert provider.calls == 1
 
@@ -224,6 +273,57 @@ def test_lost_close_reply_reuses_pending_operation_and_reconciles_after_restart(
     assert provider.archive_calls == 1
     assert fresh_provider.calls == 1
     assert fresh_provider.archive_calls == 0
+    assert provider.close_tokens == fresh_provider.close_tokens
+
+
+def test_forged_fleet_close_hmac_keeps_the_lane_active(tmp_path: Path) -> None:
+    class ForgedCloseProvider(FakeProvider):
+        def close(self, request: Any) -> CloseArchiveResult:
+            return super().close(request).model_copy(
+                update={"close_receipt_hmac": "0" * 64}
+            )
+
+    record = _record()
+    JoinedLaneStore(tmp_path).create(record)
+    _completion_gate(tmp_path, record)
+
+    decision = RecoveryEngine(
+        provider=ForgedCloseProvider(),
+        state_root=tmp_path,
+        goal_root=tmp_path,
+    ).governed_close(record, now=NOW)
+
+    assert decision.action == "waiting"
+    assert decision.record.lifecycle == "active"
+    assert decision.record.pending_operation is not None
+    assert decision.record.last_close_result is None
+
+
+def test_authenticated_close_with_wrong_prior_owner_keeps_the_lane_active(
+    tmp_path: Path,
+) -> None:
+    class WrongOwnerProvider(FakeProvider):
+        def close(self, request: Any) -> CloseArchiveResult:
+            result = super().close(request).model_copy(
+                update={"owner_process": NEW_OWNER}
+            )
+            token = json.loads(request.operation.payload)["close_token"]
+            return result.model_copy(
+                update={"close_receipt_hmac": _close_receipt_hmac(result.to_dict(), token)}
+            )
+
+    record = _record()
+    JoinedLaneStore(tmp_path).create(record)
+    _completion_gate(tmp_path, record)
+
+    decision = RecoveryEngine(
+        provider=WrongOwnerProvider(),
+        state_root=tmp_path,
+        goal_root=tmp_path,
+    ).governed_close(record, now=NOW)
+
+    assert decision.action == "waiting"
+    assert decision.record.lifecycle == "active"
 
 
 def test_supervisor_routes_done_goal_to_close_and_reconciles_after_restart(
@@ -424,6 +524,24 @@ def test_resume_after_close_restores_the_same_provider_session(tmp_path: Path) -
     assert resumed.record.last_close_result is None
     assert resumed.record.provider.provider_session_id == "physical-session-a"
     assert resumed.operation is not None and resumed.operation.kind == "create_or_resume"
+    assert json.loads(resumed.operation.payload) == {
+        "session_ref": "logical-session-a",
+        "provider_session_id": "physical-session-a",
+        "context_ref": closed.record.checkpoint_reference,
+        "goal_id": "goal-a",
+        "goal_version": 1,
+        "resume_after_close": True,
+        "close_operation_id": closed.record.last_close_result.operation_id,
+        "owner_process": OLD_OWNER.model_dump(mode="json"),
+        "resume_token": _resume_auth_token(
+            closed.record, closed.record.last_close_result, resumed.operation, state_root=tmp_path
+        ),
+    }
+    assert resumed.record.provider.process_start_token == NEW_OWNER.start_token
+    assert resumed.record.provider.observed_process == {
+        **NEW_OWNER.model_dump(mode="json"),
+        "process_start_token": NEW_OWNER.start_token,
+    }
     assert closed.record.last_close_result is not None
     assert resumed.operation.payload_digest == request_digest(
         "create_or_resume",

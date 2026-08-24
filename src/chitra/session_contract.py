@@ -13,6 +13,7 @@ the public persistence helpers for the two versioned documents in this module:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 from collections.abc import Iterable, Mapping, Sequence
@@ -801,6 +802,13 @@ def _provider_identity_key(provider: ProviderIdentity) -> tuple[object, ...]:
     )
 
 
+def _provider_thread_identity_key(provider: ProviderIdentity) -> tuple[object, ...]:
+    """Return the stable provider thread identity without its OS process fence."""
+
+    identity = _provider_identity_key(provider)
+    return (*identity[:4], *identity[5:])
+
+
 def validate_pending_operation(provider: ProviderIdentity, operation: PendingProviderOperation) -> None:
     """Reject operations the observed provider cannot perform safely."""
 
@@ -1031,7 +1039,14 @@ def validate_operation_result(pending: PendingProviderOperation, result: Provide
     if result.provider_generation is not None and pending.provider_generation != result.provider_generation:
         errors.append("provider generation changed")
     if result.process_start_token is not None and pending.process_start_token != result.process_start_token:
-        errors.append("process start token changed")
+        reopened_process = (
+            pending.kind == "create_or_resume"
+            and pending.process_start_token is None
+            and result.reopen_receipt is not None
+            and result.reopen_receipt.owner_process.start_token == result.process_start_token
+        )
+        if not reopened_process:
+            errors.append("process start token changed")
     if result.status not in {"unknown", "lost-response"}:
         for field in (
             "provider_session_id",
@@ -1464,6 +1479,17 @@ class CloseArchiveResult(_ContractModel):
     later_resume_supported: bool | None = None
     checkpoint_ref: Identifier | None = None
     quiescent: bool | None = None
+    # Fleet binds Chitra's locally verified completion receipt to the target
+    # transcript it actually stopped. The bearer challenge authenticates the
+    # returned mapping without exposing Chitra's checkpoint key.
+    checkpoint_receipt: Mapping[str, object] | None = None
+    checkpoint_receipt_sha256: EvidenceSignature | None = None
+    checkpoint_verifier: Identifier | None = None
+    checkpoint_mapping: Mapping[str, object] | None = None
+    target_checkpoint_ref: Identifier | None = None
+    target_transcript_sha256: EvidenceSignature | None = None
+    close_token: Text | None = None
+    close_receipt_hmac: EvidenceSignature | None = None
     # The process identity observed before the physical stop.  PID alone is
     # not sufficient because the OS can reuse it.
     owner_process: OwnerProcessIdentity | None = None
@@ -1848,6 +1874,12 @@ def validate_record_transition(
         errors.append("inactive-to-active transition requires an explicit resume transition")
 
     provider_changed = _provider_identity_key(previous.provider) != _provider_identity_key(current.provider)
+    resumed_process_identity = (
+        normalized_transition == "resume"
+        and _provider_thread_identity_key(previous.provider)
+        == _provider_thread_identity_key(current.provider)
+        and previous.provider.process_start_token != current.provider.process_start_token
+    )
     physical_generation_advanced = (
         previous.physical_session_generation is not None
         and current.physical_session_generation is not None
@@ -1872,7 +1904,7 @@ def validate_record_transition(
         and current.last_operation_result.accepted is True
         and current.last_operation_result.consumed is True
     )
-    if provider_changed and not initial_bound:
+    if provider_changed and not initial_bound and not resumed_process_identity:
         if normalized_transition != "provider-transfer":
             errors.append("provider identity swap requires an explicit provider-transfer transition")
         if current.chitra_ownership_epoch <= previous.chitra_ownership_epoch:
@@ -1936,6 +1968,159 @@ def validate_record_transition(
             errors.append("resume must explicitly restore an active logical lane")
         if current.last_close_result is not None:
             errors.append("resume must clear prior close evidence from the active snapshot")
+        reopen = (
+            current.last_operation_result.reopen_receipt
+            if current.last_operation_result is not None
+            else None
+        )
+        pending_resume = previous.pending_operation
+        resume_payload: dict[str, object] | None = None
+        if (
+            pending_resume is None
+            or pending_resume.kind != "create_or_resume"
+            or pending_resume.attempted is not True
+        ):
+            errors.append("resume requires the exact attempted provider operation")
+        else:
+            try:
+                candidate_payload = json.loads(pending_resume.payload)
+            except json.JSONDecodeError:
+                candidate_payload = None
+            if (
+                not isinstance(candidate_payload, dict)
+                or json.dumps(
+                    candidate_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+                != pending_resume.payload
+                or set(candidate_payload)
+                != {
+                    "session_ref",
+                    "provider_session_id",
+                    "context_ref",
+                    "goal_id",
+                    "goal_version",
+                    "resume_after_close",
+                    "close_operation_id",
+                    "owner_process",
+                    "resume_token",
+                }
+                or canonical_digest(candidate_payload) != pending_resume.payload_digest
+            ):
+                errors.append("resume operation payload is not the exact canonical request")
+            else:
+                resume_payload = candidate_payload
+        result = current.last_operation_result
+        if previous.last_operation_result != result:
+            errors.append("resume must preserve the already signed provider result")
+        if pending_resume is not None and result is not None:
+            try:
+                validate_operation_result(pending_resume, result)
+            except ContractValidationError as exc:
+                errors.append(str(exc))
+        if reopen is None:
+            errors.append("resume requires the authenticated reopen receipt")
+        else:
+            unsigned = {
+                key: value
+                for key, value in reopen.to_dict().items()
+                if key not in {"receipt_hmac", "signature"}
+            }
+            expected_hmac = (
+                hmac.new(
+                    reopen.auth_token.encode(),
+                    json.dumps(
+                        unsigned,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode(),
+                    "sha256",
+                ).hexdigest()
+                if reopen.auth_token is not None
+                else None
+            )
+            if reopen.signature is None:
+                errors.append("resume receipt requires Chitra's durable signature")
+            if (
+                reopen.receipt_hmac is None
+                or expected_hmac is None
+                or not hmac.compare_digest(reopen.receipt_hmac, expected_hmac)
+            ):
+                errors.append("resume receipt HMAC is invalid")
+            if prior_close is not None and (
+                reopen.close_operation_id != prior_close.operation_id
+                or reopen.checkpoint_ref != prior_close.checkpoint_ref
+                or reopen.prior_owner_process != prior_close.owner_process
+            ):
+                errors.append("resume receipt does not match the exact close evidence")
+            if (
+                pending_resume is None
+                or reopen.operation_id != pending_resume.operation_id
+                or reopen.lane_id != current.lane_id
+                or reopen.goal_id != current.goal_id
+                or reopen.goal_version != current.goal_version
+                or reopen.session_ref != current.session_ref
+                or reopen.provider_session_id != current.provider.provider_session_id
+                or reopen.provider_handle != current.provider.handle
+                or reopen.provider_instance_id != current.provider.instance_id
+                or reopen.provider_generation != current.provider.generation
+                or reopen.created_new_lane is not False
+                or reopen.created_new_session is not False
+                or reopen.owner_process == reopen.prior_owner_process
+            ):
+                errors.append("resume receipt changed the joined lane binding")
+            if resume_payload is None or (
+                resume_payload.get("session_ref") != current.session_ref
+                or resume_payload.get("provider_session_id")
+                != current.provider.provider_session_id
+                or resume_payload.get("context_ref") != current.checkpoint_reference
+                or resume_payload.get("goal_id") != current.goal_id
+                or resume_payload.get("goal_version") != current.goal_version
+                or resume_payload.get("resume_after_close") is not True
+                or resume_payload.get("close_operation_id")
+                != (prior_close.operation_id if prior_close is not None else None)
+                or resume_payload.get("owner_process")
+                != (
+                    prior_close.owner_process.model_dump(mode="json")
+                    if prior_close is not None and prior_close.owner_process is not None
+                    else None
+                )
+                or resume_payload.get("resume_token") != reopen.auth_token
+            ):
+                errors.append("resume receipt does not match the durable request")
+            if previous.provider.provider_session_id != current.provider.provider_session_id:
+                errors.append("resume must preserve the exact provider session")
+            if (
+                prior_close is not None
+                and prior_close.provider_session_id != current.provider.provider_session_id
+            ):
+                errors.append("resume provider session must match the close evidence")
+            if (
+                prior_close is not None
+                and prior_close.owner_process is not None
+                and previous.provider.process_start_token
+                != prior_close.owner_process.start_token
+            ):
+                errors.append("closed provider token must match the prior owner")
+            if current.provider.process_start_token != reopen.owner_process.start_token:
+                errors.append("resume provider process token must match the reopened owner")
+            if current.provider.observed_process != {
+                **reopen.owner_process.model_dump(mode="json"),
+                "process_start_token": reopen.owner_process.start_token,
+            }:
+                errors.append("resume provider observation must match the reopened owner")
+            if previous.provider.process_start_token == current.provider.process_start_token:
+                errors.append("resume must rotate the provider process token")
+            if current.provider.registration_observed_at != reopen.observed_at:
+                errors.append("resume registration observation must match the reopened owner")
+            if (
+                previous.provider.registration_digest is not None
+                and current.provider.registration_digest == previous.provider.registration_digest
+            ):
+                errors.append("resume must not retain the stopped registration digest")
     elif prior_close is not None and prior_close.later_resume_supported is True and current.lifecycle == "active":
         errors.append("later resume requires an explicit resume transition")
 

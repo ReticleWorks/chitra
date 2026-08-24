@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+
 from chitra.governed_close import _close_payload, _write_checkpoint
 from chitra.provider_protocol import CloseRequest
 from chitra.recovery import RecoveryEngine
@@ -61,19 +62,23 @@ class FakeAdapter:
 def _request(root: Path, record: JoinedLaneRecord) -> CloseRequest:
     reference = _write_checkpoint(root, record)
     bound = record.model_copy(update={"checkpoint_reference": reference})
-    operation = RecoveryEngine()._operation(
-        bound, "close", _close_payload(bound), datetime(2026, 8, 23, 14, tzinfo=UTC)
-    )
     receipt = json.loads((root / "checkpoints" / f"{reference}.json").read_text(encoding="utf-8"))
     digest = __import__("hashlib").sha256(
         json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     ).hexdigest()
+    operation = RecoveryEngine(state_root=root)._operation(
+        bound,
+        "close",
+        _close_payload(bound, checkpoint_receipt_sha256=digest),
+        datetime(2026, 8, 23, 14, tzinfo=UTC),
+    )
     return CloseRequest(
         operation=operation,
         archive=True,
         checkpoint_receipt=receipt,
         checkpoint_receipt_sha256=digest,
         checkpoint_verifier="chitra.detect.rescue.verify_checkpoint_receipt_signature",
+        close_token=json.loads(operation.payload)["close_token"],
     )
 
 
@@ -93,6 +98,7 @@ def test_facade_verifies_signed_checkpoint_and_projects_wire_request(tmp_path: P
     assert wire["session_ref"] == record.session_ref
     assert wire["provider_session_id"] == record.provider.provider_session_id
     assert wire["checkpoint_ref"] == json.loads(request.operation.payload)["checkpoint_ref"]
+    assert wire["close_token"] == json.loads(request.operation.payload)["close_token"]
     receipt = wire["checkpoint_receipt"]
     assert isinstance(receipt, dict)
     assert receipt["schema_name"] == "chitra.governed-close-checkpoint.v1"

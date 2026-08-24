@@ -15,6 +15,7 @@ waiting instead of guessing.
 
 from __future__ import annotations
 
+import hmac
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -71,16 +72,18 @@ from .session_contract import (
     canonical_digest,
     validate_update,
 )
-from .tophand_wire import TOPHAND_OPERATION_SCHEMA
+from .tophand_wire import TOPHAND_OPERATION_SCHEMA, request_digest
 from .usage_policy import launch_policy_problem
 
 try:
     # Fleet packages this exact module under /opt/polyphony/deploy-main.  The
     # import is deliberately static and allowlisted; a missing package keeps
     # recovery unavailable instead of selecting an arbitrary adapter.
+    from tools.support.chitra_adapter.tophand_adapter import (
+        TophandCommandTransport as _imported_tophand_transport,
+    )
     from tools.support.chitra_adapter.tophand_adapter import (  # type: ignore[import-untyped]
         build_tophand_provider as _imported_tophand_builder,
-        TophandCommandTransport as _imported_tophand_transport,
     )
 except ImportError:  # pragma: no cover - exercised by source-only installs
     _packaged_tophand_builder: Callable[..., object] | None = None
@@ -491,22 +494,29 @@ def _operation_dict(operation: object) -> dict[str, object]:
 
 def _tophand_operation_dict(operation: object) -> dict[str, object]:
     if isinstance(operation, PendingProviderOperation):
-        return {
+        # Keep Chitra's durable payload on this boundary. The Adapter owns
+        # projection to the exact Fleet wire and the attempted-state fence.
+        # It needs the payload to recover an attempted resume after a fresh
+        # Chitra process starts.
+        wire: dict[str, object] = {
             "schema": TOPHAND_OPERATION_SCHEMA,
             "operation_id": operation.operation_id,
             "kind": operation.kind,
             "lane_id": operation.lane_id,
             "provider_handle": operation.provider_handle,
             "provider_session_id": operation.provider_session_id,
+            "process_start_token": operation.process_start_token,
             "idempotency_key": operation.idempotency_key,
             "payload_digest": operation.payload_digest,
             "provider_instance_id": operation.provider_instance_id,
             "provider_generation": operation.provider_generation,
-            "process_start_token": operation.process_start_token,
             "created_at": operation.created_at,
             "attempt": operation.attempt,
             "attempted": operation.attempted,
         }
+        if operation.kind == "create_or_resume":
+            wire["payload"] = operation.payload
+        return wire
     if isinstance(operation, Mapping):
         return {str(key): value for key, value in operation.items()}
     raise TypeError("provider operation must be a canonical mapping")
@@ -528,6 +538,80 @@ def _mapping(value: object, name: str) -> Mapping[str, object]:
     raise TypeError(f"{name} must be a mapping")
 
 
+def _authenticated_reopen_process_token(
+    operation: PendingProviderOperation,
+    raw: Mapping[str, object],
+    receipt: ReopenReceipt | None,
+) -> str | None:
+    """Authorize the one process-token change carried by a resume receipt."""
+
+    if (
+        raw.get("status") != "consumed"
+        or operation.kind != "create_or_resume"
+        or operation.process_start_token is not None
+        or receipt is None
+    ):
+        return None
+    try:
+        payload = json.loads(operation.payload)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ) != operation.payload:
+        return None
+    if set(payload) != {
+        "session_ref",
+        "provider_session_id",
+        "context_ref",
+        "goal_id",
+        "goal_version",
+        "resume_after_close",
+        "close_operation_id",
+        "owner_process",
+        "resume_token",
+    } or payload.get("resume_after_close") is not True:
+        return None
+    token = payload.get("resume_token")
+    raw_token = raw.get("process_start_token")
+    if not isinstance(token, str) or not token or not isinstance(raw_token, str) or not raw_token:
+        return None
+    unsigned = {
+        key: value
+        for key, value in receipt.to_dict().items()
+        if key not in {"receipt_hmac", "signature"}
+    }
+    expected_hmac = hmac.new(
+        token.encode(),
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(),
+        "sha256",
+    ).hexdigest()
+    if (
+        request_digest("create_or_resume", payload) != operation.payload_digest
+        or receipt.receipt_hmac is None
+        or not hmac.compare_digest(receipt.receipt_hmac, expected_hmac)
+        or receipt.operation_id != operation.operation_id
+        or receipt.lane_id != operation.lane_id
+        or receipt.provider_handle != operation.provider_handle
+        or receipt.provider_session_id != operation.provider_session_id
+        or receipt.provider_instance_id != operation.provider_instance_id
+        or receipt.provider_generation != operation.provider_generation
+        or receipt.session_ref != payload.get("session_ref")
+        or receipt.goal_id != payload.get("goal_id")
+        or receipt.goal_version != payload.get("goal_version")
+        or receipt.checkpoint_ref != payload.get("context_ref")
+        or receipt.close_operation_id != payload.get("close_operation_id")
+        or receipt.prior_owner_process.model_dump(mode="json") != payload.get("owner_process")
+        or receipt.auth_token != token
+        or receipt.created_new_lane is not False
+        or receipt.created_new_session is not False
+        or receipt.owner_process == receipt.prior_owner_process
+        or receipt.owner_process.start_token != raw_token
+    ):
+        return None
+    return raw_token
+
+
 def _provider_result(
     value: object,
     operation: PendingProviderOperation,
@@ -540,6 +624,14 @@ def _provider_result(
     status = raw.get("status")
     if status not in {"accepted", "consumed", "rejected", "unknown", "lost-response"}:
         status = "unknown"
+    reopen_receipt = (
+        ReopenReceipt.from_dict(raw["reopen_receipt"])
+        if raw.get("reopen_receipt") is not None
+        else None
+    )
+    reopened_process_token = _authenticated_reopen_process_token(
+        operation, raw, reopen_receipt
+    )
 
     # A provider result that claims a disposition must carry the physical
     # identity and observation time that the provider actually returned.
@@ -583,6 +675,8 @@ def _provider_result(
     ):
         observed = raw.get(field)
         expected = getattr(operation, field)
+        if field == "process_start_token" and observed == reopened_process_token:
+            continue
         if (
             observed is not None
             and observed != expected
@@ -626,6 +720,8 @@ def _provider_result(
             ("provider_generation", operation.provider_generation),
             ("process_start_token", operation.process_start_token),
         ):
+            if field == "process_start_token" and ownership.get(field) == reopened_process_token:
+                continue
             if field in ownership and ownership[field] != expected:
                 raise ValueError(f"{provider_label} provider ownership {field} changed")
         nested_process = ownership.get("observed_process")
@@ -637,9 +733,8 @@ def _provider_result(
     provider_session_id = raw.get("provider_session_id")
     if provider_session_id is not None and provider_session_id != operation.provider_session_id:
         raise ValueError(f"{provider_label} provider result provider_session_id changed")
-    reopen_receipt = None
-    if raw.get("reopen_receipt") is not None:
-        reopen_receipt = ReopenReceipt.from_dict(raw["reopen_receipt"])
+    raw_provider_pid = raw.get("provider_pid")
+    raw_owner_pid = raw.get("owner_pid")
     return ProviderOperationResult(
         operation_id=operation.operation_id,
         kind=operation.kind,
@@ -653,8 +748,16 @@ def _provider_result(
         process_start_token=(
             raw.get("process_start_token") if isinstance(raw.get("process_start_token"), str) else None
         ),
-        provider_pid=raw.get("provider_pid") if isinstance(raw.get("provider_pid"), int) and not isinstance(raw.get("provider_pid"), bool) else None,
-        owner_pid=raw.get("owner_pid") if isinstance(raw.get("owner_pid"), int) and not isinstance(raw.get("owner_pid"), bool) else None,
+        provider_pid=(
+            raw_provider_pid
+            if isinstance(raw_provider_pid, int) and not isinstance(raw_provider_pid, bool)
+            else None
+        ),
+        owner_pid=(
+            raw_owner_pid
+            if isinstance(raw_owner_pid, int) and not isinstance(raw_owner_pid, bool)
+            else None
+        ),
         observed_process=dict(observed_process) if isinstance(observed_process, Mapping) else None,
         ownership=ownership,
         status=cast(Any, status),
@@ -736,6 +839,14 @@ class _PackagedTophandProvider:
         payload = json.loads(request.operation.payload)
         if not isinstance(payload, Mapping):
             raise ValueError("close payload must be an object")
+        if (
+            not isinstance(request.close_token, str)
+            or not request.close_token
+            or payload.get("close_token") != request.close_token
+            or payload.get("checkpoint_receipt_sha256")
+            != request.checkpoint_receipt_sha256
+        ):
+            raise ValueError("close bearer challenge changed or is missing")
         if any(
             receipt.get(receipt_field) != payload.get(payload_field)
             for receipt_field, payload_field in (
@@ -834,6 +945,7 @@ class _PackagedTophandProvider:
         elif isinstance(request, CloseRequest):
             self._verify_close_checkpoint(request)
             payload["archive"] = request.archive
+            payload["close_token"] = request.close_token
         raw = getattr(self._adapter, method)(payload)
         self._require_current_facts()
         result = _provider_result(raw, operation)
@@ -985,6 +1097,7 @@ class _PackagedTophandProvider:
                 "checkpoint_receipt": request.checkpoint_receipt,
                 "checkpoint_receipt_sha256": request.checkpoint_receipt_sha256,
                 "checkpoint_verifier": request.checkpoint_verifier,
+                "close_token": request.close_token,
             }
             raw = cast(Any, self._adapter).close(wire_request)
             self._result_sink(raw)

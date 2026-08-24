@@ -450,6 +450,7 @@ class RecoveryStateStore:
                 ("provider_session_id", record.provider.provider_session_id),
                 ("provider_instance_id", record.provider.instance_id),
                 ("provider_generation", record.provider.generation),
+                ("process_start_token", record.provider.process_start_token),
             )
         ):
             return False
@@ -471,6 +472,7 @@ class RecoveryStateStore:
                 ("provider_session_id", record.provider.provider_session_id),
                 ("provider_instance_id", record.provider.instance_id),
                 ("provider_generation", record.provider.generation),
+                ("process_start_token", record.provider.process_start_token),
             )
         ):
             return False
@@ -478,11 +480,11 @@ class RecoveryStateStore:
             return False
         if not _verify_mapping_signature(result.to_dict(), self.root):
             return False
-        return (
-            result.provider_thread_ref == record.provider.handle
-            and result.provider_session_id == record.provider.provider_session_id
-            and result.checkpoint_ref == record.checkpoint_reference
-        )
+        try:
+            operation = PendingProviderOperation.from_dict(operation_payload)
+        except (TypeError, ValueError):
+            return False
+        return _close_receipt_matches(record, operation, result, self.root)
 
     def write_close_evidence(
         self, operation: PendingProviderOperation, result: CloseArchiveResult
@@ -690,6 +692,62 @@ def _resume_receipt_hmac(receipt: Mapping[str, object], token: str) -> str:
     return hmac.new(token.encode(), encoded, "sha256").hexdigest()
 
 
+def _close_receipt_hmac(receipt: Mapping[str, object], token: str) -> str:
+    """Authenticate Fleet's exact terminal close evidence."""
+
+    unsigned = {
+        key: value
+        for key, value in receipt.items()
+        if key not in {"close_receipt_hmac", "signature"}
+    }
+    encoded = json.dumps(
+        unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+    return hmac.new(token.encode(), encoded, "sha256").hexdigest()
+
+
+def _close_auth_token(
+    record: JoinedLaneRecord,
+    operation: PendingProviderOperation,
+    *,
+    state_root: Path | None,
+) -> str:
+    """Create one durable close challenge without exposing Chitra's key."""
+
+    if state_root is None:
+        raise RecoveryStateError("close authentication requires Chitra state")
+    try:
+        operation_payload = json.loads(operation.payload)
+    except json.JSONDecodeError as exc:
+        raise RecoveryStateError("close authentication payload is invalid") from exc
+    if not isinstance(operation_payload, Mapping):
+        raise RecoveryStateError("close authentication payload is invalid")
+    checkpoint_digest = operation_payload.get("checkpoint_receipt_sha256")
+    if not isinstance(checkpoint_digest, str) or not checkpoint_digest:
+        raise RecoveryStateError("close authentication lacks the checkpoint digest")
+    body = {
+        "schema": "chitra.lane-close-auth.v1",
+        "schema_version": 1,
+        "close_operation_id": operation.operation_id,
+        "idempotency_key": operation.idempotency_key,
+        "lane_id": record.lane_id,
+        "goal_id": record.goal_id,
+        "goal_version": record.goal_version,
+        "session_ref": record.session_ref,
+        "provider_session_id": record.provider.provider_session_id,
+        "provider_handle": record.provider.handle,
+        "provider_instance_id": record.provider.instance_id,
+        "provider_generation": record.provider.generation,
+        "process_start_token": record.provider.process_start_token,
+        "checkpoint_ref": record.checkpoint_reference,
+        "checkpoint_receipt_sha256": checkpoint_digest,
+    }
+    encoded = json.dumps(
+        body, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+    return hmac.new(load_or_create_checkpoint_key(state_root), encoded, "sha256").hexdigest()
+
+
 def _close_session(record: JoinedLaneRecord) -> str:
     session = record.provider.provider_session_id
     if not session:
@@ -708,6 +766,113 @@ def _close_receipt_matches(
     try:
         validate_close_result(operation, result)
     except (ContractValidationError, TypeError, ValueError):
+        return False
+    try:
+        payload = json.loads(operation.payload)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    close_token = payload.get("close_token") if isinstance(payload, Mapping) else None
+    checkpoint_mapping = result.checkpoint_mapping
+    target_transcript = (
+        checkpoint_mapping.get("target_transcript")
+        if isinstance(checkpoint_mapping, Mapping)
+        else None
+    )
+    owner = result.owner_process
+    observed = record.provider.observed_process
+    observed_pid = None
+    if isinstance(observed, Mapping):
+        for field in ("pid", "provider_pid", "owner_pid"):
+            candidate_pid = observed.get(field)
+            if isinstance(candidate_pid, int) and not isinstance(candidate_pid, bool):
+                observed_pid = candidate_pid
+                break
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload)
+        != {
+            "archive",
+            "checkpoint_ref",
+            "checkpoint_receipt_sha256",
+            "close_token",
+            "goal_id",
+            "goal_version",
+            "lane_id",
+            "process_start_token",
+            "provider_generation",
+            "provider_handle",
+            "provider_instance_id",
+            "provider_session_id",
+            "session_ref",
+        }
+        or any(
+            payload.get(field) != expected
+            for field, expected in (
+                ("archive", True),
+                ("checkpoint_ref", record.checkpoint_reference),
+                ("checkpoint_receipt_sha256", result.checkpoint_receipt_sha256),
+                ("goal_id", record.goal_id),
+                ("goal_version", record.goal_version),
+                ("lane_id", record.lane_id),
+                ("process_start_token", record.provider.process_start_token),
+                ("provider_generation", record.provider.generation),
+                ("provider_handle", record.provider.handle),
+                ("provider_instance_id", record.provider.instance_id),
+                ("provider_session_id", record.provider.provider_session_id),
+                ("session_ref", record.session_ref),
+            )
+        )
+        or operation.process_start_token != record.provider.process_start_token
+        or not isinstance(close_token, str)
+        or not close_token
+        or state_root is None
+        or close_token
+        != _close_auth_token(record, operation, state_root=state_root)
+        or result.close_token != close_token
+        or result.close_receipt_hmac is None
+        or not hmac.compare_digest(
+            result.close_receipt_hmac,
+            _close_receipt_hmac(result.to_dict(), close_token),
+        )
+        or result.checkpoint_receipt is None
+        or result.checkpoint_receipt_sha256
+        != canonical_digest(result.checkpoint_receipt)
+        or result.checkpoint_receipt.get("checkpoint_ref")
+        != record.checkpoint_reference
+        or result.checkpoint_verifier
+        != "chitra.detect.rescue.verify_checkpoint_receipt_signature"
+        or not isinstance(checkpoint_mapping, Mapping)
+        or set(checkpoint_mapping)
+        != {
+            "schema",
+            "lane_id",
+            "session_ref",
+            "chitra_checkpoint_ref",
+            "chitra_checkpoint_receipt_sha256",
+            "target_transcript",
+        }
+        or checkpoint_mapping.get("schema")
+        != "chitra.cross-host-checkpoint.v1"
+        or checkpoint_mapping.get("lane_id") != record.lane_id
+        or checkpoint_mapping.get("session_ref") != _close_session(record)
+        or checkpoint_mapping.get("chitra_checkpoint_ref")
+        != record.checkpoint_reference
+        or checkpoint_mapping.get("chitra_checkpoint_receipt_sha256")
+        != result.checkpoint_receipt_sha256
+        or not isinstance(target_transcript, Mapping)
+        or set(target_transcript) != {"sha256", "size"}
+        or target_transcript.get("sha256") != result.target_transcript_sha256
+        or isinstance(target_transcript.get("size"), bool)
+        or not isinstance(target_transcript.get("size"), int)
+        or target_transcript["size"] < 0
+        or result.target_checkpoint_ref is None
+        or result.target_transcript_sha256 is None
+        or result.target_checkpoint_ref != result.target_transcript_sha256
+        or owner is None
+        or owner.start_token != operation.process_start_token
+        or owner.start_token != record.provider.process_start_token
+        or (observed_pid is not None and owner.pid != observed_pid)
+    ):
         return False
     return (
         result.provider_thread_ref == record.provider.handle
@@ -758,6 +923,7 @@ def _resume_receipt_matches(
         and receipt.created_new_lane is False
         and receipt.created_new_session is False
         and receipt.owner_process != receipt.prior_owner_process
+        and result.process_start_token == receipt.owner_process.start_token
         and receipt.auth_token == token
     )
 
@@ -866,12 +1032,24 @@ class RecoveryEngine:
 
         if self.provider is None:
             return None
+        try:
+            operation_payload = json.loads(operation.payload)
+        except json.JSONDecodeError:
+            return None
+        close_token = (
+            operation_payload.get("close_token")
+            if isinstance(operation_payload, Mapping)
+            else None
+        )
+        if not isinstance(close_token, str) or not close_token:
+            return None
         request = CloseRequest(
             operation=operation,
             archive=True,
             checkpoint_receipt=checkpoint,
             checkpoint_receipt_sha256=canonical_digest(checkpoint),
             checkpoint_verifier="chitra.detect.rescue.verify_checkpoint_receipt_signature",
+            close_token=close_token,
         )
         try:
             if isinstance(getattr(self.provider, "capabilities", None), Mapping):
@@ -886,6 +1064,7 @@ class RecoveryEngine:
                             "checkpoint_receipt": dict(checkpoint),
                             "checkpoint_receipt_sha256": canonical_digest(checkpoint),
                             "checkpoint_verifier": "chitra.detect.rescue.verify_checkpoint_receipt_signature",
+                            "close_token": close_token,
                         },
                     )
                 )
@@ -895,6 +1074,11 @@ class RecoveryEngine:
             values.pop("kind", None)
             result = CloseArchiveResult.from_dict(values)
             if self.state_root is None:
+                return None
+            if (
+                result.checkpoint_receipt != checkpoint
+                or result.checkpoint_receipt_sha256 != canonical_digest(checkpoint)
+            ):
                 return None
             if result.signature is not None and not _verify_mapping_signature(result.to_dict(), self.state_root):
                 return None
@@ -1790,9 +1974,9 @@ class RecoveryEngine:
                 "payload": payload,
             }
             operation_id = f"{action}-" + canonical_digest(identity)[:32]
-            return PendingProviderOperation(
+            provisional = PendingProviderOperation(
                 operation_id=operation_id,
-                kind="close" if action == "close" else "create_or_resume",
+                kind="close",
                 lane_id=record.lane_id,
                 provider_handle=provider.handle,
                 provider_session_id=session,
@@ -1801,7 +1985,27 @@ class RecoveryEngine:
                 payload=payload,
                 provider_instance_id=provider.instance_id,
                 provider_generation=provider.generation,
+                process_start_token=provider.process_start_token,
                 created_at=current.isoformat(),
+            )
+            try:
+                request = json.loads(payload)
+            except json.JSONDecodeError as exc:
+                raise RecoveryStateError("close operation payload is invalid") from exc
+            if not isinstance(request, dict) or "close_token" in request:
+                raise RecoveryStateError("close operation payload is invalid")
+            request["close_token"] = _close_auth_token(
+                record, provisional, state_root=self.state_root
+            )
+            final_payload = json.dumps(
+                request, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
+            final_identity = {**identity, "payload": final_payload}
+            return provisional.model_copy(
+                update={
+                    "payload": final_payload,
+                    "payload_digest": canonical_digest(final_identity),
+                }
             )
         if action == "resume":
             provider = record.provider
@@ -1846,7 +2050,17 @@ class RecoveryEngine:
                 "owner_process": close.owner_process.model_dump(mode="json") if close.owner_process is not None else None,
                 "resume_token": resume_token,
             }
-            return provisional.model_copy(update={"payload_digest": request_digest("create_or_resume", request)})
+            return provisional.model_copy(
+                update={
+                    "payload": json.dumps(
+                        request,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ),
+                    "payload_digest": request_digest("create_or_resume", request),
+                }
+            )
         cycle_id = record.recovery.cycle_id
         if cycle_id is None:
             raise RecoveryStateError("recovery cycle identity is missing")
@@ -2679,7 +2893,15 @@ class RecoveryEngine:
             return self._close_wait(working, "another provider operation is still pending", pending)
         current_time = _now(now)
         try:
-            expected = self._operation(working, "close", _close_payload(working), current_time)
+            expected = self._operation(
+                working,
+                "close",
+                _close_payload(
+                    working,
+                    checkpoint_receipt_sha256=canonical_digest(checkpoint),
+                ),
+                current_time,
+            )
         except (RecoveryStateError, TypeError, ValueError) as exc:
             return self._close_wait(working, str(exc), pending)
         if pending is None:
@@ -2841,15 +3063,21 @@ class RecoveryEngine:
             for name in ("status", "create_or_resume", "resume_after_close")
         ):
             return self._resume_wait(record, "provider lacks exact same-session resume capability")
-        status = self._provider_status(record)
-        if (
-            status is None
-            or status.provider_session_id != record.provider.provider_session_id
-            or status.provider_instance_id != record.provider.instance_id
-            or status.generation != record.provider.generation
-            or status.state not in {ProviderState.CLOSED, ProviderState.ARCHIVED, ProviderState.IDLE}
-        ):
-            return self._resume_wait(record, "provider status does not prove the closed session identity")
+        pending_resume_reconcile = (
+            record.pending_operation is not None
+            and record.pending_operation.kind == "create_or_resume"
+            and record.pending_operation.attempted
+        )
+        if not pending_resume_reconcile:
+            status = self._provider_status(record)
+            if (
+                status is None
+                or status.provider_session_id != record.provider.provider_session_id
+                or status.provider_instance_id != record.provider.instance_id
+                or status.generation != record.provider.generation
+                or status.state not in {ProviderState.CLOSED, ProviderState.ARCHIVED, ProviderState.IDLE}
+            ):
+                return self._resume_wait(record, "provider status does not prove the closed session identity")
         current_time = _now(now)
         payload = canonical_digest(
             {
@@ -2895,27 +3123,43 @@ class RecoveryEngine:
                 return self._resume_wait(record, f"resume operation could not be durably recorded: {exc}")
         elif (
             pending.kind != "create_or_resume"
-            or pending.model_dump(exclude={"created_at", "attempt"})
-            != expected.model_dump(exclude={"created_at", "attempt"})
+            or pending.model_dump(exclude={"created_at", "attempt", "attempted"})
+            != expected.model_dump(exclude={"created_at", "attempt", "attempted"})
         ):
             return self._resume_wait(record, "pending resume identity or payload changed", pending)
         stored = record.last_operation_result
         if stored is not None and stored.operation_id == pending.operation_id and stored.status == "consumed":
             result = stored
         else:
+            record = self._mark_attempted(record, persist=True)
+            pending = record.pending_operation
+            assert pending is not None
             result = self._invoke(record, pending, "resume", pending.payload, current_time)
             record = self._persist(record.model_copy(update={"last_operation_result": result}), persist=True)
         if result.status != "consumed":
             return self._resume_wait(record, "same-session resume lacks exact consumption evidence", pending, result)
+        receipt = result.reopen_receipt
+        if receipt is None:
+            return self._resume_wait(
+                record,
+                "same-session resume lacks its authenticated reopen receipt",
+                pending,
+                result,
+            )
         # Consumption of the resume command is not proof that the provider
         # actually left its archived state.  Require a fresh live observation
         # for the exact physical session before changing Chitra to active.
-        live = self._provider_status(record)
+        # The accepted reopen receipt authorizes one process-token rotation.
+        # Observe the target without applying the old Chitra token fence, then
+        # bind the new token to the authenticated receipt below.
+        live = self._provider_status()
         if (
             live is None
+            or str(live.provider) != str(record.provider.kind)
             or live.provider_session_id != record.provider.provider_session_id
             or live.provider_instance_id != record.provider.instance_id
             or live.generation != record.provider.generation
+            or live.process_start_token != receipt.owner_process.start_token
             or live.state not in {ProviderState.IDLE, ProviderState.RUNNING}
         ):
             return self._resume_wait(
@@ -2924,8 +3168,7 @@ class RecoveryEngine:
                 pending,
                 result,
             )
-        receipt = result.reopen_receipt
-        if receipt is None or receipt.auth_token != _resume_auth_token(
+        if receipt.auth_token != _resume_auth_token(
             record, close, pending, state_root=self.state_root
         ):
             return self._resume_wait(record, "same-session resume lacks its authenticated reopen receipt", pending, result)
@@ -2942,9 +3185,21 @@ class RecoveryEngine:
         if not _resume_receipt_matches(record, close, pending, result, state_root=self.state_root):
             return self._resume_wait(record, "same-session resume lacks exact authenticated reopen evidence", pending, result)
         check = self._check(current_time, "Check useful progress after resume", "a material update after the same-session resume")
+        reopened_observation = {
+            **receipt.owner_process.model_dump(mode="json"),
+            "process_start_token": receipt.owner_process.start_token,
+        }
         resumed = record.model_copy(
             update={
                 "lifecycle": "active",
+                "provider": record.provider.model_copy(
+                    update={
+                        "process_start_token": receipt.owner_process.start_token,
+                        "observed_process": reopened_observation,
+                        "registration_digest": None,
+                        "registration_observed_at": receipt.observed_at,
+                    }
+                ),
                 "last_close_result": None,
                 "pending_operation": None,
                 "next_check": check,
