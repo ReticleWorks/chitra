@@ -7,7 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -33,6 +33,7 @@ from .journal.models import CanonicalEvent, ProgressClass, ProgressClassificatio
 from .journal.store import EventJournal
 from .provider_protocol import (
     CheckpointRequest,
+    CloseRequest,
     CreateOrResumeRequest,
     Provider,
     ProviderState,
@@ -57,6 +58,7 @@ from .session_contract import (
     RecoveryState,
     WakeReceipt,
     extend_wake_archive_digest,
+    validate_close_result,
     validate_operation_result,
 )
 from .state_paths import state_dir
@@ -294,6 +296,85 @@ def _digest(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _mapping(value: object, name: str) -> Mapping[str, object]:
+    """Project a provider boundary result without accepting arbitrary objects."""
+
+    if isinstance(value, Mapping):
+        return value
+    for method_name in ("model_dump", "to_dict"):
+        method = getattr(value, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            dumped = method(mode="json") if method_name == "model_dump" else method()
+        except TypeError:
+            dumped = method()
+        if isinstance(dumped, Mapping):
+            return dumped
+    raise ValueError(f"{name} must be an object")
+
+
+def _close_session(record: JoinedLaneRecord) -> str:
+    session = record.provider.provider_session_id
+    if not session:
+        raise RecoveryStateError("governed close requires an exact physical provider session ID")
+    return session
+
+
+def _close_operation(record: JoinedLaneRecord, payload: str, current: datetime) -> PendingProviderOperation:
+    provider = record.provider
+    if provider.instance_id is None or provider.generation is None:
+        raise RecoveryStateError("close operation lacks a complete provider identity")
+    session = _close_session(record)
+    identity = {
+        "lane_id": record.lane_id,
+        "goal_id": record.goal_id,
+        "goal_version": record.goal_version,
+        "session_ref": record.session_ref,
+        "provider_handle": provider.handle,
+        "provider_session_id": session,
+        "provider_instance_id": provider.instance_id,
+        "provider_generation": provider.generation,
+        "payload": payload,
+    }
+    operation_id = "close-" + _digest(identity)[:32]
+    return PendingProviderOperation(
+        operation_id=operation_id,
+        kind="close",
+        lane_id=record.lane_id,
+        provider_handle=provider.handle,
+        provider_session_id=session,
+        idempotency_key=f"{operation_id}-idem",
+        payload_digest=_digest(identity),
+        payload=payload,
+        provider_instance_id=provider.instance_id,
+        provider_generation=provider.generation,
+        created_at=current.isoformat(),
+    )
+
+
+def _same_close_operation(
+    actual: PendingProviderOperation, expected: PendingProviderOperation
+) -> bool:
+    return actual.model_dump(exclude={"created_at", "attempt"}) == expected.model_dump(
+        exclude={"created_at", "attempt"}
+    )
+
+
+def _close_receipt_matches(
+    record: JoinedLaneRecord, operation: PendingProviderOperation, result: CloseArchiveResult
+) -> bool:
+    try:
+        validate_close_result(operation, result)
+    except (ContractValidationError, TypeError, ValueError):
+        return False
+    return (
+        result.provider_thread_ref == record.provider.handle
+        and result.provider_session_id == _close_session(record)
+        and result.checkpoint_ref == record.checkpoint_reference
+    )
+
+
 class RecoveryEngine:
     """Advance one bounded action through canonical provider and lane state."""
 
@@ -355,6 +436,55 @@ class RecoveryEngine:
     ) -> JoinedLaneRecord:
         store = self.store_for(record.lane_id)
         return store.save(record, transition=transition) if persist and store is not None else record
+
+    def _invoke_close(
+        self, record: JoinedLaneRecord, operation: PendingProviderOperation
+    ) -> CloseArchiveResult | None:
+        """Call one provider close and accept only its exact archive receipt."""
+
+        if self.provider is None:
+            return None
+        request = CloseRequest(operation=operation, archive=True)
+        try:
+            if isinstance(getattr(self.provider, "capabilities", None), Mapping):
+                raw = self.provider.close(
+                    cast(
+                        Any,
+                        {
+                            "operation": operation.model_dump(mode="json"),
+                            "archive": True,
+                            "payload": json.loads(operation.payload),
+                        },
+                    )
+                )
+            else:
+                raw = self.provider.close(request)
+            values = dict(_mapping(raw, "provider close result"))
+            values.pop("kind", None)
+            result = CloseArchiveResult.from_dict(values)
+            if not _close_receipt_matches(record, operation, result):
+                return None
+            return result
+        except (ContractValidationError, TypeError, ValueError, OSError):
+            return None
+        except Exception:  # provider outage or lost response remains pending
+            return None
+
+    def _finish_close(
+        self, record: JoinedLaneRecord, result: CloseArchiveResult, *, persist: bool
+    ) -> JoinedLaneRecord:
+        closed = record.model_copy(
+            update={
+                "lifecycle": "inactive",
+                "pending_operation": None,
+                "last_close_result": result,
+                "recovery": record.recovery.model_copy(
+                    update={"stage": "complete", "pending_payload": None}
+                ),
+                "next_check": None,
+            }
+        )
+        return self._persist(closed, persist=persist)
 
     def _cycle_id(self, record: JoinedLaneRecord, signature: str, current: datetime) -> str:
         return "cycle-" + _digest(
@@ -1234,6 +1364,167 @@ class RecoveryEngine:
             return self._finish_consumed(reconciled, current, facts, persist)
         return self._pending(reconciled, current, outcome.reason or "pending operation is not consumed", persist)
 
+    def _governed_close(
+        self,
+        record: JoinedLaneRecord | None,
+        *,
+        lane_id: str | None,
+        now: datetime | None,
+        persist: bool,
+    ) -> GovernedCloseDecision:
+        """Run the close state machine on the canonical lane store.
+
+        The close module owns checkpoint and evidence documents.  Recovery
+        owns operation identity, provider invocation, pending retry, and the
+        final lane transition so close cannot grow a second recovery engine.
+        """
+
+        from .governed_close import (
+            _close_payload,
+            _ensure_checkpoint,
+            _operation_matches,
+            _read_close_evidence,
+            _wait,
+            _write_close_evidence,
+        )
+
+        if self.state_root is None or not persist:
+            if record is None:
+                raise RecoveryStateError("governed close requires a durable joined-lane store")
+            return _wait(record, "governed close requires durable Chitra storage")
+        goal_root = self.goal_root or self.state_root
+        if goal_root is None:
+            if record is None:
+                raise RecoveryStateError("governed close requires a completion goal root")
+            return _wait(record, "governed close requires the completion gate")
+        store = self.store_for(lane_id or (record.lane_id if record else ""))
+        if store is None:
+            raise RecoveryStateError("governed close requires a durable joined-lane store")
+        current = store.load()
+        if current is not None:
+            record = current
+        if record is None:
+            if not lane_id:
+                raise RecoveryStateError("governed close requires a lane record or lane_id")
+            raise RecoveryStateError(f"no joined lane record for {lane_id!r}")
+        if record.last_close_result is not None:
+            if record.lifecycle != "inactive":
+                return _wait(record, "close evidence exists but the lane is not inactive")
+            return GovernedCloseDecision(
+                action="closed",
+                record=record,
+                reason="lane already has immutable close evidence",
+                close_result=record.last_close_result,
+            )
+        if record.lifecycle != "active":
+            return _wait(record, "lane is not active and has no close evidence")
+        try:
+            goal = get_goal(goal_root, record.session_ref)
+        except Exception as exc:  # an unreadable goal cannot authorize close
+            return _wait(record, f"completion goal is unavailable: {exc}")
+        if (
+            goal is None
+            or goal.status != "done-pending-close"
+            or (goal.session_ref, goal.lane_id, goal.goal_id, goal.goal_version)
+            != (record.session_ref, record.lane_id, record.goal_id, record.goal_version)
+        ):
+            return _wait(record, "exact enrolled goal is not done-pending-close")
+        if self.provider is None:
+            return _wait(record, "provider adapter is unavailable")
+        provider_kind = str(getattr(getattr(self.provider, "provider_name", ""), "value", getattr(self.provider, "provider_name", "")))
+        if provider_kind != str(record.provider.kind):
+            return _wait(record, "provider kind does not match the joined lane")
+        capabilities = getattr(self.provider, "capabilities", {})
+        for capability in ("status", "close"):
+            supported = (
+                capabilities.get(capability) is True
+                if isinstance(capabilities, Mapping)
+                else bool(getattr(capabilities, capability, False))
+            )
+            if not supported or not record.provider.capabilities.supports(cast(Any, capability)):
+                return _wait(record, f"provider lacks required {capability} capability")
+        try:
+            working = _ensure_checkpoint(self.state_root, record)
+        except (OSError, RecoveryStateError, TypeError, ValueError) as exc:
+            return _wait(record, f"Chitra checkpoint is not durable: {exc}")
+        pending = working.pending_operation
+        if pending is not None and pending.kind != "close":
+            return _wait(working, "another provider operation is still pending", pending)
+        current_time = _now(now)
+        try:
+            expected = _close_operation(working, _close_payload(working), current_time)
+        except (RecoveryStateError, TypeError, ValueError) as exc:
+            return _wait(working, str(exc), pending)
+        if pending is None:
+            try:
+                history = (
+                    *working.operation_history,
+                    OperationReference(
+                        operation_id=expected.operation_id,
+                        idempotency_key=expected.idempotency_key,
+                        payload_digest=expected.payload_digest,
+                        kind="close",
+                        created_at=expected.created_at,
+                    ),
+                )
+                pending = expected
+                working = self._persist(
+                    working.model_copy(update={"pending_operation": expected, "operation_history": history}),
+                    persist=True,
+                )
+            except (ContractValidationError, OSError, RecoveryStateError, TypeError, ValueError) as exc:
+                return _wait(working, f"close operation could not be durably recorded: {exc}")
+        elif not _operation_matches(pending, expected):
+            return _wait(working, "pending close identity or payload changed", pending)
+        recovered = _read_close_evidence(self.state_root, pending, working)
+        if recovered is not None:
+            try:
+                closed = self._finish_close(working, recovered, persist=True)
+            except (ContractValidationError, OSError, RecoveryStateError, TypeError, ValueError) as exc:
+                return _wait(
+                    working,
+                    f"durable close evidence exists but Chitra could not persist close state: {exc}",
+                    pending,
+                    recovered,
+                )
+            return GovernedCloseDecision(
+                action="closed",
+                record=closed,
+                reason="reconciled durable provider close evidence",
+                operation=pending,
+                close_result=recovered,
+            )
+        status = self._provider_status(working)
+        if (
+            status is None
+            or str(status.provider) != str(working.provider.kind)
+            or status.provider_session_id != _close_session(working)
+            or status.generation != working.provider.generation
+            or status.current_turn_id is not None
+            or status.state not in {ProviderState.IDLE, ProviderState.CLOSED, ProviderState.ARCHIVED}
+        ):
+            return _wait(working, "provider status does not prove the exact idle or already-closed physical session", pending)
+        result = self._invoke_close(working, pending)
+        if result is None:
+            return _wait(working, "provider close response is unknown or failed exact identity validation", pending)
+        try:
+            _write_close_evidence(self.state_root, pending, result)
+            closed = self._finish_close(working, result, persist=True)
+        except (ContractValidationError, OSError, RecoveryStateError, TypeError, ValueError) as exc:
+            return _wait(
+                working,
+                f"provider close succeeded but Chitra could not persist close evidence: {exc}",
+                pending,
+                result,
+            )
+        return GovernedCloseDecision(
+            action="closed",
+            record=closed,
+            reason="provider close is bound to Chitra's checkpoint and physical session",
+            operation=pending,
+            close_result=result,
+        )
+
     def governed_close(
         self,
         record: JoinedLaneRecord | None = None,
@@ -1242,20 +1533,7 @@ class RecoveryEngine:
         now: datetime | None = None,
         persist: bool = True,
     ) -> GovernedCloseDecision:
-        """Delegate close to the small close seam without duplicating recovery."""
-
-        from .governed_close import governed_close
-
-        return governed_close(
-            provider=self.provider,
-            state_root=self.state_root,
-            goal_root=self.goal_root or self.state_root,
-            record=record,
-            lane_id=lane_id,
-            now=now,
-            persist=persist,
-            state_store=self._state_store,
-        )
+        return self._governed_close(record, lane_id=lane_id, now=now, persist=persist)
 
     close = governed_close
 
