@@ -169,9 +169,14 @@ def _command_shims(
         'case " $* " in\n'
         '  *" list-sessions "*) printf \'%s\\n\' "$FAKE_SESSION" ;;\n'
         '  *" list-panes "*)\n'
+        '    if [ -f "$STOPPED_MARKER" ] && [ ! -f "$RESUMED_MARKER" ]; then exit 1; fi\n'
         '    if [ ! -f "$RESUMED_MARKER" ] && ! kill -0 "$FAKE_PID" 2>/dev/null; then exit 1; fi\n'
         '    printf \'%s\\t0\\t0\\t%s\\tpython\\t%s\\n\' "$FAKE_SESSION" "$PID" "$TOKEN" ;;\n'
         '  *" has-session "*) exit 1 ;;\n'
+        '  *" capture-pane "*) [ ! -f "$CAPTURE_MARKER" ] || printf \'continued\\n\' ;;\n'
+        '  *" send-keys "*)\n'
+        '    printf \'%s\\n\' "$SEND_EVENT_JSON" >> "$TRANSCRIPT_PATH"\n'
+        '    printf \'continued\' > "$CAPTURE_MARKER" ;;\n'
         "  *) exit 0 ;;\n"
         "esac\n",
     )
@@ -180,8 +185,6 @@ def _command_shims(
         "#!/usr/bin/env python3\n"
         + textwrap.dedent(
             f"""
-            import hashlib
-            import hmac
             import json
             import os
             import sys
@@ -189,6 +192,9 @@ def _command_shims(
 
             action = sys.argv[-1]
             if action == "stop":
+                count = Path(os.environ["STOP_COUNT"])
+                count.write_text(str(int(count.read_text() if count.exists() else "0") + 1))
+                Path(os.environ["STOPPED_MARKER"]).write_text("stopped")
                 raise SystemExit(0)
             if action == "start":
                 count = Path(os.environ["RESUME_COUNT"])
@@ -196,45 +202,34 @@ def _command_shims(
                 Path(os.environ["RESUMED_MARKER"]).write_text("resumed")
                 raise SystemExit(0)
             if action != "resume":
-                print(json.dumps({{"state": "closed"}}))
+                print(json.dumps({{
+                    "state": "running" if Path(os.environ["RESUMED_MARKER"]).exists() else "closed",
+                    "provider_instance_id": {INSTANCE_ID!r},
+                    "provider_generation": {GENERATION},
+                    "provider_session_id": {SESSION_REF!r},
+                    "process_start_token": {new_owner["start_token"]!r},
+                }}))
                 raise SystemExit(0)
             request = json.loads(sys.stdin.read())
             count = Path(os.environ["RESUME_COUNT"])
             count.write_text(str(int(count.read_text() if count.exists() else "0") + 1))
             Path(os.environ["RESUMED_MARKER"]).write_text("resumed")
             operation = request["operation"]
-            receipt = {{
-                "schema": "chitra.lane-reopen.v1",
-                "operation_id": operation["operation_id"],
-                "close_operation_id": request["close_operation_id"],
-                "lane_id": operation["lane_id"],
-                "goal_id": request["goal_id"],
-                "goal_version": request["goal_version"],
-                "session_ref": request["session_ref"],
-                "provider_session_id": request["provider_session_id"],
-                "provider_handle": operation["provider_handle"],
-                "provider_instance_id": operation["provider_instance_id"],
-                "provider_generation": operation["provider_generation"],
-                "checkpoint_ref": request["context_ref"],
-                "prior_owner_process": request["owner_process"],
-                "owner_process": {new_owner!r},
-                "created_new_lane": False,
-                "created_new_session": False,
-                "auth_token": request["resume_token"],
-                "observed_at": "2026-08-24T12:01:00+00:00",
-                "evidence": "exact same-session reopen",
-            }}
-            unsigned = json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-            receipt["receipt_hmac"] = hmac.new(
-                request["resume_token"].encode(), unsigned.encode(), hashlib.sha256
-            ).hexdigest()
             print(json.dumps({{
                 "status": "consumed", "accepted": True, "consumed": True,
+                "operation_id": operation["operation_id"],
+                "kind": "create_or_resume",
+                "lane_id": operation["lane_id"],
+                "goal_id": request["goal_id"],
+                "provider_handle": operation["provider_handle"],
+                "idempotency_key": operation["idempotency_key"],
+                "payload_digest": operation["payload_digest"],
                 "provider_instance_id": operation["provider_instance_id"],
                 "provider_generation": operation["provider_generation"],
                 "provider_session_id": request["provider_session_id"],
+                "session_ref": request["provider_session_id"],
+                "provider_pid": {new_owner["pid"]},
                 "process_start_token": {new_owner["start_token"]!r},
-                "reopen_receipt": receipt,
             }}, sort_keys=True, separators=(",", ":")))
             """
         ),
@@ -245,8 +240,11 @@ def _command_shims(
         + textwrap.dedent(
             """
             import importlib.util
+            import io
             import os
+            import subprocess
             import sys
+            from contextlib import redirect_stdout
             from importlib.machinery import SourceFileLoader
             from pathlib import Path
             from types import SimpleNamespace
@@ -267,8 +265,37 @@ def _command_shims(
             module.target_allowed = lambda *_args: True
             module._sync_lane_credentials = lambda *_args: True
             module._attach_transcript = lambda *_args: None
+            original_run = subprocess.run
+
+            def mapped_run(argv, *args, **kwargs):
+                command = list(argv)
+                if command and command[0] == "tmux":
+                    command[0] = module.TMUX
+                return original_run(command, *args, **kwargs)
+
+            module.subprocess.run = mapped_run
+            original_owner_alive = module.owner_alive
+            module.owner_alive = lambda pid, token: (
+                False
+                if Path(os.environ["STOPPED_MARKER"]).exists()
+                and not Path(os.environ["RESUMED_MARKER"]).exists()
+                and pid == int(os.environ["FAKE_PID"])
+                else original_owner_alive(pid, token)
+            )
             os.environ["SSH_ORIGINAL_COMMAND"] = " ".join(sys.argv[1:])
-            raise SystemExit(module.main())
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = module.main()
+            if (
+                result == 0
+                and os.environ.get("LOSE_FLEET_RESUME_REPLY") == "1"
+                and sys.argv[1] == "chitra-lane-resume"
+                and not Path(os.environ["LOST_REPLY_MARKER"]).exists()
+            ):
+                Path(os.environ["LOST_REPLY_MARKER"]).write_text("lost")
+                os._exit(91)
+            sys.stdout.write(output.getvalue())
+            raise SystemExit(result)
             """
         ),
     )
@@ -300,7 +327,13 @@ def _environment(
         "NEW_PID": str(provider_pid),
         "NEW_TOKEN": process_token,
         "RESUMED_MARKER": str(tmp_path / "resumed-marker"),
+        "STOPPED_MARKER": str(tmp_path / "stopped-marker"),
+        "LOST_REPLY_MARKER": str(tmp_path / "lost-reply-marker"),
+        "CAPTURE_MARKER": str(tmp_path / "capture-marker"),
+        "TRANSCRIPT_PATH": str(tmp_path / "state" / "tophand" / LANE / "tmux-transcript.log"),
+        "SEND_EVENT_JSON": "",
         "LANE_SESSION_COMMAND": str(target),
+        "STOP_COUNT": str(tmp_path / "stop-count"),
         "RESUME_COUNT": str(tmp_path / "resume-count"),
     }
 
@@ -325,11 +358,19 @@ def _governed_close_request(state_root: Path, process_token: str) -> dict[str, o
         "provenance": {"kind": "governed-completion-checkpoint", "owner": "chitra"},
         "signature": "a" * 64,
     }
+    checkpoint_receipt_sha256 = hashlib.sha256(
+        json.dumps(checkpoint, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     return {
-        "operation": _operation("close", "close-a", process_token, "close-digest"),
+        "close_token": "close-token-a",
+        "operation": _close_operation(
+            checkpoint_ref=checkpoint_ref,
+            checkpoint_receipt_sha256=checkpoint_receipt_sha256,
+            process_start_token=process_token,
+        ),
         "checkpoint_ref": checkpoint_ref,
         "checkpoint_receipt": checkpoint,
-        "checkpoint_receipt_sha256": hashlib.sha256(json.dumps(checkpoint, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+        "checkpoint_receipt_sha256": checkpoint_receipt_sha256,
         "checkpoint_verifier": "chitra.detect.rescue.verify_checkpoint_receipt_signature",
         "provider_session_id": SESSION_REF,
         "archive": True,
@@ -348,11 +389,16 @@ def _adapter_child(tmp_path: Path, forced: Path) -> Path:
             from tools.support.chitra_adapter.tophand_adapter import ProviderEvidence, TophandAdapter, TophandCommandTransport
 
             request = json.loads(sys.stdin.read())
+            method = sys.argv[1]
+            operation = request.get("operation", {{}})
+            process_start_token = operation.get(
+                "process_start_token", request.get("process_start_token")
+            )
             transport = TophandCommandTransport(
                 (sys.executable, {str(forced)!r}), lane_id={LANE!r},
                 session_ref={SESSION_REF!r}, goal_id={GOAL_ID!r}, goal_version=1,
                 provider_session_id={SESSION_REF!r},
-                process_start_token=request["operation"]["process_start_token"],
+                process_start_token=process_start_token,
                 forced_surface=True,
             )
             evidence = ProviderEvidence(Path(sys.argv[2]), {LANE!r})
@@ -361,10 +407,10 @@ def _adapter_child(tmp_path: Path, forced: Path) -> Path:
                 goal_version=1, session_ref={SESSION_REF!r},
                 provider_session_id={SESSION_REF!r}, provider_handle="thread-a",
                 provider_instance_id={INSTANCE_ID!r}, provider_generation={GENERATION},
-                process_start_token=request["operation"]["process_start_token"],
+                process_start_token=process_start_token,
                 evidence=evidence,
             )
-            result = getattr(adapter, sys.argv[1])(request)
+            result = adapter.status() if method == "status" else getattr(adapter, method)(request)
             print(json.dumps(result, sort_keys=True, separators=(",", ":")))
             """
         ),
@@ -483,6 +529,116 @@ def _crash_window_child(tmp_path: Path) -> Path:
     )
 
 
+def _packaged_close_projection_child(tmp_path: Path) -> Path:
+    return _write_executable(
+        tmp_path / "packaged-close-projection-child.py",
+        "#!/usr/bin/env python3\n"
+        + textwrap.dedent(
+            """
+            import hashlib
+            import json
+            import sys
+            from datetime import UTC, datetime
+            from pathlib import Path
+
+            from chitra.governed_close import _close_payload, _write_checkpoint
+            from chitra.provider_protocol import CloseRequest
+            from chitra.recovery import RecoveryEngine
+            from chitra.recovery_provider import _PackagedTophandProvider, _tophand_operation_dict
+            from chitra.session_contract import JoinedLaneRecord, ProviderCapabilities, ProviderIdentity
+            from tools.support.chitra_adapter.tophand_adapter import TophandAdapter
+
+            state_root = Path(sys.argv[1])
+            capture_path = Path(sys.argv[2])
+            record = JoinedLaneRecord(
+                lane_id="probe-lane",
+                goal_id="goal-a",
+                goal_version=1,
+                session_ref="tophand:probe-lane:0.0",
+                provider=ProviderIdentity(
+                    kind="tophand",
+                    handle="thread-a",
+                    provider_session_id="tophand:probe-lane:0.0",
+                    instance_id="instance-a",
+                    generation=1,
+                    capabilities=ProviderCapabilities(
+                        status=True, checkpoint=True, close=True
+                    ),
+                ),
+            )
+            reference = _write_checkpoint(state_root, record)
+            bound = record.model_copy(update={"checkpoint_reference": reference})
+            receipt = json.loads(
+                (state_root / "checkpoints" / f"{reference}.json").read_text()
+            )
+            receipt_digest = hashlib.sha256(
+                json.dumps(
+                    receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+                ).encode()
+            ).hexdigest()
+            operation = RecoveryEngine(state_root=state_root)._operation(
+                bound,
+                "close",
+                _close_payload(bound, checkpoint_receipt_sha256=receipt_digest),
+                datetime(2026, 8, 24, 12, tzinfo=UTC),
+            )
+            request = CloseRequest(
+                operation=operation,
+                archive=True,
+                checkpoint_receipt=receipt,
+                checkpoint_receipt_sha256=receipt_digest,
+                checkpoint_verifier=(
+                    "chitra.detect.rescue.verify_checkpoint_receipt_signature"
+                ),
+                close_token=json.loads(operation.payload)["close_token"],
+            )
+
+            class Captured(Exception):
+                pass
+
+            class Transport:
+                def close(self, value):
+                    capture_path.write_text(
+                        json.dumps(value, sort_keys=True, separators=(",", ":"))
+                    )
+                    raise Captured
+
+            adapter = TophandAdapter(
+                Transport(),
+                lane_id=record.lane_id,
+                goal_id=record.goal_id,
+                goal_version=record.goal_version,
+                session_ref=record.session_ref,
+                provider_session_id=record.provider.provider_session_id,
+                provider_handle=record.provider.handle,
+                provider_instance_id=record.provider.instance_id,
+                provider_generation=record.provider.generation,
+            )
+            provider = _PackagedTophandProvider(
+                adapter, state_root=state_root, result_sink=lambda _value: None
+            )
+            try:
+                provider._call("close", request, operation)
+            except Captured:
+                pass
+            else:
+                raise AssertionError("close did not reach the Adapter transport")
+
+            projected = json.loads(capture_path.read_text())
+            durable = json.loads(operation.payload)
+            assert projected["operation"] == _tophand_operation_dict(operation)
+            assert projected["payload"] == durable
+            assert projected["checkpoint_receipt"] == receipt
+            assert projected["checkpoint_receipt_sha256"] == receipt_digest
+            assert projected["checkpoint_verifier"] == request.checkpoint_verifier
+            assert projected["close_token"] == durable["close_token"]
+            assert projected["checkpoint_ref"] == durable["checkpoint_ref"]
+            print(json.dumps(projected, sort_keys=True, separators=(",", ":")))
+            """
+        ),
+    )
+
+
 def _operation(kind: str, operation_id: str, token: str, payload_digest: str) -> dict[str, object]:
     return {
         "operation_id": operation_id,
@@ -498,6 +654,66 @@ def _operation(kind: str, operation_id: str, token: str, payload_digest: str) ->
         "created_at": "2026-08-24T12:00:00+00:00",
         "attempt": 1,
         "payload": f"{kind}-payload",
+    }
+
+
+def test_packaged_chitra_close_projection_reaches_adapter_without_fixture_enrichment(
+    tmp_path: Path,
+) -> None:
+    child = _packaged_close_projection_child(tmp_path)
+    chitra_root = Path(__file__).resolve().parents[1]
+    environment = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(
+            (
+                str(chitra_root / "src"),
+                str(ADAPTER_ROOT),
+                os.environ.get("PYTHONPATH", ""),
+            )
+        ),
+    }
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(child),
+            str(tmp_path / "chitra-state"),
+            str(tmp_path / "captured-close.json"),
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def _close_operation(
+    *, checkpoint_ref: str, checkpoint_receipt_sha256: str, process_start_token: str
+) -> dict[str, object]:
+    payload = {
+        "archive": True,
+        "checkpoint_ref": checkpoint_ref,
+        "lane_id": LANE,
+        "goal_id": GOAL_ID,
+        "goal_version": 1,
+        "session_ref": SESSION_REF,
+        "provider_handle": "thread-a",
+        "provider_session_id": SESSION_REF,
+        "provider_instance_id": INSTANCE_ID,
+        "provider_generation": GENERATION,
+        "process_start_token": process_start_token,
+        "checkpoint_receipt_sha256": checkpoint_receipt_sha256,
+        "close_token": "close-token-a",
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return {
+        **_operation(
+            "close",
+            "close-a",
+            process_start_token,
+            hashlib.sha256(encoded.encode()).hexdigest(),
+        ),
+        "payload": encoded,
     }
 
 
@@ -538,16 +754,24 @@ def test_governed_close_returns_exact_resumable_evidence_from_a_fresh_process(
             "provenance": {"kind": "governed-completion-checkpoint", "owner": "chitra"},
             "signature": "a" * 64,
         }
+        checkpoint_receipt_sha256 = hashlib.sha256(
+            json.dumps(checkpoint, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
         request_fields = {
+            "close_token": "close-token-a",
             "checkpoint_ref": checkpoint_ref,
             "checkpoint_receipt": checkpoint,
-            "checkpoint_receipt_sha256": hashlib.sha256(json.dumps(checkpoint, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            "checkpoint_receipt_sha256": checkpoint_receipt_sha256,
             "checkpoint_verifier": "chitra.detect.rescue.verify_checkpoint_receipt_signature",
             "provider_session_id": SESSION_REF,
             "archive": True,
         }
         request = {
-            "operation": _operation("close", "close-a", token, "close-digest"),
+            "operation": _close_operation(
+                checkpoint_ref=checkpoint_ref,
+                checkpoint_receipt_sha256=checkpoint_receipt_sha256,
+                process_start_token=token,
+            ),
             **request_fields,
         }
         child = _adapter_child(tmp_path, forced)
@@ -739,6 +963,7 @@ def test_same_session_resume_uses_structured_owner_authenticated_receipt_and_no_
         assert close_result["status"] == "consumed"
         assert close_result["state"] == "closed"
         assert close_result["owner_process"] == prior_owner
+        assert (tmp_path / "stop-count").read_text() == "1"
         provider.terminate()
         provider.wait(timeout=5)
         assert provider.poll() is not None
@@ -767,6 +992,22 @@ def test_same_session_resume_uses_structured_owner_authenticated_receipt_and_no_
             },
             **resume_fields,
         }
+        lost = subprocess.run(
+            [sys.executable, str(child), "create_or_resume", str(evidence)],
+            input=json.dumps(request),
+            capture_output=True,
+            text=True,
+            env={**environment, "LOSE_FLEET_RESUME_REPLY": "1"},
+            check=False,
+        )
+        assert lost.returncode != 0
+        assert (tmp_path / "lost-reply-marker").exists(), lost.stderr
+        assert (tmp_path / "lost-reply-marker").read_text() == "lost"
+        assert (tmp_path / "resume-count").read_text() == "1"
+        fleet_state = tmp_path / "state" / "tophand" / LANE
+        assert json.loads((fleet_state / "lane-resume-attempt.json").read_text())["state"] == "consumed"
+        assert json.loads((fleet_state / "lane-reopen.json").read_text())["schema"] == "chitra.lane-reopen.v1"
+
         outcomes = []
         for _ in range(2):
             completed = subprocess.run(
@@ -813,6 +1054,51 @@ def test_same_session_resume_uses_structured_owner_authenticated_receipt_and_no_
         assert restarted == first
         assert (tmp_path / "resume-count").read_text() == "1"
         assert any((evidence / "provider-results").glob("*.jsonl"))
+
+        observed = subprocess.run(
+            [sys.executable, str(child), "status", str(evidence)],
+            input=json.dumps({"process_start_token": str(new_owner["start_token"])}),
+            capture_output=True,
+            text=True,
+            env=environment,
+            check=False,
+        )
+        assert observed.returncode == 0, observed.stderr
+        status = json.loads(observed.stdout)
+        assert status["state"] == "running"
+        assert status["process_start_token"] == new_owner["start_token"]
+
+        send_operation = _operation(
+            "send", "send-after-resume", str(new_owner["start_token"]), "send-digest"
+        )
+        send_event = {
+            "event_id": "event-send-after-resume",
+            "cursor": "cursor-send-after-resume",
+            "sequence": 1,
+            "operation_id": "send-after-resume",
+            "lane_id": LANE,
+            "session_ref": SESSION_REF,
+            "provider_session_id": SESSION_REF,
+            "provider_instance_id": INSTANCE_ID,
+            "provider_generation": GENERATION,
+            "nonce": "nonce-send-after-resume",
+            "status": "consumed",
+            "payload": {"text": "continue"},
+        }
+        sent = subprocess.run(
+            [sys.executable, str(child), "send", str(evidence)],
+            input=json.dumps({"operation": send_operation, "text": "continue"}),
+            capture_output=True,
+            text=True,
+            env={**environment, "SEND_EVENT_JSON": json.dumps(send_event, separators=(",", ":"))},
+            check=False,
+        )
+        assert sent.returncode == 0, sent.stderr
+        send_result = json.loads(sent.stdout)
+        assert send_result["status"] == "consumed"
+        assert send_result["process_start_token"] == new_owner["start_token"]
+        assert (tmp_path / "stop-count").read_text() == "1"
+        assert (tmp_path / "resume-count").read_text() == "1"
     finally:
         if provider.poll() is None:
             provider.terminate()
