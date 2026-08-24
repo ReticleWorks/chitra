@@ -115,6 +115,20 @@ def _goal_fields(record: JoinedLaneRecord, goal: GoalProjection | None) -> tuple
     return goal.goal, goal.done_when, goal.status
 
 
+def _goal_snapshot(goal: GoalProjection | None) -> dict[str, object] | None:
+    """Return the complete authoritative goal record for a report, when supplied."""
+
+    if goal is None:
+        return None
+    to_dict = getattr(goal, "to_dict", None)
+    if not callable(to_dict):
+        return None
+    value = to_dict()
+    if not isinstance(value, dict):
+        raise ValueError("goal to_dict() must return an object")
+    return dict(value)
+
+
 @dataclass(frozen=True, slots=True)
 class JoinedSessionView:
     """One immutable, report-ready view of a joined lane record.
@@ -171,6 +185,7 @@ class JoinedSessionView:
     goal: str | None
     done_when: str | None
     goal_status: str | None
+    goal_snapshot: dict[str, object] | None = None
     checkpoint_reference: str | None = None
     pending_operation: PendingProviderOperation | None = None
     close_evidence: CloseArchiveResult | None = None
@@ -239,6 +254,7 @@ class JoinedSessionView:
             "goal": self.goal,
             "done_when": self.done_when,
             "goal_status": self.goal_status,
+            "goal_snapshot": self.goal_snapshot,
             "checkpoint_reference": self.checkpoint_reference,
             "pending_operation": _pending_operation_value(self.pending_operation),
             "close_evidence": _json_value(self.close_evidence) if self.close_evidence is not None else None,
@@ -261,6 +277,7 @@ def build_joined_session_view(
     step = _current_step(update)
     problems = record.problems
     goal_text, done_when, goal_status = _goal_fields(record, goal)
+    goal_snapshot = _goal_snapshot(goal)
     chitra_action: str | None = None
     last_intervention: InterventionEvidence | None = record.last_intervention
     if record.last_intervention is not None:
@@ -332,6 +349,7 @@ def build_joined_session_view(
         goal=goal_text,
         done_when=done_when,
         goal_status=goal_status,
+        goal_snapshot=goal_snapshot,
         checkpoint_reference=record.checkpoint_reference,
         pending_operation=record.pending_operation,
         close_evidence=record.last_close_result,
