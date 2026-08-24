@@ -490,7 +490,7 @@ def test_forged_resume_receipt_hmac_keeps_the_lane_inactive(tmp_path: Path) -> N
 
     assert resumed.action == "waiting"
     assert resumed.record.lifecycle == "inactive"
-    assert "authenticated reopen evidence" in resumed.reason
+    assert "Fleet receipt HMAC" in resumed.reason
 
 def test_concurrent_supervisors_issue_one_physical_close(tmp_path: Path) -> None:
     record = _record()
