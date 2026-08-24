@@ -32,10 +32,18 @@ LANE_RECORD_VERSION = LANE_RECORD_SCHEMA
 MAX_INLINE_WAKE_RECEIPTS = 64
 LANE_LAUNCH_POLICY_VERSION = LANE_LAUNCH_POLICY_SCHEMA
 
+
+def canonical_digest(value: object) -> str:
+    """Return the one JSON digest used by the Chitra wire boundaries."""
+
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
 Identifier = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")]
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 Timestamp = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 Sha256Digest = Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"^sha256:[0-9a-f]{64}$")]
+EvidenceSignature = Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"^[0-9a-f]{64}$")]
 
 StepStatus = Literal["pending", "active", "blocked", "done", "dropped"]
 PlanState = Literal["forming", "valid", "invalid", "missing", "stale", "conflicting"]
@@ -131,6 +139,82 @@ class OwnerIdentity(_ContractModel):
     role: OwnerRole = "chitra"
     instance_id: Identifier | None = None
     active: bool = True
+
+
+class OwnerProcessIdentity(_ContractModel):
+    """OS identity of the process that owns a physical provider session.
+
+    A PID is reusable.  The kernel start token is therefore part of the
+    binding, along with the executable and account identity that produced it.
+    """
+
+    pid: int = Field(ge=1)
+    uid: int = Field(ge=0)
+    gid: int = Field(ge=0)
+    start_token: Identifier
+    comm: Text
+    exe: Text
+
+    @field_validator("pid", "uid", "gid")
+    @classmethod
+    def reject_bool_process_numbers(cls, value: int) -> int:
+        if isinstance(value, bool):
+            raise ValueError("process identity numbers must be integers")
+        return value
+
+
+class ReopenReceipt(_ContractModel):
+    """Authenticated evidence that one closed provider session was reopened."""
+
+    schema: Literal["chitra.lane-reopen.v1"] = "chitra.lane-reopen.v1"  # type: ignore[assignment]
+    operation_id: Identifier
+    close_operation_id: Identifier
+    lane_id: Identifier
+    goal_id: Identifier
+    goal_version: int = Field(ge=1)
+    session_ref: Identifier
+    provider_session_id: Identifier
+    provider_handle: Identifier
+    provider_instance_id: Identifier
+    provider_generation: int = Field(ge=1)
+    checkpoint_ref: Identifier
+    prior_owner_process: OwnerProcessIdentity
+    owner_process: OwnerProcessIdentity
+    created_new_lane: bool
+    created_new_session: bool
+    # HMAC-bound challenge echoed by the authenticated provider boundary.
+    # Legacy non-process-bound provider doubles may omit it; Fleet reopen
+    # receipts must carry it.
+    auth_token: Identifier | None = None
+    # Fleet binds the returned receipt to the bearer challenge before Chitra
+    # signs and stores its observation.  The field is optional on the wire so
+    # old receipts can be rejected cleanly at the recovery boundary rather
+    # than making the whole lane document unreadable.
+    receipt_hmac: EvidenceSignature | None = None
+    # Chitra's local signature is the durable authenticity boundary.  Fleet
+    # has no access to Chitra's signing key and must never be given one.
+    signature: EvidenceSignature | None = None
+    observed_at: Timestamp
+    evidence: Text
+
+    @field_validator("provider_generation")
+    @classmethod
+    def reject_bool_reopen_generation(cls, value: int) -> int:
+        if isinstance(value, bool):
+            raise ValueError("provider generation must be an integer")
+        return value
+
+    @field_validator("goal_version")
+    @classmethod
+    def reject_bool_reopen_goal_version(cls, value: int) -> int:
+        if isinstance(value, bool):
+            raise ValueError("goal version must be an integer")
+        return value
+
+    @field_validator("observed_at")
+    @classmethod
+    def validate_observed_at(cls, value: str) -> str:
+        return _timestamp(value, "reopen.observed_at")
 
 
 def _validate_payload(payload: object, *, schema: str, model: type[_ContractModel]) -> _ContractModel:
@@ -807,6 +891,7 @@ class ProviderOperationResult(_ContractModel):
     process_start_token: Identifier | None = None
     idempotency_key: Identifier
     payload_digest: Text
+    provider_session_id: Identifier | None = None
     provider_instance_id: Identifier | None = None
     provider_generation: int | None = Field(default=None, ge=1)
     provider_pid: int | None = Field(default=None, ge=1)
@@ -818,6 +903,9 @@ class ProviderOperationResult(_ContractModel):
     consumed: bool | None = None
     observed_at: Timestamp
     evidence: str = ""
+    # Resume results carry the provider's authenticated same-session proof.
+    # It is optional so old non-resume operations remain readable.
+    reopen_receipt: ReopenReceipt | None = None
 
     @field_validator("observed_at")
     @classmethod
@@ -910,15 +998,7 @@ def validate_operation_result(pending: PendingProviderOperation, result: Provide
         errors.append("idempotency key changed")
     if pending.payload_digest != result.payload_digest:
         errors.append("payload digest changed")
-    # A legacy pending envelope may not have persisted the physical session.
-    # In that case a raw result may newly supply it.  Once the pending record
-    # has one, the result must carry the same value; it is never copied into
-    # a result by this validator.
-    if (
-        pending.provider_session_id is not None
-        and result.provider_session_id is not None
-        and pending.provider_session_id != result.provider_session_id
-    ):
+    if result.provider_session_id is not None and pending.provider_session_id != result.provider_session_id:
         errors.append("provider session changed")
     if pending.provider_instance_id != result.provider_instance_id:
         errors.append("provider instance changed")
@@ -963,6 +1043,8 @@ def validate_close_result(pending: PendingProviderOperation, result: CloseArchiv
             continue
         if getattr(pending, field) != getattr(result, field):
             errors.append(f"{field} changed")
+    if result.provider_session_id is not None and pending.provider_session_id != result.provider_session_id:
+        errors.append("provider session changed")
     pending_time = datetime.fromisoformat(pending.created_at.replace("Z", "+00:00"))
     result_time = datetime.fromisoformat(result.observed_at.replace("Z", "+00:00"))
     if result_time < pending_time:
@@ -1023,7 +1105,12 @@ class OperatingFact(_ContractModel):
 
 
 class RecoveryState(_ContractModel):
-    """Bounded recovery ladder state that never creates a user ask."""
+    """Bounded recovery ladder state that never creates a user ask.
+
+    The execution fields are Chitra's tactical overlay. They may change how
+    an enrolled lane is pursued, but they cannot change the enrolled goal.
+    The handoff fields anchor one durable context snapshot across restart.
+    """
 
     stage: RecoveryStage = "none"
     cycle_id: Identifier | None = None
@@ -1035,6 +1122,11 @@ class RecoveryState(_ContractModel):
     # Chitra retains the exact payload that produced a pending operation.  A
     # restart must never rebuild a retry from a later mutable ``next_action``.
     pending_payload: str | None = None
+    execution_objective: str = ""
+    execution_plan: tuple[str, ...] = ()
+    handoff_id: Identifier | None = None
+    handoff_reference: str | None = None
+    handoff_digest: str | None = None
 
     @field_validator("attempt_count")
     @classmethod
@@ -1328,10 +1420,20 @@ class CloseArchiveResult(_ContractModel):
     payload_digest: Text
     state: CloseState
     provider_thread_ref: Identifier
+    # The operation/thread handle above is not necessarily the physical
+    # provider session. New adapters return this after observing the provider;
+    # old close receipts may omit it during migration.
+    provider_session_id: Identifier | None = None
     same_provider_thread: bool | None = None
     later_resume_supported: bool | None = None
     checkpoint_ref: Identifier | None = None
     quiescent: bool | None = None
+    # The process identity observed before the physical stop.  PID alone is
+    # not sufficient because the OS can reuse it.
+    owner_process: OwnerProcessIdentity | None = None
+    # Close evidence is stored and replayed by Chitra.  A provider response
+    # without this local signature is not durable terminal evidence.
+    signature: EvidenceSignature | None = None
     observed_at: Timestamp
     evidence: Text
 
@@ -1544,15 +1646,36 @@ class JoinedLaneRecord(_ContractModel):
                 or close_result.provider_handle != self.provider.handle
                 or close_result.provider_instance_id != self.provider.instance_id
                 or close_result.provider_generation != self.provider.generation
+                or (
+                    close_result.provider_session_id is not None
+                    and close_result.provider_session_id != self.provider.provider_session_id
+                )
             ):
                 raise ValueError("close evidence does not belong to joined lane provider generation")
             if close_result.state in ("closed", "archived") and self.lifecycle != "inactive":
                 raise ValueError("logical close must make the joined lane inactive")
+            if (
+                close_result.state in ("closed", "archived")
+                and (
+                    self.checkpoint_reference is None
+                    or close_result.checkpoint_ref != self.checkpoint_reference
+                )
+            ):
+                raise ValueError("close evidence checkpoint does not match joined lane checkpoint")
+            if (
+                close_result.state in ("closed", "archived")
+                and self.provider.provider_session_id is not None
+                and close_result.provider_session_id != self.provider.provider_session_id
+            ):
+                raise ValueError("close evidence provider session does not match joined lane provider")
             if self.provider.kind == "amp" and close_result.state == "closed":
                 raise ValueError("Amp close must be represented as archived")
             if close_result.later_resume_supported is True and not self.provider.capabilities.resume_after_close:
                 raise ValueError("later_resume_supported requires resume_after_close capability")
-            if self.pending_operation is not None:
+            # A later resume has its own create_or_resume operation while the
+            # close receipt remains historical evidence until that explicit
+            # resume transition completes.
+            if self.pending_operation is not None and self.pending_operation.kind == "close":
                 validate_close_result(self.pending_operation, close_result)
             if close_result.operation_id not in history_ids:
                 raise ValueError("close operation must be retained in operation history")
@@ -1830,6 +1953,7 @@ __all__ = [
     "ProviderOperationResult",
     "ProviderResult",
     "OwnerIdentity",
+    "OwnerProcessIdentity",
     "OwnerRole",
     "ProblemHistoryEvent",
     "ProblemHistoryKind",
@@ -1840,6 +1964,7 @@ __all__ = [
     "RoadmapSnapshot",
     "RoadmapMilestone",
     "RoadmapStep",
+    "ReopenReceipt",
     "SESSION_UPDATE_SCHEMA",
     "SESSION_UPDATE_VERSION",
     "SessionUpdate",
@@ -1850,6 +1975,7 @@ __all__ = [
     "Usage",
     "WakeReceipt",
     "calculate_progress",
+    "canonical_digest",
     "extend_wake_archive_digest",
     "is_valid_update",
     "migrate_legacy_record",

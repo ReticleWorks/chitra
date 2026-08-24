@@ -11,8 +11,9 @@ from test_recovery_contract_regressions import NOW, ConsumedSendProvider, append
 
 from chitra.detect.ladder import IncidentRecord, IncidentStore, ResponseLadder
 from chitra.joined_lane import JoinedLaneConflictError, JoinedLaneStore
+from chitra.journal import EventJournal
 from chitra.provider_protocol import ProviderName, ProviderState, ProviderStatus, ProviderUpdate, ReadUpdatesResult, UpdateKind
-from chitra.recovery import RecoveryEngine, RecoverySupervisor
+from chitra.recovery import RecoveryEngine, RecoveryStateError, RecoveryStateStore, RecoverySupervisor
 from chitra.session_contract import (
     JoinedLaneRecord,
     NextCheck,
@@ -142,6 +143,90 @@ def test_pending_retry_uses_allocated_payload_after_next_action_changes(tmp_path
     assert provider.calls[0][1] == provider.calls[1][1]
     assert second.record.last_operation_result is not None
     assert second.record.last_operation_result.status == "consumed"
+
+
+def test_new_failure_signature_does_not_clear_an_inflight_operation(tmp_path: Path) -> None:
+    provider = _RetryProvider()
+    record = lane_record(
+        recovery=RecoveryState(stage="none", cycle_id="cycle-signature", failure_signature="old-signature")
+    )
+    first = RecoveryEngine(provider=provider, state_root=tmp_path, check_interval=timedelta(0)).run_once(
+        record, now=NOW, goal=goal()
+    )
+    assert first.record.pending_operation is not None
+    scheduled = RecoveryEngine(provider=provider, state_root=tmp_path).schedule(
+        first.record, "new-signature", now=NOW + timedelta(seconds=1)
+    )
+    assert scheduled.pending_operation == first.record.pending_operation
+    assert scheduled.recovery.attempted_remedy == first.record.recovery.attempted_remedy
+    assert scheduled.recovery.pending_payload == first.record.recovery.pending_payload
+
+
+def test_interrupted_wake_transaction_replays_the_missing_journal_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = JoinedLaneStore(tmp_path)
+    record = store.create(lane_record())
+    engine = RecoveryEngine(state_root=tmp_path)
+    original = EventJournal.append_wakes
+
+    def fail_after_state_write(_journal: EventJournal, _rows: object) -> tuple[object, ...]:
+        raise OSError("simulated crash after joined-lane write")
+
+    monkeypatch.setattr(EventJournal, "append_wakes", fail_after_state_write)
+    with pytest.raises(OSError, match="simulated crash"):
+        engine._record_wake(record, "wake-crash", "the same logical lane resumes", 1, NOW, True)
+    monkeypatch.setattr(EventJournal, "append_wakes", original)
+
+    recovered = RecoveryStateStore(tmp_path, "lane-a").load()
+    assert recovered is not None
+    assert [item.wake_id for item in recovered.wake_receipts] == ["wake-crash"]
+    assert [item.wake_id for item in EventJournal(tmp_path, "lane-a").load_wakes()] == ["wake-crash"]
+    assert not (tmp_path / "wake-transactions" / "lane-a.json").exists()
+
+
+def test_close_evidence_symlink_is_rejected(tmp_path: Path) -> None:
+    record = lane_record(recovery=RecoveryState(cycle_id="cycle-evidence"))
+    operation = RecoveryEngine()._operation(record, "send", "payload", NOW)
+    target = tmp_path / "outside.json"
+    target.write_text("{}", encoding="utf-8")
+    evidence_dir = tmp_path / "close-evidence"
+    evidence_dir.mkdir()
+    evidence_path = evidence_dir / f"{operation.operation_id}.json"
+    evidence_path.symlink_to(target)
+
+    with pytest.raises(RecoveryStateError, match="symlink"):
+        RecoveryStateStore(tmp_path, "lane-a").close_evidence_path(operation)
+
+
+def test_lane_control_lock_rejects_a_symlinked_parent(tmp_path: Path) -> None:
+    outside = tmp_path / "outside-lock"
+    outside.mkdir()
+    (tmp_path / "lane-control").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RecoveryStateError, match="symlink"), RecoveryStateStore(tmp_path, "lane-a").lane_control_lock():
+        pass
+    assert not (outside / "lane-a.lock").exists()
+
+
+def test_wake_transaction_rejects_a_symlinked_parent(tmp_path: Path) -> None:
+    outside = tmp_path / "outside-wake"
+    outside.mkdir()
+    (tmp_path / "wake-transactions").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RecoveryStateError, match="symlink"):
+        RecoveryStateStore(tmp_path, "lane-a").load()
+    assert not list(outside.iterdir())
+
+
+def test_context_handoff_rejects_a_symlinked_parent(tmp_path: Path) -> None:
+    outside = tmp_path / "outside-handoff"
+    outside.mkdir()
+    (tmp_path / "recovery-handoffs").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RecoveryStateError, match="symlink"):
+        RecoveryEngine(state_root=tmp_path)._handoff_path(
+            "recovery-handoffs/lane-a-cycle-context.json"
+        )
+    assert not list(outside.iterdir())
 
 
 def test_pending_retry_never_calls_provider_without_durable_storage(tmp_path: Path) -> None:
@@ -280,6 +365,7 @@ def test_relaunch_accepts_opaque_provider_status_identity_without_format_guessin
                 generation=1,
                 fresh=True,
                 provider_available=True,
+                provider_instance_id="instance-a",
                 context_available=True,
             )
 

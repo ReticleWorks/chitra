@@ -167,6 +167,20 @@ function joinedSummary(report) {
       el("b", {}, "Recovery: "),
       joinedLine(report.recovery_action)));
   }
+  if (report.reframe_progress?.active) {
+    summary.append(el("div", { class: "joined-line" },
+      el("b", {}, "Reframe: "),
+      String(report.reframe_progress.stage || "active"),
+      " · attempt ", String(report.reframe_progress.attempt_count ?? 0),
+      report.reframe_progress.objective ? " · " : "",
+      report.reframe_progress.objective ? joinedLine(report.reframe_progress.objective) : null));
+  }
+  if (report.handoff) {
+    summary.append(el("div", { class: "joined-line" },
+      el("b", {}, "Handoff: "),
+      String(report.handoff.status || "unknown"),
+      report.handoff.id ? " · " + report.handoff.id : ""));
+  }
   return summary;
 }
 
@@ -486,6 +500,26 @@ function joinedDetails(report) {
       report.recovery_action ? el("p", {}, el("b", {}, "Action: "), joinedLine(report.recovery_action)) : null,
       report.chitra_action ? el("p", { class: "soft" }, "Chitra: ", joinedLine(report.chitra_action)) : null);
     root.append(recovery);
+  }
+  if (report.reframe_progress?.active || report.handoff || report.checkpoint_reference || report.pending_operation) {
+    const continuity = el("div", { class: "d-sec" }, el("h5", {}, "Recovery continuity"));
+    if (report.reframe_progress?.active) {
+      continuity.append(el("p", {}, el("b", {}, "Tactical plan: "),
+        joinedLine(report.reframe_progress.objective),
+        " (", String(report.reframe_progress.stage || "active"),
+        ", attempt ", String(report.reframe_progress.attempt_count ?? 0), ")"));
+      if (report.reframe_progress.steps?.length) {
+        const steps = el("ul", { class: "dod" });
+        for (const step of report.reframe_progress.steps) steps.append(el("li", {}, joinedLine(step)));
+        continuity.append(steps);
+      }
+    }
+    if (report.handoff) continuity.append(el("p", {}, el("b", {}, "Handoff: "),
+      String(report.handoff.status || "unknown"), report.handoff.id ? " · " + report.handoff.id : ""));
+    if (report.checkpoint_reference) continuity.append(el("p", {}, el("b", {}, "Checkpoint: "), report.checkpoint_reference));
+    if (report.pending_operation) continuity.append(el("p", {}, el("b", {}, "Pending: "),
+      report.pending_operation.kind, " · ", report.pending_operation.operation_id));
+    root.append(continuity);
   }
   return root;
 }

@@ -27,7 +27,11 @@ import structlog
 
 from ._fsio import locked_json_store
 from .amp_capability import CapabilitySignatureVerifier, verify_amp_capability_receipt
-from .detect.rescue import RecoveryCheckpointBinding, find_recovery_checkpoint_receipt
+from .detect.rescue import (
+    RecoveryCheckpointBinding,
+    find_recovery_checkpoint_receipt,
+    verify_checkpoint_receipt_signature,
+)
 from .joined_lane import JoinedLaneStore
 from .journal import EventJournal
 from .journal.models import CanonicalEvent
@@ -63,6 +67,8 @@ from .session_contract import (
     OperatingFact,
     PendingProviderOperation,
     ProviderIdentity,
+    ReopenReceipt,
+    canonical_digest,
     validate_update,
 )
 from .tophand_wire import TOPHAND_OPERATION_SCHEMA
@@ -333,6 +339,12 @@ def _provider_result(
         if observed_process is not None and dict(nested_process) != dict(observed_process):
             raise ValueError(f"{provider_label} provider result observed_process changed")
         observed_process = nested_process
+    provider_session_id = raw.get("provider_session_id")
+    if provider_session_id is not None and provider_session_id != operation.provider_session_id:
+        raise ValueError(f"{provider_label} provider result provider_session_id changed")
+    reopen_receipt = None
+    if raw.get("reopen_receipt") is not None:
+        reopen_receipt = ReopenReceipt.from_dict(raw["reopen_receipt"])
     return ProviderOperationResult(
         operation_id=operation.operation_id,
         kind=operation.kind,
@@ -340,7 +352,9 @@ def _provider_result(
         provider_handle=operation.provider_handle,
         idempotency_key=operation.idempotency_key,
         payload_digest=operation.payload_digest,
-        provider_session_id=raw_provider_session_id if isinstance(raw_provider_session_id, str) else None,
+        provider_session_id=(
+            provider_session_id if isinstance(provider_session_id, str) else operation.provider_session_id
+        ),
         provider_instance_id=operation.provider_instance_id,
         provider_generation=operation.provider_generation,
         process_start_token=(
@@ -357,6 +371,7 @@ def _provider_result(
         consumed=consumed,
         observed_at=observed_at,
         evidence=evidence if isinstance(evidence, str) else "",
+        reopen_receipt=reopen_receipt,
     )
 
 
@@ -398,10 +413,14 @@ class _PackagedTophandProvider:
         self,
         adapter: object,
         *,
+        state_root: Path | None = None,
         result_sink: RecoverySink,
         reconcile_before_call: bool = False,
         operating_facts_binding: OperatingFactsBinding | None = None,
     ) -> None:
+        # Chitra verifies the signed receipt before it crosses the provider
+        # boundary. Tophand still never reads this filesystem or its key.
+        self._state_root = state_root
         self._adapter = adapter
         self._result_sink = result_sink
         self._reconcile_before_call = reconcile_before_call
@@ -410,6 +429,43 @@ class _PackagedTophandProvider:
     def _require_current_facts(self) -> None:
         if not _facts_binding_current(self._operating_facts_binding):
             raise RuntimeError("Fleet operating-facts binding expired; recovery will retry")
+
+    def _verify_close_checkpoint(self, request: CloseRequest) -> None:
+        receipt = request.checkpoint_receipt
+        if self._state_root is None or not isinstance(receipt, Mapping):
+            raise ValueError("Chitra close requires a local signed checkpoint verifier")
+        if request.checkpoint_verifier != "chitra.detect.rescue.verify_checkpoint_receipt_signature":
+            raise ValueError("close checkpoint verifier is not canonical")
+        if request.checkpoint_receipt_sha256 != canonical_digest(receipt):
+            raise ValueError("close checkpoint digest does not match the supplied receipt")
+        if not verify_checkpoint_receipt_signature(dict(receipt), state_root=self._state_root):
+            raise ValueError("close checkpoint HMAC is invalid")
+        payload = json.loads(request.operation.payload)
+        if not isinstance(payload, Mapping):
+            raise ValueError("close payload must be an object")
+        if any(
+            receipt.get(receipt_field) != payload.get(payload_field)
+            for receipt_field, payload_field in (
+                ("checkpoint_ref", "checkpoint_ref"),
+                ("lane", "lane_id"),
+                ("goal_id", "goal_id"),
+                ("goal_version", "goal_version"),
+                ("session_ref", "session_ref"),
+            )
+        ):
+            raise ValueError("close checkpoint identity changed")
+        binding = receipt.get("provider_binding")
+        if not isinstance(binding, Mapping) or any(
+            binding.get(field) != expected
+            for field, expected in (
+                ("kind", "tophand"),
+                ("handle", request.operation.provider_handle),
+                ("provider_session_id", request.operation.provider_session_id),
+                ("instance_id", request.operation.provider_instance_id),
+                ("generation", request.operation.provider_generation),
+            )
+        ):
+            raise ValueError("close checkpoint provider binding changed")
 
     @property
     def provider_name(self) -> ProviderName:
@@ -434,6 +490,10 @@ class _PackagedTophandProvider:
             )
             if raw.get(name) is True
         )
+        if raw.get("resume_after_close") is True and all(
+            raw.get(name) is True for name in ("create_or_resume", "close")
+        ):
+            supported = (*supported, "resume_after_close")
         return ProviderCapabilities.from_supported(cast(Any, supported))
 
     def _call(
@@ -464,11 +524,22 @@ class _PackagedTophandProvider:
                     "session_ref": request.session_ref,
                     "provider_session_id": request.provider_session_id,
                     "context_ref": request.context_ref,
+                    "goal_id": request.goal_id,
+                    "goal_version": request.goal_version,
+                    "resume_after_close": request.resume_after_close,
+                    "close_operation_id": request.close_operation_id,
+                    "resume_token": request.resume_token,
+                    "owner_process": (
+                        request.owner_process.model_dump(mode="json")
+                        if request.owner_process is not None
+                        else None
+                    ),
                 }
             )
         elif isinstance(request, CancelCurrentTurnRequest):
             payload["reason"] = request.reason
         elif isinstance(request, CloseRequest):
+            self._verify_close_checkpoint(request)
             payload["archive"] = request.archive
         raw = getattr(self._adapter, method)(payload)
         self._require_current_facts()
@@ -486,6 +557,7 @@ class _PackagedTophandProvider:
         self._require_current_facts()
         state = _provider_state(raw.get("state", "unknown"))
         provider_session_id = raw.get("provider_session_id")
+        provider_instance_id = raw.get("provider_instance_id")
         generation = raw.get("generation", 0)
         if isinstance(generation, bool) or not isinstance(generation, int):
             generation = 0
@@ -500,13 +572,11 @@ class _PackagedTophandProvider:
             generation=generation,
             fresh=raw.get("fresh") is True,
             provider_available=raw.get("provider_available") is True,
+            provider_instance_id=provider_instance_id if isinstance(provider_instance_id, str) else None,
             context_available=context_available if isinstance(context_available, bool) else None,
             current_turn_id=current_turn_id if isinstance(current_turn_id, str) else None,
             last_event_id=last_event_id if isinstance(last_event_id, str) else None,
             reason=reason if isinstance(reason, str) else "",
-            provider_instance_id=(
-                raw.get("provider_instance_id") if isinstance(raw.get("provider_instance_id"), str) else None
-            ),
         )
 
     def send(self, request: SendRequest) -> ProviderOperationResult:
@@ -596,7 +666,38 @@ class _PackagedTophandProvider:
         return self._call("cancel_current_turn", request, request.operation)
 
     def close(self, request: CloseRequest) -> object:
-        raise RuntimeError("Tophand close is not part of recovery supervision")
+        operation = request.operation
+        # Validate before entering the provider-outage fallback. A forged
+        # checkpoint must be rejected as an invalid boundary, not converted
+        # into an apparently ordinary provider-unknown response.
+        self._verify_close_checkpoint(request)
+        try:
+            payload = json.loads(operation.payload)
+            if not isinstance(payload, Mapping):
+                raise ValueError("Chitra close payload must be an object")
+            wire_request = {
+                "operation": operation.model_dump(mode="json"),
+                "archive": request.archive,
+                "payload": dict(payload),
+                "goal_id": payload.get("goal_id"),
+                "lane_id": operation.lane_id,
+                "session_ref": payload.get("session_ref"),
+                "provider_session_id": operation.provider_session_id,
+                "checkpoint_ref": payload.get("checkpoint_ref"),
+                "checkpoint_receipt": request.checkpoint_receipt,
+                "checkpoint_receipt_sha256": request.checkpoint_receipt_sha256,
+                "checkpoint_verifier": request.checkpoint_verifier,
+            }
+            raw = cast(Any, self._adapter).close(wire_request)
+            self._result_sink(raw)
+            values = dict(_mapping(raw, "Tophand close result"))
+            return {
+                field: values[field]
+                for field in CloseArchiveResult.model_fields
+                if field in values
+            }
+        except Exception as exc:  # noqa: BLE001 - an unproved close remains pending
+            return _unknown_close_result(operation, f"Tophand close evidence unavailable: {exc}")
 
 
 _AMP_CAPABILITY_NAMES = (
@@ -608,7 +709,6 @@ _AMP_CAPABILITY_NAMES = (
     "usage",
     "cancel_current_turn",
     "close",
-    "resume_after_close",
     "subagents",
     "parent_child_usage",
 )
@@ -819,6 +919,7 @@ def _unknown_close_result(operation: PendingProviderOperation, evidence: str) ->
         payload_digest=operation.payload_digest,
         state="unknown",
         provider_thread_ref=operation.provider_handle,
+        provider_session_id=operation.provider_session_id,
         same_provider_thread=None,
         later_resume_supported=None,
         checkpoint_ref=None,
@@ -862,6 +963,9 @@ def _amp_close_result(
     state = raw.get("state")
     if state not in {"closed", "archived", "unknown", "failed"}:
         return _unknown_close_result(operation, "Amp close result state is unknown")
+    provider_session_id = raw.get("provider_session_id")
+    if state in {"closed", "archived"} and provider_session_id != operation.provider_session_id:
+        return _unknown_close_result(operation, "Amp close result physical session changed")
     provider_thread_ref = raw.get("provider_thread_ref")
     if not isinstance(provider_thread_ref, str) or not provider_thread_ref:
         return _unknown_close_result(operation, "Amp close result has no provider thread evidence")
@@ -869,7 +973,10 @@ def _amp_close_result(
     if checkpoint_ref is not None and not isinstance(checkpoint_ref, str):
         return _unknown_close_result(operation, "Amp close checkpoint evidence is malformed")
     same_provider_thread = raw.get("same_provider_thread")
-    later_resume_supported = raw.get("later_resume_supported")
+    # Amp can archive a thread, but this facade has no process-start identity
+    # and no authenticated reopen receipt. Preserve the archive evidence while
+    # refusing to advertise later resume as a Chitra capability.
+    later_resume_supported = False
     quiescent = raw.get("quiescent")
     evidence = raw.get("evidence")
     observed_at = raw.get("observed_at")
@@ -884,7 +991,6 @@ def _amp_close_result(
         or provider_thread_ref != operation.provider_handle
         or same_provider_thread is not True
         or quiescent is not True
-        or later_resume_supported is not True
     ):
         return _unknown_close_result(
             operation,
@@ -894,13 +1000,13 @@ def _amp_close_result(
         operation_id=operation.operation_id,
         lane_id=operation.lane_id,
         provider_handle=operation.provider_handle,
-        provider_session_id=raw_provider_session_id if isinstance(raw_provider_session_id, str) else None,
         provider_instance_id=provider_instance_id,
         provider_generation=provider_generation,
         idempotency_key=operation.idempotency_key,
         payload_digest=operation.payload_digest,
         state=cast(Any, state),
         provider_thread_ref=provider_thread_ref,
+        provider_session_id=cast(str | None, provider_session_id),
         same_provider_thread=same_provider_thread if isinstance(same_provider_thread, bool) else None,
         later_resume_supported=later_resume_supported if isinstance(later_resume_supported, bool) else None,
         checkpoint_ref=checkpoint_ref,
@@ -922,7 +1028,7 @@ def _session_update_payload(item: Mapping[str, object]) -> object | None:
         for key in ("session_update", "lane_update"):
             value = payload.get(key)
             if value is not None:
-                return value
+                return cast(object, value)
     return None
 
 
@@ -974,6 +1080,16 @@ class _PackagedAmpProvider:
                     "session_ref": request.session_ref,
                     "provider_session_id": request.provider_session_id,
                     "context_ref": request.context_ref,
+                    "goal_id": request.goal_id,
+                    "goal_version": request.goal_version,
+                    "resume_after_close": request.resume_after_close,
+                    "close_operation_id": request.close_operation_id,
+                    "owner_process": (
+                        request.owner_process.model_dump(mode="json")
+                        if request.owner_process is not None
+                        else None
+                    ),
+                    "resume_token": request.resume_token,
                 }
             )
         elif isinstance(request, CancelCurrentTurnRequest):
@@ -1014,6 +1130,7 @@ class _PackagedAmpProvider:
         if isinstance(generation, bool) or not isinstance(generation, int):
             generation = 0
         provider_session_id = raw.get("provider_session_id")
+        provider_instance_id = raw.get("provider_instance_id")
         current_turn_id = raw.get("current_turn_id")
         last_event_id = raw.get("last_event_id")
         reason = raw.get("reason")
@@ -1025,13 +1142,11 @@ class _PackagedAmpProvider:
             generation=generation,
             fresh=raw.get("fresh") is True,
             provider_available=raw.get("provider_available") is True,
+            provider_instance_id=provider_instance_id if isinstance(provider_instance_id, str) else None,
             context_available=context_available if isinstance(context_available, bool) else None,
             current_turn_id=current_turn_id if isinstance(current_turn_id, str) else None,
             last_event_id=last_event_id if isinstance(last_event_id, str) else None,
             reason=reason if isinstance(reason, str) else "",
-            provider_instance_id=(
-                raw.get("provider_instance_id") if isinstance(raw.get("provider_instance_id"), str) else None
-            ),
         )
 
     def send(self, request: SendRequest) -> ProviderOperationResult:
@@ -1234,6 +1349,7 @@ def _canonical_tophand_factory(
         return None
     provider = _PackagedTophandProvider(
         adapter,
+        state_root=state_root,
         result_sink=result_sink,
         reconcile_before_call=(record.pending_operation is not None and record.pending_operation.attempted),
         operating_facts_binding=operating_facts_binding,

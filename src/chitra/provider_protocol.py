@@ -35,6 +35,7 @@ from .session_contract import (
     CloseState,
     OperationKind,
     OperationStatus,
+    OwnerProcessIdentity,
     PendingProviderOperation,
     ProviderCapabilities,
     ProviderOperationResult,
@@ -152,6 +153,12 @@ class CreateOrResumeRequest(MutationRequest):
     session_ref: str
     provider_session_id: str | None = None
     context_ref: str | None = None
+    goal_id: str | None = None
+    goal_version: int | None = None
+    resume_after_close: bool = False
+    close_operation_id: str | None = None
+    owner_process: OwnerProcessIdentity | None = None
+    resume_token: str | None = None
 
     def __post_init__(self) -> None:
         MutationRequest.__post_init__(self)
@@ -161,6 +168,27 @@ class CreateOrResumeRequest(MutationRequest):
             _required_text(self.session_ref, "session_ref")
         _optional_text(self.provider_session_id, "provider_session_id")
         _optional_text(self.context_ref, "context_ref")
+        _optional_text(self.goal_id, "goal_id")
+        if self.goal_version is not None and (
+            isinstance(self.goal_version, bool) or self.goal_version < 1
+        ):
+            raise ValueError("goal_version must be a positive integer")
+        _optional_text(self.close_operation_id, "close_operation_id")
+        _optional_text(self.resume_token, "resume_token")
+        if not isinstance(self.resume_after_close, bool):
+            raise TypeError("resume_after_close must be boolean")
+        if self.resume_after_close and (
+            self.close_operation_id is None
+            or self.provider_session_id is None
+            or self.context_ref is None
+            or self.owner_process is None
+            or self.resume_token is None
+            or self.goal_id is None
+            or self.goal_version is None
+        ):
+            raise ValueError(
+                "same-session resume requires close operation, provider session, checkpoint, and owner process"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +235,12 @@ class CloseRequest(MutationRequest):
     """Close a session, optionally retaining it for a later resume."""
 
     archive: bool
+    # Chitra may run on a different host from the provider.  The checkpoint
+    # therefore crosses the provider boundary as an authenticated document;
+    # providers must never discover it by reading Chitra's filesystem.
+    checkpoint_receipt: Mapping[str, object] | None = None
+    checkpoint_receipt_sha256: str | None = None
+    checkpoint_verifier: str | None = None
 
     def __post_init__(self) -> None:
         MutationRequest.__post_init__(self)
@@ -214,6 +248,8 @@ class CloseRequest(MutationRequest):
             raise ValueError("operation envelope kind must be close")
         if not isinstance(self.archive, bool):
             raise ValueError("archive must be a boolean")
+        if self.checkpoint_receipt is not None and not isinstance(self.checkpoint_receipt, Mapping):
+            raise ValueError("checkpoint_receipt must be a mapping when supplied")
 
 
 # Short aliases keep call sites readable while retaining the explicit method
@@ -303,6 +339,9 @@ class ProviderStatus:
     generation: int
     fresh: bool
     provider_available: bool
+    # The provider instance is distinct from the physical session and keeps
+    # status observations on the same restart fence as mutations.
+    provider_instance_id: str | None = None
     context_available: bool | None = None
     current_turn_id: str | None = None
     last_event_id: str | None = None

@@ -179,6 +179,7 @@ def _joined_payload(
         "roadmap": {
             "version": view.plan_version,
             "assessment": view.plan_state,
+            "assessment_reason": _line(tc, view.plan_assessment_reason),
             "revision_note": _line(tc, view.plan_revision_note),
             "position": None
             if current_step is None
@@ -207,6 +208,34 @@ def _joined_payload(
         "resolved_problems": [_problem_payload(problem, tc) for problem in view.resolved_problems],
         "chitra_action": _line(tc, view.chitra_action),
         "recovery_action": tc.get(view.recovery.attempted_remedy or "none recorded."),
+        "reframe_progress": {
+            "active": bool(view.tactical_objective or view.tactical_plan),
+            "stage": view.recovery_stage,
+            "attempt_count": view.recovery_attempt_count,
+            "objective": _line(tc, view.tactical_objective),
+            "steps": [_line(tc, step) for step in view.tactical_plan],
+        },
+        "tactical_plan": {
+            "objective": _line(tc, view.tactical_objective),
+            "steps": [_line(tc, step) for step in view.tactical_plan],
+        },
+        "handoff": {
+            "status": view.handoff_status,
+            "id": view.handoff_id,
+            "reference": view.handoff_reference,
+            "digest": view.handoff_digest,
+        },
+        "checkpoint_reference": view.checkpoint_reference,
+        "pending_operation": None
+        if view.pending_operation is None
+        else {
+            "operation_id": view.pending_operation.operation_id,
+            "kind": view.pending_operation.kind,
+            "provider_handle": view.pending_operation.provider_handle,
+            "provider_session_id": view.pending_operation.provider_session_id,
+            "created_at": view.pending_operation.created_at,
+            "attempt": view.pending_operation.attempt,
+        },
         "last_useful_progress": None
         if view.last_useful_progress is None
         else {

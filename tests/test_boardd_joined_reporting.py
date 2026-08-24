@@ -45,6 +45,10 @@ def test_real_joined_lane_file_reaches_boardd_view_and_preserves_legacy_lanes(tm
     assert [problem["id"] for problem in report["open_problems"]] == ["provider-wait"]
     assert [problem["id"] for problem in report["resolved_problems"]] == ["old-report"]
     assert report["recovery_action"]["text"] == "checkpoint"
+    assert report["reframe_progress"]["active"] is True
+    assert report["reframe_progress"]["stage"] == "relaunch"
+    assert report["handoff"]["status"] == "durable"
+    assert report["checkpoint_reference"] == "checkpoint-ramble"
     assert report["owner"]["id"] == "lane"
     assert report["provider"]["kind"] == "tophand"
     assert "pid" not in json.dumps(report).lower()
@@ -66,3 +70,4 @@ def test_browser_api_payload_contains_the_joined_report(tmp_path: Path, monkeypa
     assert lane["joined_session"]["roadmap"]["position"]["title"]["text"] == "Run the proof"
     assert lane["joined_session"]["progress"]["percentage"] == 50.0
     assert lane["joined_session"]["recovery_action"]["text"] == "checkpoint"
+    assert lane["joined_session"]["handoff"]["id"] == "ramble-build-cycle-ramble-context"

@@ -18,12 +18,14 @@ from dataclasses import dataclass, replace
 from typing import Literal, Protocol, cast
 
 from chitra.session_contract import (
+    CloseArchiveResult,
     InterventionEvidence,
     JoinedLaneRecord,
     LaneLifecycle,
     LaneUpdate,
     NextCheck,
     PlanState,
+    PendingProviderOperation,
     Problem,
     Progress,
     ProgressEvidence,
@@ -63,6 +65,22 @@ def _problem_value(problem: Problem) -> dict[str, object]:
     value["resolution"] = problem.resolution
     value["reopen_event"] = problem.reopen_event
     return value
+
+
+def _pending_operation_value(operation: PendingProviderOperation | None) -> dict[str, object] | None:
+    """Expose the pending action without exposing its provider payload."""
+
+    if operation is None:
+        return None
+    return {
+        "operation_id": operation.operation_id,
+        "kind": operation.kind,
+        "lane_id": operation.lane_id,
+        "provider_handle": operation.provider_handle,
+        "provider_session_id": operation.provider_session_id,
+        "created_at": operation.created_at,
+        "attempt": operation.attempt,
+    }
 
 
 def _current_step(update: LaneUpdate | None) -> RoadmapStep | None:
@@ -139,9 +157,24 @@ class JoinedSessionView:
     update_sequence: int | None
     last_useful_progress: ProgressEvidence | None
     recovery: RecoveryState
+    tactical_objective: str | None
+    tactical_plan: tuple[str, ...]
+    recovery_stage: str
+    recovery_cycle_id: str | None
+    recovery_attempt_count: int
+    handoff_status: str
+    handoff_id: str | None
+    handoff_reference: str | None
+    handoff_digest: str | None
+    plan_assessment_reason: str
+    plan_assessed_at: str | None
     goal: str | None
     done_when: str | None
     goal_status: str | None
+    checkpoint_reference: str | None = None
+    pending_operation: PendingProviderOperation | None = None
+    close_evidence: CloseArchiveResult | None = None
+    resume_state: str = "unknown"
 
     def to_dict(self) -> dict[str, object]:
         """Return a stable JSON representation without any control fields."""
@@ -179,9 +212,37 @@ class JoinedSessionView:
             "update_sequence": self.update_sequence,
             "last_useful_progress": _json_value(self.last_useful_progress) if self.last_useful_progress is not None else None,
             "recovery": _json_value(self.recovery),
+            "tactical_plan": {
+                "objective": self.tactical_objective,
+                "steps": list(self.tactical_plan),
+                "stage": self.recovery_stage,
+                "attempt_count": self.recovery_attempt_count,
+            },
+            "reframe_progress": {
+                "active": bool(self.tactical_objective or self.tactical_plan),
+                "stage": self.recovery_stage,
+                "attempt_count": self.recovery_attempt_count,
+                "objective": self.tactical_objective,
+                "steps": list(self.tactical_plan),
+            },
+            "handoff": {
+                "status": self.handoff_status,
+                "id": self.handoff_id,
+                "reference": self.handoff_reference,
+                "digest": self.handoff_digest,
+            },
+            "plan_assessment": {
+                "state": self.plan_state,
+                "assessed_at": self.plan_assessed_at,
+                "reason": self.plan_assessment_reason,
+            },
             "goal": self.goal,
             "done_when": self.done_when,
             "goal_status": self.goal_status,
+            "checkpoint_reference": self.checkpoint_reference,
+            "pending_operation": _pending_operation_value(self.pending_operation),
+            "close_evidence": _json_value(self.close_evidence) if self.close_evidence is not None else None,
+            "resume_state": self.resume_state,
         }
 
 
@@ -204,6 +265,21 @@ def build_joined_session_view(
     last_intervention: InterventionEvidence | None = record.last_intervention
     if record.last_intervention is not None:
         chitra_action = record.last_intervention.action
+    pending_resume = (
+        record.pending_operation is not None
+        and record.pending_operation.kind == "create_or_resume"
+        and record.lifecycle == "inactive"
+    )
+    if pending_resume:
+        resume_state = "resume pending"
+    elif record.lifecycle == "active":
+        resume_state = "active"
+    elif record.last_close_result is not None and record.last_close_result.later_resume_supported is True:
+        resume_state = "closed; same-session resume available"
+    elif record.last_close_result is not None:
+        resume_state = "closed"
+    else:
+        resume_state = "inactive"
 
     return JoinedSessionView(
         schema=JOINED_SESSION_VIEW_SCHEMA,
@@ -238,9 +314,28 @@ def build_joined_session_view(
         update_sequence=update.sequence if update is not None else None,
         last_useful_progress=record.last_useful_progress,
         recovery=record.recovery,
+        tactical_objective=record.recovery.execution_objective or None,
+        tactical_plan=record.recovery.execution_plan,
+        recovery_stage=record.recovery.stage,
+        recovery_cycle_id=record.recovery.cycle_id,
+        recovery_attempt_count=record.recovery.attempt_count,
+        handoff_status=(
+            "durable"
+            if record.recovery.handoff_id and record.recovery.handoff_reference and record.recovery.handoff_digest
+            else "not-recorded"
+        ),
+        handoff_id=record.recovery.handoff_id,
+        handoff_reference=record.recovery.handoff_reference,
+        handoff_digest=record.recovery.handoff_digest,
+        plan_assessment_reason=record.plan_assessment.reason,
+        plan_assessed_at=record.plan_assessment.assessed_at,
         goal=goal_text,
         done_when=done_when,
         goal_status=goal_status,
+        checkpoint_reference=record.checkpoint_reference,
+        pending_operation=record.pending_operation,
+        close_evidence=record.last_close_result,
+        resume_state=resume_state,
     )
 
 
@@ -323,7 +418,8 @@ def render_joined_session_view(
         lines.append("Road map: unavailable (no lane update has been observed).")
     else:
         revision = f"; {view.plan_revision_note}" if view.plan_revision_note else ""
-        lines.append(f"Road map: version {view.plan_version}, assessment {view.plan_state}{revision}")
+        assessment = f"; reason: {view.plan_assessment_reason}" if view.plan_assessment_reason else ""
+        lines.append(f"Road map: version {view.plan_version}, assessment {view.plan_state}{revision}{assessment}")
     if view.current_step is None:
         lines.append("Road map position: unknown (no active or blocked step is reported).")
     else:
@@ -346,6 +442,31 @@ def render_joined_session_view(
     lines.extend(_problem_lines("Resolved problems", view.resolved_problems))
     lines.append(f"Chitra action: {view.chitra_action or 'none recorded.'}")
     lines.append(f"Recovery action: {view.recovery.attempted_remedy or 'none recorded.'}")
+    if view.tactical_objective or view.tactical_plan:
+        lines.append(
+            f"Reframe progress: stage {view.recovery_stage}, attempt {view.recovery_attempt_count}; "
+            f"objective: {view.tactical_objective or 'none recorded.'}"
+        )
+        lines.append("Tactical steps:")
+        lines.extend(f"- {step}" for step in view.tactical_plan)
+    else:
+        lines.append("Reframe progress: none recorded.")
+    handoff = f"{view.handoff_status} ({view.handoff_id})" if view.handoff_id else view.handoff_status
+    lines.append(f"Handoff: {handoff}")
+    lines.append(f"Checkpoint: {view.checkpoint_reference or 'none recorded.'}")
+    if view.pending_operation is None:
+        lines.append("Pending recovery action: none.")
+    else:
+        lines.append(
+            f"Pending recovery action: {view.pending_operation.operation_id} ({view.pending_operation.kind})"
+        )
+    if view.close_evidence is not None:
+        lines.append(
+            f"Close evidence: {view.close_evidence.state}; same provider thread: "
+            f"{view.close_evidence.same_provider_thread}; later resume: "
+            f"{view.close_evidence.later_resume_supported}"
+        )
+    lines.append(f"Resume state: {view.resume_state}")
     lines.append(f"NEXT: {view.next_action or 'unknown (no next action reported).'}")
     if view.next_check is None:
         lines.append("CHECK: unknown (no durable check is recorded).")

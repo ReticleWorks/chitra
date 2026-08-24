@@ -503,7 +503,22 @@ class JoinedLaneStore:
                 raise JoinedLaneIdentityError("Amp launch policy does not match authoritative provider facts")
             capabilities = provider_capabilities
         else:
-            capabilities = ProviderCapabilities.from_supported(("send", "read_updates"))
+            # Tophand launch receipts prove the same provider surface used by
+            # the governed recovery adapter.  Recording only send/read here
+            # strands a completed lane before Chitra can checkpoint and close
+            # it after a restart.
+            capabilities = ProviderCapabilities.from_supported(
+                (
+                    "create_or_resume",
+                    "status",
+                    "send",
+                    "read_updates",
+                    "checkpoint",
+                    "usage",
+                    "cancel_current_turn",
+                    "close",
+                )
+            )
         resolved_provider_version = provider_version if provider_kind == "amp" and provider_version is not None else ""
         provider = ProviderIdentity(
             kind=cast(Literal["tophand", "amp"], provider_kind),

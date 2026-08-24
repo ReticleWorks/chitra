@@ -660,6 +660,7 @@ def test_steady_inactive_to_active_is_forbidden_but_store_resume_is_typed(tmp_pa
         provider=resume_provider,
         operation_history=history,
         last_close_result=close,
+        checkpoint_reference=close.checkpoint_ref,
     )
     store = JoinedLaneStore(tmp_path)
     store.create(inactive)
