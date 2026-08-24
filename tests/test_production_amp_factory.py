@@ -587,6 +587,38 @@ def test_amp_facade_preserves_provider_handle_on_updates() -> None:
     assert result.updates[0].provider_session_id == "amp-session-a"
 
 
+def test_amp_factory_binds_chitra_lane_update_sink_for_roadmap_reporting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The production ORB route persists the same lane snapshot as Tophand."""
+
+    _install_amp_fakes(monkeypatch)
+    lane = _lane(tmp_path)
+    record = _record(lane)
+    store = JoinedLaneStore(lane.state_dir)
+    store.create(record)
+
+    provider = _resolver(lane, record)(record)
+
+    assert provider is not None
+    sink = _AmpAdapter.instances[-1].get("update_sink")
+    assert callable(sink)
+    assert record.current_update is not None
+    next_update = record.current_update.model_copy(
+        update={
+            "sequence": 2,
+            "current_action": "Review the ORB roadmap snapshot",
+            "next_action": "Run the focused ORB acceptance check",
+        }
+    )
+    sink(next_update.to_dict())
+
+    saved = store.require(lane.identifier)
+    assert saved.current_update == next_update
+    assert saved.current_update.steps[0].owner == "lane-manager"
+    assert saved.provider.kind == "amp"
+
+
 def test_recovery_cursor_sink_persists_into_joined_lane_store(tmp_path: Path) -> None:
     lane = _lane(tmp_path)
     record = _record(lane)

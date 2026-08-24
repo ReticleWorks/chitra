@@ -1130,6 +1130,7 @@ def _canonical_amp_factory(
             anchor_thread_id=identity.parent_thread_ref,
             lane_reader=lane_reader,
             amp_version=amp_version,
+            update_sink=_canonical_update_sink(lane),
         )
     except Exception as exc:  # noqa: BLE001 - unavailable provider is canonical unknown
         logger.warning("packaged_amp_unavailable", lane_id=record.lane_id, error=str(exc))
