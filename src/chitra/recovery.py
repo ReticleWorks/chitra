@@ -226,6 +226,9 @@ class GovernedCloseDecision:
         return False
 
 
+SupervisorDecision = RecoveryDecision | GovernedCloseDecision
+
+
 class RecoveryStateStore:
     """One-lane adapter over the canonical joined-lane store."""
 
@@ -1309,11 +1312,35 @@ class RecoverySupervisor:
                 return event.event_id, condition, sequence
         return None
 
-    def run_once(self, *, now: datetime | None = None) -> tuple[RecoveryDecision, ...]:
-        decisions: list[RecoveryDecision] = []
+    def run_once(self, *, now: datetime | None = None) -> tuple[SupervisorDecision, ...]:
+        decisions: list[SupervisorDecision] = []
         store = CanonicalJoinedLaneStore(self.state_root)
         for value in store.unfinished():
             record = cast(JoinedLaneRecord, value)
+            try:
+                goal = get_goal(self.goal_root, record.session_ref)
+            except Exception as exc:  # an unreadable goal cannot authorize close
+                logger.warning("governed_close_goal_unavailable", lane_id=record.lane_id, error=str(exc))
+                goal = None
+            if (
+                goal is not None
+                and goal.status == "done-pending-close"
+                and (goal.session_ref, goal.lane_id, goal.goal_id, goal.goal_version)
+                == (record.session_ref, record.lane_id, record.goal_id, record.goal_version)
+            ):
+                try:
+                    provider = self.provider_resolver(record)
+                    decisions.append(
+                        RecoveryEngine(
+                            provider=provider,
+                            state_root=self.state_root,
+                            goal_root=self.goal_root,
+                        ).governed_close(record, now=now)
+                    )
+                except Exception as exc:  # one close lane must not abort the pass
+                    logger.warning("governed_close_supervision_lane_failed", lane_id=record.lane_id, error=str(exc))
+                    decisions.append(GovernedCloseDecision("waiting", record, f"governed close failed: {exc}"))
+                continue
             if record.recovery.stage in {"none", "complete"}:
                 continue
             try:
@@ -1368,7 +1395,7 @@ class RecoverySupervisor:
         return tuple(decisions)
 
 
-def run_recovery_supervision(supervisor: RecoverySupervisor) -> tuple[RecoveryDecision, ...]:
+def run_recovery_supervision(supervisor: RecoverySupervisor) -> tuple[SupervisorDecision, ...]:
     """Named production seam used by dispatch before it sends new work."""
 
     return supervisor.run_once()
@@ -1433,6 +1460,7 @@ __all__ = [
     "RecoverySupervisor",
     "GovernedCloseAction",
     "GovernedCloseDecision",
+    "SupervisorDecision",
     "confirm_useful_progress",
     "load_recovery_records",
     "record_pause_recovery",

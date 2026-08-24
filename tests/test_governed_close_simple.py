@@ -7,9 +7,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from chitra.goals import GoalRecord
 from chitra.joined_lane import JoinedLaneStore
 from chitra.provider_protocol import ProviderState, ProviderStatus
-from chitra.recovery import RecoveryEngine
+from chitra.recovery import RecoveryEngine, RecoverySupervisor
 from chitra.session_contract import (
     CloseArchiveResult,
     JoinedLaneRecord,
@@ -125,6 +126,34 @@ def test_lost_close_reply_reuses_pending_operation_and_reconciles_after_restart(
     assert second.operation is not None
     assert second.operation.operation_id == operation_id
     assert provider.calls == 2
+    assert provider.archive_calls == 1
+
+
+def test_supervisor_routes_done_goal_to_close_and_reconciles_after_restart(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    record = _record()
+    JoinedLaneStore(tmp_path).create(record)
+    provider = FakeProvider(lose_first_reply=True)
+    goal = GoalRecord(
+        session_ref=record.session_ref,
+        lane_id=record.lane_id,
+        goal_id=record.goal_id,
+        goal="finish the lane",
+        done_when="the provider receipt is durable",
+        source="test",
+        status="done-pending-close",
+    )
+    monkeypatch.setattr("chitra.recovery.get_goal", lambda _root, _session: goal)
+    monkeypatch.setattr("chitra.governed_close.get_goal", lambda _root, _session: goal)
+    supervisor = RecoverySupervisor(tmp_path, lambda _record: provider)
+
+    first = supervisor.run_once(now=NOW)
+    second = supervisor.run_once(now=NOW.replace(minute=1))
+
+    assert len(first) == len(second) == 1
+    assert first[0].action == "waiting"
+    assert second[0].action == "closed"
     assert provider.archive_calls == 1
 
 
