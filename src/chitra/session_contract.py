@@ -13,6 +13,7 @@ the public persistence helpers for the two versioned documents in this module:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 from collections.abc import Iterable, Mapping, Sequence
@@ -1869,9 +1870,136 @@ def validate_record_transition(
             if current.last_operation_result is not None
             else None
         )
+        pending_resume = previous.pending_operation
+        resume_payload: dict[str, object] | None = None
+        if (
+            pending_resume is None
+            or pending_resume.kind != "create_or_resume"
+            or pending_resume.attempted is not True
+        ):
+            errors.append("resume requires the exact attempted provider operation")
+        else:
+            try:
+                candidate_payload = json.loads(pending_resume.payload)
+            except json.JSONDecodeError:
+                candidate_payload = None
+            if (
+                not isinstance(candidate_payload, dict)
+                or json.dumps(
+                    candidate_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+                != pending_resume.payload
+                or set(candidate_payload)
+                != {
+                    "session_ref",
+                    "provider_session_id",
+                    "context_ref",
+                    "goal_id",
+                    "goal_version",
+                    "resume_after_close",
+                    "close_operation_id",
+                    "owner_process",
+                    "resume_token",
+                }
+                or canonical_digest(candidate_payload) != pending_resume.payload_digest
+            ):
+                errors.append("resume operation payload is not the exact canonical request")
+            else:
+                resume_payload = candidate_payload
+        result = current.last_operation_result
+        if pending_resume is not None and result is not None:
+            try:
+                validate_operation_result(pending_resume, result)
+            except ContractValidationError as exc:
+                errors.append(str(exc))
         if reopen is None:
             errors.append("resume requires the authenticated reopen receipt")
         else:
+            unsigned = {
+                key: value
+                for key, value in reopen.to_dict().items()
+                if key not in {"receipt_hmac", "signature"}
+            }
+            expected_hmac = (
+                hmac.new(
+                    reopen.auth_token.encode(),
+                    json.dumps(
+                        unsigned,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode(),
+                    "sha256",
+                ).hexdigest()
+                if reopen.auth_token is not None
+                else None
+            )
+            if reopen.signature is None:
+                errors.append("resume receipt requires Chitra's durable signature")
+            if (
+                reopen.receipt_hmac is None
+                or expected_hmac is None
+                or not hmac.compare_digest(reopen.receipt_hmac, expected_hmac)
+            ):
+                errors.append("resume receipt HMAC is invalid")
+            if prior_close is not None and (
+                reopen.close_operation_id != prior_close.operation_id
+                or reopen.checkpoint_ref != prior_close.checkpoint_ref
+                or reopen.prior_owner_process != prior_close.owner_process
+            ):
+                errors.append("resume receipt does not match the exact close evidence")
+            if (
+                pending_resume is None
+                or reopen.operation_id != pending_resume.operation_id
+                or reopen.lane_id != current.lane_id
+                or reopen.goal_id != current.goal_id
+                or reopen.goal_version != current.goal_version
+                or reopen.session_ref != current.session_ref
+                or reopen.provider_session_id != current.provider.provider_session_id
+                or reopen.provider_handle != current.provider.handle
+                or reopen.provider_instance_id != current.provider.instance_id
+                or reopen.provider_generation != current.provider.generation
+                or reopen.created_new_lane is not False
+                or reopen.created_new_session is not False
+                or reopen.owner_process == reopen.prior_owner_process
+            ):
+                errors.append("resume receipt changed the joined lane binding")
+            if resume_payload is None or (
+                resume_payload.get("session_ref") != current.session_ref
+                or resume_payload.get("provider_session_id")
+                != current.provider.provider_session_id
+                or resume_payload.get("context_ref") != current.checkpoint_reference
+                or resume_payload.get("goal_id") != current.goal_id
+                or resume_payload.get("goal_version") != current.goal_version
+                or resume_payload.get("resume_after_close") is not True
+                or resume_payload.get("close_operation_id")
+                != (prior_close.operation_id if prior_close is not None else None)
+                or resume_payload.get("owner_process")
+                != (
+                    prior_close.owner_process.model_dump(mode="json")
+                    if prior_close is not None and prior_close.owner_process is not None
+                    else None
+                )
+                or resume_payload.get("resume_token") != reopen.auth_token
+            ):
+                errors.append("resume receipt does not match the durable request")
+            if previous.provider.provider_session_id != current.provider.provider_session_id:
+                errors.append("resume must preserve the exact provider session")
+            if (
+                prior_close is not None
+                and prior_close.provider_session_id != current.provider.provider_session_id
+            ):
+                errors.append("resume provider session must match the close evidence")
+            if (
+                prior_close is not None
+                and prior_close.owner_process is not None
+                and previous.provider.process_start_token
+                != prior_close.owner_process.start_token
+            ):
+                errors.append("closed provider token must match the prior owner")
             if current.provider.process_start_token != reopen.owner_process.start_token:
                 errors.append("resume provider process token must match the reopened owner")
             if current.provider.observed_process != {
@@ -1881,6 +2009,13 @@ def validate_record_transition(
                 errors.append("resume provider observation must match the reopened owner")
             if previous.provider.process_start_token == current.provider.process_start_token:
                 errors.append("resume must rotate the provider process token")
+            if current.provider.registration_observed_at != reopen.observed_at:
+                errors.append("resume registration observation must match the reopened owner")
+            if (
+                previous.provider.registration_digest is not None
+                and current.provider.registration_digest == previous.provider.registration_digest
+            ):
+                errors.append("resume must not retain the stopped registration digest")
     elif prior_close is not None and prior_close.later_resume_supported is True and current.lifecycle == "active":
         errors.append("later resume requires an explicit resume transition")
 

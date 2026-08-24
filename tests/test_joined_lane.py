@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,6 +41,7 @@ from chitra.session_contract import (
     ProviderIdentity,
     ProviderOperationResult,
     ReopenReceipt,
+    canonical_digest,
 )
 
 
@@ -737,10 +739,35 @@ def test_steady_inactive_to_active_is_forbidden_but_store_resume_is_typed(tmp_pa
         last_close_result=close,
         checkpoint_reference=close.checkpoint_ref,
     )
-    store = JoinedLaneStore(tmp_path)
-    store.create(inactive)
-    reopen = ReopenReceipt(
+    resume_request = {
+        "session_ref": inactive.session_ref,
+        "provider_session_id": "amp-session-a",
+        "context_ref": close.checkpoint_ref,
+        "goal_id": inactive.goal_id,
+        "goal_version": inactive.goal_version,
+        "resume_after_close": True,
+        "close_operation_id": close.operation_id,
+        "owner_process": old_owner.model_dump(mode="json"),
+        "resume_token": "resume-token-1",
+    }
+    pending_resume = PendingProviderOperation(
         operation_id="resume-1",
+        kind="create_or_resume",
+        lane_id=inactive.lane_id,
+        provider_handle=resume_provider.handle,
+        provider_session_id="amp-session-a",
+        idempotency_key="idem-resume-1",
+        payload_digest=canonical_digest(resume_request),
+        payload=json.dumps(
+            resume_request, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ),
+        provider_instance_id="instance-a",
+        provider_generation=1,
+        created_at="2026-08-23T14:01:00+00:00",
+        attempted=True,
+    )
+    reopen = ReopenReceipt(
+        operation_id=pending_resume.operation_id,
         close_operation_id=close.operation_id,
         lane_id=inactive.lane_id,
         goal_id=inactive.goal_id,
@@ -755,8 +782,29 @@ def test_steady_inactive_to_active_is_forbidden_but_store_resume_is_typed(tmp_pa
         owner_process=new_owner,
         created_new_lane=False,
         created_new_session=False,
+        auth_token="resume-token-1",
         observed_at="2026-08-23T14:01:00+00:00",
         evidence="same provider thread reopened under a fresh process",
+    )
+    reopen_unsigned = {
+        key: value
+        for key, value in reopen.to_dict().items()
+        if key not in {"receipt_hmac", "signature"}
+    }
+    reopen = reopen.model_copy(
+        update={
+            "receipt_hmac": hmac.new(
+                b"resume-token-1",
+                json.dumps(
+                    reopen_unsigned,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode(),
+                "sha256",
+            ).hexdigest(),
+            "signature": "a" * 64,
+        }
     )
     result = ProviderOperationResult(
         operation_id=reopen.operation_id,
@@ -765,8 +813,8 @@ def test_steady_inactive_to_active_is_forbidden_but_store_resume_is_typed(tmp_pa
         provider_handle=resume_provider.handle,
         provider_session_id=reopen.provider_session_id,
         process_start_token=new_owner.start_token,
-        idempotency_key="idem-resume-1",
-        payload_digest="digest-resume-1",
+        idempotency_key=pending_resume.idempotency_key,
+        payload_digest=pending_resume.payload_digest,
         provider_instance_id="instance-a",
         provider_generation=1,
         status="consumed",
@@ -776,6 +824,25 @@ def test_steady_inactive_to_active_is_forbidden_but_store_resume_is_typed(tmp_pa
         evidence=reopen.evidence,
         reopen_receipt=reopen,
     )
+    resume_history = (
+        *history,
+        OperationReference(
+            operation_id=result.operation_id,
+            idempotency_key=result.idempotency_key,
+            payload_digest=result.payload_digest,
+            kind=result.kind,
+            created_at=result.observed_at,
+        ),
+    )
+    inactive = inactive.model_copy(
+        update={
+            "pending_operation": pending_resume,
+            "last_operation_result": result,
+            "operation_history": resume_history,
+        }
+    )
+    store = JoinedLaneStore(tmp_path)
+    store.create(inactive)
     active = inactive.model_copy(
         update={
             "revision": 2,
@@ -787,18 +854,10 @@ def test_steady_inactive_to_active_is_forbidden_but_store_resume_is_typed(tmp_pa
                         **new_owner.model_dump(mode="json"),
                         "process_start_token": new_owner.start_token,
                     },
+                    "registration_observed_at": reopen.observed_at,
                 }
             ),
-            "operation_history": (
-                *history,
-                OperationReference(
-                    operation_id=result.operation_id,
-                    idempotency_key=result.idempotency_key,
-                    payload_digest=result.payload_digest,
-                    kind=result.kind,
-                    created_at=result.observed_at,
-                ),
-            ),
+            "pending_operation": None,
             "last_operation_result": result,
             "last_close_result": None,
         }

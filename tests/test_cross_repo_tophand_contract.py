@@ -11,7 +11,9 @@ default is the current local Fleet candidate layout.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import importlib.util
+import json
 import os
 import sys
 import types
@@ -26,10 +28,11 @@ from test_amp_capability import KEY as AMP_KEY
 from test_amp_capability import _payload as capability_payload
 
 from chitra.amp_capability import verify_amp_capability_receipt
-from chitra.provider_protocol import SendRequest
+from chitra.provider_protocol import CreateOrResumeRequest, SendRequest
 from chitra.recovery_provider import _PackagedTophandProvider, _provider_result, _tophand_operation_dict
 from chitra.session_contract import (
     ContractValidationError,
+    OwnerProcessIdentity,
     PendingProviderOperation,
     ProviderOperationResult,
     validate_operation_result,
@@ -122,6 +125,31 @@ def _send_operation() -> PendingProviderOperation:
         provider_instance_id="instance-a",
         provider_generation=3,
         process_start_token="start-a",
+        created_at=NOW,
+        attempted=True,
+    )
+
+
+def _resume_operation() -> PendingProviderOperation:
+    return PendingProviderOperation(
+        operation_id="resume-1",
+        kind="create_or_resume",
+        lane_id="lane-a",
+        provider_handle="thread-a",
+        provider_session_id="physical-session-a",
+        idempotency_key="idem-resume-1",
+        payload_digest=chitra_request_digest(
+            "create_or_resume", CANONICAL_CREATE_REQUEST
+        ),
+        payload=json.dumps(
+            CANONICAL_CREATE_REQUEST,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ),
+        provider_instance_id="instance-a",
+        provider_generation=3,
+        process_start_token=None,
         created_at=NOW,
         attempted=True,
     )
@@ -372,4 +400,84 @@ def test_real_fleet_adapter_through_chitra_emits_one_result_sink_callback(
     result = provider.send(SendRequest(operation=_send_operation(), text="continue"))
 
     assert result.status == "consumed"
+    assert len(received) == 1
+
+
+def test_authenticated_resume_token_rotation_crosses_packaged_chitra_result_sink(
+    fleet_modules: tuple[types.ModuleType, types.ModuleType],
+) -> None:
+    _fleet_wire, fleet_adapter = fleet_modules
+    operation = _resume_operation()
+    prior_owner = cast(dict[str, object], CANONICAL_CREATE_REQUEST["owner_process"])
+    new_owner = {**prior_owner, "pid": 20, "start_token": "start-b"}
+    receipt: dict[str, object] = {
+        "schema": "chitra.lane-reopen.v1",
+        "operation_id": operation.operation_id,
+        "close_operation_id": CANONICAL_CREATE_REQUEST["close_operation_id"],
+        "lane_id": operation.lane_id,
+        "goal_id": CANONICAL_CREATE_REQUEST["goal_id"],
+        "goal_version": CANONICAL_CREATE_REQUEST["goal_version"],
+        "session_ref": CANONICAL_CREATE_REQUEST["session_ref"],
+        "provider_session_id": operation.provider_session_id,
+        "provider_handle": operation.provider_handle,
+        "provider_instance_id": operation.provider_instance_id,
+        "provider_generation": operation.provider_generation,
+        "checkpoint_ref": CANONICAL_CREATE_REQUEST["context_ref"],
+        "prior_owner_process": prior_owner,
+        "owner_process": new_owner,
+        "created_new_lane": False,
+        "created_new_session": False,
+        "auth_token": CANONICAL_CREATE_REQUEST["resume_token"],
+        "observed_at": NOW,
+        "evidence": "authenticated same-session reopen",
+    }
+    token = cast(str, CANONICAL_CREATE_REQUEST["resume_token"])
+    receipt["receipt_hmac"] = hmac.new(
+        token.encode(),
+        json.dumps(
+            receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    response = {
+        **_tophand_operation_dict(operation),
+        "provider_session_id": operation.provider_session_id,
+        "provider_instance_id": operation.provider_instance_id,
+        "provider_generation": operation.provider_generation,
+        "process_start_token": new_owner["start_token"],
+        "status": "consumed",
+        "accepted": True,
+        "consumed": True,
+        "observed_at": NOW,
+        "evidence": "authenticated same-session reopen",
+        "reopen_receipt": receipt,
+    }
+    received: list[object] = []
+    provider = _PackagedTophandProvider(
+        _build_real_fleet_provider(fleet_adapter, FakeTransport(response)),
+        result_sink=received.append,
+    )
+    result = provider.create_or_resume(
+        CreateOrResumeRequest(
+            operation=operation,
+            session_ref=cast(str, CANONICAL_CREATE_REQUEST["session_ref"]),
+            provider_session_id=cast(
+                str, CANONICAL_CREATE_REQUEST["provider_session_id"]
+            ),
+            context_ref=cast(str, CANONICAL_CREATE_REQUEST["context_ref"]),
+            goal_id=cast(str, CANONICAL_CREATE_REQUEST["goal_id"]),
+            goal_version=cast(int, CANONICAL_CREATE_REQUEST["goal_version"]),
+            resume_after_close=True,
+            close_operation_id=cast(
+                str, CANONICAL_CREATE_REQUEST["close_operation_id"]
+            ),
+            owner_process=OwnerProcessIdentity.model_validate(prior_owner, strict=True),
+            resume_token=token,
+        )
+    )
+
+    assert result.status == "consumed"
+    assert result.process_start_token == "start-b"
+    assert result.reopen_receipt is not None
+    assert result.reopen_receipt.owner_process.start_token == "start-b"
     assert len(received) == 1

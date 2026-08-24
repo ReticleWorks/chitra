@@ -2903,6 +2903,7 @@ class RecoveryEngine:
                     update={
                         "process_start_token": receipt.owner_process.start_token,
                         "observed_process": reopened_observation,
+                        "registration_digest": None,
                         "registration_observed_at": receipt.observed_at,
                     }
                 ),
