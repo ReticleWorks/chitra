@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from chitra.session_contract import (
@@ -10,6 +11,7 @@ from chitra.session_contract import (
     JoinedLaneRecord,
     LaneUpdate,
     PlanAssessment,
+    PendingProviderOperation,
     Problem,
     ProblemHistoryEvent,
     ProviderCapabilities,
@@ -84,7 +86,7 @@ def _record(*, update: LaneUpdate | None = None) -> JoinedLaneRecord:
         provider=ProviderIdentity(
             kind="tophand",
             handle="tophand-lane-a",
-            capabilities=ProviderCapabilities.from_supported(("create_or_resume", "send", "read_updates")),
+            capabilities=ProviderCapabilities.from_supported(("create_or_resume", "send", "read_updates", "checkpoint")),
         ),
         current_update=update,
         plan_assessment=PlanAssessment(state="valid", reason="update passed validation"),
@@ -262,6 +264,51 @@ def test_report_shows_the_recorded_recovery_action() -> None:
     rendered = render_joined_session_view(record)
 
     assert "Recovery action: checkpoint" in rendered
+
+
+def test_report_shows_tactical_handoff_checkpoint_and_safe_pending_action() -> None:
+    operation = PendingProviderOperation(
+        operation_id="checkpoint-1",
+        kind="checkpoint",
+        lane_id="lane-a",
+        provider_handle="tophand-lane-a",
+        idempotency_key="checkpoint-1-idem",
+        payload_digest="checkpoint-digest",
+        provider_session_id="tophand:lane-a-1",
+        payload="secret provider payload",
+        provider_instance_id=None,
+        provider_generation=None,
+        created_at="2026-08-23T14:02:00+00:00",
+    )
+    record = _record(update=_update()).model_copy(
+        update={
+            "recovery": RecoveryState(
+                stage="relaunch",
+                cycle_id="cycle-report",
+                attempted_remedy="reframe",
+                attempt_count=6,
+                execution_objective="Complete the proof without changing the goal",
+                execution_plan=("Run the proof", "Publish the proof result"),
+                handoff_id="lane-a-cycle-report-context",
+                handoff_reference="recovery-handoffs/lane-a-cycle-report-context.json",
+                handoff_digest="handoff-digest",
+            ),
+            "checkpoint_reference": "checkpoint-report",
+            "pending_operation": operation,
+        }
+    )
+    view = build_joined_session_view(record)
+    payload = view.to_dict()
+    rendered = render_joined_session_view(view)
+
+    assert payload["handoff"]["status"] == "durable"
+    assert payload["reframe_progress"]["steps"] == ["Run the proof", "Publish the proof result"]
+    assert payload["checkpoint_reference"] == "checkpoint-report"
+    assert payload["pending_operation"]["operation_id"] == "checkpoint-1"
+    assert "secret provider payload" not in json.dumps(payload)
+    assert "Reframe progress: stage relaunch, attempt 6" in rendered
+    assert "Handoff: durable (lane-a-cycle-report-context)" in rendered
+    assert "Pending recovery action: checkpoint-1 (checkpoint)" in rendered
 
 
 def test_rotation_keeps_logical_lane_and_shows_generation_context() -> None:

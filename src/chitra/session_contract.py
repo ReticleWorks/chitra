@@ -894,7 +894,12 @@ class OperatingFact(_ContractModel):
 
 
 class RecoveryState(_ContractModel):
-    """Bounded recovery ladder state that never creates a user ask."""
+    """Bounded recovery ladder state that never creates a user ask.
+
+    The execution fields are Chitra's tactical overlay. They may change how
+    an enrolled lane is pursued, but they cannot change the enrolled goal.
+    The handoff fields anchor one durable context snapshot across restart.
+    """
 
     stage: RecoveryStage = "none"
     cycle_id: Identifier | None = None
@@ -906,6 +911,11 @@ class RecoveryState(_ContractModel):
     # Chitra retains the exact payload that produced a pending operation.  A
     # restart must never rebuild a retry from a later mutable ``next_action``.
     pending_payload: str | None = None
+    execution_objective: str = ""
+    execution_plan: tuple[str, ...] = ()
+    handoff_id: Identifier | None = None
+    handoff_reference: str | None = None
+    handoff_digest: str | None = None
 
     @field_validator("attempt_count")
     @classmethod
