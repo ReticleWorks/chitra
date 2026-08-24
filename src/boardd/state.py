@@ -73,6 +73,7 @@ class _GoalProjection(GoalProjection):
     goal: str
     done_when: str
     status: str
+    snapshot: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +105,7 @@ def _goal_for_joined(record: JoinedLaneRecord, goals: tuple[dict[str, Any], ...]
         goal=str(candidate.get("goal") or ""),
         done_when=str(candidate.get("done_when") or ""),
         status=str(candidate.get("status") or "working"),
+        snapshot=dict(candidate),
     )
 
 
@@ -168,6 +170,7 @@ def _joined_payload(
         "goal": _line(tc, view.goal) or tc.get("unavailable (goal record not joined)"),
         "done_when": _line(tc, view.done_when) or tc.get("unavailable (goal record not joined)"),
         "goal_status": view.goal_status,
+        "goal_snapshot": view.goal_snapshot,
         "progress": None
         if progress is None
         else {

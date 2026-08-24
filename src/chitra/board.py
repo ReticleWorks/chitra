@@ -100,6 +100,7 @@ class _JoinedGoalProjection(GoalProjection):
     goal: str
     done_when: str
     status: str
+    snapshot: Mapping[str, object] | None = None
 
 
 def marker_for(status: GoalStatus) -> str:
@@ -405,12 +406,15 @@ def _joined_goal(record: JoinedLaneRecord, goals: Sequence[RosterRecord]) -> Goa
     if candidate is None:
         candidate = next((goal for goal in goals if getattr(goal, "lane_id", "") == record.lane_id), None)
     if candidate is not None:
+        to_dict = getattr(candidate, "to_dict", None)
+        snapshot = to_dict() if callable(to_dict) else None
         return _JoinedGoalProjection(
             goal_id=str(getattr(candidate, "goal_id", "") or record.goal_id),
             lane_id=str(getattr(candidate, "lane_id", "") or record.lane_id),
             goal=candidate.goal,
             done_when=candidate.done_when,
             status=str(candidate.status),
+            snapshot=snapshot,
         )
     return None
 

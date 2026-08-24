@@ -14,6 +14,7 @@ canonical goal record when it needs to show the user's goal text.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Literal, Protocol, cast
 
@@ -115,18 +116,40 @@ def _goal_fields(record: JoinedLaneRecord, goal: GoalProjection | None) -> tuple
     return goal.goal, goal.done_when, goal.status
 
 
-def _goal_snapshot(goal: GoalProjection | None) -> dict[str, object] | None:
-    """Return the complete authoritative goal record for a report, when supplied."""
+_GOAL_SNAPSHOT_FIELDS = (
+    "session_ref",
+    "goal_id",
+    "lane_id",
+    "goal_version",
+    "goal",
+    "done_when",
+    "source",
+    "status",
+    "created_at",
+    "updated_at",
+)
+
+
+def _goal_snapshot(record: JoinedLaneRecord, goal: GoalProjection | None) -> dict[str, object] | None:
+    """Copy a complete enrolled goal, or report that it is unavailable."""
 
     if goal is None:
         return None
-    to_dict = getattr(goal, "to_dict", None)
-    if not callable(to_dict):
+    raw = getattr(goal, "snapshot", None)
+    if raw is None:
+        to_dict = getattr(goal, "to_dict", None)
+        raw = to_dict() if callable(to_dict) else None
+    if not isinstance(raw, Mapping) or any(field not in raw for field in _GOAL_SNAPSHOT_FIELDS):
         return None
-    value = to_dict()
-    if not isinstance(value, dict):
-        raise ValueError("goal to_dict() must return an object")
-    return dict(value)
+    snapshot = cast(dict[str, object], deepcopy(dict(raw)))
+    if (
+        snapshot["session_ref"],
+        snapshot["goal_id"],
+        snapshot["lane_id"],
+        snapshot["goal_version"],
+    ) != (record.session_ref, record.goal_id, record.lane_id, record.goal_version):
+        return None
+    return snapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,7 +208,7 @@ class JoinedSessionView:
     goal: str | None
     done_when: str | None
     goal_status: str | None
-    goal_snapshot: dict[str, object] | None = None
+    goal_snapshot: dict[str, object] | None
     checkpoint_reference: str | None = None
     pending_operation: PendingProviderOperation | None = None
     close_evidence: CloseArchiveResult | None = None
@@ -254,7 +277,7 @@ class JoinedSessionView:
             "goal": self.goal,
             "done_when": self.done_when,
             "goal_status": self.goal_status,
-            "goal_snapshot": self.goal_snapshot,
+            "goal_snapshot": deepcopy(self.goal_snapshot),
             "checkpoint_reference": self.checkpoint_reference,
             "pending_operation": _pending_operation_value(self.pending_operation),
             "close_evidence": _json_value(self.close_evidence) if self.close_evidence is not None else None,
@@ -277,7 +300,7 @@ def build_joined_session_view(
     step = _current_step(update)
     problems = record.problems
     goal_text, done_when, goal_status = _goal_fields(record, goal)
-    goal_snapshot = _goal_snapshot(goal)
+    goal_snapshot = _goal_snapshot(record, goal)
     chitra_action: str | None = None
     last_intervention: InterventionEvidence | None = record.last_intervention
     if record.last_intervention is not None:
