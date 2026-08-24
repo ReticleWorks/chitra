@@ -143,6 +143,7 @@ class ConsumedSendProvider:
             kind=request.operation.kind,
             lane_id=request.lane_id,
             provider_handle=request.provider_handle,
+            provider_session_id=request.operation.provider_session_id,
             idempotency_key=request.idempotency_key,
             payload_digest=request.payload_digest,
             provider_instance_id=request.provider_instance_id,
