@@ -572,10 +572,10 @@ def _install_amp_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(module, "_packaged_amp_adapter", _AmpAdapter, raising=True)
 
 
-def test_amp_factory_invokes_the_real_adapter_constructor_with_update_sink(
+def test_amp_factory_invokes_the_real_adapter_constructor_with_chitra_owned_update_sink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The shipped Chitra factory must exercise the actual Adapter signature."""
+    """The real Adapter stays transport-only; Chitra owns atomic lane updates."""
 
     import chitra.recovery_provider as module
 
@@ -592,7 +592,8 @@ def test_amp_factory_invokes_the_real_adapter_constructor_with_update_sink(
     assert provider is not None
     adapter = provider._adapter
     assert adapter.__class__.__module__ != __name__
-    assert callable(adapter.update_sink)
+    assert not hasattr(adapter, "update_sink")
+    assert callable(provider._update_batch_sink)
 
 
 def test_amp_factory_is_disabled_without_explicit_launch_policy(
