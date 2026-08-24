@@ -183,11 +183,14 @@ def verify_amp_capability_receipt(
             raise AmpCapabilityError("usage evidence hash is not a digest")
         if not _SHA256.fullmatch(receipt["result_digest"]):
             raise AmpCapabilityError("result digest is not a digest")
-        # A signer cannot turn an omitted ORB result into evidence by signing
-        # a sentinel digest.  The provider must publish a non-sentinel digest
-        # for the result bytes it claims to have observed.
-        if receipt["result_digest"] == "sha256:" + "0" * 64:
-            raise AmpCapabilityError("result digest is an unbound sentinel")
+        # The capability probe's only material inline result is the canonical
+        # child/status pair.  Recompute it instead of treating a signer-owned
+        # digest string as independent evidence.
+        expected_result_digest = "sha256:" + hashlib.sha256(
+            _canonical({"child_id": receipt["child_id"], "status": "consumed"})
+        ).hexdigest()
+        if receipt["result_digest"] != expected_result_digest:
+            raise AmpCapabilityError("result digest is not bound to the inline material result")
         _validate_containment(receipt["containment_proof"])
         created = _timestamp(receipt["created_at"], "created_at")
         expires = _timestamp(receipt["expires_at"], "expires_at")

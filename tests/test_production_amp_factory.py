@@ -176,7 +176,7 @@ def _amp_facts(record: JoinedLaneRecord) -> tuple[OperatingFact, ...]:
             "child_evidence_mode": "inline",
             "transcript_cursor": "amp:T-11111111-1111-4111-8111-111111111111:offset:1:boundary:M:prefix:" + "a" * 64,
             "usage_evidence_hash": "sha256:" + "b" * 64,
-            "result_digest": "sha256:" + "c" * 64,
+            "result_digest": "sha256:373167c6a1e4692169e54f1e41c631cc6a722f6977267bfabed5f57199491fe6",
             "containment_proof": {
                 "schema": "chitra.amp-linux-containment.v1",
                 "platform": "linux",
