@@ -34,10 +34,12 @@ from chitra.session_contract import (
     JoinedLaneRecord,
     LaneUpdate,
     OperationReference,
+    OwnerProcessIdentity,
     PendingProviderOperation,
     ProviderCapabilities,
     ProviderIdentity,
     ProviderOperationResult,
+    ReopenReceipt,
 )
 
 
@@ -671,6 +673,15 @@ def test_store_requires_explicit_transfer_and_resume_transition_kinds(tmp_path: 
 
 
 def test_steady_inactive_to_active_is_forbidden_but_store_resume_is_typed(tmp_path: Path) -> None:
+    old_owner = OwnerProcessIdentity(
+        pid=101,
+        uid=1000,
+        gid=1000,
+        start_token="old-process",
+        comm="amp",
+        exe="/usr/local/bin/amp",
+    )
+    new_owner = old_owner.model_copy(update={"pid": 202, "start_token": "new-process"})
     close = CloseResult.model_validate(
         {
             "operation_id": "close-1",
@@ -678,6 +689,7 @@ def test_steady_inactive_to_active_is_forbidden_but_store_resume_is_typed(tmp_pa
             "provider_handle": "thread-a",
             "provider_instance_id": "instance-a",
             "provider_generation": 1,
+            "provider_session_id": "amp-session-a",
             "idempotency_key": "idem-close-1",
             "payload_digest": "digest-close-1",
             "state": "archived",
@@ -686,6 +698,7 @@ def test_steady_inactive_to_active_is_forbidden_but_store_resume_is_typed(tmp_pa
             "later_resume_supported": True,
             "checkpoint_ref": "checkpoint-1",
             "quiescent": True,
+            "owner_process": old_owner.model_dump(mode="json"),
             "observed_at": "2026-08-23T14:00:01+00:00",
             "evidence": "archive",
         },
@@ -696,6 +709,12 @@ def test_steady_inactive_to_active_is_forbidden_but_store_resume_is_typed(tmp_pa
         handle="thread-a",
         instance_id="instance-a",
         generation=1,
+        provider_session_id="amp-session-a",
+        process_start_token=old_owner.start_token,
+        observed_process={
+            **old_owner.model_dump(mode="json"),
+            "process_start_token": old_owner.start_token,
+        },
         capabilities=ProviderCapabilities.from_supported(("create_or_resume", "close", "checkpoint", "resume_after_close")),
     )
     history = (
@@ -720,7 +739,70 @@ def test_steady_inactive_to_active_is_forbidden_but_store_resume_is_typed(tmp_pa
     )
     store = JoinedLaneStore(tmp_path)
     store.create(inactive)
-    active = inactive.model_copy(update={"revision": 2, "lifecycle": "active", "last_close_result": None})
+    reopen = ReopenReceipt(
+        operation_id="resume-1",
+        close_operation_id=close.operation_id,
+        lane_id=inactive.lane_id,
+        goal_id=inactive.goal_id,
+        goal_version=inactive.goal_version,
+        session_ref=inactive.session_ref,
+        provider_session_id="amp-session-a",
+        provider_handle=resume_provider.handle,
+        provider_instance_id="instance-a",
+        provider_generation=1,
+        checkpoint_ref=close.checkpoint_ref,
+        prior_owner_process=old_owner,
+        owner_process=new_owner,
+        created_new_lane=False,
+        created_new_session=False,
+        observed_at="2026-08-23T14:01:00+00:00",
+        evidence="same provider thread reopened under a fresh process",
+    )
+    result = ProviderOperationResult(
+        operation_id=reopen.operation_id,
+        kind="create_or_resume",
+        lane_id=inactive.lane_id,
+        provider_handle=resume_provider.handle,
+        provider_session_id=reopen.provider_session_id,
+        process_start_token=new_owner.start_token,
+        idempotency_key="idem-resume-1",
+        payload_digest="digest-resume-1",
+        provider_instance_id="instance-a",
+        provider_generation=1,
+        status="consumed",
+        accepted=True,
+        consumed=True,
+        observed_at=reopen.observed_at,
+        evidence=reopen.evidence,
+        reopen_receipt=reopen,
+    )
+    active = inactive.model_copy(
+        update={
+            "revision": 2,
+            "lifecycle": "active",
+            "provider": resume_provider.model_copy(
+                update={
+                    "process_start_token": new_owner.start_token,
+                    "observed_process": {
+                        **new_owner.model_dump(mode="json"),
+                        "process_start_token": new_owner.start_token,
+                    },
+                }
+            ),
+            "operation_history": (
+                *history,
+                OperationReference(
+                    operation_id=result.operation_id,
+                    idempotency_key=result.idempotency_key,
+                    payload_digest=result.payload_digest,
+                    kind=result.kind,
+                    created_at=result.observed_at,
+                ),
+            ),
+            "last_operation_result": result,
+            "last_close_result": None,
+        }
+    )
     with pytest.raises(JoinedLaneRevisionError, match="resume"):
         store.save(active)
     assert store.save(active, transition="resume").lifecycle == "active"

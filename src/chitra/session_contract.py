@@ -792,6 +792,13 @@ def _provider_identity_key(provider: ProviderIdentity) -> tuple[object, ...]:
     )
 
 
+def _provider_thread_identity_key(provider: ProviderIdentity) -> tuple[object, ...]:
+    """Return the stable provider thread identity without its OS process fence."""
+
+    identity = _provider_identity_key(provider)
+    return (*identity[:4], *identity[5:])
+
+
 def validate_pending_operation(provider: ProviderIdentity, operation: PendingProviderOperation) -> None:
     """Reject operations the observed provider cannot perform safely."""
 
@@ -1011,7 +1018,14 @@ def validate_operation_result(pending: PendingProviderOperation, result: Provide
     if result.provider_generation is not None and pending.provider_generation != result.provider_generation:
         errors.append("provider generation changed")
     if result.process_start_token is not None and pending.process_start_token != result.process_start_token:
-        errors.append("process start token changed")
+        reopened_process = (
+            pending.kind == "create_or_resume"
+            and pending.process_start_token is None
+            and result.reopen_receipt is not None
+            and result.reopen_receipt.owner_process.start_token == result.process_start_token
+        )
+        if not reopened_process:
+            errors.append("process start token changed")
     if result.status not in {"unknown", "lost-response"}:
         for field in (
             "provider_session_id",
@@ -1806,12 +1820,18 @@ def validate_record_transition(
         errors.append("inactive-to-active transition requires an explicit resume transition")
 
     provider_changed = _provider_identity_key(previous.provider) != _provider_identity_key(current.provider)
+    resumed_process_identity = (
+        normalized_transition == "resume"
+        and _provider_thread_identity_key(previous.provider)
+        == _provider_thread_identity_key(current.provider)
+        and previous.provider.process_start_token != current.provider.process_start_token
+    )
     physical_generation_advanced = (
         previous.physical_session_generation is not None
         and current.physical_session_generation is not None
         and current.physical_session_generation > previous.physical_session_generation
     )
-    if provider_changed:
+    if provider_changed and not resumed_process_identity:
         if normalized_transition != "provider-transfer":
             errors.append("provider identity swap requires an explicit provider-transfer transition")
         if current.chitra_ownership_epoch <= previous.chitra_ownership_epoch:
@@ -1844,6 +1864,23 @@ def validate_record_transition(
             errors.append("resume must explicitly restore an active logical lane")
         if current.last_close_result is not None:
             errors.append("resume must clear prior close evidence from the active snapshot")
+        reopen = (
+            current.last_operation_result.reopen_receipt
+            if current.last_operation_result is not None
+            else None
+        )
+        if reopen is None:
+            errors.append("resume requires the authenticated reopen receipt")
+        else:
+            if current.provider.process_start_token != reopen.owner_process.start_token:
+                errors.append("resume provider process token must match the reopened owner")
+            if current.provider.observed_process != {
+                **reopen.owner_process.model_dump(mode="json"),
+                "process_start_token": reopen.owner_process.start_token,
+            }:
+                errors.append("resume provider observation must match the reopened owner")
+            if previous.provider.process_start_token == current.provider.process_start_token:
+                errors.append("resume must rotate the provider process token")
     elif prior_close is not None and prior_close.later_resume_supported is True and current.lifecycle == "active":
         errors.append("later resume requires an explicit resume transition")
 

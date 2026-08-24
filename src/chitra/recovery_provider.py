@@ -71,7 +71,6 @@ from .session_contract import (
     canonical_digest,
     validate_update,
 )
-from .tophand_wire import TOPHAND_OPERATION_SCHEMA
 from .usage_policy import launch_policy_problem
 
 try:
@@ -491,21 +490,24 @@ def _operation_dict(operation: object) -> dict[str, object]:
 
 def _tophand_operation_dict(operation: object) -> dict[str, object]:
     if isinstance(operation, PendingProviderOperation):
+        # Keep Chitra's durable payload on this boundary. The Adapter owns
+        # projection to the exact Fleet wire and the attempted-state fence.
+        # It needs the payload to recover an attempted resume after a fresh
+        # Chitra process starts.
         return {
-            "schema": TOPHAND_OPERATION_SCHEMA,
             "operation_id": operation.operation_id,
             "kind": operation.kind,
             "lane_id": operation.lane_id,
             "provider_handle": operation.provider_handle,
             "provider_session_id": operation.provider_session_id,
+            "process_start_token": operation.process_start_token,
             "idempotency_key": operation.idempotency_key,
             "payload_digest": operation.payload_digest,
+            "payload": operation.payload,
             "provider_instance_id": operation.provider_instance_id,
             "provider_generation": operation.provider_generation,
-            "process_start_token": operation.process_start_token,
             "created_at": operation.created_at,
             "attempt": operation.attempt,
-            "attempted": operation.attempted,
         }
     if isinstance(operation, Mapping):
         return {str(key): value for key, value in operation.items()}

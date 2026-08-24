@@ -42,6 +42,11 @@ def _record() -> JoinedLaneRecord:
             kind="tophand",
             handle="remote-handle-a",
             provider_session_id="physical-session-a",
+            process_start_token=OLD_OWNER.start_token,
+            observed_process={
+                **OLD_OWNER.model_dump(mode="json"),
+                "process_start_token": OLD_OWNER.start_token,
+            },
             instance_id="tophand-instance-a",
             generation=3,
             capabilities=ProviderCapabilities(
@@ -91,6 +96,7 @@ class FakeProvider:
         self.archive_calls = 0
         self.resume_calls = 0
         self.archived = False
+        self.process_start_token = OLD_OWNER.start_token
 
     def status(self) -> ProviderStatus:
         return ProviderStatus(
@@ -101,6 +107,7 @@ class FakeProvider:
             fresh=True,
             provider_available=True,
             provider_instance_id="tophand-instance-a",
+            process_start_token=self.process_start_token,
             current_turn_id=None,
         )
 
@@ -136,6 +143,7 @@ class FakeProvider:
     def create_or_resume(self, request: Any) -> Any:
         self.resume_calls += 1
         self.archived = False
+        self.process_start_token = NEW_OWNER.start_token
         receipt = {
             "schema": "chitra.lane-reopen.v1",
             "operation_id": request.operation_id,
@@ -167,6 +175,11 @@ class FakeProvider:
             payload_digest=request.payload_digest,
             provider_instance_id=request.provider_instance_id,
             provider_generation=request.provider_generation,
+            process_start_token=NEW_OWNER.start_token,
+            observed_process={
+                **NEW_OWNER.model_dump(mode="json"),
+                "process_start_token": NEW_OWNER.start_token,
+            },
             status="consumed",
             accepted=True,
             consumed=True,
@@ -424,6 +437,24 @@ def test_resume_after_close_restores_the_same_provider_session(tmp_path: Path) -
     assert resumed.record.last_close_result is None
     assert resumed.record.provider.provider_session_id == "physical-session-a"
     assert resumed.operation is not None and resumed.operation.kind == "create_or_resume"
+    assert json.loads(resumed.operation.payload) == {
+        "session_ref": "logical-session-a",
+        "provider_session_id": "physical-session-a",
+        "context_ref": closed.record.checkpoint_reference,
+        "goal_id": "goal-a",
+        "goal_version": 1,
+        "resume_after_close": True,
+        "close_operation_id": closed.record.last_close_result.operation_id,
+        "owner_process": OLD_OWNER.model_dump(mode="json"),
+        "resume_token": _resume_auth_token(
+            closed.record, closed.record.last_close_result, resumed.operation, state_root=tmp_path
+        ),
+    }
+    assert resumed.record.provider.process_start_token == NEW_OWNER.start_token
+    assert resumed.record.provider.observed_process == {
+        **NEW_OWNER.model_dump(mode="json"),
+        "process_start_token": NEW_OWNER.start_token,
+    }
     assert closed.record.last_close_result is not None
     assert resumed.operation.payload_digest == request_digest(
         "create_or_resume",

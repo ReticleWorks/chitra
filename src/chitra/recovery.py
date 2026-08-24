@@ -754,6 +754,7 @@ def _resume_receipt_matches(
         and receipt.created_new_lane is False
         and receipt.created_new_session is False
         and receipt.owner_process != receipt.prior_owner_process
+        and result.process_start_token == receipt.owner_process.start_token
         and receipt.auth_token == token
     )
 
@@ -1837,7 +1838,17 @@ class RecoveryEngine:
                 "owner_process": close.owner_process.model_dump(mode="json") if close.owner_process is not None else None,
                 "resume_token": resume_token,
             }
-            return provisional.model_copy(update={"payload_digest": request_digest("create_or_resume", request)})
+            return provisional.model_copy(
+                update={
+                    "payload": json.dumps(
+                        request,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ),
+                    "payload_digest": request_digest("create_or_resume", request),
+                }
+            )
         cycle_id = record.recovery.cycle_id
         if cycle_id is None:
             raise RecoveryStateError("recovery cycle identity is missing")
@@ -2759,15 +2770,21 @@ class RecoveryEngine:
             for name in ("status", "create_or_resume", "resume_after_close")
         ):
             return self._resume_wait(record, "provider lacks exact same-session resume capability")
-        status = self._provider_status(record)
-        if (
-            status is None
-            or status.provider_session_id != record.provider.provider_session_id
-            or status.provider_instance_id != record.provider.instance_id
-            or status.generation != record.provider.generation
-            or status.state not in {ProviderState.CLOSED, ProviderState.ARCHIVED, ProviderState.IDLE}
-        ):
-            return self._resume_wait(record, "provider status does not prove the closed session identity")
+        pending_resume_reconcile = (
+            record.pending_operation is not None
+            and record.pending_operation.kind == "create_or_resume"
+            and record.pending_operation.attempted
+        )
+        if not pending_resume_reconcile:
+            status = self._provider_status(record)
+            if (
+                status is None
+                or status.provider_session_id != record.provider.provider_session_id
+                or status.provider_instance_id != record.provider.instance_id
+                or status.generation != record.provider.generation
+                or status.state not in {ProviderState.CLOSED, ProviderState.ARCHIVED, ProviderState.IDLE}
+            ):
+                return self._resume_wait(record, "provider status does not prove the closed session identity")
         current_time = _now(now)
         payload = canonical_digest(
             {
@@ -2813,27 +2830,43 @@ class RecoveryEngine:
                 return self._resume_wait(record, f"resume operation could not be durably recorded: {exc}")
         elif (
             pending.kind != "create_or_resume"
-            or pending.model_dump(exclude={"created_at", "attempt"})
-            != expected.model_dump(exclude={"created_at", "attempt"})
+            or pending.model_dump(exclude={"created_at", "attempt", "attempted"})
+            != expected.model_dump(exclude={"created_at", "attempt", "attempted"})
         ):
             return self._resume_wait(record, "pending resume identity or payload changed", pending)
         stored = record.last_operation_result
         if stored is not None and stored.operation_id == pending.operation_id and stored.status == "consumed":
             result = stored
         else:
+            record = self._mark_attempted(record, persist=True)
+            pending = record.pending_operation
+            assert pending is not None
             result = self._invoke(record, pending, "resume", pending.payload, current_time)
             record = self._persist(record.model_copy(update={"last_operation_result": result}), persist=True)
         if result.status != "consumed":
             return self._resume_wait(record, "same-session resume lacks exact consumption evidence", pending, result)
+        receipt = result.reopen_receipt
+        if receipt is None:
+            return self._resume_wait(
+                record,
+                "same-session resume lacks its authenticated reopen receipt",
+                pending,
+                result,
+            )
         # Consumption of the resume command is not proof that the provider
         # actually left its archived state.  Require a fresh live observation
         # for the exact physical session before changing Chitra to active.
-        live = self._provider_status(record)
+        # The accepted reopen receipt authorizes one process-token rotation.
+        # Observe the target without applying the old Chitra token fence, then
+        # bind the new token to the authenticated receipt below.
+        live = self._provider_status()
         if (
             live is None
+            or str(live.provider) != str(record.provider.kind)
             or live.provider_session_id != record.provider.provider_session_id
             or live.provider_instance_id != record.provider.instance_id
             or live.generation != record.provider.generation
+            or live.process_start_token != receipt.owner_process.start_token
             or live.state not in {ProviderState.IDLE, ProviderState.RUNNING}
         ):
             return self._resume_wait(
@@ -2842,8 +2875,7 @@ class RecoveryEngine:
                 pending,
                 result,
             )
-        receipt = result.reopen_receipt
-        if receipt is None or receipt.auth_token != _resume_auth_token(
+        if receipt.auth_token != _resume_auth_token(
             record, close, pending, state_root=self.state_root
         ):
             return self._resume_wait(record, "same-session resume lacks its authenticated reopen receipt", pending, result)
@@ -2860,9 +2892,20 @@ class RecoveryEngine:
         if not _resume_receipt_matches(record, close, pending, result, state_root=self.state_root):
             return self._resume_wait(record, "same-session resume lacks exact authenticated reopen evidence", pending, result)
         check = self._check(current_time, "Check useful progress after resume", "a material update after the same-session resume")
+        reopened_observation = {
+            **receipt.owner_process.model_dump(mode="json"),
+            "process_start_token": receipt.owner_process.start_token,
+        }
         resumed = record.model_copy(
             update={
                 "lifecycle": "active",
+                "provider": record.provider.model_copy(
+                    update={
+                        "process_start_token": receipt.owner_process.start_token,
+                        "observed_process": reopened_observation,
+                        "registration_observed_at": receipt.observed_at,
+                    }
+                ),
                 "last_close_result": None,
                 "pending_operation": None,
                 "next_check": check,
