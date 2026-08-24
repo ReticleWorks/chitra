@@ -333,6 +333,7 @@ def test_relaunch_accepts_opaque_provider_status_identity_without_format_guessin
                 generation=1,
                 fresh=True,
                 provider_available=True,
+                provider_instance_id="instance-a",
                 context_available=True,
             )
 

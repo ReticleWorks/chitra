@@ -11,16 +11,24 @@ from typing import Any
 from chitra.goals import GoalRecord
 from chitra.joined_lane import JoinedLaneStore
 from chitra.provider_protocol import ProviderState, ProviderStatus
-from chitra.recovery import RecoveryEngine, RecoverySupervisor
+from chitra.recovery import RecoveryEngine, RecoverySupervisor, _resume_receipt_hmac
 from chitra.session_contract import (
     CloseArchiveResult,
     JoinedLaneRecord,
     ProviderCapabilities,
     ProviderIdentity,
     ProviderOperationResult,
+    OwnerProcessIdentity,
+    ReopenReceipt,
 )
 
 NOW = datetime(2026, 8, 23, 14, tzinfo=UTC)
+OLD_OWNER = OwnerProcessIdentity(
+    pid=101, uid=1000, gid=1000, start_token="old", comm="claude", exe="/bin/claude"
+)
+NEW_OWNER = OwnerProcessIdentity(
+    pid=202, uid=1000, gid=1000, start_token="new", comm="claude", exe="/bin/claude"
+)
 
 
 def _record() -> JoinedLaneRecord:
@@ -91,6 +99,7 @@ class FakeProvider:
             generation=3,
             fresh=True,
             provider_available=True,
+            provider_instance_id="tophand-instance-a",
             current_turn_id=None,
         )
 
@@ -115,6 +124,7 @@ class FakeProvider:
             later_resume_supported=True,
             checkpoint_ref=payload["checkpoint_ref"],
             quiescent=True,
+            owner_process=OLD_OWNER,
             observed_at=NOW.isoformat(),
             evidence="same physical session; archive receipt",
         )
@@ -125,6 +135,26 @@ class FakeProvider:
     def create_or_resume(self, request: Any) -> Any:
         self.resume_calls += 1
         self.archived = False
+        receipt = {
+            "schema": "chitra.lane-reopen.v1",
+            "operation_id": request.operation_id,
+            "close_operation_id": request.close_operation_id,
+            "lane_id": request.lane_id,
+            "session_ref": request.session_ref,
+            "provider_session_id": "physical-session-a",
+            "provider_handle": "remote-handle-a",
+            "provider_instance_id": request.provider_instance_id,
+            "provider_generation": request.provider_generation,
+            "checkpoint_ref": request.context_ref,
+            "prior_owner_process": OLD_OWNER.model_dump(mode="json"),
+            "owner_process": NEW_OWNER.model_dump(mode="json"),
+            "created_new_lane": False,
+            "created_new_session": False,
+            "auth_token": request.resume_token,
+            "observed_at": request.operation.created_at,
+            "evidence": "same physical session resumed",
+        }
+        receipt["receipt_hmac"] = _resume_receipt_hmac(receipt, request.resume_token or "")
         result = ProviderOperationResult(
             operation_id=request.operation_id,
             kind="create_or_resume",
@@ -137,8 +167,10 @@ class FakeProvider:
             status="consumed",
             accepted=True,
             consumed=True,
+            provider_session_id="physical-session-a",
             observed_at=request.operation.created_at,
             evidence="same physical session resumed",
+            reopen_receipt=ReopenReceipt.from_dict(receipt),
         )
         if self.lose_first_resume_reply and self.resume_calls == 1:
             raise OSError("response lost after provider resumed session")
@@ -237,6 +269,7 @@ def test_physical_session_mismatch_blocks_close(tmp_path: Path) -> None:
         generation=3,
         fresh=True,
         provider_available=True,
+        provider_instance_id="tophand-instance-a",
         current_turn_id=None,
     )
 
@@ -333,6 +366,27 @@ def test_unknown_close_receipt_never_marks_the_lane_inactive(tmp_path: Path) -> 
 
     assert decision.action == "waiting"
     assert decision.record.lifecycle == "active"
+
+
+def test_persisted_close_state_without_durable_evidence_is_not_terminal(tmp_path: Path) -> None:
+    record = _record()
+    JoinedLaneStore(tmp_path).create(record)
+    _completion_gate(tmp_path, record)
+    provider = FakeProvider()
+    engine = RecoveryEngine(provider=provider, state_root=tmp_path, goal_root=tmp_path)
+
+    closed = engine.governed_close(record, now=NOW)
+    assert closed.action == "closed"
+    evidence = tmp_path / "close-evidence" / f"{closed.close_result.operation_id}.json"
+    evidence.unlink()
+
+    replay = RecoveryEngine(
+        provider=provider, state_root=tmp_path, goal_root=tmp_path
+    ).governed_close(closed.record, now=NOW.replace(minute=1))
+
+    assert replay.action == "waiting"
+    assert "durable Chitra evidence" in replay.reason
+    assert provider.archive_calls == 1
 
 
 def test_direct_close_requires_an_explicit_completion_goal_root(tmp_path: Path) -> None:

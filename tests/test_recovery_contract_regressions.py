@@ -312,6 +312,7 @@ def test_sparse_rotated_session_response_persists_same_logical_lane(tmp_path: Pa
                 generation=2,
                 fresh=True,
                 provider_available=True,
+                provider_instance_id="instance-a",
             )
 
     initial = lane_record(

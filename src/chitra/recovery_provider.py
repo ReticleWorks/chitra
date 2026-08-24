@@ -15,7 +15,6 @@ waiting instead of guessing.
 
 from __future__ import annotations
 
-import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -59,9 +58,10 @@ from .session_contract import (
     JoinedLaneRecord,
     LaneUpdate,
     OperatingFact,
-    ReopenReceipt,
     PendingProviderOperation,
     ProviderIdentity,
+    ReopenReceipt,
+    canonical_digest,
     validate_update,
 )
 from .usage_policy import launch_policy_problem
@@ -261,6 +261,9 @@ def _provider_result(
     if not isinstance(observed_at, str) or not observed_at.strip():
         observed_at = _now()
     evidence = raw.get("evidence")
+    provider_session_id = raw.get("provider_session_id")
+    if provider_session_id is not None and provider_session_id != operation.provider_session_id:
+        raise ValueError(f"{provider_label} provider result provider_session_id changed")
     reopen_receipt = None
     if raw.get("reopen_receipt") is not None:
         reopen_receipt = ReopenReceipt.from_dict(raw["reopen_receipt"])
@@ -271,6 +274,9 @@ def _provider_result(
         provider_handle=operation.provider_handle,
         idempotency_key=operation.idempotency_key,
         payload_digest=operation.payload_digest,
+        provider_session_id=(
+            provider_session_id if isinstance(provider_session_id, str) else operation.provider_session_id
+        ),
         provider_instance_id=operation.provider_instance_id,
         provider_generation=operation.provider_generation,
         status=cast(Any, status),
@@ -295,6 +301,7 @@ def _unknown_provider_result(
         provider_handle=operation.provider_handle,
         idempotency_key=operation.idempotency_key,
         payload_digest=operation.payload_digest,
+        provider_session_id=operation.provider_session_id,
         provider_instance_id=operation.provider_instance_id,
         provider_generation=operation.provider_generation,
         status="unknown",
@@ -327,19 +334,13 @@ class _PackagedTophandProvider:
         self._adapter = adapter
         self._result_sink = result_sink
 
-    @staticmethod
-    def _digest(value: object) -> str:
-        return hashlib.sha256(
-            json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-        ).hexdigest()
-
     def _verify_close_checkpoint(self, request: CloseRequest) -> None:
         receipt = request.checkpoint_receipt
         if self._state_root is None or not isinstance(receipt, Mapping):
             raise ValueError("Chitra close requires a local signed checkpoint verifier")
         if request.checkpoint_verifier != "chitra.detect.rescue.verify_checkpoint_receipt_signature":
             raise ValueError("close checkpoint verifier is not canonical")
-        if request.checkpoint_receipt_sha256 != self._digest(receipt):
+        if request.checkpoint_receipt_sha256 != canonical_digest(receipt):
             raise ValueError("close checkpoint digest does not match the supplied receipt")
         if not verify_checkpoint_receipt_signature(dict(receipt), state_root=self._state_root):
             raise ValueError("close checkpoint HMAC is invalid")
@@ -416,6 +417,8 @@ class _PackagedTophandProvider:
                     "session_ref": request.session_ref,
                     "provider_session_id": request.provider_session_id,
                     "context_ref": request.context_ref,
+                    "goal_id": request.goal_id,
+                    "goal_version": request.goal_version,
                     "resume_after_close": request.resume_after_close,
                     "close_operation_id": request.close_operation_id,
                     "resume_token": request.resume_token,
@@ -444,6 +447,7 @@ class _PackagedTophandProvider:
         raw = _mapping(adapter.status(), "Tophand status")
         state = _provider_state(raw.get("state", "unknown"))
         provider_session_id = raw.get("provider_session_id")
+        provider_instance_id = raw.get("provider_instance_id")
         generation = raw.get("generation", 0)
         if isinstance(generation, bool) or not isinstance(generation, int):
             generation = 0
@@ -458,6 +462,7 @@ class _PackagedTophandProvider:
             generation=generation,
             fresh=raw.get("fresh") is True,
             provider_available=raw.get("provider_available") is True,
+            provider_instance_id=provider_instance_id if isinstance(provider_instance_id, str) else None,
             context_available=context_available if isinstance(context_available, bool) else None,
             current_turn_id=current_turn_id if isinstance(current_turn_id, str) else None,
             last_event_id=last_event_id if isinstance(last_event_id, str) else None,
@@ -592,7 +597,6 @@ _AMP_CAPABILITY_NAMES = (
     "usage",
     "cancel_current_turn",
     "close",
-    "resume_after_close",
     "subagents",
     "parent_child_usage",
 )
@@ -826,7 +830,10 @@ def _amp_close_result(
     if checkpoint_ref is not None and not isinstance(checkpoint_ref, str):
         return _unknown_close_result(operation, "Amp close checkpoint evidence is malformed")
     same_provider_thread = raw.get("same_provider_thread")
-    later_resume_supported = raw.get("later_resume_supported")
+    # Amp can archive and unarchive a thread, but this facade has no
+    # process-start identity and no authenticated reopen receipt. Do not
+    # advertise that weaker operation as Chitra's authenticated resume.
+    later_resume_supported = None
     quiescent = raw.get("quiescent")
     evidence = raw.get("evidence")
     observed_at = raw.get("observed_at")
@@ -921,6 +928,16 @@ class _PackagedAmpProvider:
                     "session_ref": request.session_ref,
                     "provider_session_id": request.provider_session_id,
                     "context_ref": request.context_ref,
+                    "goal_id": request.goal_id,
+                    "goal_version": request.goal_version,
+                    "resume_after_close": request.resume_after_close,
+                    "close_operation_id": request.close_operation_id,
+                    "owner_process": (
+                        request.owner_process.model_dump(mode="json")
+                        if request.owner_process is not None
+                        else None
+                    ),
+                    "resume_token": request.resume_token,
                 }
             )
         elif isinstance(request, CancelCurrentTurnRequest):
@@ -957,6 +974,7 @@ class _PackagedAmpProvider:
         if isinstance(generation, bool) or not isinstance(generation, int):
             generation = 0
         provider_session_id = raw.get("provider_session_id")
+        provider_instance_id = raw.get("provider_instance_id")
         current_turn_id = raw.get("current_turn_id")
         last_event_id = raw.get("last_event_id")
         reason = raw.get("reason")
@@ -968,6 +986,7 @@ class _PackagedAmpProvider:
             generation=generation,
             fresh=raw.get("fresh") is True,
             provider_available=raw.get("provider_available") is True,
+            provider_instance_id=provider_instance_id if isinstance(provider_instance_id, str) else None,
             context_available=context_available if isinstance(context_available, bool) else None,
             current_turn_id=current_turn_id if isinstance(current_turn_id, str) else None,
             last_event_id=last_event_id if isinstance(last_event_id, str) else None,

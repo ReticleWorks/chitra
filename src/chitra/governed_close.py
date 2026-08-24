@@ -8,14 +8,13 @@ the exact operation and physical session supplied in the request.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 
-from ._fsio import write_json_atomic
+from ._fsio import read_json_rooted, write_json_rooted
 from .detect.rescue import load_or_create_checkpoint_key, sign_checkpoint_receipt, verify_checkpoint_receipt_signature
 from .provider_protocol import Provider
 from .recovery import (
@@ -26,6 +25,7 @@ from .recovery import (
 )
 from .session_contract import (
     JoinedLaneRecord,
+    canonical_digest,
 )
 
 _CHECKPOINT_SCHEMA = "chitra.governed-close-checkpoint.v1"
@@ -37,12 +37,10 @@ def _json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def _digest(value: object) -> str:
-    return hashlib.sha256(_json(value).encode()).hexdigest()
-
-
 def _checkpoint_path(state_root: Path, reference: str) -> Path | None:
     if _REFERENCE_RE.fullmatch(reference) is None:
+        return None
+    if state_root.is_symlink():
         return None
     root = state_root.resolve()
     directory = (root / "checkpoints").resolve()
@@ -123,8 +121,8 @@ def _read_checkpoint_payload(
     if path is None:
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        payload = read_json_rooted(state_root, "checkpoints", f"{reference}.json")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return None
     if not isinstance(payload, Mapping):
         return None
@@ -141,7 +139,7 @@ def _read_checkpoint(state_root: Path, record: JoinedLaneRecord, reference: str)
 
 def _write_checkpoint(state_root: Path, record: JoinedLaneRecord) -> str:
     unsigned = _checkpoint_payload(record, "")
-    reference = "completion-" + _digest(unsigned)[:32]
+    reference = "completion-" + canonical_digest(unsigned)[:32]
     payload = _checkpoint_payload(record, reference)
     path = _checkpoint_path(state_root, reference)
     if path is None:
@@ -152,7 +150,7 @@ def _write_checkpoint(state_root: Path, record: JoinedLaneRecord) -> str:
         return reference
     signed = dict(payload)
     signed["signature"] = sign_checkpoint_receipt(signed, key=load_or_create_checkpoint_key(state_root))
-    write_json_atomic(path, signed, fsync=True)
+    write_json_rooted(state_root, "checkpoints", f"{reference}.json", signed)
     if not _read_checkpoint(state_root, record, reference):
         raise RecoveryStateError("new completion checkpoint failed local verification")
     return reference

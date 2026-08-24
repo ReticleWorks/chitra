@@ -11,7 +11,7 @@ from chitra.governed_close import _close_payload, _write_checkpoint
 from chitra.provider_protocol import CloseRequest
 from chitra.recovery import RecoveryEngine
 from chitra.recovery_provider import _PackagedTophandProvider
-from chitra.session_contract import JoinedLaneRecord, ProviderCapabilities, ProviderIdentity
+from chitra.session_contract import JoinedLaneRecord, ProviderCapabilities, ProviderIdentity, canonical_digest
 
 
 def _record() -> JoinedLaneRecord:
@@ -130,7 +130,7 @@ def test_facade_rejects_a_recomputed_digest_with_a_forged_checkpoint_signature(t
             replace(
                 request,
                 checkpoint_receipt=forged,
-                checkpoint_receipt_sha256=provider._digest(forged),
+                checkpoint_receipt_sha256=canonical_digest(forged),
             )
         )
 

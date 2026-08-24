@@ -32,10 +32,18 @@ LANE_RECORD_VERSION = LANE_RECORD_SCHEMA
 MAX_INLINE_WAKE_RECEIPTS = 64
 LANE_LAUNCH_POLICY_VERSION = LANE_LAUNCH_POLICY_SCHEMA
 
+
+def canonical_digest(value: object) -> str:
+    """Return the one JSON digest used by the Chitra wire boundaries."""
+
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
 Identifier = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")]
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 Timestamp = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 Sha256Digest = Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"^sha256:[0-9a-f]{64}$")]
+EvidenceSignature = Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"^[0-9a-f]{64}$")]
 
 StepStatus = Literal["pending", "active", "blocked", "done", "dropped"]
 PlanState = Literal["forming", "valid", "invalid", "missing", "stale", "conflicting"]
@@ -176,6 +184,14 @@ class ReopenReceipt(_ContractModel):
     # Legacy non-process-bound provider doubles may omit it; Fleet reopen
     # receipts must carry it.
     auth_token: Identifier | None = None
+    # Fleet binds the returned receipt to the bearer challenge before Chitra
+    # signs and stores its observation.  The field is optional on the wire so
+    # old receipts can be rejected cleanly at the recovery boundary rather
+    # than making the whole lane document unreadable.
+    receipt_hmac: EvidenceSignature | None = None
+    # Chitra's local signature is the durable authenticity boundary.  Fleet
+    # has no access to Chitra's signing key and must never be given one.
+    signature: EvidenceSignature | None = None
     observed_at: Timestamp
     evidence: Text
 
@@ -806,6 +822,7 @@ class ProviderOperationResult(_ContractModel):
     provider_handle: Identifier
     idempotency_key: Identifier
     payload_digest: Text
+    provider_session_id: Identifier | None = None
     provider_instance_id: Identifier | None = None
     provider_generation: int | None = Field(default=None, ge=1)
     status: OperationStatus
@@ -864,6 +881,8 @@ def validate_operation_result(pending: PendingProviderOperation, result: Provide
         errors.append("idempotency key changed")
     if pending.payload_digest != result.payload_digest:
         errors.append("payload digest changed")
+    if result.provider_session_id is not None and pending.provider_session_id != result.provider_session_id:
+        errors.append("provider session changed")
     if pending.provider_instance_id != result.provider_instance_id:
         errors.append("provider instance changed")
     if pending.provider_generation != result.provider_generation:
@@ -1257,6 +1276,9 @@ class CloseArchiveResult(_ContractModel):
     # The process identity observed before the physical stop.  PID alone is
     # not sufficient because the OS can reuse it.
     owner_process: OwnerProcessIdentity | None = None
+    # Close evidence is stored and replayed by Chitra.  A provider response
+    # without this local signature is not durable terminal evidence.
+    signature: EvidenceSignature | None = None
     observed_at: Timestamp
     evidence: Text
 
@@ -1798,6 +1820,7 @@ __all__ = [
     "Usage",
     "WakeReceipt",
     "calculate_progress",
+    "canonical_digest",
     "extend_wake_archive_digest",
     "is_valid_update",
     "migrate_legacy_record",

@@ -35,10 +35,10 @@ from .session_contract import (
     CloseState,
     OperationKind,
     OperationStatus,
+    OwnerProcessIdentity,
     PendingProviderOperation,
     ProviderCapabilities,
     ProviderOperationResult,
-    OwnerProcessIdentity,
     UsageComponent,
     UsageReport,
 )
@@ -153,6 +153,8 @@ class CreateOrResumeRequest(MutationRequest):
     session_ref: str
     provider_session_id: str | None = None
     context_ref: str | None = None
+    goal_id: str | None = None
+    goal_version: int | None = None
     resume_after_close: bool = False
     close_operation_id: str | None = None
     owner_process: OwnerProcessIdentity | None = None
@@ -166,6 +168,11 @@ class CreateOrResumeRequest(MutationRequest):
             _required_text(self.session_ref, "session_ref")
         _optional_text(self.provider_session_id, "provider_session_id")
         _optional_text(self.context_ref, "context_ref")
+        _optional_text(self.goal_id, "goal_id")
+        if self.goal_version is not None and (
+            isinstance(self.goal_version, bool) or self.goal_version < 1
+        ):
+            raise ValueError("goal_version must be a positive integer")
         _optional_text(self.close_operation_id, "close_operation_id")
         _optional_text(self.resume_token, "resume_token")
         if not isinstance(self.resume_after_close, bool):
@@ -176,6 +183,8 @@ class CreateOrResumeRequest(MutationRequest):
             or self.context_ref is None
             or self.owner_process is None
             or self.resume_token is None
+            or self.goal_id is None
+            or self.goal_version is None
         ):
             raise ValueError(
                 "same-session resume requires close operation, provider session, checkpoint, and owner process"
@@ -330,6 +339,9 @@ class ProviderStatus:
     generation: int
     fresh: bool
     provider_available: bool
+    # The provider instance is distinct from the physical session and keeps
+    # status observations on the same restart fence as mutations.
+    provider_instance_id: str | None = None
     context_available: bool | None = None
     current_turn_id: str | None = None
     last_event_id: str | None = None

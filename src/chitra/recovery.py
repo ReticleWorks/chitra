@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
-import hmac
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -17,13 +17,15 @@ from typing import Any, Literal, Protocol, cast
 
 import structlog
 
-from ._fsio import write_json_atomic
+from ._fsio import read_json_rooted, write_json_atomic, write_json_rooted
 from .detect.detectors import Finding
 from .detect.ladder import IncidentStore, ResponseLadder
 from .detect.rescue import (
     RecoveryCheckpointBinding,
     find_recovery_checkpoint_receipt,
     load_or_create_checkpoint_key,
+    sign_checkpoint_receipt,
+    verify_checkpoint_receipt_signature,
 )
 from .goals import (
     LOAD_SHED_HOLD_REASON_PREFIX,
@@ -70,9 +72,9 @@ from .session_contract import (
     ProgressEvidence,
     ProviderOperationResult,
     RecordTransitionKind,
-    ReopenReceipt,
     RecoveryState,
     WakeReceipt,
+    canonical_digest,
     extend_wake_archive_digest,
     validate_close_result,
     validate_operation_result,
@@ -323,10 +325,12 @@ class RecoveryStateStore:
     def close_evidence_path(self, operation: PendingProviderOperation) -> Path:
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", operation.operation_id) is None:
             raise RecoveryStateError("close operation ID is unsafe for evidence storage")
-        root = self.root.resolve()
+        if self.root.is_symlink():
+            raise RecoveryStateError("close evidence state root is a symlink")
+        root = self.root
         directory = root / "close-evidence"
-        if directory.is_symlink() or (directory.exists() and directory.resolve() != directory):
-            raise RecoveryStateError("close evidence directory escapes the state root")
+        if directory.is_symlink():
+            raise RecoveryStateError("close evidence directory is a symlink")
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{operation.operation_id}.json"
         if path.is_symlink():
@@ -346,8 +350,9 @@ class RecoveryStateStore:
         self, operation: PendingProviderOperation, record: JoinedLaneRecord
     ) -> CloseArchiveResult | None:
         try:
-            payload = self._read_nofollow_json(self.close_evidence_path(operation))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecoveryStateError):
+            self.close_evidence_path(operation)
+            payload = read_json_rooted(self.root, "close-evidence", f"{operation.operation_id}.json")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecoveryStateError, ValueError):
             return None
         if not isinstance(payload, Mapping) or payload.get("schema") != "chitra.governed-close-evidence.v1":
             return None
@@ -357,26 +362,125 @@ class RecoveryStateStore:
             result = CloseArchiveResult.from_dict(payload.get("result"))
         except (ContractValidationError, TypeError, ValueError):
             return None
-        return result if _close_receipt_matches(record, operation, result) else None
+        return result if _close_receipt_matches(record, operation, result, self.root) else None
+
+    def has_durable_close_evidence(
+        self, record: JoinedLaneRecord, result: CloseArchiveResult
+    ) -> bool:
+        """Check that a stored terminal result was produced by this store."""
+
+        if result.state not in {"closed", "archived"} or result.signature is None:
+            return False
+        try:
+            self.close_evidence_path(
+                PendingProviderOperation(
+                    operation_id=result.operation_id,
+                    kind="close",
+                    lane_id=record.lane_id,
+                    provider_handle=result.provider_handle,
+                    idempotency_key=result.idempotency_key,
+                    payload_digest=result.payload_digest,
+                    provider_session_id=result.provider_session_id,
+                    provider_instance_id=result.provider_instance_id,
+                    provider_generation=result.provider_generation,
+                    payload="stored-close-evidence",
+                    created_at=result.observed_at,
+                    attempt=1,
+                )
+            )
+            payload = read_json_rooted(
+                self.root, "close-evidence", f"{result.operation_id}.json"
+            )
+        except (
+            ContractValidationError,
+            OSError,
+            RecoveryStateError,
+            TypeError,
+            ValueError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ):
+            return False
+        if not isinstance(payload, Mapping) or payload.get("schema") != "chitra.governed-close-evidence.v1":
+            return False
+        operation_payload = payload.get("operation")
+        if (
+            not isinstance(operation_payload, Mapping)
+            or operation_payload.get("operation_id") != result.operation_id
+        ):
+            return False
+        if any(
+            operation_payload.get(field) != expected
+            for field, expected in (
+                ("lane_id", record.lane_id),
+                ("provider_handle", record.provider.handle),
+                ("provider_session_id", record.provider.provider_session_id),
+                ("provider_instance_id", record.provider.instance_id),
+                ("provider_generation", record.provider.generation),
+            )
+        ):
+            return False
+        operation_body = operation_payload.get("payload")
+        if not isinstance(operation_body, str):
+            return False
+        try:
+            close_body = json.loads(operation_body)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(close_body, Mapping) or any(
+            close_body.get(field) != expected
+            for field, expected in (
+                ("lane_id", record.lane_id),
+                ("goal_id", record.goal_id),
+                ("goal_version", record.goal_version),
+                ("session_ref", record.session_ref),
+                ("provider_handle", record.provider.handle),
+                ("provider_session_id", record.provider.provider_session_id),
+                ("provider_instance_id", record.provider.instance_id),
+                ("provider_generation", record.provider.generation),
+            )
+        ):
+            return False
+        if payload.get("result") != result.model_dump(mode="json"):
+            return False
+        if not _verify_mapping_signature(result.to_dict(), self.root):
+            return False
+        return (
+            result.provider_thread_ref == record.provider.handle
+            and result.provider_session_id == record.provider.provider_session_id
+            and result.checkpoint_ref == record.checkpoint_reference
+        )
 
     def write_close_evidence(
         self, operation: PendingProviderOperation, result: CloseArchiveResult
     ) -> None:
-        path = self.close_evidence_path(operation)
+        if result.signature is None:
+            unsigned = {key: value for key, value in result.to_dict().items() if key != "signature"}
+            result = result.model_copy(update={"signature": _sign_mapping(unsigned, self.root)})
+        elif not _verify_mapping_signature(result.to_dict(), self.root):
+            raise RecoveryStateError("close evidence signature is invalid")
+        self.close_evidence_path(operation)
         payload = {
             "schema": "chitra.governed-close-evidence.v1",
             "operation": operation.model_dump(mode="json"),
             "result": result.model_dump(mode="json"),
         }
-        if path.exists():
-            try:
-                existing = self._read_nofollow_json(path)
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise RecoveryStateError("existing close evidence is unreadable") from exc
+        try:
+            existing = read_json_rooted(self.root, "close-evidence", f"{operation.operation_id}.json")
+        except FileNotFoundError:
+            existing = None
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RecoveryStateError("existing close evidence is unreadable") from exc
+        if existing is not None:
             if existing != payload:
                 raise RecoveryStateError("immutable close evidence changed")
             return
-        write_json_atomic(path, payload, fsync=True)
+        try:
+            write_json_rooted(self.root, "close-evidence", f"{operation.operation_id}.json", payload)
+        except FileExistsError as exc:
+            existing = read_json_rooted(self.root, "close-evidence", f"{operation.operation_id}.json")
+            if existing != payload:
+                raise RecoveryStateError("immutable close evidence changed") from exc
 
     def _wake_transaction_path(self) -> Path:
         return self.root / "wake-transactions" / f"{self.lane_id}.json"
@@ -437,10 +541,11 @@ class RecoveryStateStore:
                 raise RecoveryStateError("wake transaction identity changed")
         else:
             write_json_atomic(marker_path, marker, fsync=True)
-        if current is None:
-            saved = self._store.create(candidate)
-        else:
-            saved = self._store.save(candidate, expected_revision=current.revision)
+        saved = (
+            self._store.create(candidate)
+            if current is None
+            else self._store.save(candidate, expected_revision=current.revision)
+        )
         EventJournal(self.root, self.lane_id).append_wakes((receipt,))
         self._clear_wake_transaction()
         return cast(JoinedLaneRecord, saved)
@@ -487,11 +592,6 @@ def _now(value: datetime | str | None = None) -> datetime:
     return current.astimezone(UTC)
 
 
-def _digest(value: object) -> str:
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-    return hashlib.sha256(encoded).hexdigest()
-
-
 RECOVERY_HANDOFF_SCHEMA = "chitra.recovery-handoff.v1"
 RECOVERY_REFRAME_AFTER_ATTEMPTS = 5
 
@@ -514,6 +614,29 @@ def _mapping(value: object, name: str) -> Mapping[str, object]:
     raise ValueError(f"{name} must be an object")
 
 
+def _sign_mapping(payload: Mapping[str, object], state_root: Path) -> str:
+    """Sign Chitra-owned evidence with the local checkpoint key."""
+
+    return sign_checkpoint_receipt(dict(payload), key=load_or_create_checkpoint_key(state_root))
+
+
+def _verify_mapping_signature(payload: Mapping[str, object], state_root: Path) -> bool:
+    try:
+        return verify_checkpoint_receipt_signature(dict(payload), state_root=state_root)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _resume_receipt_hmac(receipt: Mapping[str, object], token: str) -> str:
+    """Bind a Fleet response to the bearer challenge without shared keys."""
+
+    unsigned = {
+        key: value for key, value in receipt.items() if key not in {"receipt_hmac", "signature"}
+    }
+    encoded = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hmac.new(token.encode(), encoded, "sha256").hexdigest()
+
+
 def _close_session(record: JoinedLaneRecord) -> str:
     session = record.provider.provider_session_id
     if not session:
@@ -522,7 +645,10 @@ def _close_session(record: JoinedLaneRecord) -> str:
 
 
 def _close_receipt_matches(
-    record: JoinedLaneRecord, operation: PendingProviderOperation, result: CloseArchiveResult
+    record: JoinedLaneRecord,
+    operation: PendingProviderOperation,
+    result: CloseArchiveResult,
+    state_root: Path | None = None,
 ) -> bool:
     if result.state not in {"closed", "archived"}:
         return False
@@ -534,6 +660,10 @@ def _close_receipt_matches(
         result.provider_thread_ref == record.provider.handle
         and result.provider_session_id == _close_session(record)
         and result.checkpoint_ref == record.checkpoint_reference
+        and (
+            state_root is None
+            or (result.signature is not None and _verify_mapping_signature(result.to_dict(), state_root))
+        )
     )
 
 
@@ -548,12 +678,16 @@ def _resume_receipt_matches(
     """Require positive evidence for the exact reopened physical session."""
 
     receipt = result.reopen_receipt
-    # Non-Tophand provider doubles and legacy archive providers may expose
-    # the older same-session contract. Fleet/Tophand positive resume evidence
-    # always carries the process-bound receipt below.
-    if close.owner_process is None:
-        return result.status == "consumed"
     if receipt is None or result.status != "consumed":
+        return False
+    # A legacy receipt without a closed-owner binding or Chitra signature is
+    # not proof of a same-session reopen. It must remain pending.
+    if close.owner_process is None or receipt.signature is None:
+        return False
+    if not _verify_mapping_signature(receipt.to_dict(), state_root):
+        return False
+    token = _resume_auth_token(record, close, operation, state_root=state_root)
+    if receipt.receipt_hmac is None or receipt.receipt_hmac != _resume_receipt_hmac(receipt.to_dict(), token):
         return False
     return (
         receipt.operation_id == operation.operation_id
@@ -569,7 +703,7 @@ def _resume_receipt_matches(
         and receipt.created_new_lane is False
         and receipt.created_new_session is False
         and receipt.owner_process != receipt.prior_owner_process
-        and receipt.auth_token == _resume_auth_token(record, close, operation, state_root=state_root)
+        and receipt.auth_token == token
     )
 
 
@@ -678,7 +812,7 @@ class RecoveryEngine:
             operation=operation,
             archive=True,
             checkpoint_receipt=checkpoint,
-            checkpoint_receipt_sha256=_digest(checkpoint),
+            checkpoint_receipt_sha256=canonical_digest(checkpoint),
             checkpoint_verifier="chitra.detect.rescue.verify_checkpoint_receipt_signature",
         )
         try:
@@ -692,7 +826,7 @@ class RecoveryEngine:
                             "payload": json.loads(operation.payload),
                             "checkpoint_ref": checkpoint.get("checkpoint_ref"),
                             "checkpoint_receipt": dict(checkpoint),
-                            "checkpoint_receipt_sha256": _digest(checkpoint),
+                            "checkpoint_receipt_sha256": canonical_digest(checkpoint),
                             "checkpoint_verifier": "chitra.detect.rescue.verify_checkpoint_receipt_signature",
                         },
                     )
@@ -702,7 +836,14 @@ class RecoveryEngine:
             values = dict(_mapping(raw, "provider close result"))
             values.pop("kind", None)
             result = CloseArchiveResult.from_dict(values)
-            if not _close_receipt_matches(record, operation, result):
+            if self.state_root is None:
+                return None
+            if result.signature is not None and not _verify_mapping_signature(result.to_dict(), self.state_root):
+                return None
+            if result.signature is None:
+                unsigned = {key: value for key, value in result.to_dict().items() if key != "signature"}
+                result = result.model_copy(update={"signature": _sign_mapping(unsigned, self.state_root)})
+            if not _close_receipt_matches(record, operation, result, self.state_root):
                 return None
             return result
         except (ContractValidationError, TypeError, ValueError, OSError):
@@ -738,7 +879,7 @@ class RecoveryEngine:
         )
 
     def _cycle_id(self, record: JoinedLaneRecord, signature: str, current: datetime) -> str:
-        return "cycle-" + _digest(
+        return "cycle-" + canonical_digest(
             (
                 record.lane_id,
                 record.goal_id,
@@ -1169,12 +1310,15 @@ class RecoveryEngine:
                 "lane_id",
                 "session_ref",
                 "goal_version",
+                "status",
                 "goal",
                 "done_when",
                 "source",
                 "enrolled_at",
+                "created_at",
                 "intent",
                 "scope",
+                "needs",
                 "enrolled_done_when",
                 "enrolled_done_when_items",
                 "interview_receipt",
@@ -1253,13 +1397,13 @@ class RecoveryEngine:
             "physical_session_generation": record.physical_session_generation,
             "cycle_id": record.recovery.cycle_id,
             "immutable_goal": immutable_goal,
-            "immutable_goal_digest": _digest(immutable_goal),
+            "immutable_goal_digest": canonical_digest(immutable_goal),
             "execution_objective": record.recovery.execution_objective,
             "execution_plan": list(record.recovery.execution_plan),
             "roadmap_snapshot": roadmap,
-            "roadmap_digest": _digest(roadmap),
+            "roadmap_digest": canonical_digest(roadmap),
             "provider_identity": provider,
-            "provider_digest": _digest(provider),
+            "provider_digest": canonical_digest(provider),
             "checkpoint_reference": record.checkpoint_reference,
             "pending_operation": self._operation_snapshot(record.pending_operation),
             "next_check": self._next_check_snapshot(record),
@@ -1292,7 +1436,7 @@ class RecoveryEngine:
         stored_digest = document.get("handoff_sha256")
         body = dict(document)
         body.pop("handoff_sha256", None)
-        if not isinstance(stored_digest, str) or stored_digest != _digest(body):
+        if not isinstance(stored_digest, str) or stored_digest != canonical_digest(body):
             return False
         if expected_digest is not None and stored_digest != expected_digest:
             return False
@@ -1388,7 +1532,7 @@ class RecoveryEngine:
             if record.recovery.handoff_id is not None or record.recovery.handoff_digest is not None:
                 raise RecoveryStateError("durable context handoff reference is missing")
             payload = self._handoff_payload(record, goal, current, handoff_id)
-            digest = _digest(payload)
+            digest = canonical_digest(payload)
             write_json_atomic(path, {**payload, "handoff_sha256": digest}, fsync=True)
         if not isinstance(digest, str):
             raise RecoveryStateError("durable context handoff has no digest")
@@ -1523,7 +1667,7 @@ class RecoveryEngine:
 
     @staticmethod
     def _payload_digest(record: JoinedLaneRecord, action: str, payload: str, sequence: int) -> str:
-        return _digest(
+        return canonical_digest(
             {
                 "lane_id": record.lane_id,
                 "goal_id": record.goal_id,
@@ -1556,7 +1700,7 @@ class RecoveryEngine:
                 "provider_generation": provider.generation,
                 "payload": payload,
             }
-            operation_id = f"{action}-" + _digest(identity)[:32]
+            operation_id = f"{action}-" + canonical_digest(identity)[:32]
             return PendingProviderOperation(
                 operation_id=operation_id,
                 kind="close" if action == "close" else "create_or_resume",
@@ -1564,7 +1708,7 @@ class RecoveryEngine:
                 provider_handle=provider.handle,
                 provider_session_id=session,
                 idempotency_key=f"{operation_id}-idem",
-                payload_digest=_digest(identity),
+                payload_digest=canonical_digest(identity),
                 payload=payload,
                 provider_instance_id=provider.instance_id,
                 provider_generation=provider.generation,
@@ -1649,6 +1793,7 @@ class RecoveryEngine:
             provider_handle=operation.provider_handle,
             idempotency_key=operation.idempotency_key,
             payload_digest=operation.payload_digest,
+            provider_session_id=operation.provider_session_id,
             provider_instance_id=operation.provider_instance_id,
             provider_generation=operation.provider_generation,
             status="unknown",
@@ -1682,6 +1827,8 @@ class RecoveryEngine:
                         session_ref=record.session_ref,
                         provider_session_id=operation.provider_session_id or record.session_ref,
                         context_ref=record.checkpoint_reference,
+                        goal_id=record.goal_id,
+                        goal_version=record.goal_version,
                         resume_after_close=(action == "resume" and close is not None and close.owner_process is not None),
                         close_operation_id=(close.operation_id if close is not None and close.owner_process is not None else None),
                         owner_process=(close.owner_process if close is not None and close.owner_process is not None else None),
@@ -1974,6 +2121,7 @@ class RecoveryEngine:
                 provider_handle=pending.provider_handle,
                 idempotency_key=pending.idempotency_key,
                 payload_digest=pending.payload_digest,
+                provider_session_id=pending.provider_session_id,
                 provider_instance_id=pending.provider_instance_id,
                 provider_generation=pending.provider_generation,
                 status="consumed" if consumed else "accepted",
@@ -2119,6 +2267,11 @@ class RecoveryEngine:
         if record.last_close_result is not None:
             if record.lifecycle != "inactive":
                 return self._close_wait(record, "close evidence exists but the lane is not inactive")
+            if not store.has_durable_close_evidence(record, record.last_close_result):
+                return self._close_wait(
+                    record,
+                    "lane close state is not backed by durable Chitra evidence",
+                )
             return GovernedCloseDecision(
                 action="closed",
                 record=record,
@@ -2215,6 +2368,7 @@ class RecoveryEngine:
             status is None
             or str(status.provider) != str(working.provider.kind)
             or status.provider_session_id != _close_session(working)
+            or status.provider_instance_id != working.provider.instance_id
             or status.generation != working.provider.generation
             or status.current_turn_id is not None
             or status.state not in {ProviderState.IDLE, ProviderState.CLOSED, ProviderState.ARCHIVED}
@@ -2331,12 +2485,13 @@ class RecoveryEngine:
         if (
             status is None
             or status.provider_session_id != record.provider.provider_session_id
+            or status.provider_instance_id != record.provider.instance_id
             or status.generation != record.provider.generation
             or status.state not in {ProviderState.CLOSED, ProviderState.ARCHIVED, ProviderState.IDLE}
         ):
             return self._resume_wait(record, "provider status does not prove the closed session identity")
         current_time = _now(now)
-        payload = _digest(
+        payload = canonical_digest(
             {
                 "resume_after_close": True,
                 "close_operation_id": close.operation_id,
@@ -2378,7 +2533,11 @@ class RecoveryEngine:
                 )
             except (ContractValidationError, OSError, RecoveryStateError, TypeError, ValueError) as exc:
                 return self._resume_wait(record, f"resume operation could not be durably recorded: {exc}")
-        elif pending.kind != "create_or_resume" or pending.model_dump(exclude={"created_at", "attempt"}) != expected.model_dump(exclude={"created_at", "attempt"}):
+        elif (
+            pending.kind != "create_or_resume"
+            or pending.model_dump(exclude={"created_at", "attempt"})
+            != expected.model_dump(exclude={"created_at", "attempt"})
+        ):
             return self._resume_wait(record, "pending resume identity or payload changed", pending)
         stored = record.last_operation_result
         if stored is not None and stored.operation_id == pending.operation_id and stored.status == "consumed":
@@ -2386,9 +2545,7 @@ class RecoveryEngine:
         else:
             result = self._invoke(record, pending, "resume", pending.payload, current_time)
             record = self._persist(record.model_copy(update={"last_operation_result": result}), persist=True)
-        if result.status != "consumed" or not _resume_receipt_matches(
-            record, close, pending, result, state_root=self.state_root
-        ):
+        if result.status != "consumed":
             return self._resume_wait(record, "same-session resume lacks exact consumption evidence", pending, result)
         # Consumption of the resume command is not proof that the provider
         # actually left its archived state.  Require a fresh live observation
@@ -2397,6 +2554,7 @@ class RecoveryEngine:
         if (
             live is None
             or live.provider_session_id != record.provider.provider_session_id
+            or live.provider_instance_id != record.provider.instance_id
             or live.generation != record.provider.generation
             or live.state not in {ProviderState.IDLE, ProviderState.RUNNING}
         ):
@@ -2406,6 +2564,23 @@ class RecoveryEngine:
                 pending,
                 result,
             )
+        receipt = result.reopen_receipt
+        if receipt is None or receipt.auth_token != _resume_auth_token(
+            record, close, pending, state_root=self.state_root
+        ):
+            return self._resume_wait(record, "same-session resume lacks its authenticated reopen receipt", pending, result)
+        if receipt.receipt_hmac is None or receipt.receipt_hmac != _resume_receipt_hmac(
+            receipt.to_dict(), _resume_auth_token(record, close, pending, state_root=self.state_root)
+        ):
+            return self._resume_wait(record, "same-session resume lacks its Fleet receipt HMAC", pending, result)
+        if receipt.signature is None:
+            receipt = receipt.model_copy(
+                update={"signature": _sign_mapping(receipt.to_dict(), self.state_root)}
+            )
+            result = result.model_copy(update={"reopen_receipt": receipt})
+            record = self._persist(record.model_copy(update={"last_operation_result": result}), persist=True)
+        if not _resume_receipt_matches(record, close, pending, result, state_root=self.state_root):
+            return self._resume_wait(record, "same-session resume lacks exact authenticated reopen evidence", pending, result)
         check = self._check(current_time, "Check useful progress after resume", "a material update after the same-session resume")
         resumed = record.model_copy(
             update={
@@ -2416,7 +2591,12 @@ class RecoveryEngine:
                 "recovery": record.recovery.model_copy(
                     update={"stage": "diagnostic", "attempted_remedy": "resume", "pending_payload": None}
                 ),
-                "current_update": None if record.current_update is not None and record.current_update.operation_id else record.current_update,
+                "current_update": (
+                    None
+                    if record.current_update is not None
+                    and record.current_update.operation_id
+                    else record.current_update
+                ),
             }
         )
         try:
