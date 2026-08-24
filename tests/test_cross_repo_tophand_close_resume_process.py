@@ -218,6 +218,7 @@ def _command_shims(
             print(json.dumps({{
                 "status": "consumed", "accepted": True, "consumed": True,
                 "operation_id": operation["operation_id"],
+                "kind": "create_or_resume",
                 "lane_id": operation["lane_id"],
                 "goal_id": request["goal_id"],
                 "provider_handle": operation["provider_handle"],
@@ -227,6 +228,7 @@ def _command_shims(
                 "provider_generation": operation["provider_generation"],
                 "provider_session_id": request["provider_session_id"],
                 "session_ref": request["provider_session_id"],
+                "provider_pid": {new_owner["pid"]},
                 "process_start_token": {new_owner["start_token"]!r},
             }}, sort_keys=True, separators=(",", ":")))
             """
@@ -356,12 +358,19 @@ def _governed_close_request(state_root: Path, process_token: str) -> dict[str, o
         "provenance": {"kind": "governed-completion-checkpoint", "owner": "chitra"},
         "signature": "a" * 64,
     }
+    checkpoint_receipt_sha256 = hashlib.sha256(
+        json.dumps(checkpoint, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     return {
         "close_token": "close-token-a",
-        "operation": _operation("close", "close-a", process_token, "close-digest"),
+        "operation": _close_operation(
+            checkpoint_ref=checkpoint_ref,
+            checkpoint_receipt_sha256=checkpoint_receipt_sha256,
+            process_start_token=process_token,
+        ),
         "checkpoint_ref": checkpoint_ref,
         "checkpoint_receipt": checkpoint,
-        "checkpoint_receipt_sha256": hashlib.sha256(json.dumps(checkpoint, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+        "checkpoint_receipt_sha256": checkpoint_receipt_sha256,
         "checkpoint_verifier": "chitra.detect.rescue.verify_checkpoint_receipt_signature",
         "provider_session_id": SESSION_REF,
         "archive": True,
@@ -538,6 +547,36 @@ def _operation(kind: str, operation_id: str, token: str, payload_digest: str) ->
     }
 
 
+def _close_operation(
+    *, checkpoint_ref: str, checkpoint_receipt_sha256: str, process_start_token: str
+) -> dict[str, object]:
+    payload = {
+        "archive": True,
+        "checkpoint_ref": checkpoint_ref,
+        "lane_id": LANE,
+        "goal_id": GOAL_ID,
+        "goal_version": 1,
+        "session_ref": SESSION_REF,
+        "provider_handle": "thread-a",
+        "provider_session_id": SESSION_REF,
+        "provider_instance_id": INSTANCE_ID,
+        "provider_generation": GENERATION,
+        "process_start_token": process_start_token,
+        "checkpoint_receipt_sha256": checkpoint_receipt_sha256,
+        "close_token": "close-token-a",
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return {
+        **_operation(
+            "close",
+            "close-a",
+            process_start_token,
+            hashlib.sha256(encoded.encode()).hexdigest(),
+        ),
+        "payload": encoded,
+    }
+
+
 @pytest.mark.skipif(sys.platform.startswith("win"), reason="uses POSIX forced-command wrappers")
 def test_governed_close_returns_exact_resumable_evidence_from_a_fresh_process(
     tmp_path: Path,
@@ -575,17 +614,24 @@ def test_governed_close_returns_exact_resumable_evidence_from_a_fresh_process(
             "provenance": {"kind": "governed-completion-checkpoint", "owner": "chitra"},
             "signature": "a" * 64,
         }
+        checkpoint_receipt_sha256 = hashlib.sha256(
+            json.dumps(checkpoint, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
         request_fields = {
             "close_token": "close-token-a",
             "checkpoint_ref": checkpoint_ref,
             "checkpoint_receipt": checkpoint,
-            "checkpoint_receipt_sha256": hashlib.sha256(json.dumps(checkpoint, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            "checkpoint_receipt_sha256": checkpoint_receipt_sha256,
             "checkpoint_verifier": "chitra.detect.rescue.verify_checkpoint_receipt_signature",
             "provider_session_id": SESSION_REF,
             "archive": True,
         }
         request = {
-            "operation": _operation("close", "close-a", token, "close-digest"),
+            "operation": _close_operation(
+                checkpoint_ref=checkpoint_ref,
+                checkpoint_receipt_sha256=checkpoint_receipt_sha256,
+                process_start_token=token,
+            ),
             **request_fields,
         }
         child = _adapter_child(tmp_path, forced)
@@ -815,6 +861,7 @@ def test_same_session_resume_uses_structured_owner_authenticated_receipt_and_no_
             check=False,
         )
         assert lost.returncode != 0
+        assert (tmp_path / "lost-reply-marker").exists(), lost.stderr
         assert (tmp_path / "lost-reply-marker").read_text() == "lost"
         assert (tmp_path / "resume-count").read_text() == "1"
         fleet_state = tmp_path / "state" / "tophand" / LANE
