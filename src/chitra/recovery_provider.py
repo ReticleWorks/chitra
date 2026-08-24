@@ -80,11 +80,14 @@ try:
     # recovery unavailable instead of selecting an arbitrary adapter.
     from tools.support.chitra_adapter.tophand_adapter import (  # type: ignore[import-untyped]
         build_tophand_provider as _imported_tophand_builder,
+        TophandCommandTransport as _imported_tophand_transport,
     )
 except ImportError:  # pragma: no cover - exercised by source-only installs
     _packaged_tophand_builder: Callable[..., object] | None = None
+    _packaged_tophand_transport: type[Any] | None = None
 else:
     _packaged_tophand_builder = cast(Callable[..., object], _imported_tophand_builder)
+    _packaged_tophand_transport = cast(type[Any], _imported_tophand_transport)
 
 try:
     # Amp is an optional, disabled-by-policy production capability.  Keep the
@@ -189,6 +192,262 @@ def build_recovery_facts_reader(
 # Keep the public name used by the production dispatch seam.  The longer name
 # above remains for callers that adopted the initial integration spelling.
 default_operating_facts_reader = build_recovery_facts_reader
+
+
+LANE_REGISTRATION_SCHEMA = "chitra.lane-registration.v1"
+LANE_CONTROL_SCHEMA = "chitra.lane-control.v1"
+
+
+def _registration_text(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"registration {field} is missing")
+    return value.strip()
+
+
+def _registration_positive_int(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"registration {field} is invalid")
+    return value
+
+
+def _registration_timestamp(value: object, field: str) -> str:
+    text = _registration_text(value, field)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"registration {field} is not a timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"registration {field} has no timezone")
+    return parsed.astimezone(UTC).isoformat()
+
+
+def _current_fact(facts: Sequence[OperatingFact], name: str, *, now: datetime) -> OperatingFact:
+    candidates = [fact for fact in facts if fact.name == name and fact.is_current(now=now)]
+    if len(candidates) != 1:
+        raise ValueError(f"current {name} fact is unavailable or ambiguous")
+    return candidates[0]
+
+
+def _tophand_registration_facts(
+    lane: LaneSpec, facts: Sequence[OperatingFact], *, now: datetime
+) -> tuple[ProviderCapabilities, str, str, str | None]:
+    """Resolve only current routing and capability facts.
+
+    Physical provider identity comes from the target-owned registration below.
+    This helper must never provide a handle, instance, generation, or PID.
+    """
+
+    capability_candidates = [
+        fact
+        for fact in facts
+        if fact.name in {"fleet.provider-capabilities", "fleet.provider-capabilities.tophand"}
+        and fact.is_current(now=now)
+    ]
+    if len(capability_candidates) != 1 or not isinstance(capability_candidates[0].value, Mapping):
+        raise ValueError("current provider-capabilities fact is unavailable")
+    capability_value = capability_candidates[0].value
+    authority = capability_value.get("lane_registration_authority")
+    if not isinstance(authority, Mapping) or {
+        authority.get("schema"), authority.get("source"), authority.get("mode")
+    } != {LANE_REGISTRATION_SCHEMA, "target-owned-launcher", 0o600}:
+        raise ValueError("target-owned lane registration authority is not declared")
+    top = capability_value.get("tophand")
+    if isinstance(top, Mapping):
+        top_value = top
+    elif capability_candidates[0].name == "fleet.provider-capabilities.tophand":
+        top_value = capability_value
+    else:
+        raise ValueError("Tophand capability fact is unavailable")
+    raw_capabilities = top_value.get("capabilities")
+    try:
+        if isinstance(raw_capabilities, Mapping):
+            capabilities = ProviderCapabilities.model_validate(dict(raw_capabilities), strict=True)
+        elif isinstance(raw_capabilities, Sequence) and not isinstance(raw_capabilities, (str, bytes)):
+            capabilities = ProviderCapabilities.from_supported(raw_capabilities)
+        else:
+            raise ValueError("capabilities must be an object or list")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Tophand capability fact is malformed") from exc
+    if not capabilities.create_or_resume:
+        raise ValueError("Tophand create_or_resume capability is not current")
+    placement = _current_fact(facts, "fleet.placement", now=now)
+    routing = _current_fact(facts, "fleet.routing", now=now)
+    placement_value = placement.value if isinstance(placement.value, Mapping) else {}
+    routing_value = routing.value if isinstance(routing.value, Mapping) else {}
+    dispatch_target = routing_value.get("dispatch_target")
+    if not isinstance(dispatch_target, Mapping):
+        raise ValueError("current dispatch target fact is unavailable")
+    host = dispatch_target.get("host")
+    account = dispatch_target.get("user")
+    if not isinstance(host, str) or not host.strip() or not isinstance(account, str) or not account.strip():
+        raise ValueError("current dispatch target fact is incomplete")
+    placement_host = placement_value.get("host")
+    placement_account = placement_value.get("account")
+    if placement_host != host or placement_account != account:
+        raise ValueError("placement and routing target facts disagree")
+    if lane.target_host is not None and lane.target_host != host:
+        raise ValueError("lane target host does not match current facts")
+    if lane.target_account is not None and lane.target_account != account:
+        raise ValueError("lane target account does not match current facts")
+    fact_revision = capability_candidates[0].revision
+    revision = str(fact_revision) if isinstance(fact_revision, (str, int)) else None
+    return capabilities, host, account, revision
+
+
+def _verified_tophand_registration(
+    raw: object,
+    *,
+    lane: LaneSpec,
+    goal: Any,
+    facts: Sequence[OperatingFact],
+    now: datetime,
+) -> ProviderIdentity:
+    """Turn one Fleet readback into identity, with no receipt fallback."""
+
+    if (
+        not isinstance(raw, Mapping)
+        or raw.get("schema") != LANE_CONTROL_SCHEMA
+        or raw.get("action") != "registration"
+        or raw.get("status") != "verified"
+    ):
+        raise ValueError("Fleet did not return a verified lane registration")
+    registration = raw.get("registration")
+    if not isinstance(registration, Mapping):
+        raise ValueError("Fleet registration response has no full registration")
+    capabilities, target_host, target_account, fact_revision = _tophand_registration_facts(
+        lane, facts, now=now
+    )
+    required = (
+        "provider",
+        "lane_id",
+        "provider_handle",
+        "provider_session_id",
+        "provider_instance_id",
+        "logical_session",
+        "session_ref",
+        "facts_revision",
+        "operation_id",
+        "idempotency_key",
+        "process_start_token",
+        "registration_sha256",
+    )
+    values = {field: _registration_text(registration.get(field), field) for field in required}
+    if (
+        values["provider"] != "tophand"
+        or values["lane_id"] != lane.identifier
+        or values["logical_session"] != lane.identifier
+        or values["session_ref"] != goal.session_ref
+        or values["provider_session_id"] != goal.session_ref
+        or values["process_start_token"].startswith("pid:")
+        or registration.get("lifecycle") != "running"
+        or fact_revision is not None and values["facts_revision"] != fact_revision
+    ):
+        raise ValueError("lane registration identity does not match current facts or enrolled goal")
+    generation = _registration_positive_int(
+        registration.get("provider_generation"), "provider_generation"
+    )
+    if not re.fullmatch(r"[0-9a-f]{64}", values["registration_sha256"]):
+        raise ValueError("lane registration digest is invalid")
+    target = registration.get("target")
+    if (
+        not isinstance(target, Mapping)
+        or target.get("host") != target_host
+        or target.get("account") != target_account
+    ):
+        raise ValueError("lane registration target does not match current facts")
+    process = registration.get("process")
+    if not isinstance(process, Mapping):
+        raise ValueError("lane registration has no process observation")
+    pid = _registration_positive_int(process.get("tmux_pane_pid"), "process.tmux_pane_pid")
+    boot_id = _registration_text(process.get("boot_id"), "process.boot_id")
+    start_ticks = _registration_positive_int(process.get("start_ticks"), "process.start_ticks")
+    process_token = values["process_start_token"]
+    if process_token != f"{boot_id}:{start_ticks}":
+        raise ValueError("lane registration process-start token is not bound to raw process fields")
+    observation = registration.get("observation")
+    if not isinstance(observation, Mapping):
+        raise ValueError("lane registration has no full process observation")
+    if (
+        observation.get("provider_pid") != pid
+        or observation.get("owner_pid") != pid
+        or observation.get("provider_handle") != values["provider_handle"]
+        or observation.get("provider_session_id") != values["provider_session_id"]
+        or observation.get("provider_instance_id") != values["provider_instance_id"]
+        or observation.get("provider_generation") != generation
+        or observation.get("process_start_token") != process_token
+        or observation.get("boot_id") != boot_id
+        or observation.get("start_ticks") != start_ticks
+    ):
+        raise ValueError("lane registration process observation changed")
+    observed_at = _registration_timestamp(observation.get("observed_at"), "observation.observed_at")
+    if datetime.fromisoformat(observed_at) > now:
+        raise ValueError("lane registration observation is from the future")
+    goal_id = registration.get("goal_id")
+    if goal_id is not None and goal_id != goal.goal_id:
+        raise ValueError("lane registration goal identity changed")
+    goal_version = registration.get("goal_version")
+    if goal_version is not None and goal_version != goal.goal_version:
+        raise ValueError("lane registration goal version changed")
+    return ProviderIdentity(
+        kind="tophand",
+        handle=values["provider_handle"],
+        provider_session_id=values["provider_session_id"],
+        instance_id=values["provider_instance_id"],
+        generation=generation,
+        process_start_token=process_token,
+        observed_process={
+            "provider_pid": pid,
+            "owner_pid": pid,
+            "boot_id": boot_id,
+            "start_ticks": start_ticks,
+            "process_start_token": process_token,
+            "observed_at": observed_at,
+        },
+        registration_digest=f"sha256:{values['registration_sha256']}",
+        registration_observed_at=observed_at,
+        target_host=target_host,
+        target_account=target_account,
+        capabilities=capabilities,
+        provider_version=(
+            str(capability_candidates[0].value.get("provider_version"))
+            if isinstance(capability_candidates[0].value, Mapping)
+            and isinstance(capability_candidates[0].value.get("provider_version"), str)
+            else ""
+        ),
+    )
+
+
+def build_tophand_registration_identity_resolver(
+    lane: LaneSpec,
+    *,
+    transport_factory: type[Any] | None = None,
+) -> Callable[[Any, Sequence[OperatingFact]], ProviderIdentity | None]:
+    """Build the production bootstrap resolver from target-owned registration."""
+
+    transport_type = transport_factory or _packaged_tophand_transport
+
+    def resolve(goal: Any, facts: Sequence[OperatingFact]) -> ProviderIdentity | None:
+        if transport_type is None:
+            return None
+        try:
+            transport = transport_type.from_environment(
+                lane.identifier,
+                session_ref=goal.session_ref,
+                goal_id=goal.goal_id,
+            )
+            reader = getattr(transport, "registration", None)
+            if not callable(reader):
+                return None
+            return _verified_tophand_registration(
+                reader(), lane=lane, goal=goal, facts=facts, now=datetime.now(UTC)
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            logger.info(
+                "tophand_registration_unavailable", lane_id=lane.identifier, reason=str(exc)
+            )
+            return None
+
+    return resolve
 
 
 def _facts_binding_current(binding: OperatingFactsBinding | None) -> bool:
@@ -1940,6 +2199,7 @@ __all__ = [
     "RecoveryProviderBindings",
     "RecoveryProviderFactory",
     "build_recovery_facts_reader",
+    "build_tophand_registration_identity_resolver",
     "default_operating_facts_reader",
     "RecoverySink",
     "RecoveryVerifier",

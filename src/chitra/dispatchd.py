@@ -155,6 +155,7 @@ from .recovery_provider import (
     RecoverySink,
     RecoveryVerifier,
     build_recovery_provider_resolver,
+    build_tophand_registration_identity_resolver,
     default_operating_facts_reader,
 )
 from .routing_config import (
@@ -1752,6 +1753,12 @@ def run_lanes_once(
                 operating_facts_sources=operating_facts_sources,
                 **capability_kwargs,
             )
+        registration_identity_resolver = top_hand_identity_resolver
+        if registration_identity_resolver is None:
+            registration_identity_resolver = cast(
+                Any,
+                build_tophand_registration_identity_resolver(lane),
+            )
         recovery_supervisor = RecoverySupervisor(
             lane.state_dir,
             provider_resolver,
@@ -1759,7 +1766,7 @@ def run_lanes_once(
             ledger_key_path=lane.state_dir / "ledger.key",
             facts_reader=cast(EngineRecoveryFactsReader, resolved_facts_reader),
             lane_id=lane.identifier,
-            identity_resolver=cast(Any, top_hand_identity_resolver),
+            identity_resolver=cast(Any, registration_identity_resolver),
             operating_facts_reader=lambda sources=operating_facts_sources: tuple(
                 read_operating_facts(sources).facts
             ),

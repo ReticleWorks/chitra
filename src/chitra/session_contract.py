@@ -734,6 +734,12 @@ class ProviderIdentity(_ContractModel):
     # Immutable OS/process identity.  Logical instance and generation values
     # do not fence PID reuse on their own.
     process_start_token: Identifier | None = None
+    # The target-owned lane registration remains attached to the identity so
+    # recovery can retain the complete physical observation rather than
+    # reducing it to a PID or logical handle.
+    observed_process: Mapping[str, object] | None = None
+    registration_digest: Sha256Digest | None = None
+    registration_observed_at: Timestamp | None = None
     # Unknown restart-fence values stay null.  The contract never invents a
     # provider instance or generation from a durable handle alone.
     instance_id: Identifier | None = None
