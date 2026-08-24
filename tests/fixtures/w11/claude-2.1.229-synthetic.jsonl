@@ -1,0 +1,10 @@
+{"type":"user","version":"2.1.229","sessionId":"fixture-claude-session","message":{"role":"user","content":"fixture prompt"}}
+{"type":"assistant","version":"2.1.229","sessionId":"fixture-claude-session","message":{"id":"fixture-message-1","content":[{"type":"tool_use","id":"fixture-call-1","name":"fixture_tool","input":{"action":"fixture"}}]}}
+{"type":"user","version":"2.1.229","sessionId":"fixture-claude-session","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"fixture-call-1","content":[{"type":"text","text":"fixture result"}]}]}}
+{"type":"assistant","version":"2.1.229","sessionId":"fixture-claude-session","message":{"id":"fixture-message-2","content":[{"type":"text","text":"synthetic final response"}]}}
+{"type":"system","version":"2.1.229","sessionId":"fixture-claude-session","subtype":"stop_hook_summary"}
+{"type":"system","version":"2.1.229","sessionId":"fixture-claude-session","subtype":"turn_duration"}
+{"type":"system","version":"2.1.229","sessionId":"fixture-claude-session","subtype":"compact_boundary","compactMetadata":{"trigger":"fixture"}}
+{"type":"assistant","version":"2.1.229","sessionId":"fixture-claude-session","message":{"id":"fixture-message-3","content":[{"type":"tool_use","id":"fixture-call-2","name":"fixture_tool","input":{"action":"fixture"}}]}}
+{"type":"user","version":"2.1.229","sessionId":"fixture-claude-session","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"fixture-call-2","is_error":true,"content":[{"type":"text","text":"synthetic failure"}]}]}}
+{"type":"fixture_marker","version":"2.1.229","sessionId":"fixture-claude-session","marker":"synthetic"}
