@@ -53,3 +53,11 @@ def test_drawer_fits_narrow_screens():
 def test_no_inline_pixel_widths_in_markup_or_js():
     for text, name in ((HTML, "index.html"), (JS, "app.js")):
         assert not re.search(r"width\s*:\s*\d{3,}px", text), f"wide inline width in {name}"
+
+
+def test_joined_recovery_continuity_is_read_only_html():
+    details = JS.split("function joinedDetails", 1)[1].split("function renderDrawer", 1)[0]
+    for label in ("Assessment:", "Recovery continuity", "Close evidence:", "Resume state:"):
+        assert label in details
+    assert 'el("button"' not in details
+    assert "fetch(" not in details

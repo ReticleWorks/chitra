@@ -145,6 +145,24 @@ def _problem_payload(problem: Problem, tc: TranslationCache) -> dict[str, Any]:
     }
 
 
+def _close_evidence_payload(view: JoinedSessionView, tc: TranslationCache) -> dict[str, Any] | None:
+    """Expose recorded close facts without provider payloads or controls."""
+
+    close = view.close_evidence
+    if close is None:
+        return None
+    return {
+        "state": close.state,
+        "provider_thread_ref": close.provider_thread_ref,
+        "same_provider_thread": close.same_provider_thread,
+        "later_resume_supported": close.later_resume_supported,
+        "checkpoint_ref": close.checkpoint_ref,
+        "quiescent": close.quiescent,
+        "observed_at": close.observed_at,
+        "evidence": tc.get(close.evidence),
+    }
+
+
 def _joined_payload(
     view: JoinedSessionView,
     tc: TranslationCache,
@@ -239,6 +257,8 @@ def _joined_payload(
             "created_at": view.pending_operation.created_at,
             "attempt": view.pending_operation.attempt,
         },
+        "close_evidence": _close_evidence_payload(view, tc),
+        "resume_state": view.resume_state,
         "last_useful_progress": None
         if view.last_useful_progress is None
         else {

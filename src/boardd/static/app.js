@@ -181,6 +181,12 @@ function joinedSummary(report) {
       String(report.handoff.status || "unknown"),
       report.handoff.id ? " · " + report.handoff.id : ""));
   }
+  if (report.close_evidence) {
+    summary.append(el("div", { class: "joined-line" },
+      el("b", {}, "Close: "),
+      String(report.close_evidence.state || "unknown"),
+      " · resume: ", String(report.resume_state || "unknown")));
+  }
   return summary;
 }
 
@@ -470,6 +476,7 @@ function joinedDetails(report) {
   const roadmap = el("div", { class: "d-sec" },
     el("h5", {}, "Road map"),
     el("p", {}, "Version ", report.roadmap?.version ?? "unknown", " · ", report.roadmap?.assessment ?? "unknown"),
+    report.roadmap?.assessment_reason ? el("p", { class: "soft" }, "Assessment: ", joinedLine(report.roadmap.assessment_reason)) : null,
     el("p", { class: "soft" }, "Position: ",
       position ? el("span", {}, joinedLine(position.title, position.id), " (", position.status, ")") : "unknown"),
   );
@@ -501,7 +508,8 @@ function joinedDetails(report) {
       report.chitra_action ? el("p", { class: "soft" }, "Chitra: ", joinedLine(report.chitra_action)) : null);
     root.append(recovery);
   }
-  if (report.reframe_progress?.active || report.handoff || report.checkpoint_reference || report.pending_operation) {
+  const resumeIsInformational = report.resume_state && !["active", "inactive", "unknown"].includes(report.resume_state);
+  if (report.reframe_progress?.active || report.handoff || report.checkpoint_reference || report.pending_operation || report.close_evidence || resumeIsInformational) {
     const continuity = el("div", { class: "d-sec" }, el("h5", {}, "Recovery continuity"));
     if (report.reframe_progress?.active) {
       continuity.append(el("p", {}, el("b", {}, "Tactical plan: "),
@@ -519,6 +527,13 @@ function joinedDetails(report) {
     if (report.checkpoint_reference) continuity.append(el("p", {}, el("b", {}, "Checkpoint: "), report.checkpoint_reference));
     if (report.pending_operation) continuity.append(el("p", {}, el("b", {}, "Pending: "),
       report.pending_operation.kind, " · ", report.pending_operation.operation_id));
+    if (report.close_evidence) {
+      continuity.append(el("p", {}, el("b", {}, "Close evidence: "),
+        String(report.close_evidence.state || "unknown"),
+        " · same thread: ", String(report.close_evidence.same_provider_thread),
+        report.close_evidence.evidence ? el("span", { class: "soft" }, " — ", joinedLine(report.close_evidence.evidence)) : null));
+    }
+    if (resumeIsInformational) continuity.append(el("p", {}, el("b", {}, "Resume state: "), report.resume_state));
     root.append(continuity);
   }
   return root;
