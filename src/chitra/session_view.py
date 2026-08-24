@@ -18,12 +18,14 @@ from dataclasses import dataclass, replace
 from typing import Literal, Protocol, cast
 
 from chitra.session_contract import (
+    CloseArchiveResult,
     InterventionEvidence,
     JoinedLaneRecord,
     LaneLifecycle,
     LaneUpdate,
     NextCheck,
     PlanState,
+    PendingProviderOperation,
     Problem,
     Progress,
     ProgressEvidence,
@@ -142,6 +144,10 @@ class JoinedSessionView:
     goal: str | None
     done_when: str | None
     goal_status: str | None
+    checkpoint_reference: str | None = None
+    pending_operation: PendingProviderOperation | None = None
+    close_evidence: CloseArchiveResult | None = None
+    resume_state: str = "unknown"
 
     def to_dict(self) -> dict[str, object]:
         """Return a stable JSON representation without any control fields."""
@@ -182,6 +188,10 @@ class JoinedSessionView:
             "goal": self.goal,
             "done_when": self.done_when,
             "goal_status": self.goal_status,
+            "checkpoint_reference": self.checkpoint_reference,
+            "pending_operation": _json_value(self.pending_operation) if self.pending_operation is not None else None,
+            "close_evidence": _json_value(self.close_evidence) if self.close_evidence is not None else None,
+            "resume_state": self.resume_state,
         }
 
 
@@ -204,6 +214,21 @@ def build_joined_session_view(
     last_intervention: InterventionEvidence | None = record.last_intervention
     if record.last_intervention is not None:
         chitra_action = record.last_intervention.action
+    pending_resume = (
+        record.pending_operation is not None
+        and record.pending_operation.kind == "create_or_resume"
+        and record.lifecycle == "inactive"
+    )
+    if pending_resume:
+        resume_state = "resume pending"
+    elif record.lifecycle == "active":
+        resume_state = "active"
+    elif record.last_close_result is not None and record.last_close_result.later_resume_supported is True:
+        resume_state = "closed; same-session resume available"
+    elif record.last_close_result is not None:
+        resume_state = "closed"
+    else:
+        resume_state = "inactive"
 
     return JoinedSessionView(
         schema=JOINED_SESSION_VIEW_SCHEMA,
@@ -241,6 +266,10 @@ def build_joined_session_view(
         goal=goal_text,
         done_when=done_when,
         goal_status=goal_status,
+        checkpoint_reference=record.checkpoint_reference,
+        pending_operation=record.pending_operation,
+        close_evidence=record.last_close_result,
+        resume_state=resume_state,
     )
 
 
@@ -346,6 +375,17 @@ def render_joined_session_view(
     lines.extend(_problem_lines("Resolved problems", view.resolved_problems))
     lines.append(f"Chitra action: {view.chitra_action or 'none recorded.'}")
     lines.append(f"Recovery action: {view.recovery.attempted_remedy or 'none recorded.'}")
+    if view.checkpoint_reference:
+        lines.append(f"Checkpoint: {view.checkpoint_reference}")
+    if view.pending_operation is not None:
+        lines.append(f"Pending operation: {view.pending_operation.operation_id} ({view.pending_operation.kind})")
+    if view.close_evidence is not None:
+        lines.append(
+            f"Close evidence: {view.close_evidence.state}; same provider thread: "
+            f"{view.close_evidence.same_provider_thread}; later resume: "
+            f"{view.close_evidence.later_resume_supported}"
+        )
+    lines.append(f"Resume state: {view.resume_state}")
     lines.append(f"NEXT: {view.next_action or 'unknown (no next action reported).'}")
     if view.next_check is None:
         lines.append("CHECK: unknown (no durable check is recorded).")

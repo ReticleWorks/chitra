@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -19,7 +20,16 @@ from ._fsio import write_json_atomic
 from .detect.detectors import Finding
 from .detect.ladder import IncidentStore, ResponseLadder
 from .detect.rescue import RecoveryCheckpointBinding, find_recovery_checkpoint_receipt
-from .goals import LOAD_SHED_HOLD_REASON_PREFIX, GoalRecord, done_when_with_delta, get_goal, load_goals
+from .goals import (
+    LOAD_SHED_HOLD_REASON_PREFIX,
+    GoalNotFoundError,
+    GoalRecord,
+    GoalValidationError,
+    close_goal,
+    done_when_with_delta,
+    get_goal,
+    load_goals,
+)
 from .joined_lane import (
     JoinedLaneCorruptError,
     JoinedLaneReconciler,
@@ -228,6 +238,24 @@ class GovernedCloseDecision:
         return False
 
 
+ResumeAction = Literal["resumed", "waiting"]
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeDecision:
+    """Result of an explicit resume of an archived provider session."""
+
+    action: ResumeAction
+    record: JoinedLaneRecord
+    reason: str
+    operation: PendingProviderOperation | None = None
+    result: ProviderOperationResult | None = None
+
+    @property
+    def asks_user(self) -> bool:
+        return False
+
+
 SupervisorDecision = RecoveryDecision | GovernedCloseDecision
 
 
@@ -249,6 +277,51 @@ class RecoveryStateStore:
     @property
     def lock_path(self) -> Path:
         return self._store.lock_path(self.lane_id)
+
+    @property
+    def root(self) -> Path:
+        return self._store.root
+
+    def close_evidence_path(self, operation: PendingProviderOperation) -> Path:
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", operation.operation_id) is None:
+            raise RecoveryStateError("close operation ID is unsafe for evidence storage")
+        return self.root / "close-evidence" / f"{operation.operation_id}.json"
+
+    def read_close_evidence(
+        self, operation: PendingProviderOperation, record: JoinedLaneRecord
+    ) -> CloseArchiveResult | None:
+        try:
+            payload = json.loads(self.close_evidence_path(operation).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecoveryStateError):
+            return None
+        if not isinstance(payload, Mapping) or payload.get("schema") != "chitra.governed-close-evidence.v1":
+            return None
+        if payload.get("operation") != operation.model_dump(mode="json"):
+            return None
+        try:
+            result = CloseArchiveResult.from_dict(payload.get("result"))
+        except (ContractValidationError, TypeError, ValueError):
+            return None
+        return result if _close_receipt_matches(record, operation, result) else None
+
+    def write_close_evidence(
+        self, operation: PendingProviderOperation, result: CloseArchiveResult
+    ) -> None:
+        path = self.close_evidence_path(operation)
+        payload = {
+            "schema": "chitra.governed-close-evidence.v1",
+            "operation": operation.model_dump(mode="json"),
+            "result": result.model_dump(mode="json"),
+        }
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RecoveryStateError("existing close evidence is unreadable") from exc
+            if existing != payload:
+                raise RecoveryStateError("immutable close evidence changed")
+            return
+        write_json_atomic(path, payload, fsync=True)
 
     def load(self) -> JoinedLaneRecord | None:
         try:
@@ -321,49 +394,11 @@ def _close_session(record: JoinedLaneRecord) -> str:
     return session
 
 
-def _close_operation(record: JoinedLaneRecord, payload: str, current: datetime) -> PendingProviderOperation:
-    provider = record.provider
-    if provider.instance_id is None or provider.generation is None:
-        raise RecoveryStateError("close operation lacks a complete provider identity")
-    session = _close_session(record)
-    identity = {
-        "lane_id": record.lane_id,
-        "goal_id": record.goal_id,
-        "goal_version": record.goal_version,
-        "session_ref": record.session_ref,
-        "provider_handle": provider.handle,
-        "provider_session_id": session,
-        "provider_instance_id": provider.instance_id,
-        "provider_generation": provider.generation,
-        "payload": payload,
-    }
-    operation_id = "close-" + _digest(identity)[:32]
-    return PendingProviderOperation(
-        operation_id=operation_id,
-        kind="close",
-        lane_id=record.lane_id,
-        provider_handle=provider.handle,
-        provider_session_id=session,
-        idempotency_key=f"{operation_id}-idem",
-        payload_digest=_digest(identity),
-        payload=payload,
-        provider_instance_id=provider.instance_id,
-        provider_generation=provider.generation,
-        created_at=current.isoformat(),
-    )
-
-
-def _same_close_operation(
-    actual: PendingProviderOperation, expected: PendingProviderOperation
-) -> bool:
-    return actual.model_dump(exclude={"created_at", "attempt"}) == expected.model_dump(
-        exclude={"created_at", "attempt"}
-    )
-
-
 def _close_receipt_matches(
     record: JoinedLaneRecord, operation: PendingProviderOperation, result: CloseArchiveResult
 ) -> bool:
+    if result.state not in {"closed", "archived"}:
+        return False
     try:
         validate_close_result(operation, result)
     except (ContractValidationError, TypeError, ValueError):
@@ -438,13 +473,22 @@ class RecoveryEngine:
         return store.save(record, transition=transition) if persist and store is not None else record
 
     def _invoke_close(
-        self, record: JoinedLaneRecord, operation: PendingProviderOperation
+        self,
+        record: JoinedLaneRecord,
+        operation: PendingProviderOperation,
+        checkpoint: Mapping[str, object],
     ) -> CloseArchiveResult | None:
-        """Call one provider close and accept only its exact archive receipt."""
+        """Send one explicit Chitra checkpoint handoff to the provider."""
 
         if self.provider is None:
             return None
-        request = CloseRequest(operation=operation, archive=True)
+        request = CloseRequest(
+            operation=operation,
+            archive=True,
+            checkpoint_receipt=checkpoint,
+            checkpoint_receipt_sha256=_digest(checkpoint),
+            checkpoint_verifier="chitra.detect.rescue.verify_checkpoint_receipt_signature",
+        )
         try:
             if isinstance(getattr(self.provider, "capabilities", None), Mapping):
                 raw = self.provider.close(
@@ -454,6 +498,10 @@ class RecoveryEngine:
                             "operation": operation.model_dump(mode="json"),
                             "archive": True,
                             "payload": json.loads(operation.payload),
+                            "checkpoint_ref": checkpoint.get("checkpoint_ref"),
+                            "checkpoint_receipt": dict(checkpoint),
+                            "checkpoint_receipt_sha256": _digest(checkpoint),
+                            "checkpoint_verifier": "chitra.detect.rescue.verify_checkpoint_receipt_signature",
                         },
                     )
                 )
@@ -485,6 +533,17 @@ class RecoveryEngine:
             }
         )
         return self._persist(closed, persist=persist)
+
+    @staticmethod
+    def _close_wait(
+        record: JoinedLaneRecord,
+        reason: str,
+        operation: PendingProviderOperation | None = None,
+        result: CloseArchiveResult | None = None,
+    ) -> GovernedCloseDecision:
+        return GovernedCloseDecision(
+            action="waiting", record=record, reason=reason, operation=operation, close_result=result
+        )
 
     def _cycle_id(self, record: JoinedLaneRecord, signature: str, current: datetime) -> str:
         return "cycle-" + _digest(
@@ -911,6 +970,36 @@ class RecoveryEngine:
         )
 
     def _operation(self, record: JoinedLaneRecord, action: str, payload: str, current: datetime) -> PendingProviderOperation:
+        if action == "close":
+            provider = record.provider
+            session = _close_session(record)
+            if provider.instance_id is None or provider.generation is None:
+                raise RecoveryStateError("close operation lacks a complete provider identity")
+            identity = {
+                "lane_id": record.lane_id,
+                "goal_id": record.goal_id,
+                "goal_version": record.goal_version,
+                "session_ref": record.session_ref,
+                "provider_handle": provider.handle,
+                "provider_session_id": session,
+                "provider_instance_id": provider.instance_id,
+                "provider_generation": provider.generation,
+                "payload": payload,
+            }
+            operation_id = "close-" + _digest(identity)[:32]
+            return PendingProviderOperation(
+                operation_id=operation_id,
+                kind="close",
+                lane_id=record.lane_id,
+                provider_handle=provider.handle,
+                provider_session_id=session,
+                idempotency_key=f"{operation_id}-idem",
+                payload_digest=_digest(identity),
+                payload=payload,
+                provider_instance_id=provider.instance_id,
+                provider_generation=provider.generation,
+                created_at=current.isoformat(),
+            )
         cycle_id = record.recovery.cycle_id
         if cycle_id is None:
             raise RecoveryStateError("recovery cycle identity is missing")
@@ -1382,21 +1471,18 @@ class RecoveryEngine:
         from .governed_close import (
             _close_payload,
             _ensure_checkpoint,
-            _operation_matches,
-            _read_close_evidence,
-            _wait,
-            _write_close_evidence,
+            _read_checkpoint_payload,
         )
 
         if self.state_root is None or not persist:
             if record is None:
                 raise RecoveryStateError("governed close requires a durable joined-lane store")
-            return _wait(record, "governed close requires durable Chitra storage")
-        goal_root = self.goal_root or self.state_root
+            return self._close_wait(record, "governed close requires durable Chitra storage")
+        goal_root = self.goal_root
         if goal_root is None:
             if record is None:
                 raise RecoveryStateError("governed close requires a completion goal root")
-            return _wait(record, "governed close requires the completion gate")
+            return self._close_wait(record, "governed close requires an explicit completion goal root")
         store = self.store_for(lane_id or (record.lane_id if record else ""))
         if store is None:
             raise RecoveryStateError("governed close requires a durable joined-lane store")
@@ -1409,7 +1495,7 @@ class RecoveryEngine:
             raise RecoveryStateError(f"no joined lane record for {lane_id!r}")
         if record.last_close_result is not None:
             if record.lifecycle != "inactive":
-                return _wait(record, "close evidence exists but the lane is not inactive")
+                return self._close_wait(record, "close evidence exists but the lane is not inactive")
             return GovernedCloseDecision(
                 action="closed",
                 record=record,
@@ -1417,23 +1503,23 @@ class RecoveryEngine:
                 close_result=record.last_close_result,
             )
         if record.lifecycle != "active":
-            return _wait(record, "lane is not active and has no close evidence")
+            return self._close_wait(record, "lane is not active and has no close evidence")
         try:
             goal = get_goal(goal_root, record.session_ref)
         except Exception as exc:  # an unreadable goal cannot authorize close
-            return _wait(record, f"completion goal is unavailable: {exc}")
+            return self._close_wait(record, f"completion goal is unavailable: {exc}")
         if (
             goal is None
             or goal.status != "done-pending-close"
             or (goal.session_ref, goal.lane_id, goal.goal_id, goal.goal_version)
             != (record.session_ref, record.lane_id, record.goal_id, record.goal_version)
         ):
-            return _wait(record, "exact enrolled goal is not done-pending-close")
+            return self._close_wait(record, "exact enrolled goal is not done-pending-close")
         if self.provider is None:
-            return _wait(record, "provider adapter is unavailable")
+            return self._close_wait(record, "provider adapter is unavailable")
         provider_kind = str(getattr(getattr(self.provider, "provider_name", ""), "value", getattr(self.provider, "provider_name", "")))
         if provider_kind != str(record.provider.kind):
-            return _wait(record, "provider kind does not match the joined lane")
+            return self._close_wait(record, "provider kind does not match the joined lane")
         capabilities = getattr(self.provider, "capabilities", {})
         for capability in ("status", "close"):
             supported = (
@@ -1442,19 +1528,24 @@ class RecoveryEngine:
                 else bool(getattr(capabilities, capability, False))
             )
             if not supported or not record.provider.capabilities.supports(cast(Any, capability)):
-                return _wait(record, f"provider lacks required {capability} capability")
+                return self._close_wait(record, f"provider lacks required {capability} capability")
         try:
             working = _ensure_checkpoint(self.state_root, record)
         except (OSError, RecoveryStateError, TypeError, ValueError) as exc:
-            return _wait(record, f"Chitra checkpoint is not durable: {exc}")
+            return self._close_wait(record, f"Chitra checkpoint is not durable: {exc}")
+        checkpoint = _read_checkpoint_payload(
+            self.state_root, working, working.checkpoint_reference or ""
+        )
+        if checkpoint is None:
+            return self._close_wait(working, "Chitra checkpoint could not be read for the explicit provider handoff")
         pending = working.pending_operation
         if pending is not None and pending.kind != "close":
-            return _wait(working, "another provider operation is still pending", pending)
+            return self._close_wait(working, "another provider operation is still pending", pending)
         current_time = _now(now)
         try:
-            expected = _close_operation(working, _close_payload(working), current_time)
+            expected = self._operation(working, "close", _close_payload(working), current_time)
         except (RecoveryStateError, TypeError, ValueError) as exc:
-            return _wait(working, str(exc), pending)
+            return self._close_wait(working, str(exc), pending)
         if pending is None:
             try:
                 history = (
@@ -1473,15 +1564,17 @@ class RecoveryEngine:
                     persist=True,
                 )
             except (ContractValidationError, OSError, RecoveryStateError, TypeError, ValueError) as exc:
-                return _wait(working, f"close operation could not be durably recorded: {exc}")
-        elif not _operation_matches(pending, expected):
-            return _wait(working, "pending close identity or payload changed", pending)
-        recovered = _read_close_evidence(self.state_root, pending, working)
+                return self._close_wait(working, f"close operation could not be durably recorded: {exc}")
+        elif pending.model_dump(exclude={"created_at", "attempt"}) != expected.model_dump(
+            exclude={"created_at", "attempt"}
+        ):
+            return self._close_wait(working, "pending close identity or payload changed", pending)
+        recovered = store.read_close_evidence(pending, working)
         if recovered is not None:
             try:
                 closed = self._finish_close(working, recovered, persist=True)
             except (ContractValidationError, OSError, RecoveryStateError, TypeError, ValueError) as exc:
-                return _wait(
+                return self._close_wait(
                     working,
                     f"durable close evidence exists but Chitra could not persist close state: {exc}",
                     pending,
@@ -1503,15 +1596,15 @@ class RecoveryEngine:
             or status.current_turn_id is not None
             or status.state not in {ProviderState.IDLE, ProviderState.CLOSED, ProviderState.ARCHIVED}
         ):
-            return _wait(working, "provider status does not prove the exact idle or already-closed physical session", pending)
-        result = self._invoke_close(working, pending)
+            return self._close_wait(working, "provider status does not prove the exact idle or already-closed physical session", pending)
+        result = self._invoke_close(working, pending, checkpoint)
         if result is None:
-            return _wait(working, "provider close response is unknown or failed exact identity validation", pending)
+            return self._close_wait(working, "provider close response is unknown or failed exact identity validation", pending)
         try:
-            _write_close_evidence(self.state_root, pending, result)
+            store.write_close_evidence(pending, result)
             closed = self._finish_close(working, result, persist=True)
         except (ContractValidationError, OSError, RecoveryStateError, TypeError, ValueError) as exc:
-            return _wait(
+            return self._close_wait(
                 working,
                 f"provider close succeeded but Chitra could not persist close evidence: {exc}",
                 pending,
@@ -1523,6 +1616,180 @@ class RecoveryEngine:
             reason="provider close is bound to Chitra's checkpoint and physical session",
             operation=pending,
             close_result=result,
+        )
+
+    @staticmethod
+    def _resume_operation(
+        record: JoinedLaneRecord, payload: str, current: datetime
+    ) -> PendingProviderOperation:
+        provider = record.provider
+        session = provider.provider_session_id
+        if provider.instance_id is None or provider.generation is None or not session:
+            raise RecoveryStateError("resume operation lacks the exact closed provider identity")
+        identity = {
+            "lane_id": record.lane_id,
+            "goal_id": record.goal_id,
+            "goal_version": record.goal_version,
+            "session_ref": record.session_ref,
+            "provider_handle": provider.handle,
+            "provider_session_id": session,
+            "provider_instance_id": provider.instance_id,
+            "provider_generation": provider.generation,
+            "payload": payload,
+        }
+        operation_id = "resume-" + _digest(identity)[:32]
+        return PendingProviderOperation(
+            operation_id=operation_id,
+            kind="create_or_resume",
+            lane_id=record.lane_id,
+            provider_handle=provider.handle,
+            provider_session_id=session,
+            idempotency_key=f"{operation_id}-idem",
+            payload_digest=_digest(identity),
+            payload=payload,
+            provider_instance_id=provider.instance_id,
+            provider_generation=provider.generation,
+            created_at=current.isoformat(),
+        )
+
+    @staticmethod
+    def _resume_wait(
+        record: JoinedLaneRecord,
+        reason: str,
+        operation: PendingProviderOperation | None = None,
+        result: ProviderOperationResult | None = None,
+    ) -> ResumeDecision:
+        return ResumeDecision(
+            action="waiting", record=record, reason=reason, operation=operation, result=result
+        )
+
+    def resume_after_close(
+        self,
+        record: JoinedLaneRecord | None = None,
+        *,
+        lane_id: str | None = None,
+        now: datetime | str | None = None,
+        persist: bool = True,
+    ) -> ResumeDecision:
+        """Resume the same archived provider thread through one durable operation."""
+        if self.state_root is None or not persist:
+            if record is None:
+                raise RecoveryStateError("resume requires a durable joined-lane store")
+            return self._resume_wait(record, "resume requires durable Chitra storage")
+        store = self.store_for(lane_id or (record.lane_id if record else ""))
+        if store is None:
+            raise RecoveryStateError("resume requires a durable joined-lane store")
+        current_record = store.load()
+        if current_record is not None:
+            record = current_record
+        if record is None:
+            if not lane_id:
+                raise RecoveryStateError("resume requires a lane record or lane_id")
+            raise RecoveryStateError(f"no joined lane record for {lane_id!r}")
+        close = record.last_close_result
+        if record.lifecycle != "inactive" or close is None:
+            return self._resume_wait(record, "lane has no inactive close state to resume")
+        if close.state not in {"closed", "archived"} or close.later_resume_supported is not True:
+            return self._resume_wait(record, "provider close evidence does not permit later resume")
+        if (
+            close.provider_thread_ref != record.provider.handle
+            or close.provider_instance_id != record.provider.instance_id
+            or close.provider_generation != record.provider.generation
+            or close.provider_session_id != record.provider.provider_session_id
+        ):
+            return self._resume_wait(record, "close evidence is not bound to the current provider identity")
+        if self.provider is None:
+            return self._resume_wait(record, "provider adapter is unavailable")
+        capabilities = getattr(self.provider, "capabilities", {})
+        supported = (
+            all(capabilities.get(name) is True for name in ("status", "create_or_resume", "resume_after_close"))
+            if isinstance(capabilities, Mapping)
+            else all(bool(getattr(capabilities, name, False)) for name in ("status", "create_or_resume", "resume_after_close"))
+        )
+        if not supported or not all(
+            record.provider.capabilities.supports(name)
+            for name in ("status", "create_or_resume", "resume_after_close")
+        ):
+            return self._resume_wait(record, "provider lacks exact same-session resume capability")
+        status = self._provider_status(record)
+        if (
+            status is None
+            or status.provider_session_id != record.provider.provider_session_id
+            or status.generation != record.provider.generation
+            or status.state not in {ProviderState.CLOSED, ProviderState.ARCHIVED, ProviderState.IDLE}
+        ):
+            return self._resume_wait(record, "provider status does not prove the closed session identity")
+        current_time = _now(now)
+        payload = _digest(
+            {
+                "resume_after_close": True,
+                "close_operation_id": close.operation_id,
+                "provider_session_id": record.provider.provider_session_id,
+            }
+        )
+        try:
+            expected = self._resume_operation(record, payload, current_time)
+        except (RecoveryStateError, TypeError, ValueError) as exc:
+            return self._resume_wait(record, str(exc))
+        pending = record.pending_operation
+        if pending is None:
+            history = (
+                *record.operation_history,
+                OperationReference(
+                    operation_id=expected.operation_id,
+                    idempotency_key=expected.idempotency_key,
+                    payload_digest=expected.payload_digest,
+                    kind=expected.kind,
+                    created_at=expected.created_at,
+                ),
+            )
+            try:
+                pending = expected
+                record = self._persist(
+                    record.model_copy(
+                        update={
+                            "pending_operation": pending,
+                            "last_operation_result": None,
+                            "operation_history": history,
+                        }
+                    ),
+                    persist=True,
+                )
+            except (ContractValidationError, OSError, RecoveryStateError, TypeError, ValueError) as exc:
+                return self._resume_wait(record, f"resume operation could not be durably recorded: {exc}")
+        elif pending.kind != "create_or_resume" or pending.model_dump(exclude={"created_at", "attempt"}) != expected.model_dump(exclude={"created_at", "attempt"}):
+            return self._resume_wait(record, "pending resume identity or payload changed", pending)
+        stored = record.last_operation_result
+        if stored is not None and stored.operation_id == pending.operation_id and stored.status == "consumed":
+            result = stored
+        else:
+            result = self._invoke(record, pending, "relaunch", pending.payload, current_time)
+            record = self._persist(record.model_copy(update={"last_operation_result": result}), persist=True)
+        if result.status != "consumed":
+            return self._resume_wait(record, "same-session resume lacks exact consumption evidence", pending, result)
+        check = self._check(current_time, "Check useful progress after resume", "a material update after the same-session resume")
+        resumed = record.model_copy(
+            update={
+                "lifecycle": "active",
+                "last_close_result": None,
+                "pending_operation": None,
+                "next_check": check,
+                "recovery": record.recovery.model_copy(
+                    update={"stage": "diagnostic", "attempted_remedy": "resume", "pending_payload": None}
+                ),
+                "current_update": None if record.current_update is not None and record.current_update.operation_id else record.current_update,
+            }
+        )
+        try:
+            resumed = self._persist(resumed, persist=True, transition="resume")
+        except (ContractValidationError, OSError, RecoveryStateError, TypeError, ValueError) as exc:
+            return self._resume_wait(record, f"resume succeeded but Chitra could not persist active state: {exc}", pending, result)
+        return ResumeDecision(
+            action="resumed",
+            record=resumed,
+            reason="same provider session resumed with durable consumption evidence",
+            operation=pending,
+            result=result,
         )
 
     def governed_close(
@@ -1608,13 +1875,50 @@ class RecoverySupervisor:
             ):
                 try:
                     provider = self.provider_resolver(record)
-                    decisions.append(
-                        RecoveryEngine(
-                            provider=provider,
-                            state_root=self.state_root,
-                            goal_root=self.goal_root,
-                        ).governed_close(record, now=now)
-                    )
+                    decision = RecoveryEngine(
+                        provider=provider,
+                        state_root=self.state_root,
+                        goal_root=self.goal_root,
+                    ).governed_close(record, now=now)
+                    if decision.action == "closed":
+                        try:
+                            close_goal(self.goal_root, record.session_ref)
+                        except GoalNotFoundError:
+                            pass
+                        except (GoalValidationError, OSError, TypeError, ValueError) as exc:
+                            retry_at = _now(now).isoformat()
+                            retry = decision.record.model_copy(
+                                update={
+                                    "recovery": decision.record.recovery.model_copy(
+                                        update={
+                                            "stage": "waiting",
+                                            "attempted_remedy": "close-goal",
+                                            "next_allowed_attempt": retry_at,
+                                        }
+                                    ),
+                                    "next_check": NextCheck(
+                                        at=retry_at,
+                                        reason="Retry completion-goal close",
+                                        wake_condition="the completion goal can be closed",
+                                    ),
+                                }
+                            )
+                            try:
+                                retry = RecoveryStateStore(self.state_root, record.lane_id).save(retry)
+                            except (ContractValidationError, OSError, RecoveryStateError, TypeError, ValueError) as save_exc:
+                                logger.warning(
+                                    "governed_close_goal_retry_not_persisted",
+                                    lane_id=record.lane_id,
+                                    error=str(save_exc),
+                                )
+                            decision = GovernedCloseDecision(
+                                action="waiting",
+                                record=retry,
+                                reason=f"provider close is durable; completion goal remains open: {exc}",
+                                operation=decision.operation,
+                                close_result=decision.close_result,
+                            )
+                    decisions.append(decision)
                 except Exception as exc:  # one close lane must not abort the pass
                     logger.warning("governed_close_supervision_lane_failed", lane_id=record.lane_id, error=str(exc))
                     decisions.append(GovernedCloseDecision("waiting", record, f"governed close failed: {exc}"))
@@ -1738,6 +2042,8 @@ __all__ = [
     "RecoverySupervisor",
     "GovernedCloseAction",
     "GovernedCloseDecision",
+    "ResumeAction",
+    "ResumeDecision",
     "SupervisorDecision",
     "confirm_useful_progress",
     "load_recovery_records",

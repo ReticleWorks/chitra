@@ -30,7 +30,6 @@ from ._fsio import locked_json_store
 from .detect.rescue import (
     RecoveryCheckpointBinding,
     find_recovery_checkpoint_receipt,
-    verify_checkpoint_receipt_signature,
 )
 from .joined_lane import JoinedLaneStore
 from .journal import EventJournal
@@ -314,11 +313,14 @@ class _PackagedTophandProvider:
         self,
         adapter: object,
         *,
-        state_root: Path,
+        state_root: Path | None = None,
         result_sink: RecoverySink,
     ) -> None:
+        # Retain the constructor keyword for installed callers. The provider
+        # must not read Chitra's checkpoint filesystem; the signed receipt is
+        # supplied on CloseRequest across the authenticated boundary.
+        del state_root
         self._adapter = adapter
-        self._state_root = state_root
         self._result_sink = result_sink
 
     @property
@@ -344,6 +346,10 @@ class _PackagedTophandProvider:
             )
             if raw.get(name) is True
         )
+        if raw.get("resume_after_close") is True and all(
+            raw.get(name) is True for name in ("create_or_resume", "close")
+        ):
+            supported = (*supported, "resume_after_close")
         return ProviderCapabilities.from_supported(cast(Any, supported))
 
     def _call(
@@ -495,16 +501,17 @@ class _PackagedTophandProvider:
             reference = payload.get("checkpoint_ref")
             if not isinstance(reference, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", reference) is None:
                 raise ValueError("Chitra close checkpoint reference is unsafe")
-            checkpoint_path = (self._state_root / "checkpoints" / f"{reference}.json").resolve()
-            checkpoint_dir = (self._state_root / "checkpoints").resolve()
-            if checkpoint_path.parent != checkpoint_dir:
-                raise ValueError("Chitra close checkpoint path escaped state root")
-            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-            if not isinstance(checkpoint, Mapping):
-                raise ValueError("Chitra close checkpoint is not an object")
-            receipt = dict(checkpoint)
-            if not verify_checkpoint_receipt_signature(receipt, state_root=self._state_root):
-                raise ValueError("Chitra close checkpoint signature is invalid")
+            receipt = request.checkpoint_receipt
+            if not isinstance(receipt, Mapping):
+                raise ValueError("Chitra close checkpoint receipt was not supplied over the provider boundary")
+            receipt = dict(receipt)
+            digest = hashlib.sha256(
+                json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+            if request.checkpoint_receipt_sha256 != digest:
+                raise ValueError("Chitra close checkpoint receipt digest changed")
+            if request.checkpoint_verifier != "chitra.detect.rescue.verify_checkpoint_receipt_signature":
+                raise ValueError("Chitra close checkpoint verifier evidence is missing")
             if (
                 receipt.get("schema_name") != "chitra.governed-close-checkpoint.v1"
                 or receipt.get("checkpoint_ref") != reference

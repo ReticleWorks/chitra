@@ -12,40 +12,25 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
 from ._fsio import write_json_atomic
 from .detect.rescue import load_or_create_checkpoint_key, sign_checkpoint_receipt, verify_checkpoint_receipt_signature
-from .goals import get_goal
 from .provider_protocol import Provider
 from .recovery import (
     GovernedCloseDecision,
     RecoveryEngine,
     RecoveryStateError,
     RecoveryStateStore,
-    _close_operation,
-    _close_receipt_matches,
-    _close_session,
-    _same_close_operation,
 )
 from .session_contract import (
-    CloseArchiveResult,
-    ContractValidationError,
     JoinedLaneRecord,
-    PendingProviderOperation,
 )
 
 _CHECKPOINT_SCHEMA = "chitra.governed-close-checkpoint.v1"
 _CHECKPOINT_PROVENANCE = "governed-completion-checkpoint"
 _REFERENCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-
-
-def _now(value: datetime | None) -> datetime:
-    current = datetime.now(UTC) if value is None else value
-    if current.tzinfo is None:
-        raise ValueError("close timestamps must include a timezone")
-    return current.astimezone(UTC)
 
 
 def _json(value: object) -> str:
@@ -54,10 +39,6 @@ def _json(value: object) -> str:
 
 def _digest(value: object) -> str:
     return hashlib.sha256(_json(value).encode()).hexdigest()
-
-
-def _expected_session(record: JoinedLaneRecord) -> str:
-    return _close_session(record)
 
 
 def _checkpoint_path(state_root: Path, reference: str) -> Path | None:
@@ -73,10 +54,12 @@ def _checkpoint_binding(record: JoinedLaneRecord) -> dict[str, object]:
     provider = record.provider
     if provider.instance_id is None or provider.generation is None:
         raise RecoveryStateError("governed close requires a complete provider identity")
+    if not provider.provider_session_id:
+        raise RecoveryStateError("governed close requires an exact physical provider session ID")
     return {
         "kind": str(provider.kind),
         "handle": provider.handle,
-        "provider_session_id": _expected_session(record),
+        "provider_session_id": provider.provider_session_id,
         "instance_id": provider.instance_id,
         "generation": provider.generation,
     }
@@ -133,19 +116,27 @@ def _checkpoint_matches(
     )
 
 
-def _read_checkpoint(state_root: Path, record: JoinedLaneRecord, reference: str) -> bool:
+def _read_checkpoint_payload(
+    state_root: Path, record: JoinedLaneRecord, reference: str
+) -> dict[str, object] | None:
     path = _checkpoint_path(state_root, reference)
     if path is None:
-        return False
+        return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return False
+        return None
     if not isinstance(payload, Mapping):
-        return False
+        return None
     # Keep the state-root argument explicit. It prevents a provider or a
     # remote host from ever becoming the source of checkpoint verification.
-    return _checkpoint_matches(payload, record, reference, state_root)
+    if not _checkpoint_matches(payload, record, reference, state_root):
+        return None
+    return dict(payload)
+
+
+def _read_checkpoint(state_root: Path, record: JoinedLaneRecord, reference: str) -> bool:
+    return _read_checkpoint_payload(state_root, record, reference) is not None
 
 
 def _write_checkpoint(state_root: Path, record: JoinedLaneRecord) -> str:
@@ -186,77 +177,11 @@ def _close_payload(record: JoinedLaneRecord) -> str:
             "goal_version": record.goal_version,
             "session_ref": record.session_ref,
             "provider_handle": record.provider.handle,
-            "provider_session_id": _expected_session(record),
+            "provider_session_id": record.provider.provider_session_id,
             "provider_instance_id": record.provider.instance_id,
             "provider_generation": record.provider.generation,
         }
     )
-
-
-def _operation(record: JoinedLaneRecord, payload: str, now: datetime) -> PendingProviderOperation:
-    return _close_operation(record, payload, now)
-
-
-def _operation_matches(actual: PendingProviderOperation, expected: PendingProviderOperation) -> bool:
-    return _same_close_operation(actual, expected)
-
-
-def _close_evidence_path(state_root: Path, operation: PendingProviderOperation) -> Path:
-    if _REFERENCE_RE.fullmatch(operation.operation_id) is None:
-        raise RecoveryStateError("close operation ID is unsafe for evidence storage")
-    return state_root / "close-evidence" / f"{operation.operation_id}.json"
-
-
-def _read_close_evidence(
-    state_root: Path,
-    operation: PendingProviderOperation,
-    record: JoinedLaneRecord,
-) -> CloseArchiveResult | None:
-    path = _close_evidence_path(state_root, operation)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, Mapping) or payload.get("schema") != "chitra.governed-close-evidence.v1":
-        return None
-    if payload.get("operation") != operation.model_dump(mode="json"):
-        return None
-    values = payload.get("result")
-    try:
-        result = CloseArchiveResult.from_dict(values)
-    except (ContractValidationError, TypeError, ValueError):
-        return None
-    if not _close_receipt_matches(record, operation, result):
-        return None
-    return result
-
-
-def _write_close_evidence(
-    state_root: Path,
-    operation: PendingProviderOperation,
-    result: CloseArchiveResult,
-) -> None:
-    path = _close_evidence_path(state_root, operation)
-    payload = {
-        "schema": "chitra.governed-close-evidence.v1",
-        "operation": operation.model_dump(mode="json"),
-        "result": result.model_dump(mode="json"),
-    }
-    if path.exists():
-        existing = json.loads(path.read_text(encoding="utf-8"))
-        if existing != payload:
-            raise RecoveryStateError("immutable close evidence changed")
-        return
-    write_json_atomic(path, payload, fsync=True)
-
-
-def _wait(
-    record: JoinedLaneRecord,
-    reason: str,
-    operation: PendingProviderOperation | None = None,
-    result: CloseArchiveResult | None = None,
-) -> GovernedCloseDecision:
-    return GovernedCloseDecision(action="waiting", record=record, reason=reason, operation=operation, close_result=result)
 
 
 def governed_close(

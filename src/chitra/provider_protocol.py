@@ -207,6 +207,12 @@ class CloseRequest(MutationRequest):
     """Close a session, optionally retaining it for a later resume."""
 
     archive: bool
+    # Chitra may run on a different host from the provider.  The checkpoint
+    # therefore crosses the provider boundary as an authenticated document;
+    # providers must never discover it by reading Chitra's filesystem.
+    checkpoint_receipt: Mapping[str, object] | None = None
+    checkpoint_receipt_sha256: str | None = None
+    checkpoint_verifier: str | None = None
 
     def __post_init__(self) -> None:
         MutationRequest.__post_init__(self)
@@ -214,6 +220,8 @@ class CloseRequest(MutationRequest):
             raise ValueError("operation envelope kind must be close")
         if not isinstance(self.archive, bool):
             raise ValueError("archive must be a boolean")
+        if self.checkpoint_receipt is not None and not isinstance(self.checkpoint_receipt, Mapping):
+            raise ValueError("checkpoint_receipt must be a mapping when supplied")
 
 
 # Short aliases keep call sites readable while retaining the explicit method

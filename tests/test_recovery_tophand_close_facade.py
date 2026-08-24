@@ -4,10 +4,11 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from chitra.governed_close import _close_payload, _operation, _write_checkpoint
+from chitra.governed_close import _close_payload, _write_checkpoint
 from chitra.provider_protocol import CloseRequest
+from chitra.recovery import RecoveryEngine
 from chitra.recovery_provider import _PackagedTophandProvider
-from chitra.session_contract import CloseArchiveResult, JoinedLaneRecord, ProviderCapabilities, ProviderIdentity
+from chitra.session_contract import JoinedLaneRecord, ProviderCapabilities, ProviderIdentity
 
 
 def _record() -> JoinedLaneRecord:
@@ -58,8 +59,20 @@ class FakeAdapter:
 def _request(root: Path, record: JoinedLaneRecord) -> CloseRequest:
     reference = _write_checkpoint(root, record)
     bound = record.model_copy(update={"checkpoint_reference": reference})
-    operation = _operation(bound, _close_payload(bound), datetime(2026, 8, 23, 14, tzinfo=UTC))
-    return CloseRequest(operation=operation, archive=True)
+    operation = RecoveryEngine()._operation(
+        bound, "close", _close_payload(bound), datetime(2026, 8, 23, 14, tzinfo=UTC)
+    )
+    receipt = json.loads((root / "checkpoints" / f"{reference}.json").read_text(encoding="utf-8"))
+    digest = __import__("hashlib").sha256(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+    return CloseRequest(
+        operation=operation,
+        archive=True,
+        checkpoint_receipt=receipt,
+        checkpoint_receipt_sha256=digest,
+        checkpoint_verifier="chitra.detect.rescue.verify_checkpoint_receipt_signature",
+    )
 
 
 def test_facade_verifies_signed_checkpoint_and_projects_wire_request(tmp_path: Path) -> None:
@@ -84,7 +97,7 @@ def test_facade_verifies_signed_checkpoint_and_projects_wire_request(tmp_path: P
     assert wire["checkpoint_verifier"] == "chitra.detect.rescue.verify_checkpoint_receipt_signature"
 
 
-def test_facade_keeps_tampered_checkpoint_unknown(tmp_path: Path) -> None:
+def test_facade_uses_the_explicit_checkpoint_even_if_tophand_path_changes(tmp_path: Path) -> None:
     record = _record()
     request = _request(tmp_path, record)
     reference = json.loads(request.operation.payload)["checkpoint_ref"]
@@ -97,6 +110,20 @@ def test_facade_keeps_tampered_checkpoint_unknown(tmp_path: Path) -> None:
     provider = _PackagedTophandProvider(adapter, state_root=tmp_path, result_sink=lambda _value: None)
     result = provider.close(request)
 
-    assert isinstance(result, CloseArchiveResult)
-    assert result.state == "unknown"
-    assert adapter.requests == []
+    assert isinstance(result, dict)
+    assert result["state"] == "closed"
+    assert len(adapter.requests) == 1
+
+
+def test_packaged_tophand_exposes_close_and_explicit_resume_capabilities(tmp_path: Path) -> None:
+    adapter = FakeAdapter()
+    adapter.capabilities = {
+        "create_or_resume": True,
+        "close": True,
+        "resume_after_close": True,
+    }
+    provider = _PackagedTophandProvider(adapter, state_root=tmp_path, result_sink=lambda _value: None)
+
+    assert provider.capabilities.close is True
+    assert provider.capabilities.create_or_resume is True
+    assert provider.capabilities.resume_after_close is True

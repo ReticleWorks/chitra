@@ -16,6 +16,7 @@ from chitra.session_contract import (
     JoinedLaneRecord,
     ProviderCapabilities,
     ProviderIdentity,
+    ProviderOperationResult,
 )
 
 NOW = datetime(2026, 8, 23, 14, tzinfo=UTC)
@@ -33,7 +34,13 @@ def _record() -> JoinedLaneRecord:
             provider_session_id="physical-session-a",
             instance_id="tophand-instance-a",
             generation=3,
-            capabilities=ProviderCapabilities(status=True, checkpoint=True, close=True),
+            capabilities=ProviderCapabilities(
+                create_or_resume=True,
+                status=True,
+                checkpoint=True,
+                close=True,
+                resume_after_close=True,
+            ),
         ),
     )
 
@@ -59,12 +66,20 @@ def _completion_gate(root: Path, record: JoinedLaneRecord) -> None:
 
 class FakeProvider:
     provider_name = "tophand"
-    capabilities = ProviderCapabilities(status=True, checkpoint=True, close=True)
+    capabilities = ProviderCapabilities(
+        create_or_resume=True,
+        status=True,
+        checkpoint=True,
+        close=True,
+        resume_after_close=True,
+    )
 
-    def __init__(self, *, lose_first_reply: bool = False) -> None:
+    def __init__(self, *, lose_first_reply: bool = False, lose_first_resume_reply: bool = False) -> None:
         self.lose_first_reply = lose_first_reply
+        self.lose_first_resume_reply = lose_first_resume_reply
         self.calls = 0
         self.archive_calls = 0
+        self.resume_calls = 0
         self.archived = False
 
     def status(self) -> ProviderStatus:
@@ -96,7 +111,7 @@ class FakeProvider:
             provider_thread_ref="remote-handle-a",
             provider_session_id="physical-session-a",
             same_provider_thread=True,
-            later_resume_supported=False,
+            later_resume_supported=True,
             checkpoint_ref=payload["checkpoint_ref"],
             quiescent=True,
             observed_at=NOW.isoformat(),
@@ -106,6 +121,28 @@ class FakeProvider:
             raise OSError("response lost after provider committed close")
         return result
 
+    def create_or_resume(self, request: Any) -> Any:
+        self.resume_calls += 1
+        self.archived = False
+        result = ProviderOperationResult(
+            operation_id=request.operation_id,
+            kind="create_or_resume",
+            lane_id=request.lane_id,
+            provider_handle="remote-handle-a",
+            idempotency_key=request.idempotency_key,
+            payload_digest=request.payload_digest,
+            provider_instance_id=request.provider_instance_id,
+            provider_generation=request.provider_generation,
+            status="consumed",
+            accepted=True,
+            consumed=True,
+            observed_at=request.operation.created_at,
+            evidence="same physical session resumed",
+        )
+        if self.lose_first_resume_reply and self.resume_calls == 1:
+            raise OSError("response lost after provider resumed session")
+        return result
+
 
 def test_close_persists_chitra_checkpoint_and_archives_once(tmp_path: Path) -> None:
     record = _record()
@@ -113,8 +150,8 @@ def test_close_persists_chitra_checkpoint_and_archives_once(tmp_path: Path) -> N
     _completion_gate(tmp_path, record)
     provider = FakeProvider()
 
-    first = RecoveryEngine(provider=provider, state_root=tmp_path).governed_close(record, now=NOW)
-    second = RecoveryEngine(provider=provider, state_root=tmp_path).governed_close(first.record, now=NOW)
+    first = RecoveryEngine(provider=provider, state_root=tmp_path, goal_root=tmp_path).governed_close(record, now=NOW)
+    second = RecoveryEngine(provider=provider, state_root=tmp_path, goal_root=tmp_path).governed_close(first.record, now=NOW)
 
     assert first.action == "closed"
     assert second.action == "closed"
@@ -133,21 +170,24 @@ def test_lost_close_reply_reuses_pending_operation_and_reconciles_after_restart(
     _completion_gate(tmp_path, record)
     provider = FakeProvider(lose_first_reply=True)
 
-    first = RecoveryEngine(provider=provider, state_root=tmp_path).governed_close(record, now=NOW)
+    first = RecoveryEngine(provider=provider, state_root=tmp_path, goal_root=tmp_path).governed_close(record, now=NOW)
     persisted = RecoveryEngine(provider=provider, state_root=tmp_path).load("lane-a")
     assert first.action == "waiting"
     assert persisted is not None and persisted.pending_operation is not None
     operation_id = persisted.pending_operation.operation_id
 
-    second = RecoveryEngine(provider=provider, state_root=tmp_path).governed_close(
+    fresh_provider = FakeProvider()
+    fresh_provider.archived = True
+    second = RecoveryEngine(provider=fresh_provider, state_root=tmp_path, goal_root=tmp_path).governed_close(
         persisted, now=NOW.replace(minute=1)
     )
 
     assert second.action == "closed"
     assert second.operation is not None
     assert second.operation.operation_id == operation_id
-    assert provider.calls == 2
     assert provider.archive_calls == 1
+    assert fresh_provider.calls == 1
+    assert fresh_provider.archive_calls == 0
 
 
 def test_supervisor_routes_done_goal_to_close_and_reconciles_after_restart(
@@ -167,7 +207,11 @@ def test_supervisor_routes_done_goal_to_close_and_reconciles_after_restart(
         status="done-pending-close",
     )
     monkeypatch.setattr("chitra.recovery.get_goal", lambda _root, _session: goal)
-    monkeypatch.setattr("chitra.governed_close.get_goal", lambda _root, _session: goal)
+    closed_goals: list[str] = []
+    monkeypatch.setattr(
+        "chitra.recovery.close_goal",
+        lambda _root, session_ref: closed_goals.append(session_ref) or goal,
+    )
     supervisor = RecoverySupervisor(tmp_path, lambda _record: provider)
 
     first = supervisor.run_once(now=NOW)
@@ -177,6 +221,7 @@ def test_supervisor_routes_done_goal_to_close_and_reconciles_after_restart(
     assert first[0].action == "waiting"
     assert second[0].action == "closed"
     assert provider.archive_calls == 1
+    assert closed_goals == [record.session_ref]
 
 
 def test_physical_session_mismatch_blocks_close(tmp_path: Path) -> None:
@@ -194,11 +239,27 @@ def test_physical_session_mismatch_blocks_close(tmp_path: Path) -> None:
         current_turn_id=None,
     )
 
-    decision = RecoveryEngine(provider=provider, state_root=tmp_path).governed_close(record, now=NOW)
+    decision = RecoveryEngine(provider=provider, state_root=tmp_path, goal_root=tmp_path).governed_close(record, now=NOW)
 
     assert decision.action == "waiting"
     assert "physical session" in decision.reason
     assert provider.calls == 0
+
+
+def test_supervisor_keeps_goal_pending_until_completion_close_succeeds(tmp_path: Path) -> None:
+    record = _record()
+    JoinedLaneStore(tmp_path).create(record)
+    _completion_gate(tmp_path, record)
+    provider = FakeProvider()
+    supervisor = RecoverySupervisor(tmp_path, lambda _record: provider)
+
+    first = supervisor.run_once(now=NOW)
+    second = supervisor.run_once(now=NOW.replace(minute=1))
+
+    assert first[0].action == "waiting"
+    assert "completion goal remains open" in first[0].reason
+    assert second[0].action == "waiting"
+    assert provider.archive_calls == 1
 
 
 def test_final_chitra_write_failure_reconciles_without_second_archive(tmp_path: Path, monkeypatch: Any) -> None:
@@ -217,12 +278,12 @@ def test_final_chitra_write_failure_reconciles_without_second_archive(tmp_path: 
         return original_save(store, candidate, **kwargs)
 
     monkeypatch.setattr("chitra.recovery.RecoveryStateStore.save", fail_final_save)
-    first = RecoveryEngine(provider=provider, state_root=tmp_path).governed_close(record, now=NOW)
+    first = RecoveryEngine(provider=provider, state_root=tmp_path, goal_root=tmp_path).governed_close(record, now=NOW)
     persisted = RecoveryEngine(provider=provider, state_root=tmp_path).load("lane-a")
     assert first.action == "waiting"
     assert persisted is not None and persisted.pending_operation is not None
 
-    second = RecoveryEngine(provider=provider, state_root=tmp_path).governed_close(
+    second = RecoveryEngine(provider=provider, state_root=tmp_path, goal_root=tmp_path).governed_close(
         persisted, now=NOW.replace(minute=2)
     )
 
@@ -241,8 +302,90 @@ def test_close_rejects_provider_result_without_physical_binding(tmp_path: Path) 
         return original(request).model_copy(update={"provider_session_id": None})
 
     provider.close = missing_physical_session  # type: ignore[method-assign]
-    decision = RecoveryEngine(provider=provider, state_root=tmp_path).governed_close(record, now=NOW)
+    decision = RecoveryEngine(provider=provider, state_root=tmp_path, goal_root=tmp_path).governed_close(record, now=NOW)
 
     assert decision.action == "waiting"
     assert decision.record.pending_operation is not None
     assert "identity validation" in decision.reason
+
+
+def test_unknown_close_receipt_never_marks_the_lane_inactive(tmp_path: Path) -> None:
+    record = _record()
+    JoinedLaneStore(tmp_path).create(record)
+    _completion_gate(tmp_path, record)
+    provider = FakeProvider()
+    original = provider.close
+
+    def unknown_receipt(request: Any) -> CloseArchiveResult:
+        return original(request).model_copy(
+            update={
+                "state": "unknown",
+                "same_provider_thread": None,
+                "checkpoint_ref": None,
+                "quiescent": None,
+                "later_resume_supported": None,
+            }
+        )
+
+    provider.close = unknown_receipt  # type: ignore[method-assign]
+    decision = RecoveryEngine(provider=provider, state_root=tmp_path, goal_root=tmp_path).governed_close(record, now=NOW)
+
+    assert decision.action == "waiting"
+    assert decision.record.lifecycle == "active"
+
+
+def test_direct_close_requires_an_explicit_completion_goal_root(tmp_path: Path) -> None:
+    record = _record()
+    JoinedLaneStore(tmp_path).create(record)
+    _completion_gate(tmp_path, record)
+    provider = FakeProvider()
+
+    decision = RecoveryEngine(provider=provider, state_root=tmp_path).governed_close(record, now=NOW)
+
+    assert decision.action == "waiting"
+    assert "explicit completion goal root" in decision.reason
+    assert provider.archive_calls == 0
+
+
+def test_resume_after_close_restores_the_same_provider_session(tmp_path: Path) -> None:
+    record = _record()
+    JoinedLaneStore(tmp_path).create(record)
+    _completion_gate(tmp_path, record)
+    provider = FakeProvider()
+
+    closed = RecoveryEngine(provider=provider, state_root=tmp_path, goal_root=tmp_path).governed_close(record, now=NOW)
+    resumed = RecoveryEngine(provider=provider, state_root=tmp_path).resume_after_close(
+        closed.record, now=NOW.replace(minute=1)
+    )
+
+    assert closed.action == "closed"
+    assert resumed.action == "resumed"
+    assert resumed.record.lifecycle == "active"
+    assert resumed.record.last_close_result is None
+    assert resumed.record.provider.provider_session_id == "physical-session-a"
+    assert resumed.operation is not None and resumed.operation.kind == "create_or_resume"
+    assert provider.resume_calls == 1
+
+
+def test_resume_lost_reply_reuses_the_durable_operation_after_restart(tmp_path: Path) -> None:
+    record = _record()
+    JoinedLaneStore(tmp_path).create(record)
+    _completion_gate(tmp_path, record)
+    provider = FakeProvider(lose_first_resume_reply=True)
+
+    closed = RecoveryEngine(provider=provider, state_root=tmp_path, goal_root=tmp_path).governed_close(record, now=NOW)
+    first = RecoveryEngine(provider=provider, state_root=tmp_path).resume_after_close(
+        closed.record, now=NOW.replace(minute=1)
+    )
+    persisted = RecoveryEngine(provider=provider, state_root=tmp_path).load("lane-a")
+    assert first.action == "waiting"
+    assert persisted is not None and persisted.pending_operation is not None
+    operation_id = persisted.pending_operation.operation_id
+
+    second = RecoveryEngine(provider=provider, state_root=tmp_path).resume_after_close(
+        persisted, now=NOW.replace(minute=2)
+    )
+
+    assert second.action == "resumed"
+    assert second.operation is not None and second.operation.operation_id == operation_id
+    assert provider.resume_calls == 2

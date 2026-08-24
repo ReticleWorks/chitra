@@ -1406,7 +1406,10 @@ class JoinedLaneRecord(_ContractModel):
                 raise ValueError("Amp close must be represented as archived")
             if close_result.later_resume_supported is True and not self.provider.capabilities.resume_after_close:
                 raise ValueError("later_resume_supported requires resume_after_close capability")
-            if self.pending_operation is not None:
+            # A later resume has its own create_or_resume operation while the
+            # close receipt remains historical evidence until that explicit
+            # resume transition completes.
+            if self.pending_operation is not None and self.pending_operation.kind == "close":
                 validate_close_result(self.pending_operation, close_result)
             if close_result.operation_id not in history_ids:
                 raise ValueError("close operation must be retained in operation history")

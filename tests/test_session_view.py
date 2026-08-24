@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from chitra.session_contract import (
+    CloseArchiveResult,
     InterventionEvidence,
     JoinedLaneRecord,
     LaneUpdate,
@@ -132,6 +133,39 @@ def test_projection_joins_goal_roadmap_progress_owner_problems_and_next_check() 
     }
     assert payload["open_problems"][0]["id"] == "provider-latency"
     assert payload["resolved_problems"][0]["resolution"] == "Published a versioned update"
+
+
+def test_projection_reports_checkpoint_close_evidence_and_resume_state() -> None:
+    close = CloseArchiveResult(
+        operation_id="close-1",
+        lane_id="lane-a",
+        provider_handle="tophand-lane-a",
+        provider_instance_id="instance-a",
+        provider_generation=1,
+        idempotency_key="close-1-idem",
+        payload_digest="digest-close-1",
+        state="closed",
+        provider_thread_ref="tophand-lane-a",
+        provider_session_id="tophand:lane-a-1",
+        same_provider_thread=True,
+        later_resume_supported=True,
+        checkpoint_ref="checkpoint-a",
+        quiescent=True,
+        observed_at="2026-08-23T14:03:00+00:00",
+        evidence="archive receipt",
+    )
+    record = _record().model_copy(
+        update={"lifecycle": "inactive", "checkpoint_reference": "checkpoint-a", "last_close_result": close}
+    )
+
+    view = build_joined_session_view(record)
+    rendered = render_joined_session_view(view)
+
+    assert view.resume_state == "closed; same-session resume available"
+    assert view.close_evidence == close
+    assert view.to_dict()["checkpoint_reference"] == "checkpoint-a"
+    assert "Close evidence: closed" in rendered
+    assert "Resume state: closed; same-session resume available" in rendered
 
 
 def test_projection_keeps_progress_unknown_when_plan_assessment_is_missing() -> None:
