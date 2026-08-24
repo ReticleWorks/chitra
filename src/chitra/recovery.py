@@ -1262,7 +1262,7 @@ class RecoveryEngine:
                 kind=pending.kind,
                 lane_id=pending.lane_id,
                 provider_handle=pending.provider_handle,
-                provider_session_id=expected_session_id,
+                provider_session_id=update.provider_session_id,
                 process_start_token=pending.process_start_token,
                 idempotency_key=pending.idempotency_key,
                 payload_digest=pending.payload_digest,

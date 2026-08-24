@@ -16,6 +16,7 @@ waiting instead of guessing.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -25,6 +26,7 @@ from typing import Any, Protocol, cast
 import structlog
 
 from ._fsio import locked_json_store
+from .amp_capability import CapabilitySignatureVerifier, verify_amp_capability_receipt
 from .detect.rescue import RecoveryCheckpointBinding, find_recovery_checkpoint_receipt
 from .joined_lane import JoinedLaneStore
 from .journal import EventJournal
@@ -283,12 +285,19 @@ def _provider_result(
         expected = getattr(operation, field)
         if observed is not None and observed != expected:
             raise ValueError(f"{provider_label} provider result {field} changed")
-    observed_session = raw.get("provider_session_id")
-    if observed_session is not None and observed_session != operation.provider_session_id:
-        raise ValueError(f"{provider_label} provider result provider_session_id changed")
+    raw_provider_session_id = raw.get("provider_session_id")
+    if raw_provider_session_id is not None and (
+        not isinstance(raw_provider_session_id, str) or not raw_provider_session_id.strip()
+    ):
+        raise ValueError(f"{provider_label} provider result provider_session_id is malformed")
     status = raw.get("status")
     if status not in {"accepted", "consumed", "rejected", "unknown", "lost-response"}:
         status = "unknown"
+    if operation.provider_session_id is not None:
+        if raw_provider_session_id is not None and raw_provider_session_id != operation.provider_session_id:
+            raise ValueError(f"{provider_label} provider result provider_session_id changed")
+        if raw_provider_session_id is None and status not in {"unknown", "lost-response"}:
+            raise ValueError(f"{provider_label} provider result provider_session_id is missing")
     accepted: bool | None
     consumed: bool | None
     if status == "consumed":
@@ -329,13 +338,9 @@ def _provider_result(
         kind=operation.kind,
         lane_id=operation.lane_id,
         provider_handle=operation.provider_handle,
-        provider_session_id=(
-            raw.get("provider_session_id")
-            if isinstance(raw.get("provider_session_id"), str)
-            else operation.provider_session_id
-        ),
         idempotency_key=operation.idempotency_key,
         payload_digest=operation.payload_digest,
+        provider_session_id=raw_provider_session_id if isinstance(raw_provider_session_id, str) else None,
         provider_instance_id=operation.provider_instance_id,
         provider_generation=operation.provider_generation,
         process_start_token=(
@@ -499,6 +504,9 @@ class _PackagedTophandProvider:
             current_turn_id=current_turn_id if isinstance(current_turn_id, str) else None,
             last_event_id=last_event_id if isinstance(last_event_id, str) else None,
             reason=reason if isinstance(reason, str) else "",
+            provider_instance_id=(
+                raw.get("provider_instance_id") if isinstance(raw.get("provider_instance_id"), str) else None
+            ),
         )
 
     def send(self, request: SendRequest) -> ProviderOperationResult:
@@ -622,6 +630,8 @@ class _AmpRuntimeConfig:
     orb_size: str
     visibility: str
     fleet_enabled: bool
+    capability_receipt_digest: str
+    capability_receipt_expires_at: str
 
 
 def _amp_runtime_config(
@@ -630,6 +640,8 @@ def _amp_runtime_config(
     expected_project_ref: str,
     expected_profile_digest: str,
     expected_version: str,
+    capability_verifier: CapabilitySignatureVerifier | None = None,
+    now: datetime | None = None,
 ) -> _AmpRuntimeConfig | None:
     """Return the reviewed Amp binary and version from current Fleet facts.
 
@@ -707,6 +719,21 @@ def _amp_runtime_config(
             or surface.get("no_archive_after_execute") is not True
         ):
             return None
+        capability_receipt = surface.get("capability_probe")
+        verified_receipt = verify_amp_capability_receipt(
+            capability_receipt,
+            expected_binary=binary,
+            expected_version=version,
+            expected_project_ref=expected_project_ref,
+            expected_profile_digest=expected_profile_digest,
+            expected_orb_size=orb_size,
+            now=now,
+            signature_verifier=capability_verifier,
+        )
+        if verified_receipt is None:
+            # Fleet has not published a current, signed probe result.  The
+            # ordinary lane surface must remain unavailable.
+            return None
         candidates.add(
             _AmpRuntimeConfig(
                 binary=binary,
@@ -714,6 +741,8 @@ def _amp_runtime_config(
                 orb_size=orb_size,
                 visibility=visibility,
                 fleet_enabled=fleet_enabled,
+                capability_receipt_digest=verified_receipt.digest,
+                capability_receipt_expires_at=verified_receipt.expires_at,
             )
         )
     if len(candidates) != 1:
@@ -746,6 +775,11 @@ def _amp_usage_report(value: object, lane_reader: Callable[[], object]) -> Usage
     # The launch policy remains the only owner of any ceiling.
     raw.pop("usage_scope", None)
     raw.pop("ceiling", None)
+    # The pinned Amp version is checked by the adapter's runtime capability
+    # probe and retained in Chitra's typed usage evidence.
+    amp_version = raw.get("amp_version")
+    if not isinstance(amp_version, str) or not amp_version.strip():
+        raise ValueError("Amp usage report lacks its reviewed amp_version")
     expected = _amp_child_roster(lane_reader)
     observed = raw.get("child_roster", ())
     if not isinstance(observed, Sequence) or isinstance(observed, (str, bytes)):
@@ -754,20 +788,18 @@ def _amp_usage_report(value: object, lane_reader: Callable[[], object]) -> Usage
         isinstance(value, Mapping) and "retained_state" in value and "material_result" in value
         for value in observed
     ):
-        by_id = {entry.child_id: entry for entry in expected}
-        observed_ids = {
-            str(value.get("child_id", value.get("thread_id", value.get("id", ""))))
-            for value in observed
-            if isinstance(value, Mapping)
-        }
-        if observed_ids != set(by_id):
-            raise ValueError("Amp usage roster does not match Chitra's observed child roster")
-        raw["child_roster"] = [by_id[child_id].model_dump(mode="json") for child_id in sorted(by_id)]
+        raise ValueError("Amp usage roster lacks retained-state or material-result evidence")
     elif observed:
-        canonical = tuple(ChildRosterEntry.model_validate(value, strict=True) for value in observed)
-        if canonical != expected:
+        canonical = tuple(ChildRosterEntry.from_dict(value) for value in observed)
+        # A root ORB can retain a material built-in Task result without a
+        # durable provider child.  The adapter has already bound this
+        # synthetic roster to the lane and aggregate usage evidence.
+        inline_discovery = raw.get("child_evidence_mode") == "inline" and not expected
+        if not inline_discovery and canonical != expected:
             raise ValueError("Amp usage changed Chitra's child roster evidence")
         raw["child_roster"] = [entry.model_dump(mode="json") for entry in canonical]
+    elif raw.get("child_evidence_mode") == "inline" and raw.get("complete") is True:
+        raise ValueError("complete inline Amp usage omitted its material child result")
     elif expected and raw.get("complete") is True:
         raise ValueError("complete Amp usage omitted Chitra's observed child roster")
     return UsageReport.from_dict(raw)
@@ -820,6 +852,13 @@ def _amp_close_result(
         expected = getattr(operation, field)
         if observed is not None and observed != expected:
             return _unknown_close_result(operation, f"Amp close result {field} changed")
+    raw_provider_session_id = raw.get("provider_session_id")
+    if raw_provider_session_id is not None and (
+        not isinstance(raw_provider_session_id, str) or not raw_provider_session_id.strip()
+    ):
+        return _unknown_close_result(operation, "Amp close result provider_session_id is malformed")
+    if operation.provider_session_id is not None and raw_provider_session_id != operation.provider_session_id:
+        return _unknown_close_result(operation, "Amp close result provider_session_id changed or is missing")
     state = raw.get("state")
     if state not in {"closed", "archived", "unknown", "failed"}:
         return _unknown_close_result(operation, "Amp close result state is unknown")
@@ -845,12 +884,17 @@ def _amp_close_result(
         or provider_thread_ref != operation.provider_handle
         or same_provider_thread is not True
         or quiescent is not True
+        or later_resume_supported is not True
     ):
-        return _unknown_close_result(operation, "Amp archive did not prove Chitra's governed close conditions")
+        return _unknown_close_result(
+            operation,
+            "Amp archive did not prove Chitra's governed close conditions and later resume",
+        )
     return CloseArchiveResult(
         operation_id=operation.operation_id,
         lane_id=operation.lane_id,
         provider_handle=operation.provider_handle,
+        provider_session_id=raw_provider_session_id if isinstance(raw_provider_session_id, str) else None,
         provider_instance_id=provider_instance_id,
         provider_generation=provider_generation,
         idempotency_key=operation.idempotency_key,
@@ -864,6 +908,22 @@ def _amp_close_result(
         observed_at=observed_at,
         evidence=evidence,
     )
+
+
+def _session_update_payload(item: Mapping[str, object]) -> object | None:
+    """Return one lane snapshot nested in a normalized Amp event, if any."""
+
+    for key in ("session_update", "update", "lane_update"):
+        value = item.get(key)
+        if value is not None:
+            return value
+    payload = item.get("payload")
+    if isinstance(payload, Mapping):
+        for key in ("session_update", "lane_update"):
+            value = payload.get(key)
+            if value is not None:
+                return value
+    return None
 
 
 class _PackagedAmpProvider:
@@ -883,12 +943,14 @@ class _PackagedAmpProvider:
         cursor_sink: RecoverySink,
         lane_reader: Callable[[], object],
         operating_facts_binding: OperatingFactsBinding | None = None,
+        update_batch_sink: Callable[[Sequence[object], str], object | None] | None = None,
     ) -> None:
         self._adapter = adapter
         self._result_sink = result_sink
         self._cursor_sink = cursor_sink
         self._lane_reader = lane_reader
         self._operating_facts_binding = operating_facts_binding
+        self._update_batch_sink = update_batch_sink
 
     def _require_current_facts(self) -> None:
         if not _facts_binding_current(self._operating_facts_binding):
@@ -967,6 +1029,9 @@ class _PackagedAmpProvider:
             current_turn_id=current_turn_id if isinstance(current_turn_id, str) else None,
             last_event_id=last_event_id if isinstance(last_event_id, str) else None,
             reason=reason if isinstance(reason, str) else "",
+            provider_instance_id=(
+                raw.get("provider_instance_id") if isinstance(raw.get("provider_instance_id"), str) else None
+            ),
         )
 
     def send(self, request: SendRequest) -> ProviderOperationResult:
@@ -981,13 +1046,19 @@ class _PackagedAmpProvider:
         if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
             raise TypeError("Amp updates must be a sequence")
         updates: list[ProviderUpdate] = []
+        session_updates: list[object] = []
         for value in values:
             item = _mapping(value, "Amp update")
+            session_update = _session_update_payload(item)
             required = tuple(item.get(name) for name in ("operation_id", "event_id", "cursor"))
             if not all(isinstance(field, str) and field for field in required):
+                if session_update is not None:
+                    raise ValueError("Amp session update envelope is malformed")
                 continue
             generation = item.get("provider_generation", 0)
             if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+                if session_update is not None:
+                    raise ValueError("Amp session update envelope is malformed")
                 continue
             identity = tuple(
                 item.get(name)
@@ -1000,10 +1071,14 @@ class _PackagedAmpProvider:
                 )
             )
             if not all(isinstance(field, str) and field for field in identity):
+                if session_update is not None:
+                    raise ValueError("Amp session update envelope is malformed")
                 continue
             payload = item.get("payload", {})
             if not isinstance(payload, Mapping):
                 payload = {}
+            if session_update is not None:
+                session_updates.append(session_update)
             observed_at = item.get("observed_at")
             if not isinstance(observed_at, str) or not observed_at:
                 observed_at = _now()
@@ -1027,7 +1102,14 @@ class _PackagedAmpProvider:
             )
         next_cursor = raw.get("next_cursor", raw.get("cursor"))
         next_cursor_text = next_cursor if isinstance(next_cursor, str) else cursor or ""
-        self._cursor_sink(next_cursor_text)
+        if self._update_batch_sink is not None:
+            # Chitra commits every lane snapshot and the cursor as one state
+            # transition.  The adapter callback is intentionally not used on
+            # this production route: a malformed later snapshot must not
+            # leave an earlier snapshot durable with the old cursor.
+            self._update_batch_sink(tuple(session_updates), next_cursor_text)
+        else:
+            self._cursor_sink(next_cursor_text)
         reason = raw.get("reason")
         return ReadUpdatesResult(
             requested_cursor=cursor,
@@ -1174,6 +1256,7 @@ def _canonical_amp_factory(
     facts_reader: RecoveryFactsReader,
     operating_facts: tuple[OperatingFact, ...],
     operating_facts_binding: OperatingFactsBinding | None,
+    amp_capability_verifier: CapabilitySignatureVerifier | None = None,
 ) -> Provider | None:
     """Build the one static Amp route after Chitra's launch-policy gate."""
 
@@ -1205,6 +1288,7 @@ def _canonical_amp_factory(
         expected_project_ref=policy.project_ref,
         expected_profile_digest=policy.profile_digest,
         expected_version=identity.provider_version,
+        capability_verifier=amp_capability_verifier,
     )
     if runtime is None:
         return None
@@ -1212,8 +1296,6 @@ def _canonical_amp_factory(
     amp_version = runtime.version
 
     store = JoinedLaneStore(state_root)
-    initial_facts = tuple(operating_facts)
-
     def lane_reader() -> dict[str, object]:
         current = store.load(lane.identifier) or record
         current_facts = tuple(facts_reader(current))
@@ -1247,8 +1329,6 @@ def _canonical_amp_factory(
             "observed_at": update.observed_at if update is not None else _now(),
             "operating_facts": tuple(fact.model_dump(mode="json") for fact in current_facts),
         }
-        if not current_facts and initial_facts:
-            context["operating_facts"] = tuple(fact.model_dump(mode="json") for fact in initial_facts)
         return context
 
     try:
@@ -1265,6 +1345,9 @@ def _canonical_amp_factory(
             profile,
             amp_binary=amp_binary,
             amp_version=amp_version,
+            reviewed_subagents=True,
+            capability_receipt_digest=runtime.capability_receipt_digest,
+            capability_receipt_expires_at=runtime.capability_receipt_expires_at,
         )
         adapter = _packaged_amp_adapter(
             transport=transport,
@@ -1275,7 +1358,6 @@ def _canonical_amp_factory(
             anchor_thread_id=identity.parent_thread_ref,
             lane_reader=lane_reader,
             amp_version=amp_version,
-            update_sink=_canonical_update_sink(lane),
         )
     except Exception as exc:  # noqa: BLE001 - unavailable provider is canonical unknown
         logger.warning("packaged_amp_unavailable", lane_id=record.lane_id, error=str(exc))
@@ -1288,8 +1370,37 @@ def _canonical_amp_factory(
         cursor_sink=cursor_sink,
         lane_reader=lane_reader,
         operating_facts_binding=operating_facts_binding,
+        update_batch_sink=_canonical_update_batch_sink(lane),
     )
     return provider if isinstance(provider, Provider) else None
+
+
+def _cursor_is_not_older(previous: str, current: str) -> bool:
+    if not previous:
+        return True
+    if not current:
+        return False
+    pattern = re.compile(
+        r"^amp:(?P<thread>[^:]+):offset:(?P<offset>[0-9]+):"
+        r"boundary:(?P<boundary>[^:]+):prefix:(?P<prefix>[0-9a-f]{64})$"
+    )
+    previous_match = pattern.match(previous)
+    current_match = pattern.match(current)
+    if current_match is None:
+        # An opaque initial cursor may be accepted once.  A bound Amp cursor
+        # may never be replaced by malformed or replay-shaped text.
+        return previous_match is None
+    if previous_match is None:
+        return True
+    if previous_match.group("thread") != current_match.group("thread"):
+        return False
+    previous_offset = int(previous_match.group("offset"))
+    current_offset = int(current_match.group("offset"))
+    if current_offset < previous_offset:
+        return False
+    if current_offset == previous_offset:
+        return current == previous
+    return True
 
 
 def _canonical_recovery_bindings(
@@ -1315,6 +1426,8 @@ def _canonical_recovery_bindings(
         def apply(current: JoinedLaneRecord) -> JoinedLaneRecord:
             if current.update_cursor == cursor:
                 return current
+            if not _cursor_is_not_older(current.update_cursor, cursor):
+                raise ValueError("provider cursor regressed or changed its Amp thread")
             return current.model_copy(update={"update_cursor": cursor})
 
         store.update(lane.identifier, apply)
@@ -1414,11 +1527,12 @@ def _canonical_update_sink(lane: LaneSpec) -> RecoverySink:
     store = JoinedLaneStore(lane.state_dir)
 
     def update_sink(value: object) -> None:
-        update = LaneUpdate.from_dict(value)
+        raw = _mapping(value, "provider session update")
+        nested = raw.get("update")
+        update = LaneUpdate.from_dict(nested if isinstance(nested, Mapping) else raw)
 
         def apply(current: JoinedLaneRecord) -> JoinedLaneRecord:
-            if update.lane_id != current.lane_id or update.goal_id != current.goal_id:
-                raise ValueError("provider session update identity changed")
+            _validate_lane_update_identity(current, update)
             if current.current_update is not None:
                 validate_update(current.current_update, update)
             return current.model_copy(update={"current_update": update})
@@ -1426,6 +1540,44 @@ def _canonical_update_sink(lane: LaneSpec) -> RecoverySink:
         store.update(lane.identifier, apply)
 
     return update_sink
+
+
+def _validate_lane_update_identity(current: JoinedLaneRecord, update: LaneUpdate) -> None:
+    expected = (current.lane_id, current.goal_id, current.session_ref, current.goal_version)
+    observed = (update.lane_id, update.goal_id, update.session_ref, update.goal_version)
+    if observed != expected:
+        raise ValueError("provider session update identity changed")
+
+
+def _canonical_update_batch_sink(lane: LaneSpec) -> Callable[[Sequence[object], str], None]:
+    """Atomically persist a complete Amp snapshot batch and its cursor."""
+
+    store = JoinedLaneStore(lane.state_dir)
+
+    def update_batch_sink(values: Sequence[object], cursor: str) -> None:
+        if not isinstance(cursor, str):
+            raise TypeError("provider cursor must be text")
+        # Parse every snapshot before opening the state transition.  A later
+        # malformed snapshot therefore cannot leave an earlier one durable.
+        updates = tuple(LaneUpdate.from_dict(value) for value in values)
+
+        def apply(current: JoinedLaneRecord) -> JoinedLaneRecord:
+            if not _cursor_is_not_older(current.update_cursor, cursor):
+                raise ValueError("provider cursor regressed or changed its Amp thread")
+            previous = current.current_update
+            for update in updates:
+                _validate_lane_update_identity(current, update)
+                if previous is not None:
+                    validate_update(previous, update)
+                previous = update
+            changes: dict[str, object] = {"update_cursor": cursor}
+            if updates:
+                changes["current_update"] = updates[-1]
+            return current.model_copy(update=changes)
+
+        store.update(lane.identifier, apply)
+
+    return update_batch_sink
 
 
 def _factory_map(
@@ -1458,6 +1610,7 @@ def build_recovery_provider_resolver(
     facts_reader: RecoveryFactsReader | None = None,
     operating_facts_reader: RecoveryFactsReader | None = None,
     operating_facts_sources: OperatingFactsSources | None = None,
+    amp_capability_verifier: CapabilitySignatureVerifier | None = None,
 ) -> RecoveryProviderResolver:
     """Build a fail-closed resolver for one rendered lane.
 
@@ -1498,7 +1651,14 @@ def build_recovery_provider_resolver(
             cancel_verifier,
         ) = _canonical_recovery_bindings(lane)
         tophand_factory = _canonical_tophand_factory
-        amp_factory = _canonical_amp_factory
+
+        def packaged_amp_factory(**kwargs: object) -> Provider | None:
+            return _canonical_amp_factory(
+                **cast(dict[str, Any], kwargs),
+                amp_capability_verifier=amp_capability_verifier,
+            )
+
+        amp_factory = cast(RecoveryProviderFactory, packaged_amp_factory)
 
     factories = _factory_map(
         tophand_factory=tophand_factory,

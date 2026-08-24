@@ -630,6 +630,77 @@ def test_usage_must_match_update_roster_and_parent_ancestry() -> None:
         validate_usage_against_lane(update, report.model_copy(update={"child_roster": ()}))
 
 
+def test_inline_usage_binds_material_result_to_cursor_and_exact_aggregate() -> None:
+    cursor = "amp:T-11111111-1111-4111-8111-111111111111:offset:3:boundary:M-2:prefix:" + "a" * 64
+    child = ChildRosterEntry(
+        child_id="inline-child-1",
+        parent_id="lane-a",
+        ancestry=("lane-a", "inline-child-1"),
+        retained_state="retained",
+        material_result=True,
+        material_result_ref="sha256:" + "b" * 64,
+        transcript_cursor=cursor,
+    )
+    report = UsageReport(
+        parent={"name": "lane-a", "amount": 9, "unit": "tokens"},
+        children=(),
+        child_roster=(child,),
+        child_roster_complete=True,
+        child_roster_evidence="T-11111111-1111-4111-8111-111111111111",
+        total={"name": "total", "amount": 9, "unit": "tokens"},
+        evidence_source="amp-thread-usage",
+        observed_at="2026-08-23T14:00:00+00:00",
+        complete=True,
+        child_evidence_mode="inline",
+        usage_evidence_hash="sha256:" + "c" * 64,
+    )
+    assert report.to_dict()["child_evidence_mode"] == "inline"
+    assert report.to_dict()["child_roster"][0]["transcript_cursor"] == cursor
+    validate_usage_against_lane(_update(), report)
+
+    with pytest.raises(ValueError, match="aggregate usage evidence hash"):
+        invalid = report.model_dump(mode="python")
+        invalid["usage_evidence_hash"] = None
+        UsageReport.model_validate(
+            invalid,
+            strict=True,
+        )
+
+
+def test_orb_child_identity_and_reviewed_version_round_trip() -> None:
+    child = ChildRosterEntry(
+        child_id="inline-child-2",
+        parent_id="lane-a",
+        ancestry=("lane-a", "inline-child-2"),
+        retained_state="retained",
+        material_result=True,
+        material_result_ref="sha256:" + "d" * 64,
+        transcript_cursor="amp:T-2:offset:2:boundary:M-2:prefix:" + "e" * 64,
+        provider_handle="T-2",
+        provider_session_id="T-2",
+        provider_instance_id="amp-instance-2",
+        provider_generation=3,
+    )
+    report = UsageReport(
+        parent={"name": "lane-a", "amount": 2, "unit": "tokens"},
+        children=(),
+        child_roster=(child,),
+        child_roster_complete=True,
+        child_roster_evidence="T-2",
+        total={"name": "total", "amount": 2, "unit": "tokens"},
+        evidence_source="amp-thread-usage",
+        observed_at="2026-08-23T14:00:00+00:00",
+        complete=True,
+        child_evidence_mode="inline",
+        usage_evidence_hash="sha256:" + "f" * 64,
+        amp_version="0.0.reviewed",
+    )
+    serialized = report.to_dict()
+    assert serialized["amp_version"] == "0.0.reviewed"
+    assert serialized["child_roster"][0]["provider_instance_id"] == "amp-instance-2"
+    assert UsageReport.from_dict(serialized) == report
+
+
 def test_provider_fences_unknown_identity_and_capability_bound_operations() -> None:
     unknown = ProviderIdentity(kind="tophand", handle="thread-a", capabilities=ProviderCapabilities())
     assert unknown.instance_id is None and unknown.generation is None

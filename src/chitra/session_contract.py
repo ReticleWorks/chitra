@@ -289,6 +289,17 @@ class ChildRosterEntry(_ContractModel):
     retained_state: ChildRetention
     material_result: bool
     material_result_ref: Text | None = None
+    # The provider transcript position that proves the result.  Older
+    # Tophand/Amp records did not carry this field, so the default is omitted
+    # from their serialized form; a newly observed ORB child must carry it.
+    transcript_cursor: Text | None = Field(default=None, exclude_if=lambda value: value is None)
+    # ORB child evidence must retain the physical identity observed by the
+    # adapter.  These are optional for legacy Tophand records, but a newly
+    # observed ORB child carries all four values.
+    provider_handle: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
+    provider_session_id: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
+    provider_instance_id: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
+    provider_generation: int | None = Field(default=None, ge=1, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def validate_observation(self) -> Self:
@@ -297,6 +308,13 @@ class ChildRosterEntry(_ContractModel):
         if self.material_result and self.material_result_ref is None:
             raise ValueError("material child result requires material_result_ref")
         return self
+
+    @field_validator("provider_generation")
+    @classmethod
+    def reject_bool_provider_generation(cls, value: int | None) -> int | None:
+        if isinstance(value, bool):
+            raise ValueError("provider_generation must be an integer")
+        return value
 
 
 class LaneUpdate(_ContractModel):
@@ -783,10 +801,9 @@ class ProviderOperationResult(_ContractModel):
     kind: OperationKind
     lane_id: Identifier
     provider_handle: Identifier
-    # The physical provider session is separate from the operation handle.
-    # It is optional on legacy observations, but a new launch result must
-    # carry it so Chitra can prove that the returned lane is the enrolled one.
-    provider_session_id: Identifier | None = None
+    # This value must come from the raw provider result or event.  Recovery
+    # must never manufacture it from the pending operation.
+    provider_session_id: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
     process_start_token: Identifier | None = None
     idempotency_key: Identifier
     payload_digest: Text
@@ -893,6 +910,16 @@ def validate_operation_result(pending: PendingProviderOperation, result: Provide
         errors.append("idempotency key changed")
     if pending.payload_digest != result.payload_digest:
         errors.append("payload digest changed")
+    # A legacy pending envelope may not have persisted the physical session.
+    # In that case a raw result may newly supply it.  Once the pending record
+    # has one, the result must carry the same value; it is never copied into
+    # a result by this validator.
+    if (
+        pending.provider_session_id is not None
+        and result.provider_session_id is not None
+        and pending.provider_session_id != result.provider_session_id
+    ):
+        errors.append("provider session changed")
     if pending.provider_instance_id != result.provider_instance_id:
         errors.append("provider instance changed")
     if pending.provider_generation != result.provider_generation:
@@ -917,12 +944,23 @@ def validate_close_result(pending: PendingProviderOperation, result: CloseArchiv
         "operation_id",
         "lane_id",
         "provider_handle",
+        "provider_session_id",
         "provider_instance_id",
         "provider_generation",
         "idempotency_key",
         "payload_digest",
     )
     for field in fields:
+        if (
+            field == "provider_session_id"
+            and (
+                pending.provider_session_id is None
+                or (result.provider_session_id is None and result.state in {"unknown", "failed"})
+            )
+        ):
+            # Legacy pending records may gain a raw session on close. Unknown
+            # close evidence deliberately carries no physical session claim.
+            continue
         if getattr(pending, field) != getattr(result, field):
             errors.append(f"{field} changed")
     pending_time = datetime.fromisoformat(pending.created_at.replace("Z", "+00:00"))
@@ -1168,6 +1206,16 @@ class UsageReport(_ContractModel):
     observed_at: Timestamp
     complete: bool
     ceiling: int | float | None = Field(default=None, ge=0)
+    # Durable child usage has one component per child.  An inline ORB child
+    # has no provider thread, so the exact parent aggregate is reported while
+    # its material result remains in the typed roster.
+    child_evidence_mode: Literal["durable", "inline"] = Field(
+        default="durable", exclude_if=lambda value: value == "durable"
+    )
+    usage_evidence_hash: Sha256Digest | None = Field(default=None, exclude_if=lambda value: value is None)
+    # Keep the exact provider version alongside usage evidence.  Fleet binds
+    # this to the reviewed capability receipt; Chitra does not guess it.
+    amp_version: Text | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @field_validator("observed_at")
     @classmethod
@@ -1190,12 +1238,16 @@ class UsageReport(_ContractModel):
         if len(roster_ids) != len(set(roster_ids)):
             raise ValueError("child roster IDs must be unique")
         child_names = set(child.name for child in self.children)
-        if set(roster_ids) != child_names:
+        if self.child_evidence_mode == "durable" and set(roster_ids) != child_names:
             raise ValueError("child roster must identify every reported child exactly once")
+        if self.child_evidence_mode == "inline" and child_names:
+            raise ValueError("inline child evidence cannot invent a per-child usage component")
         if any(entry.parent_id != self.parent.name for entry in self.child_roster):
             raise ValueError("child roster parent_id must match the usage parent name")
         if self.complete and (not self.child_roster_complete or self.child_roster_evidence is None):
             raise ValueError("complete usage requires an observed child roster and evidence")
+        if self.complete and self.child_evidence_mode == "inline" and self.usage_evidence_hash is None:
+            raise ValueError("complete inline usage requires an exact aggregate usage evidence hash")
         units = {self.parent.unit, *(child.unit for child in self.children), self.total.unit}
         if len(units) != 1:
             raise ValueError("parent, child, and total usage units must match")
@@ -1228,8 +1280,18 @@ def validate_usage_against_lane(update: LaneUpdate, report: UsageReport) -> None
         raise ContractValidationError(f"usage report failed strict round-trip validation: {exc}") from exc
     expected = {entry.child_id: entry for entry in update.child_roster}
     observed = {entry.child_id: entry for entry in report.child_roster}
-    if set(expected) != set(observed):
+    # A built-in ORB Task can leave no durable provider child.  In that case
+    # the usage readback is the first canonical observation of its synthetic
+    # inline result.  Durable child evidence still has to match the lane
+    # update exactly.
+    inline_discovery = report.child_evidence_mode == "inline" and not expected
+    if not inline_discovery and set(expected) != set(observed):
         raise ContractValidationError("usage child roster does not exactly cover the lane update roster")
+    if inline_discovery:
+        for child_id, observed_entry in observed.items():
+            if observed_entry.parent_id != update.lane_id or observed_entry.ancestry[0] != update.lane_id:
+                raise ContractValidationError(f"inline child {child_id} ancestry is not rooted at the lane")
+        return
     for child_id, expected_entry in expected.items():
         if observed[child_id] != expected_entry:
             raise ContractValidationError(f"usage child roster evidence changed for {child_id}")
@@ -1259,6 +1321,7 @@ class CloseArchiveResult(_ContractModel):
     operation_id: Identifier
     lane_id: Identifier
     provider_handle: Identifier
+    provider_session_id: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
     provider_instance_id: Identifier
     provider_generation: int = Field(ge=1)
     idempotency_key: Identifier

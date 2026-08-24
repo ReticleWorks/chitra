@@ -307,12 +307,18 @@ class ProviderStatus:
     current_turn_id: str | None = None
     last_event_id: str | None = None
     reason: str = ""
+    # Physical provider instance identity is separate from the logical
+    # session and generation.  Older status adapters may omit it; mutation
+    # results and operation markers still require it when the provider can
+    # supply it.
+    provider_instance_id: str | None = None
 
     def __post_init__(self) -> None:
         _required_text(str(self.provider), "provider")
         if isinstance(self.generation, bool) or self.generation < 0:
             raise ValueError("generation must be a non-negative integer")
         _optional_text(self.provider_session_id, "provider_session_id")
+        _optional_text(self.provider_instance_id, "provider_instance_id")
         _optional_text(self.current_turn_id, "current_turn_id")
         _optional_text(self.last_event_id, "last_event_id")
 

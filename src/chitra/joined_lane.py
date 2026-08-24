@@ -589,6 +589,7 @@ class ProviderObservation:
     operation_id: str
     lane_id: str
     provider_handle: str
+    provider_session_id: str | None
     provider_instance_id: str
     provider_generation: int
     evidence: str
@@ -607,6 +608,7 @@ class ProviderObservation:
             operation_id=result.operation_id,
             lane_id=result.lane_id,
             provider_handle=result.provider_handle,
+            provider_session_id=result.provider_session_id,
             provider_instance_id=instance_id,
             provider_generation=generation,
             evidence=result.evidence,
@@ -639,6 +641,7 @@ class ProviderObservation:
             operation_id=update.operation_id,
             lane_id=update.lane_id,
             provider_handle=provider_handle,
+            provider_session_id=update.provider_session_id,
             provider_instance_id=instance_id,
             provider_generation=generation,
             evidence=update.event_id,
@@ -934,6 +937,7 @@ class JoinedLaneReconciler:
             kind=pending.kind,
             lane_id=pending.lane_id,
             provider_handle=pending.provider_handle,
+            provider_session_id=observation.provider_session_id,
             idempotency_key=pending.idempotency_key,
             payload_digest=pending.payload_digest,
             provider_instance_id=pending.provider_instance_id,

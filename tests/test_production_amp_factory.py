@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from _amp_capability_fixtures import hmac_capability_verifier, sign_amp_capability_receipt
 from _goal_fixtures import enrollment_fields
 
 import chitra.recovery as recovery
@@ -30,8 +31,10 @@ from chitra.provider_protocol import (
 )
 from chitra.recovery_provider import (
     _canonical_recovery_bindings,
+    _canonical_update_batch_sink,
     _PackagedAmpProvider,
     _PackagedTophandProvider,
+    _provider_result,
     build_recovery_provider_resolver,
 )
 from chitra.operating_facts import OperatingFactsBinding
@@ -50,6 +53,7 @@ from chitra.session_contract import (
 NOW = datetime(2026, 8, 23, 15, tzinfo=UTC)
 PROFILE_DIGEST = "sha256:" + "a" * 64
 AMP_VERSION = "0.0.1787241916-g56aafe"
+CAPABILITY_KEY = b"test-amp-capability-key"
 CAPABILITIES: tuple[CapabilityName, ...] = (
     "create_or_resume",
     "status",
@@ -60,6 +64,7 @@ CAPABILITIES: tuple[CapabilityName, ...] = (
     "cancel_current_turn",
     "close",
     "resume_after_close",
+    "subagents",
     "parent_child_usage",
 )
 
@@ -149,6 +154,41 @@ def _operation(kind: str, *, operation_id: str = "operation-1") -> PendingProvid
 
 
 def _amp_facts(record: JoinedLaneRecord) -> tuple[OperatingFact, ...]:
+    current = datetime.now(UTC)
+    receipt = sign_amp_capability_receipt(
+        {
+            "schema": "chitra.amp-capability-probe.v1",
+            "probe_id": "fixture-probe",
+            "operation_id": "capability-probe:fixture-probe",
+            "lane_id": "capability-probe:fixture-probe",
+            "goal_id": "chitra-amp-capability-probe",
+            "goal_version": 1,
+            "session_ref": "chitra:amp-capability-probe:fixture-probe",
+            "amp_binary": "/usr/local/bin/amp",
+            "amp_version": record.provider.provider_version,
+            "project_ref": record.provider.project_ref,
+            "profile_digest": record.provider.profile_digest,
+            "orb_size": "a1.tiny",
+            "visibility": "private",
+            "root_thread_id": "T-11111111-1111-4111-8111-111111111111",
+            "child_id": "inline:fixture-child",
+            "child_evidence_mode": "inline",
+            "transcript_cursor": "amp:T-11111111-1111-4111-8111-111111111111:offset:1:boundary:M:prefix:" + "a" * 64,
+            "usage_evidence_hash": "sha256:" + "b" * 64,
+            "result_digest": "sha256:" + "c" * 64,
+            "containment_proof": {
+                "schema": "chitra.amp-linux-containment.v1",
+                "platform": "linux",
+                "address_space_limit_bytes": 2 * 1024 * 1024 * 1024,
+                "process_group_killed": True,
+                "escaped_descendant_killed": True,
+            },
+            "created_at": (current - timedelta(minutes=1)).isoformat(),
+            "expires_at": (current + timedelta(minutes=59)).isoformat(),
+        },
+        signature_key_id="test-key-1",
+        key=CAPABILITY_KEY,
+    )
     return (
         OperatingFact(
             name="fleet.provider-capabilities",
@@ -167,6 +207,7 @@ def _amp_facts(record: JoinedLaneRecord) -> tuple[OperatingFact, ...]:
                     "visibility": "private",
                     "orb_size": "a1.tiny",
                     "no_archive_after_execute": True,
+                    "capability_probe": receipt,
                 },
             },
             state="known",
@@ -174,7 +215,7 @@ def _amp_facts(record: JoinedLaneRecord) -> tuple[OperatingFact, ...]:
             revision="amp-runtime-1",
             observed_at=NOW.isoformat(),
             freshness="current",
-            fresh_until=(NOW + timedelta(days=1)).isoformat(),
+            fresh_until=(current + timedelta(days=1)).isoformat(),
             within_authority=True,
         ),
     )
@@ -243,7 +284,21 @@ def _resolver(lane: LaneSpec, record: JoinedLaneRecord) -> recovery.RecoveryProv
     return build_recovery_provider_resolver(
         lane,
         facts_reader=lambda _record: _amp_facts(record),
+        amp_capability_verifier=hmac_capability_verifier(CAPABILITY_KEY),
     )
+
+
+def _fact_with_receipt(record: JoinedLaneRecord, receipt: dict[str, object]) -> OperatingFact:
+    source = _amp_facts(record)[0]
+    value = cast(dict[str, object], source.value)
+    surface = cast(dict[str, object], value["orb_lane_surface"])
+    return source.model_copy(update={"value": {**value, "orb_lane_surface": {**surface, "capability_probe": receipt}}})
+
+
+def _resigned_receipt(receipt: dict[str, object], **changes: object) -> dict[str, object]:
+    unsigned = {key: value for key, value in receipt.items() if key not in {"digest", "signature"}}
+    unsigned.update(changes)
+    return sign_amp_capability_receipt(unsigned, signature_key_id="test-key-1", key=CAPABILITY_KEY)
 
 
 class _AmpProfile:
@@ -257,7 +312,7 @@ class _AmpProfile:
 
 class _AmpTransport:
     calls: list[tuple[object, dict[str, object]]] = []
-    capabilities = {name: True for name in CAPABILITIES} | {"subagents": False}
+    capabilities = {name: True for name in CAPABILITIES}
 
     def __init__(self, profile: object, **kwargs: object) -> None:
         self.calls.append((profile, kwargs))
@@ -295,6 +350,7 @@ class _AmpAdapter:
         return {
             "provider": "amp",
             "provider_session_id": "amp-thread-a",
+            "provider_instance_id": self.kwargs.get("provider_instance_id", "amp-instance-a"),
             "state": "idle",
             "generation": 1,
             "fresh": True,
@@ -323,6 +379,7 @@ class _AmpAdapter:
             "child_roster": [],
             "child_roster_complete": True,
             "child_roster_evidence": "amp-roster",
+            "amp_version": self.kwargs.get("amp_version", AMP_VERSION),
             "total": {"name": "total", "amount": 1, "unit": "usd"},
             "evidence_source": "amp-fixture",
             "observed_at": NOW.isoformat(),
@@ -348,6 +405,21 @@ class _AmpAdapter:
             "observed_at": NOW.isoformat(),
             "evidence": "post-archive export proves same thread and quiescence",
         }
+
+
+def test_packaged_result_keeps_raw_provider_session_and_rejects_missing_session() -> None:
+    operation = _operation("send").model_copy(update={"provider_session_id": "amp-session-a"})
+    raw = {
+        **operation.model_dump(mode="json"),
+        "provider_session_id": "amp-session-a",
+        "status": "consumed",
+        "observed_at": NOW.isoformat(),
+        "evidence": "raw provider result",
+    }
+    result = _provider_result(raw, operation, provider_label="Amp")
+    assert result.provider_session_id == "amp-session-a"
+    with pytest.raises(ValueError, match="provider_session_id is missing"):
+        _provider_result({key: value for key, value in raw.items() if key != "provider_session_id"}, operation)
 
 
 class _ArchiveTransport:
@@ -383,6 +455,29 @@ def _install_amp_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(module, "_packaged_amp_profile", _AmpProfile, raising=True)
     monkeypatch.setattr(module, "_packaged_amp_transport", _AmpTransport, raising=True)
     monkeypatch.setattr(module, "_packaged_amp_adapter", _AmpAdapter, raising=True)
+
+
+def test_amp_factory_invokes_the_real_adapter_constructor_with_update_sink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shipped Chitra factory must exercise the actual Adapter signature."""
+
+    import chitra.recovery_provider as module
+
+    if module._packaged_amp_adapter is None:
+        pytest.skip("Polyphony Adapter package is not importable in this source-only environment")
+    assert getattr(module._packaged_amp_adapter, "__module__", "") != __name__
+    monkeypatch.setattr(module, "_packaged_amp_profile", _AmpProfile, raising=True)
+    monkeypatch.setattr(module, "_packaged_amp_transport", _AmpTransport, raising=True)
+    lane = _lane(tmp_path)
+    record = _record(lane)
+
+    provider = _resolver(lane, record)(record)
+
+    assert provider is not None
+    adapter = provider._adapter
+    assert adapter.__class__.__module__ != __name__
+    assert callable(adapter.update_sink)
 
 
 def test_amp_factory_is_disabled_without_explicit_launch_policy(
@@ -427,6 +522,86 @@ def test_amp_factory_rejects_missing_or_mismatched_twinridge_runtime_fact(
     assert _AmpProfile.calls == []
     assert _AmpTransport.calls == []
     assert _AmpAdapter.calls == []
+
+
+def test_amp_factory_requires_authoritative_signed_probe_before_lane_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first ordinary lane cannot bypass the disposable capability probe."""
+
+    _install_amp_fakes(monkeypatch)
+    lane = _lane(tmp_path)
+    record = _record(lane)
+    source = _amp_facts(record)[0]
+    value = cast(dict[str, object], source.value)
+    surface = cast(dict[str, object], value["orb_lane_surface"])
+    surface_without_probe = {key: item for key, item in surface.items() if key != "capability_probe"}
+    missing = source.model_copy(update={"value": {**value, "orb_lane_surface": surface_without_probe}})
+    resolver = build_recovery_provider_resolver(
+        lane,
+        facts_reader=lambda _record: (missing,),
+        amp_capability_verifier=hmac_capability_verifier(CAPABILITY_KEY),
+    )
+
+    assert resolver(record) is None
+    assert _AmpProfile.calls == []
+    assert _AmpTransport.calls == []
+    assert _AmpAdapter.calls == []
+
+
+@pytest.mark.parametrize("failure", ("stale", "version", "tampered", "no-verifier"))
+def test_amp_factory_rejects_stale_drift_or_tampered_probe_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """Restarted construction accepts only the same current, signed proof."""
+
+    _install_amp_fakes(monkeypatch)
+    lane = _lane(tmp_path)
+    record = _record(lane)
+    source = _amp_facts(record)[0]
+    value = cast(dict[str, object], source.value)
+    surface = cast(dict[str, object], value["orb_lane_surface"])
+    receipt = cast(dict[str, object], surface["capability_probe"])
+    if failure == "stale":
+        receipt = _resigned_receipt(
+            receipt,
+            created_at=(datetime.now(UTC) - timedelta(hours=2)).isoformat(),
+            expires_at=(datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+        )
+    elif failure == "version":
+        receipt = _resigned_receipt(receipt, amp_version=record.provider.provider_version + "-drift")
+    elif failure == "tampered":
+        receipt = {**receipt, "result_digest": "sha256:" + "d" * 64}
+    resolver = build_recovery_provider_resolver(
+        lane,
+        facts_reader=lambda _record: (_fact_with_receipt(record, receipt),),
+        amp_capability_verifier=None if failure == "no-verifier" else hmac_capability_verifier(CAPABILITY_KEY),
+    )
+
+    assert resolver(record) is None
+    assert _AmpProfile.calls == []
+    assert _AmpTransport.calls == []
+    assert _AmpAdapter.calls == []
+
+
+def test_amp_factory_carries_verified_receipt_across_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each resolver restart re-verifies Fleet facts; no mutable adapter flag is trusted."""
+
+    _install_amp_fakes(monkeypatch)
+    lane = _lane(tmp_path)
+    record = _record(lane)
+    resolver = _resolver(lane, record)
+
+    first = resolver(record)
+    second = resolver(record)
+
+    assert first is not None
+    assert second is not None
+    assert len(_AmpTransport.calls) == 2
+    for _profile, kwargs in _AmpTransport.calls:
+        assert kwargs["reviewed_subagents"] is True
+        assert isinstance(kwargs["capability_receipt_digest"], str)
+        assert isinstance(kwargs["capability_receipt_expires_at"], str)
 
 
 def test_amp_factory_rejects_conflicting_amp_runtime_fact_shapes(
@@ -718,10 +893,10 @@ def test_amp_facade_preserves_provider_handle_on_updates() -> None:
     assert result.updates[0].provider_session_id == "amp-session-a"
 
 
-def test_amp_factory_binds_chitra_lane_update_sink_for_roadmap_reporting(
+def test_amp_factory_binds_atomic_chitra_lane_update_batch_sink_for_roadmap_reporting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The production ORB route persists the same lane snapshot as Tophand."""
+    """The production ORB route persists snapshots and cursor atomically."""
 
     _install_amp_fakes(monkeypatch)
     lane = _lane(tmp_path)
@@ -732,7 +907,8 @@ def test_amp_factory_binds_chitra_lane_update_sink_for_roadmap_reporting(
     provider = _resolver(lane, record)(record)
 
     assert provider is not None
-    sink = _AmpAdapter.instances[-1].get("update_sink")
+    assert "update_sink" not in _AmpAdapter.instances[-1]
+    sink = provider._update_batch_sink  # type: ignore[attr-defined]
     assert callable(sink)
     assert record.current_update is not None
     next_update = record.current_update.model_copy(
@@ -742,12 +918,143 @@ def test_amp_factory_binds_chitra_lane_update_sink_for_roadmap_reporting(
             "next_action": "Run the focused ORB acceptance check",
         }
     )
-    sink(next_update.to_dict())
+    first_cursor = "amp:thread-a:offset:2:boundary:M-2:prefix:" + "a" * 64
+    sink((next_update.to_dict(),), first_cursor)
 
     saved = store.require(lane.identifier)
     assert saved.current_update == next_update
     assert saved.current_update.steps[0].owner == "lane-manager"
     assert saved.provider.kind == "amp"
+    assert saved.update_cursor == first_cursor
+
+    later_update = next_update.model_copy(
+        update={
+            "sequence": 3,
+            "current_action": "Record the atomic snapshot",
+            "next_action": "Run the resume check",
+        }
+    )
+    with pytest.raises(ValueError, match="cursor regressed"):
+        sink((later_update.to_dict(),), "not-an-amp-cursor")
+    with pytest.raises(ValueError, match="cursor regressed"):
+        sink(
+            (later_update.to_dict(),),
+            "amp:thread-a:offset:2:boundary:M-2:prefix:" + "b" * 64,
+        )
+    saved = store.require(lane.identifier)
+    assert saved.current_update == next_update
+    assert saved.update_cursor == first_cursor
+
+
+def test_amp_batch_validates_before_persisting_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    """A malformed later snapshot cannot wedge the cursor or partial state."""
+
+    lane = _lane(tmp_path)
+    record = _record(lane)
+    assert record.current_update is not None
+    first = record.current_update.model_copy(
+        update={
+            "sequence": 2,
+            "current_action": "Review the ORB roadmap snapshot",
+            "next_action": "Run the focused ORB acceptance check",
+        }
+    )
+    second = first.model_copy(
+        update={
+            "sequence": 3,
+            "current_action": "Run the focused ORB acceptance check",
+            "next_action": "Record the acceptance evidence",
+        }
+    )
+
+    def event(number: int, update: object) -> dict[str, object]:
+        return {
+            "operation_id": f"operation-{number}",
+            "event_id": f"event-{number}",
+            "cursor": f"cursor-{number}",
+            "kind": "progress_claim",
+            "provider_session_id": "amp-session-a",
+            "lane_id": lane.identifier,
+            "provider_handle": "amp-thread-a",
+            "idempotency_key": f"idem-operation-{number}",
+            "payload_digest": f"digest-operation-{number}",
+            "provider_instance_id": "amp-instance-a",
+            "provider_generation": 1,
+            "payload": {},
+            "session_update": update,
+        }
+
+    class BatchAmp(_AmpAdapter):
+        def __init__(self, batch: list[dict[str, object]], next_cursor: str) -> None:
+            super().__init__()
+            self.batch = batch
+            self.next_cursor = next_cursor
+
+        def read_updates(self, _cursor: str | None = None) -> dict[str, object]:
+            return {
+                "updates": self.batch,
+                "next_cursor": self.next_cursor,
+                "provider_available": True,
+                "complete": True,
+            }
+
+    store = JoinedLaneStore(lane.state_dir)
+    store.create(record)
+    malformed = event(2, {"schema": "chitra.session-update.v1"})
+    bad_provider = _PackagedAmpProvider(
+        BatchAmp([event(1, first.to_dict()), malformed], "cursor-2"),
+        result_sink=lambda _value: None,
+        cursor_sink=lambda _value: pytest.fail("atomic batch path must not call cursor sink"),
+        lane_reader=lambda: {},
+        update_batch_sink=_canonical_update_batch_sink(lane),
+    )
+
+    with pytest.raises((TypeError, ValueError)):
+        bad_provider.read_updates("cursor-0")
+
+    after_failure = JoinedLaneStore(lane.state_dir).require(lane.identifier)
+    assert after_failure.current_update == record.current_update
+    assert after_failure.update_cursor == ""
+
+    # A restart may retry the same bad batch without replaying the valid first
+    # item.  The record remains at its original cursor and sequence.
+    with pytest.raises((TypeError, ValueError)):
+        _PackagedAmpProvider(
+            BatchAmp([event(1, first.to_dict()), malformed], "cursor-2"),
+            result_sink=lambda _value: None,
+            cursor_sink=lambda _value: pytest.fail("atomic batch path must not call cursor sink"),
+            lane_reader=lambda: {},
+            update_batch_sink=_canonical_update_batch_sink(lane),
+        ).read_updates("cursor-0")
+    assert JoinedLaneStore(lane.state_dir).require(lane.identifier).current_update == record.current_update
+
+    accepted = _PackagedAmpProvider(
+        BatchAmp([event(1, first.to_dict()), event(2, second.to_dict())], "cursor-2"),
+        result_sink=lambda _value: None,
+        cursor_sink=lambda _value: pytest.fail("atomic batch path must not call cursor sink"),
+        lane_reader=lambda: {},
+        update_batch_sink=_canonical_update_batch_sink(lane),
+    )
+    result = accepted.read_updates("cursor-0")
+    assert len(result.updates) == 2
+    persisted = JoinedLaneStore(lane.state_dir).require(lane.identifier)
+    assert persisted.current_update == second
+    assert persisted.update_cursor == "cursor-2"
+
+    # The original batch cannot replay after the atomic commit.
+    with pytest.raises((TypeError, ValueError)):
+        _PackagedAmpProvider(
+            BatchAmp([event(1, first.to_dict()), event(2, second.to_dict())], "cursor-2"),
+            result_sink=lambda _value: None,
+            cursor_sink=lambda _value: pytest.fail("atomic batch path must not call cursor sink"),
+            lane_reader=lambda: {},
+            update_batch_sink=_canonical_update_batch_sink(lane),
+        ).read_updates("cursor-0")
+    replayed = JoinedLaneStore(lane.state_dir).require(lane.identifier)
+    assert replayed.current_update == second
+    assert replayed.update_cursor == "cursor-2"
 
 
 def test_recovery_cursor_sink_persists_into_joined_lane_store(tmp_path: Path) -> None:
@@ -760,6 +1067,60 @@ def test_recovery_cursor_sink_persists_into_joined_lane_store(tmp_path: Path) ->
     cursor_sink("amp-cursor-7")
 
     assert store.require(lane.identifier).update_cursor == "amp-cursor-7"
+
+
+def test_recovery_cursor_sink_rejects_a_regressing_bound_amp_cursor(tmp_path: Path) -> None:
+    lane = _lane(tmp_path)
+    record = _record(lane)
+    store = JoinedLaneStore(lane.state_dir)
+    store.create(record)
+    _pending_sink, cursor_sink, *_rest = _canonical_recovery_bindings(lane)
+
+    cursor_sink("amp:thread-a:offset:2:boundary:M-2:prefix:" + "a" * 64)
+    with pytest.raises(ValueError, match="cursor regressed"):
+        cursor_sink("amp:thread-a:offset:1:boundary:M-1:prefix:" + "b" * 64)
+
+
+def test_recovery_cursor_sink_rejects_malformed_or_replayed_bound_cursor(tmp_path: Path) -> None:
+    lane = _lane(tmp_path)
+    record = _record(lane)
+    store = JoinedLaneStore(lane.state_dir)
+    store.create(record)
+    _pending_sink, cursor_sink, *_rest = _canonical_recovery_bindings(lane)
+
+    first = "amp:thread-a:offset:2:boundary:M-2:prefix:" + "a" * 64
+    cursor_sink(first)
+    with pytest.raises(ValueError, match="cursor regressed"):
+        cursor_sink("not-an-amp-cursor")
+    with pytest.raises(ValueError, match="cursor regressed"):
+        cursor_sink("amp:thread-a:offset:2:boundary:M-2:prefix:" + "b" * 64)
+
+    assert store.require(lane.identifier).update_cursor == first
+
+
+def test_amp_factory_does_not_restore_stale_initial_facts_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import chitra.recovery_provider as module
+
+    if module._packaged_amp_adapter is None:
+        pytest.skip("Polyphony Adapter package is not importable in this source-only environment")
+    monkeypatch.setattr(module, "_packaged_amp_profile", _AmpProfile, raising=True)
+    monkeypatch.setattr(module, "_packaged_amp_transport", _AmpTransport, raising=True)
+    lane = _lane(tmp_path)
+    record = _record(lane)
+    facts = list(_amp_facts(record))
+    resolver = build_recovery_provider_resolver(
+        lane,
+        facts_reader=lambda _record: tuple(facts),
+        amp_capability_verifier=hmac_capability_verifier(CAPABILITY_KEY),
+    )
+    provider = resolver(record)
+    assert provider is not None
+    adapter = provider._adapter
+    facts.clear()
+
+    assert adapter.lane_reader()["operating_facts"] == ()
 
 
 def test_amp_close_requires_chitra_checkpoint_and_maps_same_thread_archive(
@@ -969,7 +1330,10 @@ def test_lanes_file_uses_static_amp_factory_before_queue_dispatch(
         events.append("queue-dispatch")
 
     monkeypatch.setattr(dispatchd, "process_one_order", process_stub)
-    assert dispatchd.main(["--lanes-file", str(manifest), "--once"]) == 0
+    dispatchd.run_lanes_once(
+        manifest,
+        amp_capability_verifier=hmac_capability_verifier(CAPABILITY_KEY),
+    )
 
     persisted = JoinedLaneStore(lane.state_dir).require(lane.identifier)
     assert persisted.pending_operation is not None
@@ -987,6 +1351,9 @@ def test_lanes_file_uses_static_amp_factory_before_queue_dispatch(
     ]
     assert _AmpTransport.calls[0][1]["amp_binary"] == "/usr/local/bin/amp"
     assert _AmpTransport.calls[0][1]["amp_version"] == AMP_VERSION
+    assert _AmpTransport.calls[0][1]["reviewed_subagents"] is True
+    assert isinstance(_AmpTransport.calls[0][1]["capability_receipt_digest"], str)
+    assert isinstance(_AmpTransport.calls[0][1]["capability_receipt_expires_at"], str)
     assert _AmpAdapter.instances
     assert "state_dir" not in _AmpAdapter.instances[0]
     assert _AmpAdapter.instances[0]["enabled"] is True

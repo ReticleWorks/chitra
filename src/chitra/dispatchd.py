@@ -110,6 +110,7 @@ import structlog
 
 from . import ledger as ledger_mod
 from ._fsio import write_json_atomic
+from .amp_capability import CapabilitySignatureVerifier
 from .completion_gate import evaluate_completion_claim, is_completion_claim
 from .dispatch import (
     DISPATCH_VERIFY_WAIT_SECONDS,
@@ -1683,6 +1684,7 @@ def run_lanes_once(
     facts_reader: RecoveryFactsReader | None = None,
     operating_facts_sources: OperatingFactsSources | None = None,
     top_hand_identity_resolver: Callable[[object, Sequence[object]], object | None] | None = None,
+    amp_capability_verifier: CapabilitySignatureVerifier | None = None,
 ) -> dict[str, list[DispatchResult]]:
     """Drain every enabled lane from one rendered declaration.
 
@@ -1695,6 +1697,9 @@ def run_lanes_once(
 
     results: dict[str, list[DispatchResult]] = {}
     resolved_facts_reader = facts_reader or default_operating_facts_reader(operating_facts_sources)
+    capability_kwargs: dict[str, object] = (
+        {} if amp_capability_verifier is None else {"amp_capability_verifier": amp_capability_verifier}
+    )
     for lane in enabled_lanes(lanes_file):
         if all(
             dependency is None
@@ -1711,19 +1716,25 @@ def run_lanes_once(
             )
         ):
             if facts_reader is None and operating_facts_sources is None:
-                provider_resolver = build_recovery_provider_resolver(lane)
+                provider_resolver = build_recovery_provider_resolver(lane, **capability_kwargs)
             elif facts_reader is None:
                 provider_resolver = build_recovery_provider_resolver(
                     lane,
                     operating_facts_sources=operating_facts_sources,
+                    **capability_kwargs,
                 )
             elif operating_facts_sources is None:
-                provider_resolver = build_recovery_provider_resolver(lane, facts_reader=facts_reader)
+                provider_resolver = build_recovery_provider_resolver(
+                    lane,
+                    facts_reader=facts_reader,
+                    **capability_kwargs,
+                )
             else:
                 provider_resolver = build_recovery_provider_resolver(
                     lane,
                     facts_reader=facts_reader,
                     operating_facts_sources=operating_facts_sources,
+                    **capability_kwargs,
                 )
         else:
             provider_resolver = build_recovery_provider_resolver(
@@ -1739,6 +1750,7 @@ def run_lanes_once(
                 cancel_verifier=cancel_verifier,
                 facts_reader=facts_reader,
                 operating_facts_sources=operating_facts_sources,
+                **capability_kwargs,
             )
         recovery_supervisor = RecoverySupervisor(
             lane.state_dir,
@@ -1836,6 +1848,7 @@ def run_lanes_forever(
     facts_reader: RecoveryFactsReader | None = None,
     operating_facts_sources: OperatingFactsSources | None = None,
     top_hand_identity_resolver: Callable[[object, Sequence[object]], object | None] | None = None,
+    amp_capability_verifier: CapabilitySignatureVerifier | None = None,
 ) -> None:
     """Run one shared dispatchd process over all enabled lane queues."""
     while True:
@@ -1857,6 +1870,7 @@ def run_lanes_forever(
             facts_reader=facts_reader,
             operating_facts_sources=operating_facts_sources,
             top_hand_identity_resolver=top_hand_identity_resolver,
+            amp_capability_verifier=amp_capability_verifier,
         )
         time.sleep(poll_seconds)
 

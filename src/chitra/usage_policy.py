@@ -93,8 +93,12 @@ def launch_policy_problem(record: JoinedLaneRecord) -> str | None:
         return "launch policy profile digest does not match the provider identity"
     if policy.provider_version != record.provider.provider_version:
         return "launch policy provider version does not match the provider identity"
-    if not record.provider.capabilities.usage or not record.provider.capabilities.parent_child_usage:
-        return "Amp provider does not declare complete parent-child usage capability"
+    if (
+        not record.provider.capabilities.usage
+        or not record.provider.capabilities.parent_child_usage
+        or not record.provider.capabilities.subagents
+    ):
+        return "Amp provider does not declare complete subagent and parent-child usage capability"
     if not record.provider.capabilities.cancel_current_turn or not record.provider.capabilities.status:
         return "Amp provider does not declare cancellation and status capability for quiescence enforcement"
     return None

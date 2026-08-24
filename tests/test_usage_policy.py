@@ -34,6 +34,7 @@ from chitra.usage_policy import (
     evaluate_amp_create_policy,
     evaluate_usage_policy,
     expected_amp_create_tag,
+    launch_policy_problem,
 )
 
 NOW = datetime(2026, 8, 23, 15, 0, tzinfo=UTC)
@@ -258,6 +259,19 @@ def test_no_launch_policy_holds_amp_lane() -> None:
     assert not decision.mutation_allowed
     assert not decision.cancel_required
     assert decision.reason == "Amp lane has no Chitra launch policy"
+
+
+def test_missing_subagent_capability_holds_amp_lane() -> None:
+    source = provider()
+    capabilities = source.capabilities.model_copy(update={"subagents": False})
+    record = lane_record(policy=launch_policy()).model_copy(
+        update={"provider": source.model_copy(update={"capabilities": capabilities})}
+    )
+
+    assert launch_policy_problem(record) == "Amp provider does not declare complete subagent and parent-child usage capability"
+    decision = evaluate_usage_policy(record, usage_report(1.0), now=NOW)
+    assert decision.action == "unknown-and-hold"
+    assert not decision.mutation_allowed
 
 
 def test_profile_digest_mismatch_holds_amp_lane() -> None:
