@@ -361,19 +361,26 @@ def _governed_close_request(state_root: Path, process_token: str) -> dict[str, o
     checkpoint_receipt_sha256 = hashlib.sha256(
         json.dumps(checkpoint, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+    operation = _close_operation(
+        checkpoint_ref=checkpoint_ref,
+        checkpoint_receipt_sha256=checkpoint_receipt_sha256,
+        process_start_token=process_token,
+    )
+    payload = json.loads(str(operation["payload"]))
     return {
-        "close_token": "close-token-a",
-        "operation": _close_operation(
-            checkpoint_ref=checkpoint_ref,
-            checkpoint_receipt_sha256=checkpoint_receipt_sha256,
-            process_start_token=process_token,
-        ),
+        "operation": operation,
+        "archive": payload["archive"],
+        "payload": payload,
+        "goal_id": payload["goal_id"],
+        "goal_version": payload["goal_version"],
+        "lane_id": payload["lane_id"],
+        "session_ref": payload["session_ref"],
+        "provider_session_id": payload["provider_session_id"],
         "checkpoint_ref": checkpoint_ref,
         "checkpoint_receipt": checkpoint,
         "checkpoint_receipt_sha256": checkpoint_receipt_sha256,
         "checkpoint_verifier": "chitra.detect.rescue.verify_checkpoint_receipt_signature",
-        "provider_session_id": SESSION_REF,
-        "archive": True,
+        "close_token": payload["close_token"],
     }
 
 
@@ -641,6 +648,7 @@ def _packaged_close_projection_child(tmp_path: Path) -> Path:
 
 def _operation(kind: str, operation_id: str, token: str, payload_digest: str) -> dict[str, object]:
     return {
+        "schema": "chitra.tophand.operation.v1",
         "operation_id": operation_id,
         "kind": kind,
         "lane_id": LANE,
@@ -653,7 +661,7 @@ def _operation(kind: str, operation_id: str, token: str, payload_digest: str) ->
         "process_start_token": token,
         "created_at": "2026-08-24T12:00:00+00:00",
         "attempt": 1,
-        "payload": f"{kind}-payload",
+        "attempted": True,
     }
 
 
@@ -706,12 +714,25 @@ def _close_operation(
         "close_token": "close-token-a",
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    identity = {
+        "lane_id": LANE,
+        "goal_id": GOAL_ID,
+        "goal_version": 1,
+        "session_ref": SESSION_REF,
+        "provider_handle": "thread-a",
+        "provider_session_id": SESSION_REF,
+        "provider_instance_id": INSTANCE_ID,
+        "provider_generation": GENERATION,
+        "payload": encoded,
+    }
     return {
         **_operation(
             "close",
             "close-a",
             process_start_token,
-            hashlib.sha256(encoded.encode()).hexdigest(),
+            hashlib.sha256(
+                json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
         ),
         "payload": encoded,
     }
@@ -757,21 +778,28 @@ def test_governed_close_returns_exact_resumable_evidence_from_a_fresh_process(
         checkpoint_receipt_sha256 = hashlib.sha256(
             json.dumps(checkpoint, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
+        operation = _close_operation(
+            checkpoint_ref=checkpoint_ref,
+            checkpoint_receipt_sha256=checkpoint_receipt_sha256,
+            process_start_token=token,
+        )
+        payload = json.loads(str(operation["payload"]))
         request_fields = {
-            "close_token": "close-token-a",
-            "checkpoint_ref": checkpoint_ref,
+            "archive": payload["archive"],
+            "payload": payload,
+            "goal_id": payload["goal_id"],
+            "goal_version": payload["goal_version"],
+            "lane_id": payload["lane_id"],
+            "session_ref": payload["session_ref"],
+            "provider_session_id": payload["provider_session_id"],
+            "checkpoint_ref": payload["checkpoint_ref"],
             "checkpoint_receipt": checkpoint,
             "checkpoint_receipt_sha256": checkpoint_receipt_sha256,
             "checkpoint_verifier": "chitra.detect.rescue.verify_checkpoint_receipt_signature",
-            "provider_session_id": SESSION_REF,
-            "archive": True,
+            "close_token": payload["close_token"],
         }
         request = {
-            "operation": _close_operation(
-                checkpoint_ref=checkpoint_ref,
-                checkpoint_receipt_sha256=checkpoint_receipt_sha256,
-                process_start_token=token,
-            ),
+            "operation": operation,
             **request_fields,
         }
         child = _adapter_child(tmp_path, forced)
@@ -830,11 +858,7 @@ def test_attempted_resume_reconciles_lost_reply_once_then_send_uses_rotated_toke
             ),
         }
         resume_request = {"operation": resume_operation, **resume_fields}
-        attempted = {
-            "schema": "chitra.tophand.operation.v1",
-            **{key: value for key, value in resume_operation.items() if key != "payload"},
-            "attempted": True,
-        }
+        attempted = {**resume_operation, "attempted": True}
         child = _crash_window_child(tmp_path)
         evidence = tmp_path / "adapter-evidence"
         environment = {
@@ -898,7 +922,12 @@ def test_attempted_resume_reconciles_lost_reply_once_then_send_uses_rotated_toke
         assert json.loads(replayed.stdout) == result
         assert (tmp_path / "physical-reopen-count").read_text() == "1"
 
-        send_operation = _operation("send", "send-after-resume", str(new_owner["start_token"]), "send-digest")
+        send_operation = _operation(
+            "send",
+            "send-after-resume",
+            str(new_owner["start_token"]),
+            hashlib.sha256(b'{"text":"continue"}').hexdigest(),
+        )
         sent = subprocess.run(
             [sys.executable, str(child), "send", str(evidence)],
             input=json.dumps({"operation": send_operation, "text": "continue"}),
@@ -1069,7 +1098,10 @@ def test_same_session_resume_uses_structured_owner_authenticated_receipt_and_no_
         assert status["process_start_token"] == new_owner["start_token"]
 
         send_operation = _operation(
-            "send", "send-after-resume", str(new_owner["start_token"]), "send-digest"
+            "send",
+            "send-after-resume",
+            str(new_owner["start_token"]),
+            hashlib.sha256(b'{"text":"continue"}').hexdigest(),
         )
         send_event = {
             "event_id": "event-send-after-resume",
