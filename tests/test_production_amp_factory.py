@@ -30,6 +30,7 @@ from chitra.provider_protocol import (
     SendRequest,
 )
 from chitra.recovery_provider import (
+    _amp_close_result,
     _canonical_recovery_bindings,
     _canonical_update_batch_sink,
     _PackagedAmpProvider,
@@ -420,6 +421,39 @@ def test_packaged_result_keeps_raw_provider_session_and_rejects_missing_session(
     assert result.provider_session_id == "amp-session-a"
     with pytest.raises(ValueError, match="provider_session_id is missing"):
         _provider_result({key: value for key, value in raw.items() if key != "provider_session_id"}, operation)
+
+
+@pytest.mark.parametrize("field", ("provider_instance_id", "provider_generation", "observed_at"))
+def test_packaged_result_never_fabricates_physical_identity_or_observation_time(field: str) -> None:
+    operation = _operation("send")
+    raw = {
+        **operation.model_dump(mode="json"),
+        "status": "consumed",
+        "accepted": True,
+        "consumed": True,
+        "observed_at": NOW.isoformat(),
+        "evidence": "raw provider result",
+    }
+    raw.pop(field)
+    with pytest.raises(ValueError):
+        _provider_result(raw, operation, provider_label="Amp")
+
+
+def test_amp_close_does_not_fabricate_provider_observation_time() -> None:
+    operation = _operation("close")
+    raw = {
+        **operation.model_dump(mode="json"),
+        "provider_thread_ref": operation.provider_handle,
+        "state": "archived",
+        "same_provider_thread": True,
+        "later_resume_supported": True,
+        "checkpoint_ref": "checkpoint-a",
+        "quiescent": True,
+        "evidence": "same-thread archive evidence",
+    }
+    result = _amp_close_result(raw, operation, expected_checkpoint_ref="checkpoint-a")
+    assert result.state == "unknown"
+    assert result.evidence == "Amp close result observed_at is missing"
 
 
 class _ArchiveTransport:

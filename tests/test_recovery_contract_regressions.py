@@ -309,6 +309,7 @@ def test_sparse_rotated_session_response_persists_same_logical_lane(tmp_path: Pa
                 provider=ProviderName.TOPHAND,
                 state=ProviderState.IDLE,
                 provider_session_id="tophand:lane-a:2",
+                provider_instance_id="instance-a",
                 generation=2,
                 fresh=True,
                 provider_available=True,
@@ -348,6 +349,23 @@ def test_sparse_rotated_session_response_persists_same_logical_lane(tmp_path: Pa
     assert reloaded.current_update.current_action == initial.current_update.current_action
     assert reloaded.current_update.next_action == initial.current_update.next_action
     assert reloaded.physical_session_generation == 2
+
+
+def test_provider_status_replacement_is_not_current_for_same_generation(tmp_path: Path) -> None:
+    class ReplacedProvider(ConsumedSendProvider):
+        def status(self) -> ProviderStatus:
+            return ProviderStatus(
+                provider=ProviderName.TOPHAND,
+                state=ProviderState.IDLE,
+                provider_session_id="tophand:lane-a:1",
+                provider_instance_id="instance-replaced",
+                generation=1,
+                fresh=True,
+                provider_available=True,
+            )
+
+    engine = RecoveryEngine(provider=ReplacedProvider(), state_root=tmp_path)
+    assert engine._provider_status(lane_record()) is None
 
 
 def test_transport_acceptance_does_not_complete_diagnostic_sibling(tmp_path: Path) -> None:

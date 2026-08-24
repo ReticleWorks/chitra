@@ -351,6 +351,10 @@ class ProviderStatus:
     # results and operation markers still require it when the provider can
     # supply it.
     provider_instance_id: str | None = None
+    # The process start token fences PID reuse and provider restarts.  A
+    # status that cannot carry the enrolled token is not a current observation
+    # for that lane.
+    process_start_token: str | None = None
 
     def __post_init__(self) -> None:
         _required_text(str(self.provider), "provider")
@@ -358,6 +362,7 @@ class ProviderStatus:
             raise ValueError("generation must be a non-negative integer")
         _optional_text(self.provider_session_id, "provider_session_id")
         _optional_text(self.provider_instance_id, "provider_instance_id")
+        _optional_text(self.process_start_token, "process_start_token")
         _optional_text(self.current_turn_id, "current_turn_id")
         _optional_text(self.last_event_id, "last_event_id")
 

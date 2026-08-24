@@ -276,6 +276,33 @@ def _provider_result(
     """Translate the packaged adapter result into Chitra's typed result."""
 
     raw = _mapping(value, f"{provider_label} provider result")
+    status = raw.get("status")
+    if status not in {"accepted", "consumed", "rejected", "unknown", "lost-response"}:
+        status = "unknown"
+
+    # A provider result that claims a disposition must carry the physical
+    # identity and observation time that the provider actually returned.
+    # Copying these fields from Chitra's pending envelope would turn an
+    # unknown or replaced provider into a false success receipt.
+    observed_at = raw.get("observed_at")
+    if not isinstance(observed_at, str) or not observed_at.strip():
+        raise ValueError(f"{provider_label} provider result observed_at is missing")
+    raw_instance_id = raw.get("provider_instance_id")
+    raw_generation = raw.get("provider_generation")
+    if status not in {"unknown", "lost-response"}:
+        if not isinstance(raw_instance_id, str) or not raw_instance_id.strip():
+            raise ValueError(f"{provider_label} provider result provider_instance_id is missing")
+        if operation.provider_instance_id is None or raw_instance_id != operation.provider_instance_id:
+            raise ValueError(f"{provider_label} provider result provider_instance_id changed or is missing")
+        if isinstance(raw_generation, bool) or not isinstance(raw_generation, int) or raw_generation < 1:
+            raise ValueError(f"{provider_label} provider result provider_generation is missing or invalid")
+        if operation.provider_generation is None or raw_generation != operation.provider_generation:
+            raise ValueError(f"{provider_label} provider result provider_generation changed or is missing")
+        if operation.process_start_token is not None:
+            raw_process_token = raw.get("process_start_token")
+            if not isinstance(raw_process_token, str) or raw_process_token != operation.process_start_token:
+                raise ValueError(f"{provider_label} provider result process_start_token changed or is missing")
+
     for field in (
         "operation_id",
         "kind",
@@ -296,9 +323,6 @@ def _provider_result(
         not isinstance(raw_provider_session_id, str) or not raw_provider_session_id.strip()
     ):
         raise ValueError(f"{provider_label} provider result provider_session_id is malformed")
-    status = raw.get("status")
-    if status not in {"accepted", "consumed", "rejected", "unknown", "lost-response"}:
-        status = "unknown"
     if operation.provider_session_id is not None:
         if raw_provider_session_id is not None and raw_provider_session_id != operation.provider_session_id:
             raise ValueError(f"{provider_label} provider result provider_session_id changed")
@@ -314,9 +338,6 @@ def _provider_result(
         accepted, consumed = False, None
     else:
         accepted, consumed = None, None
-    observed_at = raw.get("observed_at")
-    if not isinstance(observed_at, str) or not observed_at.strip():
-        observed_at = _now()
     evidence = raw.get("evidence")
     ownership = dict(raw["ownership"]) if isinstance(raw.get("ownership"), Mapping) else None
     observed_process = raw.get("observed_process")
@@ -352,10 +373,10 @@ def _provider_result(
         provider_handle=operation.provider_handle,
         idempotency_key=operation.idempotency_key,
         payload_digest=operation.payload_digest,
-        provider_session_id=(
-            provider_session_id if isinstance(provider_session_id, str) else operation.provider_session_id
+        provider_session_id=raw_provider_session_id if isinstance(raw_provider_session_id, str) else None,
+        provider_instance_id=(
+            raw_instance_id if isinstance(raw_instance_id, str) else operation.provider_instance_id
         ),
-        provider_instance_id=operation.provider_instance_id,
         provider_generation=operation.provider_generation,
         process_start_token=(
             raw.get("process_start_token")
@@ -415,6 +436,7 @@ class _PackagedTophandProvider:
         *,
         state_root: Path | None = None,
         result_sink: RecoverySink,
+        process_start_token: str | None = None,
         reconcile_before_call: bool = False,
         operating_facts_binding: OperatingFactsBinding | None = None,
     ) -> None:
@@ -423,6 +445,7 @@ class _PackagedTophandProvider:
         self._state_root = state_root
         self._adapter = adapter
         self._result_sink = result_sink
+        self._process_start_token = process_start_token
         self._reconcile_before_call = reconcile_before_call
         self._operating_facts_binding = operating_facts_binding
 
@@ -577,6 +600,11 @@ class _PackagedTophandProvider:
             current_turn_id=current_turn_id if isinstance(current_turn_id, str) else None,
             last_event_id=last_event_id if isinstance(last_event_id, str) else None,
             reason=reason if isinstance(reason, str) else "",
+            process_start_token=(
+                raw.get("process_start_token")
+                if isinstance(raw.get("process_start_token"), str)
+                else self._process_start_token
+            ),
         )
 
     def send(self, request: SendRequest) -> ProviderOperationResult:
@@ -732,6 +760,7 @@ class _AmpRuntimeConfig:
     fleet_enabled: bool
     capability_receipt_digest: str
     capability_receipt_expires_at: str
+    capability_receipt_json: str
 
 
 def _amp_runtime_config(
@@ -843,6 +872,12 @@ def _amp_runtime_config(
                 fleet_enabled=fleet_enabled,
                 capability_receipt_digest=verified_receipt.digest,
                 capability_receipt_expires_at=verified_receipt.expires_at,
+                capability_receipt_json=json.dumps(
+                    verified_receipt.value,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ),
             )
         )
     if len(candidates) != 1:
@@ -951,8 +986,8 @@ def _amp_close_result(
     ):
         observed = raw.get(field)
         expected = getattr(operation, field)
-        if observed is not None and observed != expected:
-            return _unknown_close_result(operation, f"Amp close result {field} changed")
+        if observed is None or observed != expected:
+            return _unknown_close_result(operation, f"Amp close result {field} is missing or changed")
     raw_provider_session_id = raw.get("provider_session_id")
     if raw_provider_session_id is not None and (
         not isinstance(raw_provider_session_id, str) or not raw_provider_session_id.strip()
@@ -981,7 +1016,7 @@ def _amp_close_result(
     evidence = raw.get("evidence")
     observed_at = raw.get("observed_at")
     if not isinstance(observed_at, str) or not observed_at.strip():
-        observed_at = _now()
+        return _unknown_close_result(operation, "Amp close result observed_at is missing")
     if not isinstance(evidence, str) or not evidence.strip():
         evidence = "Amp close evidence is unavailable"
     if state in {"closed", "archived"} and (
@@ -1000,8 +1035,8 @@ def _amp_close_result(
         operation_id=operation.operation_id,
         lane_id=operation.lane_id,
         provider_handle=operation.provider_handle,
-        provider_instance_id=provider_instance_id,
-        provider_generation=provider_generation,
+        provider_instance_id=cast(str, raw["provider_instance_id"]),
+        provider_generation=cast(int, raw["provider_generation"]),
         idempotency_key=operation.idempotency_key,
         payload_digest=operation.payload_digest,
         state=cast(Any, state),
@@ -1048,6 +1083,7 @@ class _PackagedAmpProvider:
         result_sink: RecoverySink,
         cursor_sink: RecoverySink,
         lane_reader: Callable[[], object],
+        process_start_token: str | None = None,
         operating_facts_binding: OperatingFactsBinding | None = None,
         update_batch_sink: Callable[[Sequence[object], str], object | None] | None = None,
     ) -> None:
@@ -1055,6 +1091,7 @@ class _PackagedAmpProvider:
         self._result_sink = result_sink
         self._cursor_sink = cursor_sink
         self._lane_reader = lane_reader
+        self._process_start_token = process_start_token
         self._operating_facts_binding = operating_facts_binding
         self._update_batch_sink = update_batch_sink
 
@@ -1147,6 +1184,11 @@ class _PackagedAmpProvider:
             current_turn_id=current_turn_id if isinstance(current_turn_id, str) else None,
             last_event_id=last_event_id if isinstance(last_event_id, str) else None,
             reason=reason if isinstance(reason, str) else "",
+            process_start_token=(
+                raw.get("process_start_token")
+                if isinstance(raw.get("process_start_token"), str)
+                else self._process_start_token
+            ),
         )
 
     def send(self, request: SendRequest) -> ProviderOperationResult:
@@ -1336,7 +1378,11 @@ def _canonical_tophand_factory(
             seen_event_ids=seen_event_ids,
             seen_idempotency_keys=seen_keys,
             update_sink=_canonical_update_sink(lane),
-            result_sink=result_sink,
+            # The Chitra facade is the sole production result sink.  The
+            # adapter remains a translation layer and must not invoke the
+            # same callback a second time.
+            result_sink=None,
+            process_start_token=identity.process_start_token,
             cursor_sink=cursor_sink,
             event_sink=event_sink,
             checkpoint_verifier=checkpoint_verifier,
@@ -1351,6 +1397,7 @@ def _canonical_tophand_factory(
         adapter,
         state_root=state_root,
         result_sink=result_sink,
+        process_start_token=identity.process_start_token,
         reconcile_before_call=(record.pending_operation is not None and record.pending_operation.attempted),
         operating_facts_binding=operating_facts_binding,
     )
@@ -1464,6 +1511,8 @@ def _canonical_amp_factory(
             reviewed_subagents=True,
             capability_receipt_digest=runtime.capability_receipt_digest,
             capability_receipt_expires_at=runtime.capability_receipt_expires_at,
+            capability_receipt=json.loads(runtime.capability_receipt_json),
+            capability_receipt_verifier=amp_capability_verifier,
         )
         adapter = _packaged_amp_adapter(
             transport=transport,
@@ -1474,6 +1523,7 @@ def _canonical_amp_factory(
             anchor_thread_id=identity.parent_thread_ref,
             lane_reader=lane_reader,
             amp_version=amp_version,
+            process_start_token=identity.process_start_token,
         )
     except Exception as exc:  # noqa: BLE001 - unavailable provider is canonical unknown
         logger.warning("packaged_amp_unavailable", lane_id=record.lane_id, error=str(exc))
@@ -1485,6 +1535,7 @@ def _canonical_amp_factory(
         result_sink=result_sink,
         cursor_sink=cursor_sink,
         lane_reader=lane_reader,
+        process_start_token=identity.process_start_token,
         operating_facts_binding=operating_facts_binding,
         update_batch_sink=_canonical_update_batch_sink(lane),
     )

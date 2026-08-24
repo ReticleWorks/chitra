@@ -2218,6 +2218,27 @@ class RecoveryEngine:
                 and (
                     str(status.provider) != str(record.provider.kind)
                     or status.generation < (record.provider.generation or 0)
+                    or (
+                        status.generation == (record.provider.generation or 0)
+                        and (
+                            status.provider_instance_id != record.provider.instance_id
+                            or (
+                                record.provider.process_start_token is not None
+                                and status.process_start_token != record.provider.process_start_token
+                            )
+                        )
+                    )
+                    or (
+                        status.generation > (record.provider.generation or 0)
+                        and (
+                            status.provider_session_id == record.session_ref
+                            or status.provider_instance_id is None
+                            or (
+                                record.provider.process_start_token is not None
+                                and status.process_start_token is None
+                            )
+                        )
+                    )
                 )
             )
         ):
@@ -2229,8 +2250,15 @@ class RecoveryEngine:
             raise RecoveryStateError("relaunch rotation lacks session identity")
         physical_generation = max((record.physical_session_generation or 0) + 1, status.generation)
         provider = record.provider
+        provider_updates: dict[str, object] = {}
         if status.generation > (provider.generation or 0):
-            provider = provider.model_copy(update={"generation": status.generation})
+            provider_updates["generation"] = status.generation
+        if status.provider_instance_id is not None:
+            provider_updates["instance_id"] = status.provider_instance_id
+        if status.process_start_token is not None:
+            provider_updates["process_start_token"] = status.process_start_token
+        if provider_updates:
+            provider = provider.model_copy(update=provider_updates)
         update = record.current_update
         if update is not None:
             update = update.model_copy(update={"session_ref": status.provider_session_id})

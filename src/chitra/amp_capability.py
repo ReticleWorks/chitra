@@ -24,6 +24,12 @@ MAX_PROBE_LIFETIME = timedelta(hours=1)
 
 CapabilitySignatureVerifier = Callable[[bytes, str, str], bool]
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
+_THREAD_ID = re.compile(r"^T-[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.I)
+_BOUND_CURSOR = re.compile(
+    r"^amp:(?P<thread>T-[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})"
+    r":offset:[0-9]+:boundary:[^:]+:prefix:[0-9a-f]{64}$",
+    re.I,
+)
 _TEXT_FIELDS = (
     "probe_id",
     "operation_id",
@@ -154,6 +160,11 @@ def verify_amp_capability_receipt(
             raise AmpCapabilityError("capability probe ORB launch policy changed")
         if receipt.get("child_evidence_mode") != "inline":
             raise AmpCapabilityError("capability probe did not prove inline child evidence")
+        if not _THREAD_ID.fullmatch(receipt["root_thread_id"]):
+            raise AmpCapabilityError("capability probe root thread identity is malformed")
+        cursor_match = _BOUND_CURSOR.fullmatch(receipt["transcript_cursor"])
+        if cursor_match is None or cursor_match.group("thread") != receipt["root_thread_id"]:
+            raise AmpCapabilityError("capability probe cursor is not bound to the root thread")
         if receipt.get("operation_id") != f"capability-probe:{receipt['probe_id']}":
             raise AmpCapabilityError("capability probe operation identity changed")
         if receipt.get("lane_id") != f"capability-probe:{receipt['probe_id']}":
@@ -170,6 +181,8 @@ def verify_amp_capability_receipt(
             raise AmpCapabilityError("capability receipt is bound to a different Amp build or profile")
         if not _SHA256.fullmatch(receipt["usage_evidence_hash"]):
             raise AmpCapabilityError("usage evidence hash is not a digest")
+        if not _SHA256.fullmatch(receipt["result_digest"]):
+            raise AmpCapabilityError("result digest is not a digest")
         _validate_containment(receipt["containment_proof"])
         created = _timestamp(receipt["created_at"], "created_at")
         expires = _timestamp(receipt["expires_at"], "expires_at")

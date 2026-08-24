@@ -361,8 +361,9 @@ def test_relaunch_accepts_opaque_provider_status_identity_without_format_guessin
             return ProviderStatus(
                 provider=ProviderName.TOPHAND,
                 state=ProviderState.IDLE,
-                provider_session_id="tophand-session-opaque-2",
-                generation=1,
+                    provider_session_id="tophand-session-opaque-2",
+                    provider_instance_id="instance-a",
+                    generation=1,
                 fresh=True,
                 provider_available=True,
                 provider_instance_id="instance-a",
