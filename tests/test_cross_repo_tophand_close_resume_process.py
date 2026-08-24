@@ -12,7 +12,6 @@ import hashlib
 import hmac
 import json
 import os
-import shlex
 import subprocess
 import sys
 import textwrap
@@ -49,26 +48,20 @@ def _process_start_token(pid: int) -> str:
 
 def _owner_process(process: subprocess.Popen[str], token: str) -> dict[str, object]:
     completed = subprocess.run(
-        ["ps", "-p", str(process.pid), "-o", "comm="],
+        ["ps", "-p", str(process.pid), "-o", "uid=", "-o", "gid=", "-o", "comm="],
         capture_output=True,
         text=True,
         check=False,
     )
     assert completed.returncode == 0 and completed.stdout.strip()
-    command = subprocess.run(
-        ["ps", "-p", str(process.pid), "-o", "command="],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert command.returncode == 0 and command.stdout.strip()
+    uid, gid, executable = completed.stdout.strip().split(None, 2)
     return {
         "pid": process.pid,
-        "uid": os.getuid(),
-        "gid": os.getgid(),
+        "uid": int(uid),
+        "gid": int(gid),
         "start_token": token,
-        "comm": completed.stdout.strip(),
-        "exe": shlex.split(command.stdout.strip())[0],
+        "comm": Path(executable).name,
+        "exe": executable,
     }
 
 
@@ -175,7 +168,9 @@ def _command_shims(
         'if [ -f "$RESUMED_MARKER" ]; then PID=$NEW_PID TOKEN=$NEW_TOKEN; else PID=$FAKE_PID TOKEN=$FAKE_TOKEN; fi\n'
         'case " $* " in\n'
         '  *" list-sessions "*) printf \'%s\\n\' "$FAKE_SESSION" ;;\n'
-        '  *" list-panes "*) printf \'%s\\t0\\t0\\t%s\\tpython\\t%s\\n\' "$FAKE_SESSION" "$PID" "$TOKEN" ;;\n'
+        '  *" list-panes "*)\n'
+        '    if [ ! -f "$RESUMED_MARKER" ] && ! kill -0 "$FAKE_PID" 2>/dev/null; then exit 1; fi\n'
+        '    printf \'%s\\t0\\t0\\t%s\\tpython\\t%s\\n\' "$FAKE_SESSION" "$PID" "$TOKEN" ;;\n'
         '  *" has-session "*) exit 1 ;;\n'
         "  *) exit 0 ;;\n"
         "esac\n",
@@ -206,6 +201,7 @@ def _command_shims(
             request = json.loads(sys.stdin.read())
             count = Path(os.environ["RESUME_COUNT"])
             count.write_text(str(int(count.read_text() if count.exists() else "0") + 1))
+            Path(os.environ["RESUMED_MARKER"]).write_text("resumed")
             operation = request["operation"]
             receipt = {{
                 "schema": "chitra.lane-reopen.v1",
@@ -237,7 +233,7 @@ def _command_shims(
                 "provider_instance_id": operation["provider_instance_id"],
                 "provider_generation": operation["provider_generation"],
                 "provider_session_id": request["provider_session_id"],
-                "process_start_token": operation["process_start_token"],
+                "process_start_token": {new_owner["start_token"]!r},
                 "reopen_receipt": receipt,
             }}, sort_keys=True, separators=(",", ":")))
             """
@@ -602,6 +598,12 @@ def test_attempted_resume_reconciles_lost_reply_once_then_send_uses_rotated_toke
         resume_operation = {
             **_operation("create_or_resume", "resume-a", "unused", resume_digest),
             "process_start_token": None,
+            "payload": json.dumps(
+                resume_fields,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ),
         }
         resume_request = {"operation": resume_operation, **resume_fields}
         attempted = {
@@ -756,6 +758,12 @@ def test_same_session_resume_uses_structured_owner_authenticated_receipt_and_no_
             "operation": {
                 **_operation("create_or_resume", "resume-a", "unused", digest),
                 "process_start_token": None,
+                "payload": json.dumps(
+                    resume_fields,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ),
             },
             **resume_fields,
         }
