@@ -73,6 +73,20 @@ def test_signed_receipt_verifies_and_projects_digest_deadline() -> None:
     assert verified.expires_at == receipt["expires_at"]
 
 
+def test_signed_receipt_accepts_the_actual_bounded_material_result() -> None:
+    material = "A retained built-in Task result."
+    receipt = sign_amp_capability_receipt(
+        _payload(
+            result_material=material,
+            result_digest="sha256:" + hashlib.sha256(material.encode("utf-8")).hexdigest(),
+        ),
+        signature_key_id="fleet-key-1",
+        key=KEY,
+    )
+
+    assert _verify(receipt) is not None
+
+
 def test_receipt_gate_rejects_stale_version_drift_tampering_and_missing_verifier() -> None:
     receipt = sign_amp_capability_receipt(_payload(), signature_key_id="fleet-key-1", key=KEY)
     stale = sign_amp_capability_receipt(
