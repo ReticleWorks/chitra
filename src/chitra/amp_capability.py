@@ -21,6 +21,7 @@ LINUX_CONTAINMENT_SCHEMA = "chitra.amp-linux-containment.v1"
 CAPABILITY_PROBE_GOAL = "chitra-amp-capability-probe"
 MAX_ADDRESS_SPACE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_PROBE_LIFETIME = timedelta(hours=1)
+MAX_RESULT_MATERIAL_BYTES = 16 * 1024
 
 CapabilitySignatureVerifier = Callable[[bytes, str, str], bool]
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -44,6 +45,7 @@ _TEXT_FIELDS = (
     "transcript_cursor",
     "usage_evidence_hash",
     "result_digest",
+    "result_material",
     "created_at",
     "expires_at",
     "signature_key_id",
@@ -115,6 +117,13 @@ def _require_text(value: object, field: str) -> str:
     return value
 
 
+def _require_result_material(value: object) -> str:
+    material = _require_text(value, "result_material")
+    if len(material.encode("utf-8")) > MAX_RESULT_MATERIAL_BYTES:
+        raise AmpCapabilityError("result material exceeds the probe bound")
+    return material
+
+
 def _validate_containment(value: object) -> dict[str, Any]:
     if not isinstance(value, Mapping) or set(value) != _PROOF_FIELDS:
         raise AmpCapabilityError("Linux containment proof is incomplete")
@@ -183,14 +192,12 @@ def verify_amp_capability_receipt(
             raise AmpCapabilityError("usage evidence hash is not a digest")
         if not _SHA256.fullmatch(receipt["result_digest"]):
             raise AmpCapabilityError("result digest is not a digest")
-        # The capability probe's only material inline result is the canonical
-        # child/status pair.  Recompute it instead of treating a signer-owned
-        # digest string as independent evidence.
-        expected_result_digest = "sha256:" + hashlib.sha256(
-            _canonical({"child_id": receipt["child_id"], "status": "consumed"})
-        ).hexdigest()
+        # Recompute the digest from the bounded material result.  A signed
+        # digest without these bytes would only be a signer assertion.
+        result_material = _require_result_material(receipt["result_material"])
+        expected_result_digest = "sha256:" + hashlib.sha256(result_material.encode("utf-8")).hexdigest()
         if receipt["result_digest"] != expected_result_digest:
-            raise AmpCapabilityError("result digest is not bound to the inline material result")
+            raise AmpCapabilityError("result digest is not bound to its material result")
         _validate_containment(receipt["containment_proof"])
         created = _timestamp(receipt["created_at"], "created_at")
         expires = _timestamp(receipt["expires_at"], "expires_at")
@@ -230,6 +237,7 @@ __all__ = [
     "CAPABILITY_PROBE_SCHEMA",
     "LINUX_CONTAINMENT_SCHEMA",
     "MAX_ADDRESS_SPACE_BYTES",
+    "MAX_RESULT_MATERIAL_BYTES",
     "capability_receipt_digest",
     "verify_amp_capability_receipt",
 ]

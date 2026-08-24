@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime, timedelta
 
 from _amp_capability_fixtures import hmac_capability_verifier, sign_amp_capability_receipt
@@ -10,6 +11,7 @@ from chitra.amp_capability import verify_amp_capability_receipt
 
 KEY = b"amp-capability-test-key"
 NOW = datetime.now(UTC)
+RESULT_MATERIAL = '{"child_id":"inline:child-test","status":"consumed"}'
 
 
 def _payload(**changes: object) -> dict[str, object]:
@@ -32,7 +34,8 @@ def _payload(**changes: object) -> dict[str, object]:
         "child_evidence_mode": "inline",
         "transcript_cursor": "amp:T-11111111-1111-4111-8111-111111111111:offset:1:boundary:M:prefix:" + "a" * 64,
         "usage_evidence_hash": "sha256:" + "b" * 64,
-        "result_digest": "sha256:760ba20db7d00836ad38b291b54284f41539fec73a7114dbd564b0f6ba7f79d7",
+        "result_digest": "sha256:" + hashlib.sha256(RESULT_MATERIAL.encode("utf-8")).hexdigest(),
+        "result_material": RESULT_MATERIAL,
         "containment_proof": {
             "schema": "chitra.amp-linux-containment.v1",
             "platform": "linux",
