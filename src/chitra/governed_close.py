@@ -391,7 +391,7 @@ def _invoke(provider: Provider, operation: PendingProviderOperation, record: Joi
 
 
 def _persist(store: RecoveryStateStore, record: JoinedLaneRecord) -> JoinedLaneRecord:
-    return cast(JoinedLaneRecord, store.save(record))
+    return store.save(record)
 
 
 def _wait(
