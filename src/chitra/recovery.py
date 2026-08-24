@@ -9,11 +9,11 @@ import hmac
 import json
 import os
 import re
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Literal, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 import structlog
 
@@ -27,6 +27,7 @@ from .detect.rescue import (
     sign_checkpoint_receipt,
     verify_checkpoint_receipt_signature,
 )
+from .dispatch import LaneLock, LaneLockError
 from .goals import (
     DONE_STATUSES,
     LOAD_SHED_HOLD_REASON_PREFIX,
@@ -38,8 +39,10 @@ from .goals import (
     get_goal,
     load_goals,
 )
-from .dispatch import LaneLock, LaneLockError
 from .initial_launch import (
+    amp_bootstrap_from_facts,
+    amp_bootstrap_record,
+    amp_create_operation,
     top_hand_bootstrap_record,
     top_hand_create_operation,
     top_hand_identity_from_facts,
@@ -78,8 +81,8 @@ from .session_contract import (
     OperationReference,
     PendingProviderOperation,
     ProgressEvidence,
-    ProviderOperationResult,
     ProviderIdentity,
+    ProviderOperationResult,
     RecordTransitionKind,
     RecoveryState,
     WakeReceipt,
@@ -90,6 +93,7 @@ from .session_contract import (
 )
 from .state_paths import state_dir
 from .tophand_wire import request_digest
+from .usage_policy import launch_policy_problem
 
 logger = structlog.get_logger(__name__)
 SCHEMA = "chitra.pause_recovery.v1"
@@ -1051,7 +1055,12 @@ class RecoveryEngine:
             )
             working = self._persist(working.model_copy(update={"recovery": migrated}), persist=persist)
         named_wake = self._named_wake(working, wake_id, observed_wake_condition, wake_event_sequence)
-        if working.next_check is not None and _now(working.next_check.at) > current and not named_wake:
+        if (
+            working.next_check is not None
+            and _now(working.next_check.at) > current
+            and not named_wake
+            and not self._is_initial_create(working)
+        ):
             return self._decision("noop", working, "scheduled check is not due")
         del wake_event
         if named_wake:
@@ -2050,7 +2059,13 @@ class RecoveryEngine:
     def _checkpoint_binding(self, record: JoinedLaneRecord, operation: PendingProviderOperation) -> RecoveryCheckpointBinding:
         cycle_id = record.recovery.cycle_id
         sequence = record.recovery.event_sequence
-        if cycle_id is None or sequence is None or operation.provider_instance_id is None or operation.provider_generation is None:
+        if (
+            cycle_id is None
+            or sequence is None
+            or operation.provider_handle is None
+            or operation.provider_instance_id is None
+            or operation.provider_generation is None
+        ):
             raise RecoveryStateError("checkpoint operation lacks exact recovery/provider identity")
         return RecoveryCheckpointBinding(
             lane_id=record.lane_id,
@@ -2073,7 +2088,7 @@ class RecoveryEngine:
         """Return true for the one pending operation created before joining."""
 
         return bool(
-            record.provider.kind == "tophand"
+            record.provider.kind in {"tophand", "amp"}
             and record.current_update is None
             and record.pending_operation is not None
             and record.pending_operation.kind == "create_or_resume"
@@ -2160,20 +2175,71 @@ class RecoveryEngine:
         operation, result = record.pending_operation, record.last_operation_result
         if operation is None or result is None:
             raise RecoveryStateError("initial create result has no pending operation")
-        if result.status not in {"accepted", "consumed"}:
-            return self._pending(record, current, "initial Tophand create has no accepted ownership receipt", persist)
-        failure = self._initial_ownership_failure(record, operation, result)
-        if failure is not None:
-            return self._pending(record, current, failure, persist)
-        check = self._check(current, "Continue the enrolled Tophand goal", "a material Tophand lane update")
+        if record.provider.kind == "amp":
+            problem = launch_policy_problem(record)
+            if problem is not None:
+                return self._pending(record, current, problem, persist)
+            if result.status != "consumed":
+                return self._pending(record, current, "initial Amp create has no exact consumed receipt", persist)
+            try:
+                validate_operation_result(operation, result)
+            except ContractValidationError as exc:
+                return self._pending(record, current, f"initial Amp result identity rejected: {exc}", persist)
+            if result.provider_session_id != record.session_ref:
+                return self._pending(
+                    record,
+                    current,
+                    "initial Amp result provider_session_id does not match the enrolled session",
+                    persist,
+                )
+            if result.provider_handle is None:
+                return self._pending(
+                    record,
+                    current,
+                    "initial Amp result lacks the created or adopted provider handle",
+                    persist,
+                )
+            bound_provider = record.provider.model_copy(update={"handle": result.provider_handle})
+            provider_label = "Amp"
+            transition: RecordTransitionKind = "initial-bind"
+        else:
+            if result.status not in {"accepted", "consumed"}:
+                return self._pending(
+                    record, current, "initial Tophand create has no accepted ownership receipt", persist
+                )
+            failure = self._initial_ownership_failure(record, operation, result)
+            if failure is not None:
+                return self._pending(record, current, failure, persist)
+            bound_provider = record.provider
+            provider_label = "Tophand"
+            transition = "steady"
+        check = self._check(
+            current,
+            f"Continue the enrolled {provider_label} goal",
+            f"a material {provider_label} lane update",
+        )
         recovery = record.recovery.model_copy(
             update={"stage": "diagnostic", "next_allowed_attempt": check.at, "pending_payload": None}
         )
         candidate = self._persist(
-            record.model_copy(update={"pending_operation": None, "recovery": recovery, "next_check": check}),
+            record.model_copy(
+                update={
+                    "provider": bound_provider,
+                    "pending_operation": None,
+                    "recovery": recovery,
+                    "next_check": check,
+                }
+            ),
             persist=persist,
+            transition=transition,
         )
-        return self._decision("relaunch", candidate, "exact Tophand launch ownership is proven", operation, facts=facts)
+        return self._decision(
+            "relaunch",
+            candidate,
+            f"exact {provider_label} launch identity is proven",
+            operation,
+            facts=facts,
+        )
 
     def _finish_consumed(
         self,
@@ -2423,7 +2489,7 @@ class RecoveryEngine:
                 return self._finish_initial_create(record, current, facts, persist)
             pending = record.pending_operation
             if pending is None:
-                raise RecoveryStateError("initial Tophand create is missing its pending operation")
+                raise RecoveryStateError("initial provider create is missing its pending operation")
             payload = pending.payload or record.recovery.pending_payload or ""
             record = self._mark_attempted(record, persist=persist)
             pending = record.pending_operation
@@ -2983,7 +3049,7 @@ class RecoverySupervisor:
         *,
         now: datetime | None,
     ) -> tuple[tuple[RecoveryDecision, ...], set[str]]:
-        """Persist a pending Tophand create before any provider call.
+        """Persist a pending governed create before any provider call.
 
         The returned lane set prevents the new row from being processed again
         in the same pass.  A second supervisor wins or loses the same lane
@@ -3003,7 +3069,7 @@ class RecoverySupervisor:
                 or not goal.enrolled_done_when.strip()
                 or goal.status in DONE_STATUSES
                 or goal.status == "held"
-                or not goal.session_ref.startswith("tophand:")
+                or not goal.session_ref.startswith(("tophand:", "amp:"))
                 or (self.lane_id is not None and goal.lane_id != self.lane_id)
             ):
                 continue
@@ -3018,11 +3084,19 @@ class RecoverySupervisor:
                 facts = self._facts_for_bootstrap()
                 if not facts:
                     continue
-                identity = self.identity_resolver(goal, facts)
-                if identity is None:
-                    continue
-                operation = top_hand_create_operation(goal, identity, now=now)
-                pending = top_hand_bootstrap_record(goal, identity, operation, now=now)
+                if goal.session_ref.startswith("amp:"):
+                    identity, policy = amp_bootstrap_from_facts(goal, facts, now=now)
+                    operation = amp_create_operation(goal, identity, now=now)
+                    pending = amp_bootstrap_record(
+                        goal, identity, policy, operation, now=now
+                    )
+                else:
+                    resolved_identity = self.identity_resolver(goal, facts)
+                    if resolved_identity is None:
+                        continue
+                    identity = resolved_identity
+                    operation = top_hand_create_operation(goal, identity, now=now)
+                    pending = top_hand_bootstrap_record(goal, identity, operation, now=now)
                 try:
                     stored = cast(JoinedLaneRecord, store.create(pending))
                 except Exception as exc:  # noqa: BLE001 - a concurrent winner is harmless

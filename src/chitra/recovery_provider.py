@@ -550,7 +550,13 @@ def _provider_result(
         raise ValueError(f"{provider_label} provider result observed_at is missing")
     raw_instance_id = raw.get("provider_instance_id")
     raw_generation = raw.get("provider_generation")
+    raw_handle = raw.get("provider_handle")
+    initial_handle_bind = operation.kind == "create_or_resume" and operation.provider_handle is None
     if status not in {"unknown", "lost-response"}:
+        if status in {"accepted", "consumed"} and (
+            not isinstance(raw_handle, str) or not raw_handle.strip()
+        ):
+            raise ValueError(f"{provider_label} provider result provider_handle is missing")
         if not isinstance(raw_instance_id, str) or not raw_instance_id.strip():
             raise ValueError(f"{provider_label} provider result provider_instance_id is missing")
         if operation.provider_instance_id is None or raw_instance_id != operation.provider_instance_id:
@@ -577,7 +583,11 @@ def _provider_result(
     ):
         observed = raw.get(field)
         expected = getattr(operation, field)
-        if observed is not None and observed != expected:
+        if (
+            observed is not None
+            and observed != expected
+            and not (field == "provider_handle" and initial_handle_bind)
+        ):
             raise ValueError(f"{provider_label} provider result {field} changed")
     raw_provider_session_id = raw.get("provider_session_id")
     if raw_provider_session_id is not None and (
@@ -608,7 +618,10 @@ def _provider_result(
         for field, expected in (
             ("lane_id", operation.lane_id),
             ("provider_session_id", operation.provider_session_id),
-            ("provider_handle", operation.provider_handle),
+            (
+                "provider_handle",
+                raw_handle if initial_handle_bind else operation.provider_handle,
+            ),
             ("provider_instance_id", operation.provider_instance_id),
             ("provider_generation", operation.provider_generation),
             ("process_start_token", operation.process_start_token),
@@ -631,7 +644,7 @@ def _provider_result(
         operation_id=operation.operation_id,
         kind=operation.kind,
         lane_id=operation.lane_id,
-        provider_handle=operation.provider_handle,
+        provider_handle=(raw_handle if isinstance(raw_handle, str) else operation.provider_handle),
         idempotency_key=operation.idempotency_key,
         payload_digest=operation.payload_digest,
         provider_session_id=raw_provider_session_id if isinstance(raw_provider_session_id, str) else None,
@@ -1199,18 +1212,19 @@ def _amp_usage_report(value: object, lane_reader: Callable[[], object]) -> Usage
 
 def _unknown_close_result(operation: PendingProviderOperation, evidence: str) -> CloseArchiveResult:
     provider_generation = operation.provider_generation
-    if provider_generation is None:  # MutationRequest normally prevents this.
-        raise ValueError("close operation lacks provider generation")
+    provider_handle = operation.provider_handle
+    if provider_generation is None or provider_handle is None:  # MutationRequest normally prevents this.
+        raise ValueError("close operation lacks provider handle or generation")
     return CloseArchiveResult(
         operation_id=operation.operation_id,
         lane_id=operation.lane_id,
-        provider_handle=operation.provider_handle,
+        provider_handle=provider_handle,
         provider_instance_id=operation.provider_instance_id or "unknown-instance",
         provider_generation=provider_generation,
         idempotency_key=operation.idempotency_key,
         payload_digest=operation.payload_digest,
         state="unknown",
-        provider_thread_ref=operation.provider_handle,
+        provider_thread_ref=provider_handle,
         provider_session_id=operation.provider_session_id,
         same_provider_thread=None,
         later_resume_supported=None,
@@ -1230,6 +1244,9 @@ def _amp_close_result(
     raw = dict(_mapping(value, "Amp close result"))
     provider_generation = operation.provider_generation
     provider_instance_id = operation.provider_instance_id
+    provider_handle = operation.provider_handle
+    if provider_handle is None:
+        raise ValueError("close operation lacks a provider handle")
     if provider_generation is None or provider_instance_id is None:
         return _unknown_close_result(operation, "close operation lacks a complete provider identity")
     for field in (
@@ -1291,7 +1308,7 @@ def _amp_close_result(
     return CloseArchiveResult(
         operation_id=operation.operation_id,
         lane_id=operation.lane_id,
-        provider_handle=operation.provider_handle,
+        provider_handle=provider_handle,
         provider_instance_id=cast(str, raw["provider_instance_id"]),
         provider_generation=cast(int, raw["provider_generation"]),
         idempotency_key=operation.idempotency_key,
@@ -1721,7 +1738,7 @@ def _canonical_amp_factory(
         current_facts = tuple(facts_reader(current))
         update = current.current_update
         roster = () if update is None else update.child_roster
-        known_handles = [current.provider.handle]
+        known_handles = [current.provider.handle] if current.provider.handle is not None else []
         if current.last_close_result is not None:
             known_handles.append(current.last_close_result.provider_thread_ref)
         context: dict[str, object] = {

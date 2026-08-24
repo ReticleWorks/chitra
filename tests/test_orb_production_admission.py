@@ -8,6 +8,7 @@ restart reconciliation before the provider is allowed to create anything.
 
 from __future__ import annotations
 
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -18,7 +19,7 @@ from _goal_fixtures import enrollment_fields
 from chitra.goals import GoalRecord, upsert_goal
 from chitra.joined_lane import JoinedLaneStore
 from chitra.provider_protocol import CreateOrResumeRequest, ProviderName
-from chitra.recovery import RecoverySupervisor, run_recovery_supervision
+from chitra.recovery import RecoveryStateStore, RecoverySupervisor, run_recovery_supervision
 from chitra.session_contract import (
     CapabilityName,
     FactFreshness,
@@ -28,10 +29,12 @@ from chitra.session_contract import (
     ProviderCapabilities,
     ProviderIdentity,
     ProviderOperationResult,
+    RecordTransitionKind,
 )
 
 PROFILE_DIGEST = "sha256:" + "a" * 64
 AMP_VERSION = "0.0.1787241916-g56aafe"
+CREATED_HANDLE = "amp-created-thread-a"
 CAPABILITIES: tuple[CapabilityName, ...] = (
     "create_or_resume",
     "status",
@@ -70,6 +73,7 @@ def _orb_fact(
     enabled: bool = False,
     freshness: FactFreshness = "current",
     provider_session_id: str | None = None,
+    provider_handle: str | None = None,
     revision: str = "orb-admission-1",
 ) -> OperatingFact:
     now = datetime.now(UTC)
@@ -89,7 +93,6 @@ def _orb_fact(
                 "amp_binary_path": "/usr/local/bin/amp",
                 "amp_version": AMP_VERSION,
                 "lane_id": goal.lane_id,
-                "provider_handle": f"amp-thread-{goal.lane_id}",
                 "provider_session_id": provider_session_id or goal.session_ref,
                 "provider_instance_id": f"amp-instance-{goal.lane_id}",
                 "provider_generation": 1,
@@ -102,6 +105,7 @@ def _orb_fact(
                 "turn_reserve_usd": 1,
                 "usage_poll_interval_seconds": 30,
                 "usage_max_age_seconds": 120,
+                **({"provider_handle": provider_handle} if provider_handle is not None else {}),
             },
         },
         state="known",
@@ -118,18 +122,29 @@ class _OrbLaunchProvider:
     provider_name = ProviderName.AMP
     capabilities = ProviderCapabilities.from_supported(CAPABILITIES)
 
-    def __init__(self, root: Path, *, lose_first_response: bool = False) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        lose_first_response: bool = False,
+        result_provider_session_id: str | None = None,
+        result_instance_id: str | None = None,
+    ) -> None:
         self.root = root
         self.lose_first_response = lose_first_response
         self.calls: list[PendingProviderOperation] = []
         self.physical_creates: set[str] = set()
         self.pre_io_rows: list[JoinedLaneRecord] = []
+        self.create_request_handles: list[str | None] = []
+        self.result_provider_session_id = result_provider_session_id
+        self.result_instance_id = result_instance_id
 
     def create_or_resume(self, request: CreateOrResumeRequest) -> ProviderOperationResult:
         operation = request.operation
         # This read happens at the provider boundary.  It proves the canonical
         # row, policy, and attempted pending envelope existed before I/O.
         self.pre_io_rows.append(cast(JoinedLaneRecord, JoinedLaneStore(self.root).require(operation.lane_id)))
+        self.create_request_handles.append(operation.provider_handle)
         self.calls.append(operation)
         first_physical_create = operation.idempotency_key not in self.physical_creates
         self.physical_creates.add(operation.idempotency_key)
@@ -140,12 +155,14 @@ class _OrbLaunchProvider:
             operation_id=operation.operation_id,
             kind=operation.kind,
             lane_id=operation.lane_id,
-            provider_handle=operation.provider_handle,
-            provider_session_id=operation.provider_session_id,
+            # Amp alone supplies the created/adopted physical thread.  A
+            # caller-provided handle would turn this create into a resume.
+            provider_handle=CREATED_HANDLE,
+            provider_session_id=self.result_provider_session_id or operation.provider_session_id,
             process_start_token=operation.process_start_token,
             idempotency_key=operation.idempotency_key,
             payload_digest=operation.payload_digest,
-            provider_instance_id=operation.provider_instance_id,
+            provider_instance_id=self.result_instance_id or operation.provider_instance_id,
             provider_generation=operation.provider_generation,
             status="consumed",
             accepted=True,
@@ -202,8 +219,10 @@ def test_public_supervisor_persists_orb_policy_and_pending_create_before_provide
     pre_io = provider.pre_io_rows[0]
     assert pre_io.provider.kind == "amp"
     assert pre_io.provider.provider_session_id == goal.session_ref
-    assert pre_io.provider.handle == f"amp-thread-{goal.lane_id}"
+    assert pre_io.provider.handle is None
     assert pre_io.pending_operation == provider.calls[0]
+    assert pre_io.pending_operation.provider_handle is None
+    assert provider.create_request_handles == [None]
     assert pre_io.pending_operation.attempted is True
     assert pre_io.current_update is None
     assert pre_io.launch_policy is not None
@@ -222,9 +241,16 @@ def test_public_supervisor_persists_orb_policy_and_pending_create_before_provide
         "usage_max_age_seconds": 120,
     }
     assert decisions and decisions[0].record.lane_id == goal.lane_id
+    stored = JoinedLaneStore(tmp_path).require(goal.lane_id)
+    assert stored.provider.handle == CREATED_HANDLE
+    assert stored.last_operation_result is not None
+    assert stored.last_operation_result.provider_handle == CREATED_HANDLE
 
 
-@pytest.mark.parametrize("inadmissible", ("missing", "stale", "duplicate", "enabled", "wrong-session"))
+@pytest.mark.parametrize(
+    "inadmissible",
+    ("missing", "stale", "duplicate", "enabled", "wrong-session", "prebound-handle"),
+)
 def test_public_supervisor_does_not_create_before_exact_orb_admission(
     tmp_path: Path,
     inadmissible: str,
@@ -242,8 +268,10 @@ def test_public_supervisor_does_not_create_before_exact_orb_admission(
         facts = (fact, _orb_fact(goal, revision="orb-admission-2"))
     elif inadmissible == "enabled":
         facts = (_orb_fact(goal, enabled=True),)
-    else:
+    elif inadmissible == "wrong-session":
         facts = (_orb_fact(goal, provider_session_id="amp:some-other-lane:1"),)
+    else:
+        facts = (_orb_fact(goal, provider_handle="invented-before-create"),)
 
     run_recovery_supervision(
         _supervisor(tmp_path, goal, provider, facts, tophand_calls=tophand_calls)
@@ -251,6 +279,7 @@ def test_public_supervisor_does_not_create_before_exact_orb_admission(
 
     assert provider.calls == []
     assert provider.pre_io_rows == []
+    assert provider.create_request_handles == []
     assert JoinedLaneStore(tmp_path).load(goal.lane_id) is None
     assert tophand_calls == []
 
@@ -271,6 +300,8 @@ def test_restarted_public_supervisor_reuses_pending_orb_create_after_lost_respon
     assert provider.calls[0].operation_id == pending.operation_id
     assert provider.calls[0].idempotency_key == pending.idempotency_key
     assert provider.calls[0].payload_digest == pending.payload_digest
+    assert pending.provider_handle is None
+    assert provider.create_request_handles == [None]
     assert len(provider.physical_creates) == 1
 
     second = run_recovery_supervision(_supervisor(tmp_path, goal, provider, facts))
@@ -282,6 +313,90 @@ def test_restarted_public_supervisor_reuses_pending_orb_create_after_lost_respon
         exclude={"attempt", "created_at"}
     )
     assert len(provider.physical_creates) == 1
+    assert provider.create_request_handles == [None, None]
     assert stored.pending_operation is None
     assert stored.last_operation_result is not None
     assert stored.last_operation_result.operation_id == pending.operation_id
+    assert stored.last_operation_result.provider_handle == CREATED_HANDLE
+    assert stored.provider.handle == CREATED_HANDLE
+
+
+@pytest.mark.parametrize("mismatch", ("session", "instance"))
+def test_initial_amp_result_must_preserve_every_preallocated_identity_field(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    goal = _goal(tmp_path)
+    provider = _OrbLaunchProvider(
+        tmp_path,
+        result_provider_session_id=("amp:wrong-session:1" if mismatch == "session" else None),
+        result_instance_id=("amp-wrong-instance" if mismatch == "instance" else None),
+    )
+
+    run_recovery_supervision(_supervisor(tmp_path, goal, provider, (_orb_fact(goal),)))
+
+    stored = JoinedLaneStore(tmp_path).require(goal.lane_id)
+    assert stored.provider.handle is None
+    assert stored.pending_operation is not None
+    assert stored.pending_operation.provider_handle is None
+    assert stored.last_operation_result is not None
+    assert stored.last_operation_result.status == "unknown"
+
+
+def test_restart_binds_stored_amp_result_without_another_provider_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    goal = _goal(tmp_path)
+    provider = _OrbLaunchProvider(tmp_path)
+    original_save = RecoveryStateStore.save
+
+    def crash_before_bind(
+        store: RecoveryStateStore,
+        record: JoinedLaneRecord,
+        *,
+        transition: RecordTransitionKind = "steady",
+    ) -> JoinedLaneRecord:
+        if transition == "initial-bind":
+            raise RuntimeError("simulated crash after result persistence")
+        return original_save(store, record, transition=transition)
+
+    with monkeypatch.context() as context:
+        context.setattr(RecoveryStateStore, "save", crash_before_bind)
+        run_recovery_supervision(_supervisor(tmp_path, goal, provider, (_orb_fact(goal),)))
+
+    interrupted = JoinedLaneStore(tmp_path).require(goal.lane_id)
+    assert interrupted.provider.handle is None
+    assert interrupted.pending_operation is not None
+    assert interrupted.last_operation_result is not None
+    assert interrupted.last_operation_result.provider_handle == CREATED_HANDLE
+    assert len(provider.calls) == 1
+
+    run_recovery_supervision(_supervisor(tmp_path, goal, provider, (_orb_fact(goal),)))
+
+    resumed = JoinedLaneStore(tmp_path).require(goal.lane_id)
+    assert len(provider.calls) == 1
+    assert resumed.pending_operation is None
+    assert resumed.provider.handle == CREATED_HANDLE
+
+
+def test_concurrent_public_supervisors_issue_one_amp_create(tmp_path: Path) -> None:
+    goal = _goal(tmp_path)
+    facts = (_orb_fact(goal),)
+    provider = _OrbLaunchProvider(tmp_path)
+    barrier = threading.Barrier(2)
+    decisions: list[object] = []
+
+    def run() -> None:
+        barrier.wait()
+        decisions.append(run_recovery_supervision(_supervisor(tmp_path, goal, provider, facts)))
+
+    threads = (threading.Thread(target=run), threading.Thread(target=run))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(decisions) == 2
+    assert len(provider.calls) == 1
+    assert JoinedLaneStore(tmp_path).require(goal.lane_id).provider.handle == CREATED_HANDLE

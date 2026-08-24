@@ -53,7 +53,13 @@ FactFreshness = Literal["current", "fresh", "stale", "unknown"]
 ProviderKind = Literal["tophand", "amp"]
 OwnerRole = Literal["chitra", "lane-manager", "provider"]
 ProblemHistoryKind = Literal["resolved", "reopened"]
-RecordTransitionKind = Literal["steady", "provider-transfer", "provider_transfer", "resume"]
+RecordTransitionKind = Literal[
+    "steady",
+    "provider-transfer",
+    "provider_transfer",
+    "resume",
+    "initial-bind",
+]
 LaneLifecycle = Literal["active", "inactive", "closed", "archived"]
 OperationKind = Literal[
     "create_or_resume",
@@ -725,7 +731,10 @@ class ProviderIdentity(_ContractModel):
     """Provider identity and its observed capabilities."""
 
     kind: ProviderKind
-    handle: Identifier
+    # A new Amp root lane has no physical thread before the provider returns
+    # create/adoption evidence.  ``None`` is valid only for that durable
+    # bootstrap intent; the joined-lane validator rejects it elsewhere.
+    handle: Identifier | None
     capabilities: ProviderCapabilities
     # Provider adapters may expose a physical session ID distinct from the
     # operation/thread handle.  Keep both values typed instead of relying on
@@ -797,6 +806,10 @@ def validate_pending_operation(provider: ProviderIdentity, operation: PendingPro
 
     if operation.provider_handle != provider.handle:
         raise ContractValidationError("pending operation provider handle does not match provider identity")
+    if provider.handle is None and not (
+        provider.kind == "amp" and operation.kind == "create_or_resume"
+    ):
+        raise ContractValidationError("only an initial Amp create may omit the provider handle")
     if (
         provider.instance_id is not None
         and operation.provider_instance_id is not None
@@ -829,7 +842,7 @@ class PendingProviderOperation(_ContractModel):
     operation_id: Identifier
     kind: OperationKind
     lane_id: Identifier
-    provider_handle: Identifier
+    provider_handle: Identifier | None
     idempotency_key: Identifier
     payload_digest: Text
     # ``provider_handle`` identifies the provider operation endpoint.  It is
@@ -890,7 +903,7 @@ class ProviderOperationResult(_ContractModel):
     operation_id: Identifier
     kind: OperationKind
     lane_id: Identifier
-    provider_handle: Identifier
+    provider_handle: Identifier | None
     # This value must come from the raw provider result or event.  Recovery
     # must never manufacture it from the pending operation.
     provider_session_id: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -934,6 +947,8 @@ class ProviderOperationResult(_ContractModel):
 
     @model_validator(mode="after")
     def validate_disposition(self) -> Self:
+        if self.status in ("accepted", "consumed") and self.provider_handle is None:
+            raise ValueError("a known provider result requires a physical provider handle")
         if self.status == "consumed" and (self.accepted is not True or self.consumed is not True):
             raise ValueError("consumed result requires accepted=true and consumed=true")
         if self.status == "accepted" and (self.accepted is not True or self.consumed is True):
@@ -998,7 +1013,12 @@ def validate_operation_result(pending: PendingProviderOperation, result: Provide
         errors.append("operation kind changed")
     if pending.lane_id != result.lane_id:
         errors.append("lane_id changed")
-    if pending.provider_handle != result.provider_handle:
+    initial_amp_bind = (
+        pending.kind == "create_or_resume"
+        and pending.provider_handle is None
+        and result.provider_handle is not None
+    )
+    if pending.provider_handle != result.provider_handle and not initial_amp_bind:
         errors.append("provider handle changed")
     if pending.idempotency_key != result.idempotency_key:
         errors.append("idempotency key changed")
@@ -1621,14 +1641,36 @@ class JoinedLaneRecord(_ContractModel):
         history_times = [datetime.fromisoformat(entry.created_at.replace("Z", "+00:00")) for entry in self.operation_history]
         if any(left > right for left, right in zip(history_times, history_times[1:], strict=False)):
             raise ValueError("joined-lane operation history timestamps must be monotonic")
+        initial_amp_result = (
+            self.provider.kind == "amp"
+            and self.provider.handle is None
+            and self.pending_operation is not None
+            and self.pending_operation.kind == "create_or_resume"
+        )
         for operation in (self.pending_operation, self.last_operation_result):
+            handle_matches = operation is not None and operation.provider_handle == self.provider.handle
+            if (
+                operation is not None
+                and operation is self.last_operation_result
+                and initial_amp_result
+                and operation.provider_handle is not None
+            ):
+                handle_matches = True
             if operation is not None and (
                 operation.lane_id != self.lane_id
-                or operation.provider_handle != self.provider.handle
+                or not handle_matches
                 or operation.provider_instance_id != self.provider.instance_id
                 or operation.provider_generation != self.provider.generation
             ):
                 raise ValueError("provider operation does not belong to joined lane")
+        if self.provider.handle is None and not (
+            self.provider.kind == "amp"
+            and self.current_update is None
+            and self.pending_operation is not None
+            and self.pending_operation.kind == "create_or_resume"
+            and self.recovery.attempted_remedy == "bootstrap"
+        ):
+            raise ValueError("only a pending initial Amp create may omit the provider handle")
         if self.pending_operation is not None:
             if self.pending_operation.provider_session_id not in (
                 None,
@@ -1777,7 +1819,7 @@ def validate_record_transition(
             raise ContractValidationError("transition and transition_kind disagree")
         transition = transition_kind
     normalized_transition = "provider-transfer" if transition == "provider_transfer" else transition
-    if normalized_transition not in ("steady", "provider-transfer", "resume"):
+    if normalized_transition not in ("steady", "provider-transfer", "resume", "initial-bind"):
         raise ContractValidationError(f"unknown record transition: {transition}")
 
     try:
@@ -1811,13 +1853,58 @@ def validate_record_transition(
         and current.physical_session_generation is not None
         and current.physical_session_generation > previous.physical_session_generation
     )
-    if provider_changed:
+    initial_bound = (
+        normalized_transition == "initial-bind"
+        and previous.provider.kind == "amp"
+        and previous.provider.handle is None
+        and current.provider.kind == "amp"
+        and current.provider.handle is not None
+        and previous.current_update is None
+        and current.current_update is None
+        and previous.pending_operation is not None
+        and previous.pending_operation.kind == "create_or_resume"
+        and previous.recovery.attempted_remedy == "bootstrap"
+        and current.last_operation_result is not None
+        and current.last_operation_result.provider_handle == current.provider.handle
+    )
+    if provider_changed and not initial_bound:
         if normalized_transition != "provider-transfer":
             errors.append("provider identity swap requires an explicit provider-transfer transition")
         if current.chitra_ownership_epoch <= previous.chitra_ownership_epoch:
             errors.append("provider identity swap requires ownership epoch advance")
         if not physical_generation_advanced:
             errors.append("provider identity swap requires physical session generation advance")
+    if normalized_transition == "initial-bind" and not initial_bound:
+        errors.append("initial-bind requires exact Amp create/adoption evidence for a handleless intent")
+    if initial_bound:
+        stable_provider = (
+            "kind",
+            "capabilities",
+            "provider_session_id",
+            "process_start_token",
+            "observed_process",
+            "registration_digest",
+            "registration_observed_at",
+            "instance_id",
+            "generation",
+            "parent_thread_ref",
+            "project_ref",
+            "profile_digest",
+            "provider_version",
+            "target_host",
+            "target_account",
+            "operating_facts_digest",
+            "operating_facts_deadline",
+        )
+        if any(getattr(previous.provider, field) != getattr(current.provider, field) for field in stable_provider):
+            errors.append("initial-bind may bind only the provider handle")
+        pending_create = previous.pending_operation
+        create_result = current.last_operation_result
+        assert pending_create is not None and create_result is not None
+        try:
+            validate_operation_result(pending_create, create_result)
+        except ContractValidationError as exc:
+            errors.append(str(exc))
     if normalized_transition == "provider-transfer":
         if current.chitra_ownership_epoch <= previous.chitra_ownership_epoch:
             errors.append("provider transfer requires ownership epoch advance")

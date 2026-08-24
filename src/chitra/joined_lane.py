@@ -148,6 +148,21 @@ def _owner_identity(record: JoinedLaneRecord) -> tuple[str, str, str, int]:
     handle = record.provider.handle
     instance_id = record.provider.instance_id
     generation = record.provider.generation
+    pending = record.pending_operation
+    if (
+        handle is None
+        and record.provider.kind == "amp"
+        and pending is not None
+        and pending.kind == "create_or_resume"
+        and pending.provider_handle is None
+        and instance_id
+        and generation is not None
+        and generation >= 1
+    ):
+        # The operation ID fences the handleless admission intent without
+        # pretending that it is a provider thread.  The session fence still
+        # prevents two lanes from owning one logical enrollment.
+        return (record.session_ref, pending.operation_id, instance_id, generation)
     if not handle or not instance_id or generation is None or generation < 1:
         raise JoinedLaneIdentityError("active joined-lane record has no complete provider owner identity")
     return (record.session_ref, handle, instance_id, generation)
@@ -614,7 +629,8 @@ class ProviderObservation:
     def from_operation(cls, result: ProviderOperationResult) -> ProviderObservation:
         instance_id = result.provider_instance_id
         generation = result.provider_generation
-        if instance_id is None or generation is None:
+        provider_handle = result.provider_handle
+        if instance_id is None or generation is None or provider_handle is None:
             raise ValueError("provider result lacks complete provider identity")
         return cls(
             status=result.status,
@@ -623,7 +639,7 @@ class ProviderObservation:
             consumed=result.consumed,
             operation_id=result.operation_id,
             lane_id=result.lane_id,
-            provider_handle=result.provider_handle,
+            provider_handle=provider_handle,
             provider_session_id=result.provider_session_id,
             process_start_token=result.process_start_token,
             provider_instance_id=instance_id,

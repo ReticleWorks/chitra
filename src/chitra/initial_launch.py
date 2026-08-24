@@ -1,4 +1,4 @@
-"""Pure helpers for the first Tophand operation.
+"""Pure helpers for the first governed provider operation.
 
 This module does not own a launch state machine or call a provider.  It only
 turns one current, authoritative operating fact into the identity and pending
@@ -17,9 +17,10 @@ from datetime import UTC, datetime
 from .goals import GoalRecord
 from .session_contract import (
     JoinedLaneRecord,
+    LaneLaunchPolicy,
     NextCheck,
-    OperationReference,
     OperatingFact,
+    OperationReference,
     PendingProviderOperation,
     ProviderCapabilities,
     ProviderIdentity,
@@ -28,6 +29,8 @@ from .session_contract import (
 from .tophand_wire import request_digest
 
 TOPHAND_IDENTITY_FACT = "fleet.provider-capabilities.tophand"
+AMP_ADMISSION_FACT = "fleet.provider-capabilities"
+AMP_BINARY = "/usr/local/bin/amp"
 
 
 class InitialLaunchError(ValueError):
@@ -74,6 +77,20 @@ def _required_generation(payload: Mapping[str, object]) -> int:
     return value
 
 
+def _required_number(payload: Mapping[str, object], name: str) -> int | float:
+    value = payload.get(name)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise InitialLaunchError(f"identity fact lacks numeric {name}")
+    return value
+
+
+def _required_positive_int(payload: Mapping[str, object], name: str) -> int:
+    value = payload.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise InitialLaunchError(f"identity fact lacks positive integer {name}")
+    return value
+
+
 def _capabilities(payload: Mapping[str, object]) -> ProviderCapabilities:
     raw = payload.get("capabilities")
     try:
@@ -88,7 +105,7 @@ def _capabilities(payload: Mapping[str, object]) -> ProviderCapabilities:
     except (TypeError, ValueError) as exc:
         raise InitialLaunchError(f"identity fact capabilities are invalid: {exc}") from exc
     if not result.create_or_resume:
-        raise InitialLaunchError("Tophand identity fact does not authorize create_or_resume")
+        raise InitialLaunchError("identity fact does not authorize create_or_resume")
     return result
 
 
@@ -147,6 +164,9 @@ def top_hand_identity_from_facts(
     provider_version = payload.get("provider_version", "")
     if not isinstance(provider_version, str):
         raise InitialLaunchError("Tophand identity fact provider_version must be a string")
+    parent_thread_ref = payload.get("parent_thread_ref")
+    project_ref = payload.get("project_ref")
+    profile_digest = payload.get("profile_digest")
     return ProviderIdentity(
         kind="tophand",
         handle=handle,
@@ -155,11 +175,98 @@ def top_hand_identity_from_facts(
         process_start_token=process_start_token,
         generation=generation,
         capabilities=_capabilities(payload),
-        parent_thread_ref=payload.get("parent_thread_ref") if isinstance(payload.get("parent_thread_ref"), str) else None,
-        project_ref=payload.get("project_ref") if isinstance(payload.get("project_ref"), str) else None,
-        profile_digest=payload.get("profile_digest") if isinstance(payload.get("profile_digest"), str) else None,
+        parent_thread_ref=parent_thread_ref if isinstance(parent_thread_ref, str) else None,
+        project_ref=project_ref if isinstance(project_ref, str) else None,
+        profile_digest=profile_digest if isinstance(profile_digest, str) else None,
         provider_version=provider_version,
     )
+
+
+def amp_bootstrap_from_facts(
+    goal: GoalRecord,
+    facts: Sequence[OperatingFact],
+    *,
+    now: datetime | None = None,
+) -> tuple[ProviderIdentity, LaneLaunchPolicy]:
+    """Authorize one Amp bootstrap from the exact disabled Fleet surface.
+
+    Fleet advertises the fixed runtime surface while Chitra turns its lane
+    policy fields into an immutable, goal-bound launch policy.  Missing,
+    stale, duplicate, enabled, or mismatched facts fail closed.
+    """
+
+    candidates = [fact for fact in facts if fact.name == AMP_ADMISSION_FACT]
+    current = [fact for fact in candidates if fact.is_current(now=now)]
+    if len(current) != 1:
+        raise InitialLaunchError("exactly one current Amp admission fact is required")
+    value = _mapping(current[0].value)
+    amp = _mapping(value.get("amp")) if value is not None else None
+    surface = _mapping(value.get("orb_lane_surface")) if value is not None else None
+    if amp is None or surface is None:
+        raise InitialLaunchError("Amp admission fact lacks the runtime or ORB lane surface")
+
+    amp_version = _required_text(amp, "version")
+    required_surface: tuple[tuple[str, object], ...] = (
+        ("name", "orb"),
+        ("target_machine", "twinridge"),
+        ("provider", "amp"),
+        ("transport", "direct-amp-cli"),
+        ("enabled", False),
+        ("visibility", "private"),
+        ("orb_size", "a1.tiny"),
+        ("no_archive_after_execute", True),
+        ("amp_binary_path", AMP_BINARY),
+        ("amp_version", amp_version),
+        ("lane_id", goal.lane_id),
+    )
+    if amp.get("binary") != AMP_BINARY:
+        raise InitialLaunchError("Amp admission fact does not select the fixed Amp binary")
+    for field, expected in required_surface:
+        if surface.get(field) != expected:
+            raise InitialLaunchError(f"Amp admission fact has inadmissible {field}")
+
+    provider_session_id = _required_text(surface, "provider_session_id")
+    if provider_session_id != goal.session_ref:
+        raise InitialLaunchError("Amp admission fact session does not match the enrolled physical session")
+    if surface.get("provider_handle") is not None or surface.get("handle") is not None:
+        raise InitialLaunchError("Amp admission must not pre-bind a physical provider handle")
+    capabilities = _capabilities(surface)
+    if not capabilities.subagents or not capabilities.parent_child_usage:
+        raise InitialLaunchError("Amp admission fact does not authorize the ORB multi-agent contract")
+    project_ref = _required_text(surface, "project_ref")
+    profile_digest = _required_text(surface, "profile_digest")
+    parent_thread_ref = surface.get("parent_thread_ref")
+    identity = ProviderIdentity(
+        kind="amp",
+        handle=None,
+        provider_session_id=provider_session_id,
+        instance_id=_required_text(surface, "provider_instance_id", "instance_id"),
+        process_start_token=_required_text(
+            surface, "process_start_token", "process_start", "start_token"
+        ),
+        generation=_required_generation(surface),
+        capabilities=capabilities,
+        parent_thread_ref=parent_thread_ref if isinstance(parent_thread_ref, str) else None,
+        project_ref=project_ref,
+        profile_digest=profile_digest,
+        provider_version=amp_version,
+    )
+    policy = LaneLaunchPolicy(
+        lane_id=goal.lane_id,
+        goal_id=goal.goal_id,
+        goal_version=goal.goal_version,
+        project_ref=project_ref,
+        profile_digest=profile_digest,
+        provider_version=amp_version,
+        cost_ceiling_usd=_required_number(surface, "cost_ceiling_usd"),
+        turn_reserve_usd=_required_number(surface, "turn_reserve_usd"),
+        usage_poll_interval_seconds=_required_positive_int(
+            surface, "usage_poll_interval_seconds"
+        ),
+        usage_max_age_seconds=_required_positive_int(surface, "usage_max_age_seconds"),
+        created_at=_timestamp(now),
+    )
+    return identity, policy
 
 
 # Short spelling retained for callers that describe this as a bootstrap.
@@ -211,6 +318,19 @@ def top_hand_create_operation(
     )
 
 
+def amp_create_operation(
+    goal: GoalRecord,
+    identity: ProviderIdentity,
+    *,
+    now: datetime | str | None = None,
+) -> PendingProviderOperation:
+    """Build the stable Amp create envelope used across a restart."""
+
+    if identity.kind != "amp":
+        raise InitialLaunchError("Amp create requires an Amp identity")
+    return top_hand_create_operation(goal, identity, now=now)
+
+
 def top_hand_bootstrap_record(
     goal: GoalRecord,
     identity: ProviderIdentity,
@@ -257,9 +377,61 @@ def top_hand_bootstrap_record(
     )
 
 
+def amp_bootstrap_record(
+    goal: GoalRecord,
+    identity: ProviderIdentity,
+    policy: LaneLaunchPolicy,
+    operation: PendingProviderOperation,
+    *,
+    now: datetime | str | None = None,
+) -> JoinedLaneRecord:
+    """Create the durable Amp policy and pending launch snapshot."""
+
+    if goal.lane_id != operation.lane_id or identity.kind != "amp":
+        raise InitialLaunchError("initial Amp operation identity does not match the enrolled lane")
+    current = _timestamp(now)
+    check = NextCheck(
+        at=current,
+        reason="Prove the exact Amp launch envelope",
+        wake_condition="an exact Amp launch result",
+    )
+    recovery = RecoveryState(
+        stage="relaunch",
+        cycle_id="bootstrap-" + operation.operation_id.removeprefix("bootstrap-"),
+        attempted_remedy="bootstrap",
+        attempt_count=1,
+        next_allowed_attempt=current,
+        pending_payload=operation.payload,
+    )
+    return JoinedLaneRecord(
+        lane_id=goal.lane_id,
+        goal_id=goal.goal_id,
+        goal_version=goal.goal_version,
+        session_ref=goal.session_ref,
+        provider=identity,
+        launch_policy=policy,
+        next_check=check,
+        recovery=recovery,
+        pending_operation=operation,
+        operation_history=(
+            OperationReference(
+                operation_id=operation.operation_id,
+                idempotency_key=operation.idempotency_key,
+                payload_digest=operation.payload_digest,
+                kind=operation.kind,
+                created_at=operation.created_at,
+            ),
+        ),
+    )
+
+
 __all__ = [
+    "AMP_ADMISSION_FACT",
     "InitialLaunchError",
     "TOPHAND_IDENTITY_FACT",
+    "amp_bootstrap_from_facts",
+    "amp_bootstrap_record",
+    "amp_create_operation",
     "top_hand_bootstrap_identity",
     "top_hand_create_operation",
     "top_hand_bootstrap_record",
