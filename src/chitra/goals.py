@@ -10,7 +10,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -1399,6 +1399,213 @@ def close_goal(
         reason=administrative_reason if administrative else "",
     )
     return closed
+
+
+GOAL_BLOCKER_SCHEMA = "chitra.goal-blockers.v1"
+#: Consecutive controller-owned turn observations required before a goal may
+#: carry an externally-authorized work stoppage. This is a goal-level
+#: authorization concept and is deliberately disjoint from the ordinary lane
+#: operational status ``blocked`` in ``GoalStatus``: ``GOAL_BLOCKED_MARKER``
+#: never appears in ``GOAL_STATUSES`` and this module never writes it there.
+REQUIRED_BLOCKER_OBSERVATIONS = 3
+GOAL_BLOCKED_MARKER = "goal-blocked"
+_SHA256_PROOF_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+class GoalBlockerError(ValueError):
+    """Raised when blocker evidence is malformed or replayed."""
+
+
+@pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True))
+class BlockerTurnReceipt:
+    """One controller-owned turn observation of an external stop condition."""
+
+    receipt_id: str
+    condition_id: str
+    observer_id: str
+    turn_sequence: int
+    observed_at: str
+    route_expires_at: str
+
+    def to_dict(self) -> dict[str, object]:
+        return cast(dict[str, object], _BLOCKER_RECEIPT_ADAPTER.dump_python(self, mode="json"))
+
+    @classmethod
+    def from_dict(cls, payload: object) -> BlockerTurnReceipt:
+        try:
+            receipt = _BLOCKER_RECEIPT_ADAPTER.validate_python(payload, strict=False)
+        except (TypeError, ValueError) as exc:
+            raise GoalBlockerError(f"invalid blocker turn receipt: {exc}") from exc
+        if isinstance(receipt.turn_sequence, bool) or not isinstance(receipt.turn_sequence, int):
+            raise GoalBlockerError("blocker turn_sequence must be an integer")
+        for field_name in ("observed_at", "route_expires_at"):
+            parse_iso8601(
+                getattr(receipt, field_name),
+                invalid_message=f"blocker receipt {field_name} must be ISO-8601",
+                require_timezone=True,
+                error_type=GoalBlockerError,
+            )
+        return receipt
+
+
+_BLOCKER_RECEIPT_ADAPTER = TypeAdapter(BlockerTurnReceipt)
+
+
+@dataclass(frozen=True)
+class GoalBlockerDecision:
+    """The deterministic result of a blocked-goal authorization check."""
+
+    authorized: bool
+    reason: str
+
+
+def _blocker_unauthorized(reason: str) -> GoalBlockerDecision:
+    return GoalBlockerDecision(authorized=False, reason=reason)
+
+
+def authorize_goal_block_transition(
+    *,
+    receipts: Sequence[BlockerTurnReceipt],
+    assertor_id: str,
+    no_work_remaining_proof: str,
+    now: datetime,
+    approver_id: str | None = None,
+) -> GoalBlockerDecision:
+    """Decide whether an external work stoppage may mark a goal as blocked.
+
+    Authorization requires ALL of:
+
+    - a stable external ``condition_id`` observed on at least
+      ``REQUIRED_BLOCKER_OBSERVATIONS`` consecutive controller-owned turn
+      receipts;
+    - every observing controller distinct from both the asserting agent and
+      the approving coordinator (a self-created hold is never sufficient);
+    - strictly increasing, previously unseen turn sequences and unique
+      receipt IDs (stale or replayed evidence fails closed);
+    - every observation made while its route/lease was still valid at
+      ``now`` (an expired lease is never sufficient);
+    - an explicit content-addressed proof that no meaningful work remains.
+
+    Coordinator silence -- too few controller-owned observations -- fails
+    the count gate. The returned decision never mutates goal state.
+    """
+
+    if not assertor_id.strip():
+        raise GoalBlockerError("assertor identity must be non-empty")
+    if approver_id is not None and approver_id.strip() and approver_id.strip() == assertor_id.strip():
+        return _blocker_unauthorized("the same identity created and approved the blocker")
+    if not _SHA256_PROOF_RE.fullmatch(no_work_remaining_proof.strip()):
+        return _blocker_unauthorized("blocked transition requires explicit proof that no meaningful work remains")
+    if len(receipts) < REQUIRED_BLOCKER_OBSERVATIONS:
+        return _blocker_unauthorized(
+            f"coordinator silence: requires {REQUIRED_BLOCKER_OBSERVATIONS} consecutive controller-owned observations"
+        )
+    condition_ids = {receipt.condition_id.strip() for receipt in receipts}
+    if len(condition_ids) != 1 or "" in condition_ids:
+        return _blocker_unauthorized("external condition ID is not stable across observations")
+    receipt_ids = [receipt.receipt_id.strip() for receipt in receipts]
+    sequences = []
+    for receipt in receipts:
+        observer = receipt.observer_id.strip()
+        if observer == assertor_id.strip() or (approver_id is not None and observer == approver_id.strip()):
+            return _blocker_unauthorized("self-created holds cannot authorize a blocked goal")
+        if receipt.turn_sequence in sequences:
+            return _blocker_unauthorized("stale or replayed blocker evidence cannot authorize a blocked goal")
+        sequences.append(receipt.turn_sequence)
+        if parse_iso8601(receipt.observed_at, require_timezone=True) > now:
+            return _blocker_unauthorized("observation timestamp lies in the future relative to the decision clock")
+        if parse_iso8601(receipt.route_expires_at, require_timezone=True) <= now:
+            return _blocker_unauthorized("expired route or lease is insufficient to authorize a blocked goal")
+    if len(set(receipt_ids)) != len(receipt_ids):
+        return _blocker_unauthorized("duplicate receipt IDs cannot authorize a blocked goal")
+    if any(later - earlier != 1 for earlier, later in zip(sequences, sequences[1:])):
+        return _blocker_unauthorized("observations are not consecutive controller-owned turns")
+    return GoalBlockerDecision(
+        authorized=True,
+        reason=f"stable external condition {next(iter(condition_ids))} proven on {len(receipts)} controller turns",
+    )
+
+
+def goal_blockers_path(root: Path | None = None) -> Path:
+    """Return the persistent blocker-evidence document path."""
+    return (state_dir() if root is None else root) / "goal_blockers.json"
+
+
+def load_goal_blocker_receipts(root: Path | None, session_ref: str) -> tuple[BlockerTurnReceipt, ...]:
+    """Load one lane's stored blocker evidence; a missing store has none."""
+    if not session_ref.strip():
+        raise GoalBlockerError("session_ref must be non-empty")
+    try:
+        payload: Any = json.loads(goal_blockers_path(root).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ()
+    if not isinstance(payload, dict) or payload.get("schema") != GOAL_BLOCKER_SCHEMA:
+        raise GoalBlockerError("goal_blockers.json is not a chitra.goal-blockers.v1 document")
+    sessions = payload.get("sessions")
+    if not isinstance(sessions, list):
+        raise GoalBlockerError("goal_blockers.json sessions must be a list")
+    for entry in sessions:
+        if isinstance(entry, dict) and entry.get("session_ref") == session_ref:
+            raw_receipts = entry.get("receipts")
+            if not isinstance(raw_receipts, list):
+                raise GoalBlockerError("goal_blockers.json receipts must be a list")
+            return tuple(BlockerTurnReceipt.from_dict(item) for item in raw_receipts)
+    return ()
+
+
+def record_goal_blocker_receipts(
+    root: Path | None,
+    session_ref: str,
+    receipts: Sequence[BlockerTurnReceipt],
+) -> tuple[BlockerTurnReceipt, ...]:
+    """Append controller-owned observations under anti-replay sequencing.
+
+    A receipt whose ``turn_sequence`` does not exceed everything already
+    recorded for the lane, or whose ID already appears there, is rejected
+    instead of landing, so replayed evidence can never accumulate toward the
+    three-consecutive-observation requirement.
+    """
+
+    if not session_ref.strip():
+        raise GoalBlockerError("session_ref must be non-empty")
+    incoming = tuple(receipts)
+    if not incoming:
+        raise GoalBlockerError("record_goal_blocker_receipts requires at least one receipt")
+    path = goal_blockers_path(root)
+    with locked_json_store(path):
+        try:
+            payload: Any = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            payload = {"schema": GOAL_BLOCKER_SCHEMA, "sessions": []}
+        if not isinstance(payload, dict) or payload.get("schema") != GOAL_BLOCKER_SCHEMA:
+            raise GoalBlockerError("goal_blockers.json is not a chitra.goal-blockers.v1 document")
+        sessions = payload.get("sessions")
+        if not isinstance(sessions, list):
+            raise GoalBlockerError("goal_blockers.json sessions must be a list")
+        entry = next((item for item in sessions if isinstance(item, dict) and item.get("session_ref") == session_ref), None)
+        if entry is None:
+            entry = {"session_ref": session_ref, "receipts": []}
+            sessions.append(entry)
+        stored_raw = entry.get("receipts")
+        if not isinstance(stored_raw, list):
+            raise GoalBlockerError("goal_blockers.json receipts must be a list")
+        stored = tuple(BlockerTurnReceipt.from_dict(item) for item in stored_raw)
+        known_sequences = {receipt.turn_sequence for receipt in stored}
+        known_ids = {receipt.receipt_id for receipt in stored}
+        for receipt in incoming:
+            if receipt.turn_sequence in known_sequences or receipt.turn_sequence <= max(
+                (item.turn_sequence for item in stored), default=0
+            ):
+                raise GoalBlockerError("stale or replayed blocker evidence is refused by the store")
+            if receipt.receipt_id in known_ids:
+                raise GoalBlockerError("duplicate blocker receipt ID is refused by the store")
+            known_sequences.add(receipt.turn_sequence)
+            known_ids.add(receipt.receipt_id)
+        entry["receipts"] = [item.to_dict() for item in (*stored, *incoming)]
+        payload["updated_at"] = _utc_now()
+        write_json_atomic(path, payload, fsync=True)
+    logger.info("goal_blocker_evidence_recorded", session_ref=session_ref, count=len(incoming))
+    return (*stored, *incoming)
 
 
 def main(argv: list[str] | None = None) -> int:
