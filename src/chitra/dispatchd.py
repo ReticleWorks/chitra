@@ -135,7 +135,13 @@ from .goals import (
 from .goals import (
     SCHEMA as GOALS_INSTALLED_SCHEMA,
 )
-from .joined_lane import JoinedLaneReconciler, JoinedLaneStore, ReconcileReport, build_filesystem_reconciler
+from .joined_lane import (
+    JoinedLaneReconciler,
+    JoinedLaneStore,
+    ReconcileOutcome,
+    ReconcileReport,
+    build_filesystem_reconciler,
+)
 from .journal import native_session_identity
 from .lane_config import LaneCredentials, LaneSpec
 from .operating_facts import (
@@ -670,6 +676,51 @@ def _requeue_joined_lane_deferred(queue_dir: Path, report: ReconcileReport) -> l
     if requeued:
         logger.info("dispatchd_joined_lane_requeued", order_ids=[path.stem for path in requeued])
     return requeued
+
+
+def _supervised_lane_report(root: Path) -> ReconcileReport:
+    """Project the canonical post-supervision rows into the dispatch barrier."""
+
+    try:
+        records = tuple(JoinedLaneStore(root).unfinished())
+    except Exception as exc:  # noqa: BLE001 - an unreadable barrier must fail closed
+        return ReconcileReport((), (f"joined-lane barrier load failed: {exc}",))
+    outcomes: list[ReconcileOutcome] = []
+    for value in records:
+        record = cast(JoinedLaneRecord, value)
+        amp_initial_bound = (
+            record.provider.kind != "amp"
+            or (
+                record.provider.handle is not None
+                and (
+                    record.physical_session_generation == record.provider.generation
+                    # Pre-admission records already have lane-authored
+                    # provider activity.  Preserve that established path;
+                    # newly bootstrapped ORB rows start with no update and
+                    # must carry the explicit initial-bind generation.
+                    or record.current_update is not None
+                )
+            )
+        )
+        # This projection is narrower than the legacy joined-lane reconciler:
+        # RecoverySupervisor already owns ordinary pending recovery work.  Its
+        # extra dispatch invariant is the Amp admission boundary itself.
+        send_allowed = amp_initial_bound
+        reason = ""
+        if not amp_initial_bound:
+            reason = "the initial Amp create or adoption is not consumed and durably bound"
+        outcomes.append(
+            ReconcileOutcome(
+                lane_id=record.lane_id,
+                session_ref=record.session_ref,
+                status="ready" if send_allowed else "blocked",
+                send_allowed=send_allowed,
+                reason=reason,
+                next_check_at=record.next_check.at if record.next_check is not None else "",
+                record=record,
+            )
+        )
+    return ReconcileReport(tuple(outcomes))
 
 
 def _requeue_lane_lock_deferred(queue_dir: Path, orders_dir: Path) -> list[Path]:
@@ -1486,10 +1537,9 @@ def run_once(
     elif joined_lane_reconciler is not None and recovery_supervisor is None:
         joined_lane_report = joined_lane_reconciler.reconcile_all()
     elif recovery_supervisor is not None and joined_lane_root is not None:
-        # RecoverySupervisor owns the lane lock and canonical state transition.
-        # There is no separate mutable reconciler barrier in this production
-        # path; it would be a second state machine.
-        joined_lane_report = ReconcileReport(())
+        joined_lane_report = ReconcileReport(
+            (), ("recovery supervision has not produced a joined-lane barrier",)
+        )
     elif joined_lane_root is not None:
         joined_lane_report = ReconcileReport((), ("joined-lane reconciler is required when joined_lane_root is set",))
     else:
@@ -1507,12 +1557,26 @@ def run_once(
                 else ReconcileReport(())
             )
     if recovery_supervisor is not None:
-        run_recovery_supervision(recovery_supervisor)
-        if reconciliation_gate is not None:
-            joined_lane_report = reconciliation_gate()
-        elif joined_lane_reconciler is not None and recovery_supervisor is None:
-            joined_lane_report = joined_lane_reconciler.reconcile_all()
+        try:
+            run_recovery_supervision(recovery_supervisor)
+        except Exception as exc:  # noqa: BLE001 - supervision failure blocks every queued send
+            joined_lane_report = ReconcileReport(
+                (), (f"recovery supervision failed before the dispatch barrier: {exc}",)
+            )
+        else:
+            if reconciliation_gate is not None:
+                joined_lane_report = reconciliation_gate()
+            elif joined_lane_reconciler is None:
+                joined_lane_report = _supervised_lane_report(
+                    joined_lane_root or recovery_supervisor.state_root
+                )
     _requeue_joined_lane_deferred(queue_dir, joined_lane_report)
+    if recovery_supervisor is not None and not joined_lane_report.ready:
+        # Do not claim queue work and ask its inner processor to rediscover
+        # the same barrier.  In particular, an Amp lane with a handleless or
+        # attempted create cannot reach any dispatch seam until the consumed
+        # initial-bind transition is durable.
+        return []
     _reclaim_stale_in_flight(queue_dir)
     note_goals_schema_state(goals_root)
     if isinstance(_preloaded_routing_config, _ConfigNotPreloaded):

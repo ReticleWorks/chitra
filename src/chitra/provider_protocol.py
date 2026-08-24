@@ -142,7 +142,7 @@ class MutationRequest:
         return self.operation.payload_digest
 
     @property
-    def provider_handle(self) -> str:
+    def provider_handle(self) -> str | None:
         return self.operation.provider_handle
 
 
@@ -159,6 +159,11 @@ class CreateOrResumeRequest(MutationRequest):
     close_operation_id: str | None = None
     owner_process: OwnerProcessIdentity | None = None
     resume_token: str | None = None
+    # For a handleless create, this is the state of Chitra's durable pending
+    # envelope before the current provider call.  Recovery marks the envelope
+    # attempted before I/O, so the Adapter cannot recover this distinction
+    # from ``operation.attempted`` itself.
+    create_attempted: bool | None = None
 
     def __post_init__(self) -> None:
         MutationRequest.__post_init__(self)
@@ -173,6 +178,8 @@ class CreateOrResumeRequest(MutationRequest):
             isinstance(self.goal_version, bool) or self.goal_version < 1
         ):
             raise ValueError("goal_version must be a positive integer")
+        if self.create_attempted is not None and not isinstance(self.create_attempted, bool):
+            raise ValueError("create_attempted must be a boolean when supplied")
         _optional_text(self.close_operation_id, "close_operation_id")
         _optional_text(self.resume_token, "resume_token")
         if not isinstance(self.resume_after_close, bool):

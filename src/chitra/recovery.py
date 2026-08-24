@@ -1943,6 +1943,8 @@ class RecoveryEngine:
         action: str,
         payload: str,
         current: datetime,
+        *,
+        create_attempted: bool | None = None,
     ) -> ProviderOperationResult:
         if self.provider is None:
             return self._unknown(operation, current, "no provider is registered for the lane")
@@ -1968,6 +1970,7 @@ class RecoveryEngine:
                         close_operation_id=(close.operation_id if close is not None and close.owner_process is not None else None),
                         owner_process=(close.owner_process if close is not None and close.owner_process is not None else None),
                         resume_token=resume_token,
+                        create_attempted=create_attempted,
                     )
                 )
             else:
@@ -2225,6 +2228,11 @@ class RecoveryEngine:
             record.model_copy(
                 update={
                     "provider": bound_provider,
+                    "physical_session_generation": (
+                        result.provider_generation
+                        if record.provider.kind == "amp"
+                        else record.physical_session_generation
+                    ),
                     "pending_operation": None,
                     "recovery": recovery,
                     "next_check": check,
@@ -2491,10 +2499,18 @@ class RecoveryEngine:
             if pending is None:
                 raise RecoveryStateError("initial provider create is missing its pending operation")
             payload = pending.payload or record.recovery.pending_payload or ""
+            create_attempted = pending.attempted
             record = self._mark_attempted(record, persist=persist)
             pending = record.pending_operation
             assert pending is not None
-            retried = self._invoke(record, pending, "relaunch", payload, current)
+            retried = self._invoke(
+                record,
+                pending,
+                "relaunch",
+                payload,
+                current,
+                create_attempted=create_attempted,
+            )
             recorded = self._persist(record.model_copy(update={"last_operation_result": retried}), persist=persist)
             return self._finish_initial_create(recorded, current, facts, persist)
 

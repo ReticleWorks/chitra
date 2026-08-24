@@ -1358,14 +1358,18 @@ class _PackagedAmpProvider:
         cursor_sink: RecoverySink,
         lane_reader: Callable[[], object],
         process_start_token: str | None = None,
+        create_attempted: bool = False,
         operating_facts_binding: OperatingFactsBinding | None = None,
         update_batch_sink: Callable[[Sequence[object], str], object | None] | None = None,
     ) -> None:
+        if not isinstance(create_attempted, bool):
+            raise TypeError("create_attempted must be a boolean")
         self._adapter = adapter
         self._result_sink = result_sink
         self._cursor_sink = cursor_sink
         self._lane_reader = lane_reader
         self._process_start_token = process_start_token
+        self._create_attempted = create_attempted
         self._operating_facts_binding = operating_facts_binding
         self._update_batch_sink = update_batch_sink
 
@@ -1382,7 +1386,18 @@ class _PackagedAmpProvider:
         return _amp_capabilities(getattr(self._adapter, "capabilities", {}))
 
     def _payload(self, request: object, operation: PendingProviderOperation) -> dict[str, object]:
-        payload: dict[str, object] = {"operation": _operation_dict(operation)}
+        operation_payload = _operation_dict(operation)
+        if isinstance(request, CreateOrResumeRequest) and operation.provider_handle is None:
+            # The real Amp Adapter distinguishes a first post from restart
+            # reconciliation with this exact peer-owned field. Recovery
+            # captures it before marking the imminent I/O attempt; direct
+            # factory users fall back to the row used to resolve this facade.
+            operation_payload["create_attempted"] = (
+                request.create_attempted
+                if request.create_attempted is not None
+                else self._create_attempted
+            )
+        payload: dict[str, object] = {"operation": operation_payload}
         if isinstance(request, SendRequest):
             payload["text"] = request.text
         elif isinstance(request, CreateOrResumeRequest):
@@ -1420,8 +1435,18 @@ class _PackagedAmpProvider:
         operation: PendingProviderOperation,
     ) -> ProviderOperationResult:
         self._require_current_facts()
-        raw = getattr(self._adapter, method)(self._payload(request, operation))
+        raw = _mapping(
+            getattr(self._adapter, method)(self._payload(request, operation)),
+            f"Amp {method} result",
+        )
         self._require_current_facts()
+        enrolled_process_token = operation.process_start_token or self._process_start_token
+        if raw.get("process_start_token") is None and enrolled_process_token is not None:
+            # The Adapter owns physical thread evidence but does not carry
+            # Fleet's process-start fence in its transport identity. Preserve
+            # the already enrolled Chitra identity; never infer a token from
+            # transport output.
+            raw = {**raw, "process_start_token": enrolled_process_token}
         result = _provider_result(raw, operation, provider_label="Amp")
         self._result_sink(raw)
         return result
@@ -1797,7 +1822,6 @@ def _canonical_amp_factory(
             anchor_thread_id=identity.parent_thread_ref,
             lane_reader=lane_reader,
             amp_version=amp_version,
-            process_start_token=identity.process_start_token,
         )
     except Exception as exc:  # noqa: BLE001 - unavailable provider is canonical unknown
         logger.warning("packaged_amp_unavailable", lane_id=record.lane_id, error=str(exc))
@@ -1810,6 +1834,11 @@ def _canonical_amp_factory(
         cursor_sink=cursor_sink,
         lane_reader=lane_reader,
         process_start_token=identity.process_start_token,
+        create_attempted=(
+            record.pending_operation is not None
+            and record.pending_operation.kind == "create_or_resume"
+            and record.pending_operation.attempted
+        ),
         operating_facts_binding=operating_facts_binding,
         update_batch_sink=_canonical_update_batch_sink(lane),
     )

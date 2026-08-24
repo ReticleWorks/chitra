@@ -1859,6 +1859,8 @@ def validate_record_transition(
         and previous.provider.handle is None
         and current.provider.kind == "amp"
         and current.provider.handle is not None
+        and previous.physical_session_generation is None
+        and current.physical_session_generation == current.provider.generation
         and previous.current_update is None
         and current.current_update is None
         and previous.pending_operation is not None
@@ -1866,6 +1868,9 @@ def validate_record_transition(
         and previous.recovery.attempted_remedy == "bootstrap"
         and current.last_operation_result is not None
         and current.last_operation_result.provider_handle == current.provider.handle
+        and current.last_operation_result.status == "consumed"
+        and current.last_operation_result.accepted is True
+        and current.last_operation_result.consumed is True
     )
     if provider_changed and not initial_bound:
         if normalized_transition != "provider-transfer":

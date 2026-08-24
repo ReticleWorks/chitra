@@ -409,6 +409,63 @@ class _AmpAdapter:
         }
 
 
+@pytest.mark.parametrize(("create_attempted", "expected"), ((False, False), (True, True)))
+def test_amp_facade_carries_chitra_create_attempt_evidence(
+    create_attempted: bool,
+    expected: bool,
+) -> None:
+    """The real Adapter's post/adopt decision uses this exact durable field."""
+
+    calls: list[dict[str, object]] = []
+
+    class CapturingAdapter:
+        capabilities = _AmpTransport.capabilities
+
+        def create_or_resume(self, request: dict[str, object]) -> dict[str, object]:
+            calls.append(request)
+            operation = cast(dict[str, object], request["operation"])
+            return {
+                **operation,
+                "provider_handle": None,
+                "status": "unknown",
+                "accepted": None,
+                "consumed": None,
+                "observed_at": NOW.isoformat(),
+                "evidence": "handleless create remains pending",
+            }
+
+    operation = _operation("create_or_resume").model_copy(
+        update={
+            "provider_handle": None,
+            "provider_session_id": "amp:amp-lane:1",
+            # Recovery persists this as true immediately before I/O.  The
+            # facade must still carry the pre-I/O durable state captured when
+            # the provider was resolved.
+            "attempted": True,
+        }
+    )
+    provider = _PackagedAmpProvider(
+        CapturingAdapter(),
+        result_sink=lambda _value: None,
+        cursor_sink=lambda _value: None,
+        lane_reader=lambda: {},
+        create_attempted=create_attempted,
+    )
+
+    result = provider.create_or_resume(
+        CreateOrResumeRequest(
+            operation=operation,
+            session_ref="amp:amp-lane:1",
+            provider_session_id="amp:amp-lane:1",
+            goal_id="goal-amp",
+            goal_version=1,
+        )
+    )
+
+    assert result.status == "unknown"
+    assert cast(dict[str, object], calls[0]["operation"])["create_attempted"] is expected
+
+
 def test_packaged_result_keeps_raw_provider_session_and_rejects_missing_session() -> None:
     operation = _operation("send").model_copy(update={"provider_session_id": "amp-session-a"})
     raw = {
