@@ -970,11 +970,11 @@ class RecoveryEngine:
         )
 
     def _operation(self, record: JoinedLaneRecord, action: str, payload: str, current: datetime) -> PendingProviderOperation:
-        if action == "close":
+        if action in {"close", "resume"}:
             provider = record.provider
             session = _close_session(record)
             if provider.instance_id is None or provider.generation is None:
-                raise RecoveryStateError("close operation lacks a complete provider identity")
+                raise RecoveryStateError(f"{action} operation lacks a complete provider identity")
             identity = {
                 "lane_id": record.lane_id,
                 "goal_id": record.goal_id,
@@ -986,10 +986,10 @@ class RecoveryEngine:
                 "provider_generation": provider.generation,
                 "payload": payload,
             }
-            operation_id = "close-" + _digest(identity)[:32]
+            operation_id = f"{action}-" + _digest(identity)[:32]
             return PendingProviderOperation(
                 operation_id=operation_id,
-                kind="close",
+                kind="close" if action == "close" else "create_or_resume",
                 lane_id=record.lane_id,
                 provider_handle=provider.handle,
                 provider_session_id=session,
@@ -1619,40 +1619,6 @@ class RecoveryEngine:
         )
 
     @staticmethod
-    def _resume_operation(
-        record: JoinedLaneRecord, payload: str, current: datetime
-    ) -> PendingProviderOperation:
-        provider = record.provider
-        session = provider.provider_session_id
-        if provider.instance_id is None or provider.generation is None or not session:
-            raise RecoveryStateError("resume operation lacks the exact closed provider identity")
-        identity = {
-            "lane_id": record.lane_id,
-            "goal_id": record.goal_id,
-            "goal_version": record.goal_version,
-            "session_ref": record.session_ref,
-            "provider_handle": provider.handle,
-            "provider_session_id": session,
-            "provider_instance_id": provider.instance_id,
-            "provider_generation": provider.generation,
-            "payload": payload,
-        }
-        operation_id = "resume-" + _digest(identity)[:32]
-        return PendingProviderOperation(
-            operation_id=operation_id,
-            kind="create_or_resume",
-            lane_id=record.lane_id,
-            provider_handle=provider.handle,
-            provider_session_id=session,
-            idempotency_key=f"{operation_id}-idem",
-            payload_digest=_digest(identity),
-            payload=payload,
-            provider_instance_id=provider.instance_id,
-            provider_generation=provider.generation,
-            created_at=current.isoformat(),
-        )
-
-    @staticmethod
     def _resume_wait(
         record: JoinedLaneRecord,
         reason: str,
@@ -1728,7 +1694,7 @@ class RecoveryEngine:
             }
         )
         try:
-            expected = self._resume_operation(record, payload, current_time)
+            expected = self._operation(record, "resume", payload, current_time)
         except (RecoveryStateError, TypeError, ValueError) as exc:
             return self._resume_wait(record, str(exc))
         pending = record.pending_operation

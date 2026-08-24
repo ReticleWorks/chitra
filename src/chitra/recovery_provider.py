@@ -15,9 +15,7 @@ waiting instead of guessing.
 
 from __future__ import annotations
 
-import hashlib
 import json
-import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -498,55 +496,18 @@ class _PackagedTophandProvider:
             payload = json.loads(operation.payload)
             if not isinstance(payload, Mapping):
                 raise ValueError("Chitra close payload must be an object")
-            reference = payload.get("checkpoint_ref")
-            if not isinstance(reference, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", reference) is None:
-                raise ValueError("Chitra close checkpoint reference is unsafe")
-            receipt = request.checkpoint_receipt
-            if not isinstance(receipt, Mapping):
-                raise ValueError("Chitra close checkpoint receipt was not supplied over the provider boundary")
-            receipt = dict(receipt)
-            digest = hashlib.sha256(
-                json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-            ).hexdigest()
-            if request.checkpoint_receipt_sha256 != digest:
-                raise ValueError("Chitra close checkpoint receipt digest changed")
-            if request.checkpoint_verifier != "chitra.detect.rescue.verify_checkpoint_receipt_signature":
-                raise ValueError("Chitra close checkpoint verifier evidence is missing")
-            if (
-                receipt.get("schema_name") != "chitra.governed-close-checkpoint.v1"
-                or receipt.get("checkpoint_ref") != reference
-                or receipt.get("lane") != operation.lane_id
-                or receipt.get("goal_id") != payload.get("goal_id")
-                or receipt.get("goal_version") != payload.get("goal_version")
-                or receipt.get("session_ref") != payload.get("session_ref")
-                or receipt.get("provenance") != {"kind": "governed-completion-checkpoint", "owner": "chitra"}
-            ):
-                raise ValueError("Chitra close checkpoint logical binding changed")
-            binding = receipt.get("provider_binding")
-            expected_binding = {
-                "kind": "tophand",
-                "handle": operation.provider_handle,
-                "provider_session_id": operation.provider_session_id,
-                "instance_id": operation.provider_instance_id,
-                "generation": operation.provider_generation,
-            }
-            if not isinstance(binding, Mapping) or dict(binding) != expected_binding:
-                raise ValueError("Chitra close checkpoint provider binding changed")
-            receipt_digest = hashlib.sha256(
-                json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-            ).hexdigest()
             wire_request = {
                 "operation": operation.model_dump(mode="json"),
-                "archive": True,
+                "archive": request.archive,
                 "payload": dict(payload),
                 "goal_id": payload.get("goal_id"),
                 "lane_id": operation.lane_id,
                 "session_ref": payload.get("session_ref"),
                 "provider_session_id": operation.provider_session_id,
-                "checkpoint_ref": reference,
-                "checkpoint_receipt": receipt,
-                "checkpoint_receipt_sha256": receipt_digest,
-                "checkpoint_verifier": "chitra.detect.rescue.verify_checkpoint_receipt_signature",
+                "checkpoint_ref": payload.get("checkpoint_ref"),
+                "checkpoint_receipt": request.checkpoint_receipt,
+                "checkpoint_receipt_sha256": request.checkpoint_receipt_sha256,
+                "checkpoint_verifier": request.checkpoint_verifier,
             }
             raw = cast(Any, self._adapter).close(wire_request)
             self._result_sink(raw)
