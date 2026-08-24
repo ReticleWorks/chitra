@@ -605,6 +605,7 @@ class ProviderObservation:
     lane_id: str
     provider_handle: str
     provider_session_id: str | None
+    process_start_token: str | None
     provider_instance_id: str
     provider_generation: int
     evidence: str
@@ -624,6 +625,7 @@ class ProviderObservation:
             lane_id=result.lane_id,
             provider_handle=result.provider_handle,
             provider_session_id=result.provider_session_id,
+            process_start_token=result.process_start_token,
             provider_instance_id=instance_id,
             provider_generation=generation,
             evidence=result.evidence,
@@ -657,6 +659,11 @@ class ProviderObservation:
             lane_id=update.lane_id,
             provider_handle=provider_handle,
             provider_session_id=update.provider_session_id,
+            process_start_token=(
+                update.payload.get("process_start_token")
+                if isinstance(update.payload.get("process_start_token"), str)
+                else None
+            ),
             provider_instance_id=instance_id,
             provider_generation=generation,
             evidence=update.event_id,
@@ -953,6 +960,7 @@ class JoinedLaneReconciler:
             lane_id=pending.lane_id,
             provider_handle=pending.provider_handle,
             provider_session_id=observation.provider_session_id,
+            process_start_token=observation.process_start_token,
             idempotency_key=pending.idempotency_key,
             payload_digest=pending.payload_digest,
             provider_instance_id=pending.provider_instance_id,

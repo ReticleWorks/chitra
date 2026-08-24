@@ -260,7 +260,10 @@ def journal_observation(operation_id: str, *, consumed: bool | None, event_id: s
         provider_instance_id="instance-a",
         provider_generation=1,
         provider_handle="thread-a",
-        payload={"result_evidence": {"accepted": True, "consumed": consumed}},
+        payload={
+            "result_evidence": {"accepted": True, "consumed": consumed},
+            "process_start_token": "boot-a:77",
+        },
     )
 
 
