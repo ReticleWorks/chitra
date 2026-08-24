@@ -90,6 +90,8 @@ def _record() -> JoinedLaneRecord:
         provider=ProviderIdentity(
             kind="tophand",
             handle="tophand-lane-a",
+            provider_session_id="tophand:lane-a:1",
+            process_start_token="boot-a:77",
             instance_id="instance-a",
             generation=1,
             capabilities=ProviderCapabilities.from_supported(
@@ -132,8 +134,18 @@ def _result(request: SendRequest | CheckpointRequest | CreateOrResumeRequest, st
         provider_handle=request.provider_handle,
         idempotency_key=request.idempotency_key,
         payload_digest=request.payload_digest,
+        provider_session_id=request.operation.provider_session_id,
+        process_start_token=request.operation.process_start_token,
         provider_instance_id=request.provider_instance_id,
         provider_generation=request.provider_generation,
+        provider_pid=4242,
+        owner_pid=4242,
+        observed_process={
+            "pid": 4242,
+            "boot_id": "boot-a",
+            "start_ticks": 77,
+            "process_start_token": request.operation.process_start_token,
+        },
         status=status,  # type: ignore[arg-type]
         accepted=True,
         consumed=consumed,
@@ -272,6 +284,8 @@ class SequenceProvider:
             generation=self.relaunch_count + 1,
             fresh=True,
             provider_available=True,
+            provider_instance_id="instance-a",
+            process_start_token=f"boot-a:{77 + self.relaunch_count}",
         )
 
     def read_updates(self, cursor: str | None = None) -> ReadUpdatesResult:

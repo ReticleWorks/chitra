@@ -41,10 +41,18 @@ from chitra.session_contract import (
 )
 
 
-def provider(*, instance_id: str = "instance-a", generation: int = 1) -> ProviderIdentity:
+def provider(
+    *,
+    instance_id: str = "instance-a",
+    generation: int = 1,
+    provider_session_id: str | None = None,
+    process_start_token: str | None = None,
+) -> ProviderIdentity:
     return ProviderIdentity(
         kind="tophand",
         handle="thread-a",
+        provider_session_id=provider_session_id,
+        process_start_token=process_start_token,
         instance_id=instance_id,
         generation=generation,
         capabilities=ProviderCapabilities.from_supported(("send", "read_updates")),
@@ -96,7 +104,13 @@ def append_wake_event(root: Path, wake_id: str, condition: str) -> None:
     )
 
 
-def pending_operation(*, operation_id: str = "op-1", provider_instance_id: str = "instance-a") -> PendingProviderOperation:
+def pending_operation(
+    *,
+    operation_id: str = "op-1",
+    provider_instance_id: str = "instance-a",
+    provider_session_id: str | None = None,
+    process_start_token: str | None = None,
+) -> PendingProviderOperation:
     return PendingProviderOperation(
         operation_id=operation_id,
         kind="send",
@@ -104,6 +118,8 @@ def pending_operation(*, operation_id: str = "op-1", provider_instance_id: str =
         provider_handle="thread-a",
         idempotency_key=f"idem-{operation_id}",
         payload_digest=f"digest-{operation_id}",
+        provider_session_id=provider_session_id,
+        process_start_token=process_start_token,
         provider_instance_id=provider_instance_id,
         provider_generation=1,
         created_at="2026-08-23T14:00:00+00:00",
@@ -188,6 +204,8 @@ def accepted_observation(
     status: str = "accepted",
     provider_instance_id: str = "instance-a",
     provider_generation: int = 1,
+    provider_session_id: str | None = None,
+    process_start_token: str | None = None,
 ) -> ProviderOperationResult:
     if status == "unknown":
         accepted: bool | None = None
@@ -209,8 +227,18 @@ def accepted_observation(
         provider_handle="thread-a",
         idempotency_key=f"idem-{operation_id}",
         payload_digest=f"digest-{operation_id}",
+        provider_session_id=provider_session_id,
+        process_start_token=process_start_token,
         provider_instance_id=provider_instance_id,
         provider_generation=provider_generation,
+        provider_pid=4242,
+        owner_pid=4242,
+        observed_process={
+            "pid": 4242,
+            "boot_id": "boot-a",
+            "start_ticks": 77,
+            "process_start_token": process_start_token,
+        },
         status=status,
         accepted=accepted,
         consumed=consumed,
@@ -454,11 +482,29 @@ def test_provider_acceptance_without_durable_ack_is_held(tmp_path: Path) -> None
 
 def test_sent_direction_without_journal_observation_is_not_replayed(tmp_path: Path) -> None:
     store = JoinedLaneStore(tmp_path)
-    pending = pending_operation()
-    store.create(record(pending=pending, result=operation_result(pending)))
+    pending = pending_operation(provider_session_id="tophand:lane-a", process_start_token="boot-a:77")
+    enrolled = provider(provider_session_id="tophand:lane-a", process_start_token="boot-a:77")
+    result = operation_result(pending)
+    result = result.model_copy(
+        update={
+            "provider_session_id": "tophand:lane-a",
+            "process_start_token": "boot-a:77",
+            "provider_pid": 4242,
+            "owner_pid": 4242,
+            "observed_process": {
+                "pid": 4242,
+                "boot_id": "boot-a",
+                "start_ticks": 77,
+                "process_start_token": "boot-a:77",
+            },
+        }
+    )
+    store.create(record(pending=pending, result=result, provider_identity=enrolled))
     reconciler = JoinedLaneReconciler(
         store,
-        provider_probe=lambda _record: accepted_observation("op-1"),
+        provider_probe=lambda _record: accepted_observation(
+            "op-1", provider_session_id="tophand:lane-a", process_start_token="boot-a:77"
+        ),
         journal_probe=lambda _record: journal_observation("op-1", consumed=None),
         ledger_probe=lambda _record: ledger_observation("op-1"),
         ownership_probe=lambda _record: ownership(),
@@ -469,12 +515,19 @@ def test_sent_direction_without_journal_observation_is_not_replayed(tmp_path: Pa
 
 def test_exact_journal_observation_allows_progress_but_ledger_alone_does_not(tmp_path: Path) -> None:
     store = JoinedLaneStore(tmp_path)
-    pending = pending_operation()
-    store.create(record(pending=pending))
+    pending = pending_operation(provider_session_id="tophand:lane-a", process_start_token="boot-a:77")
+    store.create(
+        record(
+            pending=pending,
+            provider_identity=provider(provider_session_id="tophand:lane-a", process_start_token="boot-a:77"),
+        )
+    )
     probes = {"journal": lambda _record: None}
     reconciler = JoinedLaneReconciler(
         store,
-        provider_probe=lambda _record: accepted_observation("op-1"),
+        provider_probe=lambda _record: accepted_observation(
+            "op-1", provider_session_id="tophand:lane-a", process_start_token="boot-a:77"
+        ),
         journal_probe=lambda current: probes["journal"](current),
         ledger_probe=lambda _record: ledger_observation("op-1"),
         ownership_probe=lambda _record: ownership(),
