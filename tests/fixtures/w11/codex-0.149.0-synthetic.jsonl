@@ -1,0 +1,16 @@
+{"id":"fixture-codex-01","type":"session_meta","payload":{"id":"fixture-codex-session","cli_version":"0.149.0"}}
+{"id":"fixture-codex-02","type":"event_msg","payload":{"type":"task_started"}}
+{"id":"fixture-codex-03","type":"response_item","payload":{"type":"message","role":"assistant","id":"fixture-message-1","content":[{"type":"output_text","text":"synthetic response one"}]}}
+{"id":"fixture-codex-04","type":"response_item","payload":{"type":"custom_tool_call","call_id":"fixture-call-1","name":"fixture_tool","input":{"action":"fixture"}}}
+{"id":"fixture-codex-05","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"fixture-call-1","output":[{"type":"text","text":"{\"exit_code\":0,\"stdout\":\"fixture result\"}"}]}}
+{"id":"fixture-codex-06","type":"event_msg","payload":{"type":"task_complete","turn_id":"fixture-turn-1"}}
+{"id":"fixture-codex-07","type":"response_item","payload":{"type":"message","role":"assistant","id":"fixture-message-2","content":[{"type":"output_text","text":"synthetic response two"}]}}
+{"id":"fixture-codex-08","type":"response_item","payload":{"type":"custom_tool_call","call_id":"fixture-call-2","name":"fixture_tool","input":{"action":"fixture"}}}
+{"id":"fixture-codex-09","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"fixture-call-2","output":[{"type":"text","text":"{\"exit_code\":1,\"stderr\":\"synthetic failure\"}"}]}}
+{"id":"fixture-codex-10","type":"event_msg","payload":{"type":"task_complete","turn_id":"fixture-turn-2"}}
+{"id":"fixture-codex-11","type":"compacted","payload":{"window_number":1,"first_window_id":"fixture-window-1","previous_window_id":null,"window_id":"fixture-window-2","replacement_history":["fixture"]}}
+{"id":"fixture-codex-12","type":"response_item","payload":{"type":"custom_tool_call","call_id":"fixture-call-3","name":"fixture_tool","input":{"action":"fixture"}}}
+{"id":"fixture-codex-13","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"fixture-call-3","output":[{"type":"text","text":"{\"exit_code\":0,\"stdout\":\"fixture result\"}"}]}}
+{"id":"fixture-codex-14","type":"response_item","payload":{"type":"message","role":"assistant","id":"fixture-message-3","content":[{"type":"output_text","text":"synthetic response three"}]}}
+{"id":"fixture-codex-15","type":"event_msg","payload":{"type":"task_complete","turn_id":"fixture-turn-3"}}
+{"id":"fixture-codex-16","type":"fixture_marker","payload":{"value":"synthetic"}}
