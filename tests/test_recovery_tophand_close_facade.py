@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from chitra.governed_close import _close_payload, _write_checkpoint
 from chitra.provider_protocol import CloseRequest
@@ -113,6 +116,23 @@ def test_facade_uses_the_explicit_checkpoint_even_if_tophand_path_changes(tmp_pa
     assert isinstance(result, dict)
     assert result["state"] == "closed"
     assert len(adapter.requests) == 1
+
+
+def test_facade_rejects_a_recomputed_digest_with_a_forged_checkpoint_signature(tmp_path: Path) -> None:
+    record = _record()
+    request = _request(tmp_path, record)
+    forged = dict(request.checkpoint_receipt or {})
+    forged["signature"] = "0" * 64
+    provider = _PackagedTophandProvider(FakeAdapter(), state_root=tmp_path, result_sink=lambda _value: None)
+
+    with pytest.raises(ValueError, match="HMAC"):
+        provider.close(
+            replace(
+                request,
+                checkpoint_receipt=forged,
+                checkpoint_receipt_sha256=provider._digest(forged),
+            )
+        )
 
 
 def test_packaged_tophand_exposes_close_and_explicit_resume_capabilities(tmp_path: Path) -> None:

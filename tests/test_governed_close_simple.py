@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -389,3 +390,43 @@ def test_resume_lost_reply_reuses_the_durable_operation_after_restart(tmp_path: 
     assert second.action == "resumed"
     assert second.operation is not None and second.operation.operation_id == operation_id
     assert provider.resume_calls == 2
+
+
+def test_concurrent_supervisors_issue_one_physical_close(tmp_path: Path) -> None:
+    record = _record()
+    JoinedLaneStore(tmp_path).create(record)
+    _completion_gate(tmp_path, record)
+    provider = FakeProvider()
+
+    def close_once() -> str:
+        return RecoveryEngine(provider=provider, state_root=tmp_path, goal_root=tmp_path).governed_close(
+            lane_id="lane-a", now=NOW
+        ).action
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        actions = tuple(workers.map(lambda _index: close_once(), (1, 2)))
+
+    assert actions == ("closed", "closed")
+    assert provider.archive_calls == 1
+
+
+def test_consumed_resume_does_not_activate_an_archived_provider(tmp_path: Path) -> None:
+    record = _record()
+    JoinedLaneStore(tmp_path).create(record)
+    _completion_gate(tmp_path, record)
+
+    class StaleResumeProvider(FakeProvider):
+        def create_or_resume(self, request: Any) -> ProviderOperationResult:
+            result = super().create_or_resume(request)
+            self.archived = True
+            return result
+
+    provider = StaleResumeProvider()
+    closed = RecoveryEngine(provider=provider, state_root=tmp_path, goal_root=tmp_path).governed_close(record, now=NOW)
+    resumed = RecoveryEngine(provider=provider, state_root=tmp_path).resume_after_close(
+        closed.record, now=NOW.replace(minute=1)
+    )
+
+    assert resumed.action == "waiting"
+    assert resumed.record.lifecycle == "inactive"
+    assert "fresh live provider status" in resumed.reason

@@ -38,6 +38,7 @@ from .session_contract import (
     PendingProviderOperation,
     ProviderCapabilities,
     ProviderOperationResult,
+    OwnerProcessIdentity,
     UsageComponent,
     UsageReport,
 )
@@ -152,6 +153,10 @@ class CreateOrResumeRequest(MutationRequest):
     session_ref: str
     provider_session_id: str | None = None
     context_ref: str | None = None
+    resume_after_close: bool = False
+    close_operation_id: str | None = None
+    owner_process: OwnerProcessIdentity | None = None
+    resume_token: str | None = None
 
     def __post_init__(self) -> None:
         MutationRequest.__post_init__(self)
@@ -161,6 +166,20 @@ class CreateOrResumeRequest(MutationRequest):
             _required_text(self.session_ref, "session_ref")
         _optional_text(self.provider_session_id, "provider_session_id")
         _optional_text(self.context_ref, "context_ref")
+        _optional_text(self.close_operation_id, "close_operation_id")
+        _optional_text(self.resume_token, "resume_token")
+        if not isinstance(self.resume_after_close, bool):
+            raise TypeError("resume_after_close must be boolean")
+        if self.resume_after_close and (
+            self.close_operation_id is None
+            or self.provider_session_id is None
+            or self.context_ref is None
+            or self.owner_process is None
+            or self.resume_token is None
+        ):
+            raise ValueError(
+                "same-session resume requires close operation, provider session, checkpoint, and owner process"
+            )
 
 
 @dataclass(frozen=True, slots=True)

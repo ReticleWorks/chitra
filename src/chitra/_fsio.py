@@ -63,6 +63,15 @@ def write_json_atomic(
                 os.fsync(tmp.fileno())
         os.replace(tmp_name, path)
         tmp_name = None
+        if fsync:
+            # The replacement is durable only after the containing directory
+            # entry is durable as well.  A crash after the file fsync but
+            # before this directory fsync can lose the new name.
+            directory_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     finally:
         if cleanup_on_error and tmp_name is not None and os.path.exists(tmp_name):
             os.unlink(tmp_name)

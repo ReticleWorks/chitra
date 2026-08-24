@@ -349,6 +349,8 @@ def test_context_handoff_survives_restart_and_binds_all_continuity_fields(
     handoff = json.loads(path.read_text(encoding="utf-8"))
     assert handoff["handoff_id"] == record.recovery.handoff_id
     assert handoff["session_ref"] == before.session_ref
+    assert handoff["immutable_goal"]["source"] == goal.source
+    assert handoff["immutable_goal"]["enrolled_at"] == goal.enrolled_at
     assert handoff["physical_session_generation"] == before.physical_session_generation
     assert handoff["roadmap_snapshot"] == before.current_update.to_dict()
     assert handoff["roadmap_digest"] == _document_digest(handoff["roadmap_snapshot"])

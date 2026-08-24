@@ -133,6 +133,65 @@ class OwnerIdentity(_ContractModel):
     active: bool = True
 
 
+class OwnerProcessIdentity(_ContractModel):
+    """OS identity of the process that owns a physical provider session.
+
+    A PID is reusable.  The kernel start token is therefore part of the
+    binding, along with the executable and account identity that produced it.
+    """
+
+    pid: int = Field(ge=1)
+    uid: int = Field(ge=0)
+    gid: int = Field(ge=0)
+    start_token: Identifier
+    comm: Text
+    exe: Text
+
+    @field_validator("pid", "uid", "gid")
+    @classmethod
+    def reject_bool_process_numbers(cls, value: int) -> int:
+        if isinstance(value, bool):
+            raise ValueError("process identity numbers must be integers")
+        return value
+
+
+class ReopenReceipt(_ContractModel):
+    """Authenticated evidence that one closed provider session was reopened."""
+
+    schema: Literal["chitra.lane-reopen.v1"] = "chitra.lane-reopen.v1"  # type: ignore[assignment]
+    operation_id: Identifier
+    close_operation_id: Identifier
+    lane_id: Identifier
+    session_ref: Identifier
+    provider_session_id: Identifier
+    provider_handle: Identifier
+    provider_instance_id: Identifier
+    provider_generation: int = Field(ge=1)
+    checkpoint_ref: Identifier
+    prior_owner_process: OwnerProcessIdentity
+    owner_process: OwnerProcessIdentity
+    created_new_lane: bool
+    created_new_session: bool
+    # HMAC-bound challenge echoed by the authenticated provider boundary.
+    # Legacy non-process-bound provider doubles may omit it; Fleet reopen
+    # receipts must carry it.
+    auth_token: Identifier | None = None
+    observed_at: Timestamp
+    evidence: Text
+
+    @field_validator("provider_generation")
+    @classmethod
+    def reject_bool_reopen_generation(cls, value: int) -> int:
+        if isinstance(value, bool):
+            raise ValueError("provider generation must be an integer")
+        return value
+
+    @field_validator("observed_at")
+    @classmethod
+    def validate_observed_at(cls, value: str) -> str:
+        return _timestamp(value, "reopen.observed_at")
+
+
 def _validate_payload(payload: object, *, schema: str, model: type[_ContractModel]) -> _ContractModel:
     if not isinstance(payload, Mapping):
         raise ValueError(f"{schema} document must be an object")
@@ -754,6 +813,9 @@ class ProviderOperationResult(_ContractModel):
     consumed: bool | None = None
     observed_at: Timestamp
     evidence: str = ""
+    # Resume results carry the provider's authenticated same-session proof.
+    # It is optional so old non-resume operations remain readable.
+    reopen_receipt: ReopenReceipt | None = None
 
     @field_validator("observed_at")
     @classmethod
@@ -1192,6 +1254,9 @@ class CloseArchiveResult(_ContractModel):
     later_resume_supported: bool | None = None
     checkpoint_ref: Identifier | None = None
     quiescent: bool | None = None
+    # The process identity observed before the physical stop.  PID alone is
+    # not sufficient because the OS can reuse it.
+    owner_process: OwnerProcessIdentity | None = None
     observed_at: Timestamp
     evidence: Text
 
@@ -1412,6 +1477,20 @@ class JoinedLaneRecord(_ContractModel):
                 raise ValueError("close evidence does not belong to joined lane provider generation")
             if close_result.state in ("closed", "archived") and self.lifecycle != "inactive":
                 raise ValueError("logical close must make the joined lane inactive")
+            if (
+                close_result.state in ("closed", "archived")
+                and (
+                    self.checkpoint_reference is None
+                    or close_result.checkpoint_ref != self.checkpoint_reference
+                )
+            ):
+                raise ValueError("close evidence checkpoint does not match joined lane checkpoint")
+            if (
+                close_result.state in ("closed", "archived")
+                and self.provider.provider_session_id is not None
+                and close_result.provider_session_id != self.provider.provider_session_id
+            ):
+                raise ValueError("close evidence provider session does not match joined lane provider")
             if self.provider.kind == "amp" and close_result.state == "closed":
                 raise ValueError("Amp close must be represented as archived")
             if close_result.later_resume_supported is True and not self.provider.capabilities.resume_after_close:
@@ -1697,6 +1776,7 @@ __all__ = [
     "ProviderOperationResult",
     "ProviderResult",
     "OwnerIdentity",
+    "OwnerProcessIdentity",
     "OwnerRole",
     "ProblemHistoryEvent",
     "ProblemHistoryKind",
@@ -1707,6 +1787,7 @@ __all__ = [
     "RoadmapSnapshot",
     "RoadmapMilestone",
     "RoadmapStep",
+    "ReopenReceipt",
     "SESSION_UPDATE_SCHEMA",
     "SESSION_UPDATE_VERSION",
     "SessionUpdate",

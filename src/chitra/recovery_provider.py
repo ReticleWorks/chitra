@@ -15,6 +15,7 @@ waiting instead of guessing.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from ._fsio import locked_json_store
 from .detect.rescue import (
     RecoveryCheckpointBinding,
     find_recovery_checkpoint_receipt,
+    verify_checkpoint_receipt_signature,
 )
 from .joined_lane import JoinedLaneStore
 from .journal import EventJournal
@@ -57,6 +59,7 @@ from .session_contract import (
     JoinedLaneRecord,
     LaneUpdate,
     OperatingFact,
+    ReopenReceipt,
     PendingProviderOperation,
     ProviderIdentity,
     validate_update,
@@ -258,6 +261,9 @@ def _provider_result(
     if not isinstance(observed_at, str) or not observed_at.strip():
         observed_at = _now()
     evidence = raw.get("evidence")
+    reopen_receipt = None
+    if raw.get("reopen_receipt") is not None:
+        reopen_receipt = ReopenReceipt.from_dict(raw["reopen_receipt"])
     return ProviderOperationResult(
         operation_id=operation.operation_id,
         kind=operation.kind,
@@ -272,6 +278,7 @@ def _provider_result(
         consumed=consumed,
         observed_at=observed_at,
         evidence=evidence if isinstance(evidence, str) else "",
+        reopen_receipt=reopen_receipt,
     )
 
 
@@ -314,12 +321,54 @@ class _PackagedTophandProvider:
         state_root: Path | None = None,
         result_sink: RecoverySink,
     ) -> None:
-        # Retain the constructor keyword for installed callers. The provider
-        # must not read Chitra's checkpoint filesystem; the signed receipt is
-        # supplied on CloseRequest across the authenticated boundary.
-        del state_root
+        # Chitra verifies the signed receipt before it crosses the provider
+        # boundary. Tophand still never reads this filesystem or its key.
+        self._state_root = state_root
         self._adapter = adapter
         self._result_sink = result_sink
+
+    @staticmethod
+    def _digest(value: object) -> str:
+        return hashlib.sha256(
+            json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+
+    def _verify_close_checkpoint(self, request: CloseRequest) -> None:
+        receipt = request.checkpoint_receipt
+        if self._state_root is None or not isinstance(receipt, Mapping):
+            raise ValueError("Chitra close requires a local signed checkpoint verifier")
+        if request.checkpoint_verifier != "chitra.detect.rescue.verify_checkpoint_receipt_signature":
+            raise ValueError("close checkpoint verifier is not canonical")
+        if request.checkpoint_receipt_sha256 != self._digest(receipt):
+            raise ValueError("close checkpoint digest does not match the supplied receipt")
+        if not verify_checkpoint_receipt_signature(dict(receipt), state_root=self._state_root):
+            raise ValueError("close checkpoint HMAC is invalid")
+        payload = json.loads(request.operation.payload)
+        if not isinstance(payload, Mapping):
+            raise ValueError("close payload must be an object")
+        if any(
+            receipt.get(receipt_field) != payload.get(payload_field)
+            for receipt_field, payload_field in (
+                ("checkpoint_ref", "checkpoint_ref"),
+                ("lane", "lane_id"),
+                ("goal_id", "goal_id"),
+                ("goal_version", "goal_version"),
+                ("session_ref", "session_ref"),
+            )
+        ):
+            raise ValueError("close checkpoint identity changed")
+        binding = receipt.get("provider_binding")
+        if not isinstance(binding, Mapping) or any(
+            binding.get(field) != expected
+            for field, expected in (
+                ("kind", "tophand"),
+                ("handle", request.operation.provider_handle),
+                ("provider_session_id", request.operation.provider_session_id),
+                ("instance_id", request.operation.provider_instance_id),
+                ("generation", request.operation.provider_generation),
+            )
+        ):
+            raise ValueError("close checkpoint provider binding changed")
 
     @property
     def provider_name(self) -> ProviderName:
@@ -367,11 +416,20 @@ class _PackagedTophandProvider:
                     "session_ref": request.session_ref,
                     "provider_session_id": request.provider_session_id,
                     "context_ref": request.context_ref,
+                    "resume_after_close": request.resume_after_close,
+                    "close_operation_id": request.close_operation_id,
+                    "resume_token": request.resume_token,
+                    "owner_process": (
+                        request.owner_process.model_dump(mode="json")
+                        if request.owner_process is not None
+                        else None
+                    ),
                 }
             )
         elif isinstance(request, CancelCurrentTurnRequest):
             payload["reason"] = request.reason
         elif isinstance(request, CloseRequest):
+            self._verify_close_checkpoint(request)
             payload["archive"] = request.archive
         raw = getattr(self._adapter, method)(payload)
         result = _provider_result(raw, operation)
@@ -492,6 +550,10 @@ class _PackagedTophandProvider:
 
     def close(self, request: CloseRequest) -> object:
         operation = request.operation
+        # Validate before entering the provider-outage fallback. A forged
+        # checkpoint must be rejected as an invalid boundary, not converted
+        # into an apparently ordinary provider-unknown response.
+        self._verify_close_checkpoint(request)
         try:
             payload = json.loads(operation.payload)
             if not isinstance(payload, Mapping):

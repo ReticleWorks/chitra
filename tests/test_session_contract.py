@@ -755,6 +755,7 @@ def test_close_evidence_preserves_provider_state_and_same_thread_resume() -> Non
         provider=provider,
         operation_history=operation_history,
         last_close_result=close,
+        checkpoint_reference=close.checkpoint_ref,
     )
     resumed = inactive.model_copy(update={"revision": 2, "lifecycle": "active", "last_close_result": None})
     validate_record_transition(inactive, resumed, transition="resume")
@@ -807,6 +808,7 @@ def test_close_evidence_preserves_provider_state_and_same_thread_resume() -> Non
                 ),
             ),
             last_close_result=amp_native,
+            checkpoint_reference=amp_native.checkpoint_ref,
         )
 
 
@@ -836,6 +838,7 @@ def test_later_resume_evidence_requires_the_current_resume_capability() -> None:
                 ),
             ),
             last_close_result=close,
+            checkpoint_reference=close.checkpoint_ref,
         )
 
 
