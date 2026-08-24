@@ -1249,7 +1249,7 @@ class RecoveryEngine:
         return governed_close(
             provider=self.provider,
             state_root=self.state_root,
-            goal_root=self.goal_root,
+            goal_root=self.goal_root or self.state_root,
             record=record,
             lane_id=lane_id,
             now=now,

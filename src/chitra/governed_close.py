@@ -298,6 +298,63 @@ def _operation_matches(actual: PendingProviderOperation, expected: PendingProvid
     return all(getattr(actual, field) == getattr(expected, field) for field in fields)
 
 
+def _close_evidence_path(state_root: Path, operation: PendingProviderOperation) -> Path:
+    if _REFERENCE_RE.fullmatch(operation.operation_id) is None:
+        raise RecoveryStateError("close operation ID is unsafe for evidence storage")
+    return state_root / "close-evidence" / f"{operation.operation_id}.json"
+
+
+def _read_close_evidence(
+    state_root: Path,
+    operation: PendingProviderOperation,
+    record: JoinedLaneRecord,
+) -> CloseArchiveResult | None:
+    path = _close_evidence_path(state_root, operation)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping) or payload.get("schema") != "chitra.governed-close-evidence.v1":
+        return None
+    if payload.get("operation") != operation.model_dump(mode="json"):
+        return None
+    values = payload.get("result")
+    try:
+        result = CloseArchiveResult.from_dict(values)
+        validate_close_result(operation, result)
+    except (ContractValidationError, TypeError, ValueError):
+        return None
+    if (
+        result.state not in {"closed", "archived"}
+        or result.provider_thread_ref != record.provider.handle
+        or result.provider_session_id != operation.provider_session_id
+        or result.same_provider_thread is not True
+        or result.quiescent is not True
+        or result.checkpoint_ref != record.checkpoint_reference
+    ):
+        return None
+    return result
+
+
+def _write_close_evidence(
+    state_root: Path,
+    operation: PendingProviderOperation,
+    result: CloseArchiveResult,
+) -> None:
+    path = _close_evidence_path(state_root, operation)
+    payload = {
+        "schema": "chitra.governed-close-evidence.v1",
+        "operation": operation.model_dump(mode="json"),
+        "result": result.model_dump(mode="json"),
+    }
+    if path.exists():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if existing != payload:
+            raise RecoveryStateError("immutable close evidence changed")
+        return
+    write_json_atomic(path, payload, fsync=True)
+
+
 def _invoke(provider: Provider, operation: PendingProviderOperation, record: JoinedLaneRecord) -> CloseArchiveResult | None:
     request = CloseRequest(operation=operation, archive=True)
     try:
@@ -363,6 +420,10 @@ def governed_close(
         if record is None:
             raise RecoveryStateError("governed close requires a durable joined-lane store")
         return _wait(record, "governed close requires durable Chitra storage")
+    if goal_root is None:
+        if record is None:
+            raise RecoveryStateError("governed close requires a completion goal root")
+        return _wait(record, "governed close requires the completion gate")
     store = state_store or RecoveryStateStore(state_root, lane_id or (record.lane_id if record else ""))
     current = store.load()
     if current is not None:
@@ -436,6 +497,28 @@ def governed_close(
             return _wait(working, str(exc), pending)
         if not _operation_matches(pending, expected):
             return _wait(working, "pending close identity or payload changed", pending)
+    recovered = _read_close_evidence(state_root, pending, working)
+    if recovered is not None:
+        closed = working.model_copy(
+            update={
+                "lifecycle": "inactive",
+                "pending_operation": None,
+                "last_close_result": recovered,
+                "recovery": working.recovery.model_copy(update={"stage": "complete", "pending_payload": None}),
+                "next_check": None,
+            }
+        )
+        try:
+            closed = _persist(store, closed)
+        except (ContractValidationError, OSError, RecoveryStateError, TypeError, ValueError) as exc:
+            return _wait(working, f"durable close evidence exists but Chitra could not persist close state: {exc}", pending, recovered)
+        return GovernedCloseDecision(
+            action="closed",
+            record=closed,
+            reason="reconciled durable provider close evidence",
+            operation=pending,
+            close_result=recovered,
+        )
     status = _status(provider, working)
     expected_session = _expected_session(working)
     if (
@@ -453,6 +536,10 @@ def governed_close(
     result = _invoke(provider, pending, working)
     if result is None:
         return _wait(working, "provider close response is unknown or failed exact identity validation", pending)
+    try:
+        _write_close_evidence(state_root, pending, result)
+    except (ContractValidationError, OSError, RecoveryStateError, TypeError, ValueError) as exc:
+        return _wait(working, f"provider close succeeded but Chitra could not persist close evidence: {exc}", pending, result)
     closed = working.model_copy(
         update={
             "lifecycle": "inactive",

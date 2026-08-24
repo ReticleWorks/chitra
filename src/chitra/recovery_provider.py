@@ -15,7 +15,9 @@ waiting instead of guessing.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -25,7 +27,11 @@ from typing import Any, Protocol, cast
 import structlog
 
 from ._fsio import locked_json_store
-from .detect.rescue import RecoveryCheckpointBinding, find_recovery_checkpoint_receipt
+from .detect.rescue import (
+    RecoveryCheckpointBinding,
+    find_recovery_checkpoint_receipt,
+    verify_checkpoint_receipt_signature,
+)
 from .joined_lane import JoinedLaneStore
 from .journal import EventJournal
 from .journal.models import CanonicalEvent
@@ -308,9 +314,11 @@ class _PackagedTophandProvider:
         self,
         adapter: object,
         *,
+        state_root: Path,
         result_sink: RecoverySink,
     ) -> None:
         self._adapter = adapter
+        self._state_root = state_root
         self._result_sink = result_sink
 
     @property
@@ -479,7 +487,70 @@ class _PackagedTophandProvider:
         return self._call("cancel_current_turn", request, request.operation)
 
     def close(self, request: CloseRequest) -> object:
-        raise RuntimeError("Tophand close is not part of recovery supervision")
+        operation = request.operation
+        try:
+            payload = json.loads(operation.payload)
+            if not isinstance(payload, Mapping):
+                raise ValueError("Chitra close payload must be an object")
+            reference = payload.get("checkpoint_ref")
+            if not isinstance(reference, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", reference) is None:
+                raise ValueError("Chitra close checkpoint reference is unsafe")
+            checkpoint_path = (self._state_root / "checkpoints" / f"{reference}.json").resolve()
+            checkpoint_dir = (self._state_root / "checkpoints").resolve()
+            if checkpoint_path.parent != checkpoint_dir:
+                raise ValueError("Chitra close checkpoint path escaped state root")
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            if not isinstance(checkpoint, Mapping):
+                raise ValueError("Chitra close checkpoint is not an object")
+            receipt = dict(checkpoint)
+            if not verify_checkpoint_receipt_signature(receipt, state_root=self._state_root):
+                raise ValueError("Chitra close checkpoint signature is invalid")
+            if (
+                receipt.get("schema_name") != "chitra.governed-close-checkpoint.v1"
+                or receipt.get("checkpoint_ref") != reference
+                or receipt.get("lane") != operation.lane_id
+                or receipt.get("goal_id") != payload.get("goal_id")
+                or receipt.get("goal_version") != payload.get("goal_version")
+                or receipt.get("session_ref") != payload.get("session_ref")
+                or receipt.get("provenance") != {"kind": "governed-completion-checkpoint", "owner": "chitra"}
+            ):
+                raise ValueError("Chitra close checkpoint logical binding changed")
+            binding = receipt.get("provider_binding")
+            expected_binding = {
+                "kind": "tophand",
+                "handle": operation.provider_handle,
+                "provider_session_id": operation.provider_session_id,
+                "instance_id": operation.provider_instance_id,
+                "generation": operation.provider_generation,
+            }
+            if not isinstance(binding, Mapping) or dict(binding) != expected_binding:
+                raise ValueError("Chitra close checkpoint provider binding changed")
+            receipt_digest = hashlib.sha256(
+                json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+            wire_request = {
+                "operation": operation.model_dump(mode="json"),
+                "archive": True,
+                "payload": dict(payload),
+                "goal_id": payload.get("goal_id"),
+                "lane_id": operation.lane_id,
+                "session_ref": payload.get("session_ref"),
+                "provider_session_id": operation.provider_session_id,
+                "checkpoint_ref": reference,
+                "checkpoint_receipt": receipt,
+                "checkpoint_receipt_sha256": receipt_digest,
+                "checkpoint_verifier": "chitra.detect.rescue.verify_checkpoint_receipt_signature",
+            }
+            raw = cast(Any, self._adapter).close(wire_request)
+            self._result_sink(raw)
+            values = dict(_mapping(raw, "Tophand close result"))
+            return {
+                field: values[field]
+                for field in CloseArchiveResult.model_fields
+                if field in values
+            }
+        except Exception as exc:  # noqa: BLE001 - an unproved close remains pending
+            return _unknown_close_result(operation, f"Tophand close evidence unavailable: {exc}")
 
 
 _AMP_CAPABILITY_NAMES = (
@@ -1023,7 +1094,7 @@ def _canonical_tophand_factory(
         return None
     if adapter is None:
         return None
-    provider = _PackagedTophandProvider(adapter, result_sink=result_sink)
+    provider = _PackagedTophandProvider(adapter, state_root=state_root, result_sink=result_sink)
     return provider if isinstance(provider, Provider) else None
 
 

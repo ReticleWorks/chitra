@@ -38,6 +38,25 @@ def _record() -> JoinedLaneRecord:
     )
 
 
+def _completion_gate(root: Path, record: JoinedLaneRecord) -> None:
+    goal = GoalRecord(
+        session_ref=record.session_ref,
+        lane_id=record.lane_id,
+        goal_id=record.goal_id,
+        goal_version=record.goal_version,
+        goal="finish the lane",
+        done_when="the provider receipt is durable",
+        source="test",
+        status="done-pending-close",
+        created_at=NOW.isoformat(),
+        updated_at=NOW.isoformat(),
+    )
+    (root / "goals.json").write_text(
+        json.dumps({"schema": "chitra.goals.v4", "goals": [goal.to_dict()]}),
+        encoding="utf-8",
+    )
+
+
 class FakeProvider:
     provider_name = "tophand"
     capabilities = ProviderCapabilities(status=True, checkpoint=True, close=True)
@@ -91,6 +110,7 @@ class FakeProvider:
 def test_close_persists_chitra_checkpoint_and_archives_once(tmp_path: Path) -> None:
     record = _record()
     JoinedLaneStore(tmp_path).create(record)
+    _completion_gate(tmp_path, record)
     provider = FakeProvider()
 
     first = RecoveryEngine(provider=provider, state_root=tmp_path).governed_close(record, now=NOW)
@@ -110,6 +130,7 @@ def test_close_persists_chitra_checkpoint_and_archives_once(tmp_path: Path) -> N
 def test_lost_close_reply_reuses_pending_operation_and_reconciles_after_restart(tmp_path: Path) -> None:
     record = _record()
     JoinedLaneStore(tmp_path).create(record)
+    _completion_gate(tmp_path, record)
     provider = FakeProvider(lose_first_reply=True)
 
     first = RecoveryEngine(provider=provider, state_root=tmp_path).governed_close(record, now=NOW)
@@ -134,6 +155,7 @@ def test_supervisor_routes_done_goal_to_close_and_reconciles_after_restart(
 ) -> None:
     record = _record()
     JoinedLaneStore(tmp_path).create(record)
+    _completion_gate(tmp_path, record)
     provider = FakeProvider(lose_first_reply=True)
     goal = GoalRecord(
         session_ref=record.session_ref,
@@ -160,6 +182,7 @@ def test_supervisor_routes_done_goal_to_close_and_reconciles_after_restart(
 def test_physical_session_mismatch_blocks_close(tmp_path: Path) -> None:
     record = _record()
     JoinedLaneStore(tmp_path).create(record)
+    _completion_gate(tmp_path, record)
     provider = FakeProvider()
     provider.status = lambda: ProviderStatus(  # type: ignore[method-assign]
         provider="tophand",
@@ -181,6 +204,7 @@ def test_physical_session_mismatch_blocks_close(tmp_path: Path) -> None:
 def test_final_chitra_write_failure_reconciles_without_second_archive(tmp_path: Path, monkeypatch: Any) -> None:
     record = _record()
     JoinedLaneStore(tmp_path).create(record)
+    _completion_gate(tmp_path, record)
     provider = FakeProvider()
     original_save = __import__("chitra.recovery", fromlist=["RecoveryStateStore"]).RecoveryStateStore.save
     saves = 0
@@ -209,6 +233,7 @@ def test_final_chitra_write_failure_reconciles_without_second_archive(tmp_path: 
 def test_close_rejects_provider_result_without_physical_binding(tmp_path: Path) -> None:
     record = _record()
     JoinedLaneStore(tmp_path).create(record)
+    _completion_gate(tmp_path, record)
     provider = FakeProvider()
     original = provider.close
 
