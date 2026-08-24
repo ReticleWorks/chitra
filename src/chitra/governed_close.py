@@ -165,21 +165,27 @@ def _ensure_checkpoint(state_root: Path, record: JoinedLaneRecord) -> JoinedLane
     return record.model_copy(update={"checkpoint_reference": _write_checkpoint(state_root, record)})
 
 
-def _close_payload(record: JoinedLaneRecord) -> str:
-    return _json(
-        {
-            "archive": True,
-            "checkpoint_ref": record.checkpoint_reference,
-            "lane_id": record.lane_id,
-            "goal_id": record.goal_id,
-            "goal_version": record.goal_version,
-            "session_ref": record.session_ref,
-            "provider_handle": record.provider.handle,
-            "provider_session_id": record.provider.provider_session_id,
-            "provider_instance_id": record.provider.instance_id,
-            "provider_generation": record.provider.generation,
-        }
-    )
+def _close_payload(
+    record: JoinedLaneRecord,
+    *,
+    checkpoint_receipt_sha256: str | None = None,
+) -> str:
+    payload = {
+        "archive": True,
+        "checkpoint_ref": record.checkpoint_reference,
+        "lane_id": record.lane_id,
+        "goal_id": record.goal_id,
+        "goal_version": record.goal_version,
+        "session_ref": record.session_ref,
+        "provider_handle": record.provider.handle,
+        "provider_session_id": record.provider.provider_session_id,
+        "provider_instance_id": record.provider.instance_id,
+        "provider_generation": record.provider.generation,
+        "process_start_token": record.provider.process_start_token,
+    }
+    if checkpoint_receipt_sha256 is not None:
+        payload["checkpoint_receipt_sha256"] = checkpoint_receipt_sha256
+    return _json(payload)
 
 
 def governed_close(

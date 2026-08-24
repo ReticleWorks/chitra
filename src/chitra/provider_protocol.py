@@ -241,6 +241,7 @@ class CloseRequest(MutationRequest):
     checkpoint_receipt: Mapping[str, object] | None = None
     checkpoint_receipt_sha256: str | None = None
     checkpoint_verifier: str | None = None
+    close_token: str | None = None
 
     def __post_init__(self) -> None:
         MutationRequest.__post_init__(self)
@@ -250,6 +251,7 @@ class CloseRequest(MutationRequest):
             raise ValueError("archive must be a boolean")
         if self.checkpoint_receipt is not None and not isinstance(self.checkpoint_receipt, Mapping):
             raise ValueError("checkpoint_receipt must be a mapping when supplied")
+        _optional_text(self.close_token, "close_token")
 
 
 # Short aliases keep call sites readable while retaining the explicit method

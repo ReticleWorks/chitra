@@ -822,6 +822,14 @@ class _PackagedTophandProvider:
         payload = json.loads(request.operation.payload)
         if not isinstance(payload, Mapping):
             raise ValueError("close payload must be an object")
+        if (
+            not isinstance(request.close_token, str)
+            or not request.close_token
+            or payload.get("close_token") != request.close_token
+            or payload.get("checkpoint_receipt_sha256")
+            != request.checkpoint_receipt_sha256
+        ):
+            raise ValueError("close bearer challenge changed or is missing")
         if any(
             receipt.get(receipt_field) != payload.get(payload_field)
             for receipt_field, payload_field in (
@@ -920,6 +928,7 @@ class _PackagedTophandProvider:
         elif isinstance(request, CloseRequest):
             self._verify_close_checkpoint(request)
             payload["archive"] = request.archive
+            payload["close_token"] = request.close_token
         raw = getattr(self._adapter, method)(payload)
         self._require_current_facts()
         result = _provider_result(raw, operation)
@@ -1071,6 +1080,7 @@ class _PackagedTophandProvider:
                 "checkpoint_receipt": request.checkpoint_receipt,
                 "checkpoint_receipt_sha256": request.checkpoint_receipt_sha256,
                 "checkpoint_verifier": request.checkpoint_verifier,
+                "close_token": request.close_token,
             }
             raw = cast(Any, self._adapter).close(wire_request)
             self._result_sink(raw)

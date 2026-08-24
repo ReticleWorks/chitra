@@ -1459,6 +1459,16 @@ class CloseArchiveResult(_ContractModel):
     later_resume_supported: bool | None = None
     checkpoint_ref: Identifier | None = None
     quiescent: bool | None = None
+    # Fleet binds Chitra's locally verified completion receipt to the target
+    # transcript it actually stopped. The bearer challenge authenticates the
+    # returned mapping without exposing Chitra's checkpoint key.
+    checkpoint_receipt: Mapping[str, object] | None = None
+    checkpoint_receipt_sha256: EvidenceSignature | None = None
+    checkpoint_verifier: Identifier | None = None
+    target_checkpoint_ref: Identifier | None = None
+    target_transcript_sha256: EvidenceSignature | None = None
+    close_token: Text | None = None
+    close_receipt_hmac: EvidenceSignature | None = None
     # The process identity observed before the physical stop.  PID alone is
     # not sufficient because the OS can reuse it.
     owner_process: OwnerProcessIdentity | None = None
