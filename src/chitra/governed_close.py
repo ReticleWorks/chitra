@@ -10,14 +10,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 from collections.abc import Mapping
-from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
+from ._fsio import write_json_atomic
 from .detect.rescue import load_or_create_checkpoint_key, sign_checkpoint_receipt, verify_checkpoint_receipt_signature
 from .goals import get_goal
 from .provider_protocol import CloseRequest, Provider, ProviderState, ProviderStatus
@@ -211,26 +210,13 @@ def _write_checkpoint(state_root: Path, record: JoinedLaneRecord) -> str:
     path = _checkpoint_path(state_root, reference)
     if path is None:
         raise RecoveryStateError("governed close generated an unsafe checkpoint reference")
+    if path.exists():
+        if not _read_checkpoint(state_root, record, reference):
+            raise RecoveryStateError("existing completion checkpoint binding changed")
+        return reference
     signed = dict(payload)
     signed["signature"] = sign_checkpoint_receipt(signed, key=load_or_create_checkpoint_key(state_root))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
-    try:
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        if not _read_checkpoint(state_root, record, reference):
-            raise RecoveryStateError("existing completion checkpoint binding changed") from None
-        return reference
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(signed, stream, sort_keys=True, indent=2)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-    except BaseException:
-        with suppress(OSError):
-            path.unlink()
-        raise
+    write_json_atomic(path, signed, fsync=True)
     if not _read_checkpoint(state_root, record, reference):
         raise RecoveryStateError("new completion checkpoint failed local verification")
     return reference
