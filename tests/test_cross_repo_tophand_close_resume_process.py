@@ -529,6 +529,116 @@ def _crash_window_child(tmp_path: Path) -> Path:
     )
 
 
+def _packaged_close_projection_child(tmp_path: Path) -> Path:
+    return _write_executable(
+        tmp_path / "packaged-close-projection-child.py",
+        "#!/usr/bin/env python3\n"
+        + textwrap.dedent(
+            """
+            import hashlib
+            import json
+            import sys
+            from datetime import UTC, datetime
+            from pathlib import Path
+
+            from chitra.governed_close import _close_payload, _write_checkpoint
+            from chitra.provider_protocol import CloseRequest
+            from chitra.recovery import RecoveryEngine
+            from chitra.recovery_provider import _PackagedTophandProvider, _tophand_operation_dict
+            from chitra.session_contract import JoinedLaneRecord, ProviderCapabilities, ProviderIdentity
+            from tools.support.chitra_adapter.tophand_adapter import TophandAdapter
+
+            state_root = Path(sys.argv[1])
+            capture_path = Path(sys.argv[2])
+            record = JoinedLaneRecord(
+                lane_id="probe-lane",
+                goal_id="goal-a",
+                goal_version=1,
+                session_ref="tophand:probe-lane:0.0",
+                provider=ProviderIdentity(
+                    kind="tophand",
+                    handle="thread-a",
+                    provider_session_id="tophand:probe-lane:0.0",
+                    instance_id="instance-a",
+                    generation=1,
+                    capabilities=ProviderCapabilities(
+                        status=True, checkpoint=True, close=True
+                    ),
+                ),
+            )
+            reference = _write_checkpoint(state_root, record)
+            bound = record.model_copy(update={"checkpoint_reference": reference})
+            receipt = json.loads(
+                (state_root / "checkpoints" / f"{reference}.json").read_text()
+            )
+            receipt_digest = hashlib.sha256(
+                json.dumps(
+                    receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+                ).encode()
+            ).hexdigest()
+            operation = RecoveryEngine(state_root=state_root)._operation(
+                bound,
+                "close",
+                _close_payload(bound, checkpoint_receipt_sha256=receipt_digest),
+                datetime(2026, 8, 24, 12, tzinfo=UTC),
+            )
+            request = CloseRequest(
+                operation=operation,
+                archive=True,
+                checkpoint_receipt=receipt,
+                checkpoint_receipt_sha256=receipt_digest,
+                checkpoint_verifier=(
+                    "chitra.detect.rescue.verify_checkpoint_receipt_signature"
+                ),
+                close_token=json.loads(operation.payload)["close_token"],
+            )
+
+            class Captured(Exception):
+                pass
+
+            class Transport:
+                def close(self, value):
+                    capture_path.write_text(
+                        json.dumps(value, sort_keys=True, separators=(",", ":"))
+                    )
+                    raise Captured
+
+            adapter = TophandAdapter(
+                Transport(),
+                lane_id=record.lane_id,
+                goal_id=record.goal_id,
+                goal_version=record.goal_version,
+                session_ref=record.session_ref,
+                provider_session_id=record.provider.provider_session_id,
+                provider_handle=record.provider.handle,
+                provider_instance_id=record.provider.instance_id,
+                provider_generation=record.provider.generation,
+            )
+            provider = _PackagedTophandProvider(
+                adapter, state_root=state_root, result_sink=lambda _value: None
+            )
+            try:
+                provider._call("close", request, operation)
+            except Captured:
+                pass
+            else:
+                raise AssertionError("close did not reach the Adapter transport")
+
+            projected = json.loads(capture_path.read_text())
+            durable = json.loads(operation.payload)
+            assert projected["operation"] == _tophand_operation_dict(operation)
+            assert projected["payload"] == durable
+            assert projected["checkpoint_receipt"] == receipt
+            assert projected["checkpoint_receipt_sha256"] == receipt_digest
+            assert projected["checkpoint_verifier"] == request.checkpoint_verifier
+            assert projected["close_token"] == durable["close_token"]
+            assert projected["checkpoint_ref"] == durable["checkpoint_ref"]
+            print(json.dumps(projected, sort_keys=True, separators=(",", ":")))
+            """
+        ),
+    )
+
+
 def _operation(kind: str, operation_id: str, token: str, payload_digest: str) -> dict[str, object]:
     return {
         "operation_id": operation_id,
@@ -545,6 +655,36 @@ def _operation(kind: str, operation_id: str, token: str, payload_digest: str) ->
         "attempt": 1,
         "payload": f"{kind}-payload",
     }
+
+
+def test_packaged_chitra_close_projection_reaches_adapter_without_fixture_enrichment(
+    tmp_path: Path,
+) -> None:
+    child = _packaged_close_projection_child(tmp_path)
+    chitra_root = Path(__file__).resolve().parents[1]
+    environment = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(
+            (
+                str(chitra_root / "src"),
+                str(ADAPTER_ROOT),
+                os.environ.get("PYTHONPATH", ""),
+            )
+        ),
+    }
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(child),
+            str(tmp_path / "chitra-state"),
+            str(tmp_path / "captured-close.json"),
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def _close_operation(
