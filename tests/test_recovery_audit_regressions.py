@@ -11,9 +11,9 @@ from test_recovery_contract_regressions import NOW, ConsumedSendProvider, append
 
 from chitra.detect.ladder import IncidentRecord, IncidentStore, ResponseLadder
 from chitra.joined_lane import JoinedLaneConflictError, JoinedLaneStore
-from chitra.provider_protocol import ProviderName, ProviderState, ProviderStatus, ProviderUpdate, ReadUpdatesResult, UpdateKind
 from chitra.journal import EventJournal
-from chitra.recovery import RecoveryEngine, RecoveryStateStore, RecoveryStateError, RecoverySupervisor
+from chitra.provider_protocol import ProviderName, ProviderState, ProviderStatus, ProviderUpdate, ReadUpdatesResult, UpdateKind
+from chitra.recovery import RecoveryEngine, RecoveryStateError, RecoveryStateStore, RecoverySupervisor
 from chitra.session_contract import (
     JoinedLaneRecord,
     NextCheck,
@@ -195,6 +195,38 @@ def test_close_evidence_symlink_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(RecoveryStateError, match="symlink"):
         RecoveryStateStore(tmp_path, "lane-a").close_evidence_path(operation)
+
+
+def test_lane_control_lock_rejects_a_symlinked_parent(tmp_path: Path) -> None:
+    outside = tmp_path / "outside-lock"
+    outside.mkdir()
+    (tmp_path / "lane-control").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RecoveryStateError, match="symlink"), RecoveryStateStore(tmp_path, "lane-a").lane_control_lock():
+        pass
+    assert not (outside / "lane-a.lock").exists()
+
+
+def test_wake_transaction_rejects_a_symlinked_parent(tmp_path: Path) -> None:
+    outside = tmp_path / "outside-wake"
+    outside.mkdir()
+    (tmp_path / "wake-transactions").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RecoveryStateError, match="symlink"):
+        RecoveryStateStore(tmp_path, "lane-a").load()
+    assert not list(outside.iterdir())
+
+
+def test_context_handoff_rejects_a_symlinked_parent(tmp_path: Path) -> None:
+    outside = tmp_path / "outside-handoff"
+    outside.mkdir()
+    (tmp_path / "recovery-handoffs").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RecoveryStateError, match="symlink"):
+        RecoveryEngine(state_root=tmp_path)._handoff_path(
+            "recovery-handoffs/lane-a-cycle-context.json"
+        )
+    assert not list(outside.iterdir())
 
 
 def test_pending_retry_never_calls_provider_without_durable_storage(tmp_path: Path) -> None:

@@ -214,6 +214,22 @@ class RecoveryStateError(ValueError):
     pass
 
 
+def _reject_state_symlinks(root: Path, path: Path) -> None:
+    """Keep state transactions below their exact root without following links."""
+
+    if root.is_symlink():
+        raise RecoveryStateError("state root must not be a symlink")
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise RecoveryStateError("state path escaped its root") from exc
+    current = root
+    for component in relative.parts:
+        current /= component
+        if current.is_symlink():
+            raise RecoveryStateError(f"state path contains a symlink: {current}")
+
+
 class RecoveryFactsReader(Protocol):
     def __call__(self, record: JoinedLaneRecord) -> Sequence[OperatingFact]: ...
 
@@ -311,8 +327,11 @@ class RecoveryStateStore:
     @contextlib.contextmanager
     def lane_control_lock(self) -> Iterator[None]:
         path = self.control_path
+        _reject_state_symlinks(self.root, path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
+        descriptor = os.open(
+            str(path), os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600
+        )
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             try:
@@ -487,11 +506,14 @@ class RecoveryStateStore:
 
     def _clear_wake_transaction(self) -> None:
         path = self._wake_transaction_path()
+        _reject_state_symlinks(self.root, path)
         try:
             path.unlink()
         except FileNotFoundError:
             return
-        directory_fd = os.open(str(path.parent), os.O_RDONLY)
+        directory_fd = os.open(
+            str(path.parent), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        )
         try:
             os.fsync(directory_fd)
         finally:
@@ -500,11 +522,16 @@ class RecoveryStateStore:
     def _recover_wake_transaction(self) -> None:
         """Finish a wake whose state/journal two-file write was interrupted."""
 
-        path = self._wake_transaction_path()
-        if not path.exists():
-            return
+        _reject_state_symlinks(self.root, self._wake_transaction_path())
         try:
-            payload = self._read_nofollow_json(path)
+            payload = read_json_rooted(
+                self.root, "wake-transactions", f"{self.lane_id}.json"
+            )
+        except FileNotFoundError:
+            return
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RecoveryStateError("wake transaction marker is unreadable") from exc
+        try:
             if not isinstance(payload, dict) or payload.get("schema") != "chitra.wake-transaction.v1":
                 raise ValueError("wake transaction schema changed")
             candidate = JoinedLaneRecord.from_dict(payload.get("record"))
@@ -532,15 +559,27 @@ class RecoveryStateStore:
         candidate = record.model_copy(update={"revision": next_revision})
         marker = {"schema": "chitra.wake-transaction.v1", "record": candidate.to_dict(), "wake": receipt.to_dict()}
         marker_path = self._wake_transaction_path()
-        if marker_path.exists():
+        _reject_state_symlinks(self.root, marker_path)
+        try:
+            existing = read_json_rooted(
+                self.root, "wake-transactions", f"{self.lane_id}.json"
+            )
+        except FileNotFoundError:
+            existing = None
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RecoveryStateError("wake transaction marker is unreadable") from exc
+        if existing is not None:
             try:
-                existing = self._read_nofollow_json(marker_path)
+                if not isinstance(existing, Mapping):
+                    raise ValueError("wake transaction marker is not an object")
             except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise RecoveryStateError("wake transaction marker is unreadable") from exc
             if existing != marker:
                 raise RecoveryStateError("wake transaction identity changed")
         else:
-            write_json_atomic(marker_path, marker, fsync=True)
+            write_json_rooted(
+                self.root, "wake-transactions", f"{self.lane_id}.json", marker
+            )
         saved = (
             self._store.create(candidate)
             if current is None
@@ -693,6 +732,8 @@ def _resume_receipt_matches(
         receipt.operation_id == operation.operation_id
         and receipt.close_operation_id == close.operation_id
         and receipt.lane_id == record.lane_id
+        and receipt.goal_id == record.goal_id
+        and receipt.goal_version == record.goal_version
         and receipt.session_ref == record.session_ref
         and receipt.provider_session_id == _close_session(record)
         and receipt.provider_handle == record.provider.handle
@@ -1302,28 +1343,10 @@ class RecoveryEngine:
 
     @staticmethod
     def _immutable_goal_payload(goal: GoalRecord) -> dict[str, object]:
-        payload = goal.to_dict()
-        return {
-            field: payload.get(field)
-            for field in (
-                "goal_id",
-                "lane_id",
-                "session_ref",
-                "goal_version",
-                "status",
-                "goal",
-                "done_when",
-                "source",
-                "enrolled_at",
-                "created_at",
-                "intent",
-                "scope",
-                "needs",
-                "enrolled_done_when",
-                "enrolled_done_when_items",
-                "interview_receipt",
-            )
-        }
+        # GoalRecord.to_dict() is the authoritative projection. Keep every
+        # field so a newer or tactical goal attribute cannot silently fall out
+        # of the immutable handoff binding.
+        return dict(goal.to_dict())
 
     @staticmethod
     def _roadmap_snapshot(record: JoinedLaneRecord) -> dict[str, object] | None:
@@ -1374,11 +1397,10 @@ class RecoveryEngine:
         parts = Path(reference).parts
         if len(parts) != 2 or parts[0] != "recovery-handoffs" or parts[1] in {"", ".", ".."}:
             raise RecoveryStateError("recovery handoff reference is not a safe relative path")
-        root = self.state_root.resolve()
-        directory = (root / parts[0]).resolve()
-        path = (directory / parts[1]).resolve()
-        if directory.parent != root or path.parent != directory:
-            raise RecoveryStateError("recovery handoff path escaped the state root")
+        root = self.state_root
+        directory = root / parts[0]
+        path = directory / parts[1]
+        _reject_state_symlinks(root, path)
         return path
 
     def _handoff_binding(
@@ -1518,9 +1540,16 @@ class RecoveryEngine:
         if reference != self._handoff_reference_for_id(handoff_id):
             raise RecoveryStateError("recovery handoff reference does not match its handoff ID")
         path = self._handoff_path(reference)
-        if path.exists():
+        try:
+            existing = read_json_rooted(
+                self.state_root, "recovery-handoffs", path.name
+            )
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
             try:
-                existing = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(existing, dict):
+                    raise ValueError("handoff is not an object")
             except (OSError, TypeError, ValueError) as exc:
                 raise RecoveryStateError(f"durable context handoff cannot be read: {exc}") from exc
             if not isinstance(existing, dict) or not self._handoff_body_valid(
@@ -1533,7 +1562,12 @@ class RecoveryEngine:
                 raise RecoveryStateError("durable context handoff reference is missing")
             payload = self._handoff_payload(record, goal, current, handoff_id)
             digest = canonical_digest(payload)
-            write_json_atomic(path, {**payload, "handoff_sha256": digest}, fsync=True)
+            write_json_rooted(
+                self.state_root,
+                "recovery-handoffs",
+                path.name,
+                {**payload, "handoff_sha256": digest},
+            )
         if not isinstance(digest, str):
             raise RecoveryStateError("durable context handoff has no digest")
         recovery = record.recovery.model_copy(
@@ -1555,7 +1589,9 @@ class RecoveryEngine:
         ):
             return False
         try:
-            payload = json.loads(self._handoff_path(reference).read_text(encoding="utf-8"))
+            payload = read_json_rooted(
+                self.state_root, "recovery-handoffs", Path(reference).name
+            )
         except (OSError, TypeError, ValueError, RecoveryStateError):
             return False
         return isinstance(payload, dict) and self._handoff_body_valid(

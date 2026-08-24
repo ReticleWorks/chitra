@@ -15,10 +15,10 @@ from chitra.recovery import RecoveryEngine, RecoverySupervisor, _resume_receipt_
 from chitra.session_contract import (
     CloseArchiveResult,
     JoinedLaneRecord,
+    OwnerProcessIdentity,
     ProviderCapabilities,
     ProviderIdentity,
     ProviderOperationResult,
-    OwnerProcessIdentity,
     ReopenReceipt,
 )
 
@@ -140,6 +140,8 @@ class FakeProvider:
             "operation_id": request.operation_id,
             "close_operation_id": request.close_operation_id,
             "lane_id": request.lane_id,
+            "goal_id": request.goal_id,
+            "goal_version": request.goal_version,
             "session_ref": request.session_ref,
             "provider_session_id": "physical-session-a",
             "provider_handle": "remote-handle-a",

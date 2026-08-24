@@ -170,6 +170,8 @@ class ReopenReceipt(_ContractModel):
     operation_id: Identifier
     close_operation_id: Identifier
     lane_id: Identifier
+    goal_id: Identifier
+    goal_version: int = Field(ge=1)
     session_ref: Identifier
     provider_session_id: Identifier
     provider_handle: Identifier
@@ -200,6 +202,13 @@ class ReopenReceipt(_ContractModel):
     def reject_bool_reopen_generation(cls, value: int) -> int:
         if isinstance(value, bool):
             raise ValueError("provider generation must be an integer")
+        return value
+
+    @field_validator("goal_version")
+    @classmethod
+    def reject_bool_reopen_goal_version(cls, value: int) -> int:
+        if isinstance(value, bool):
+            raise ValueError("goal version must be an integer")
         return value
 
     @field_validator("observed_at")
