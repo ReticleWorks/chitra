@@ -1007,16 +1007,15 @@ def validate_operation_result(pending: PendingProviderOperation, result: Provide
     if result.process_start_token is not None and pending.process_start_token != result.process_start_token:
         errors.append("process start token changed")
     if result.status not in {"unknown", "lost-response"}:
-        physical_fields = (
+        for field in (
             "provider_session_id",
             "provider_instance_id",
             "provider_generation",
             "process_start_token",
-        )
-        if any(getattr(pending, field) is not None for field in physical_fields) and all(
-            getattr(result, field) is None for field in physical_fields
         ):
-            errors.append("physical provider identity is missing")
+            expected = getattr(pending, field)
+            if expected is not None and getattr(result, field) is None:
+                errors.append(f"{field} is missing")
     pending_time = datetime.fromisoformat(pending.created_at.replace("Z", "+00:00"))
     result_time = datetime.fromisoformat(result.observed_at.replace("Z", "+00:00"))
     if result_time < pending_time:
