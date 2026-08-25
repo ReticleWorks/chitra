@@ -3269,6 +3269,7 @@ class RecoverySupervisor:
         self.ledger_key_path = ledger_key_path or state_root / "ledger.key"
         self.facts_reader = facts_reader
         self.lane_id = lane_id
+        self._identity_resolver_uses_explicit_now = identity_resolver is None
         self.identity_resolver = identity_resolver or top_hand_identity_from_facts
         self.operating_facts_reader = operating_facts_reader or (lambda: read_operating_facts().facts)
         self.lane_lock_timeout_seconds = lane_lock_timeout_seconds
@@ -3362,7 +3363,11 @@ class RecoverySupervisor:
                         goal, identity, policy, operation, now=now
                     )
                 else:
-                    resolved_identity = self.identity_resolver(goal, facts)
+                    resolved_identity = (
+                        self.identity_resolver(goal, facts, now=now)
+                        if self._identity_resolver_uses_explicit_now
+                        else self.identity_resolver(goal, facts)
+                    )
                     if resolved_identity is None:
                         continue
                     identity = resolved_identity

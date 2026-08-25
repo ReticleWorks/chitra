@@ -1011,32 +1011,145 @@ def sealed_loader_selftest() -> dict:
         shutil.rmtree(root, ignore_errors=True)
 
 
+_PRODUCT_MUTATIONS: dict[str, tuple[str, bytes, bytes]] = {
+    "D1": (
+        "drop the oldest pending order from every dispatch pass",
+        b"    pending = [path for _, _, path in sorted(dated, key=lambda item: item[:2])]\n",
+        b"    pending = [path for _, _, path in sorted(dated, key=lambda item: item[:2])][1:]\n",
+    ),
+    "D2": (
+        "re-dispatch a nonce-marked order and discard its successful result",
+        b"        if nonce_path.exists():\n",
+        (
+            b"        if nonce_path.exists():\n"
+            b"            result = dispatch_to_tmux(\n"
+            b"                order, policy=policy, tuning=tuning, runner=dispatch_runner,\n"
+            b"                projects_root=projects_root, local_extra=local_extra,\n"
+            b"                tmux_socket=tmux_socket,\n"
+            b"            )\n"
+            b"            result.status = DispatchStatus.DELIVERY_UNCONFIRMED\n"
+            b"        elif False:  # injected defect: real nonce reconciliation bypassed\n"
+        ),
+    ),
+    "D3": (
+        "hide the durable terminal result from both suppression checks",
+        b'    existing_result = results_dir / f"{order.order_id}.json"\n',
+        b'    existing_result = results_dir / f".mutant-{order.order_id}.json"\n',
+    ),
+}
+_CLEAN_DIMENSION_SCORES = {"D1": 12, "D2": 10, "D3": 13}
+_PRODUCT_MUTATION_TIMEOUT_S = 180
+
+
+def _copy_for_product_mutation() -> Path:
+    container = Path(tempfile.mkdtemp(prefix="chitra-product-mutation-"))
+    checkout = container / "repo"
+    shutil.copytree(
+        REPO_ROOT,
+        checkout,
+        symlinks=True,
+        ignore=shutil.ignore_patterns(
+            ".git", "__pycache__", ".pytest_cache", ".venv", "*.pyc"
+        ),
+    )
+    return checkout
+
+
+def _run_dimension_probe(checkout: Path, key: str) -> int:
+    command = [
+        sys.executable,
+        str(checkout / "tools" / "autoresearch_v2_benchmark.py"),
+        "--internal-dimension",
+        key,
+    ]
+    environment = dict(os.environ)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(checkout / "src"),
+            environment.get("PYTHONPATH", ""),
+        ]
+    ).rstrip(os.pathsep)
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(checkout),
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=_PRODUCT_MUTATION_TIMEOUT_S,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise InfraError(f"{key} product-mutation probe timed out") from exc
+    if completed.returncode != 0:
+        tail = ((completed.stdout or "") + (completed.stderr or ""))[-800:]
+        raise InfraError(
+            f"{key} product-mutation probe exited {completed.returncode}: {tail}"
+        )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise InfraError(f"{key} product-mutation probe returned invalid JSON") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("mode") != "internal-product-mutation-probe"
+        or payload.get("key") != key
+        or payload.get("admission_evidence") is not False
+    ):
+        raise InfraError(f"{key} product-mutation probe returned the wrong contract")
+    score = payload.get("score")
+    if isinstance(score, bool) or not isinstance(score, int):
+        raise InfraError(f"{key} product-mutation probe score is not an integer")
+    return score
+
+
+def _prove_product_mutation(key: str) -> dict:
+    description, target_bytes, replacement_bytes = _PRODUCT_MUTATIONS[key]
+    clean_checkout = _copy_for_product_mutation()
+    mutant_checkout = _copy_for_product_mutation()
+    try:
+        clean_score = _run_dimension_probe(clean_checkout, key)
+        expected_clean = _CLEAN_DIMENSION_SCORES[key]
+        if clean_score != expected_clean:
+            raise InfraError(
+                f"{key} clean score changed: {clean_score}; expected {expected_clean}"
+            )
+        product_path = mutant_checkout / "src" / "chitra" / "dispatchd.py"
+        product_bytes = product_path.read_bytes()
+        occurrences = product_bytes.count(target_bytes)
+        if occurrences != 1:
+            raise InfraError(
+                f"{key} production mutation target occurs {occurrences} times; expected 1"
+            )
+        product_path.write_bytes(product_bytes.replace(target_bytes, replacement_bytes, 1))
+        mutated_score = _run_dimension_probe(mutant_checkout, key)
+        return {
+            "key": key,
+            "clean": clean_score,
+            "mutated": mutated_score,
+            "detects_regression": mutated_score < clean_score,
+            "mutation": description,
+            "production_path": "src/chitra/dispatchd.py",
+            "fresh_process": True,
+        }
+    finally:
+        shutil.rmtree(clean_checkout.parent, ignore_errors=True)
+        shutil.rmtree(mutant_checkout.parent, ignore_errors=True)
+
+
 def run_selftest(report: dict, as_json: bool, sealed_dimensions: list[Dimension]) -> int:
     results = []
-    ok = True
-    sealed_attempted = 0
-    sealed_detected = 0
-    for dim in [*PUBLIC_DIMENSIONS, *sealed_dimensions]:
-        entry = {"key": dim.key, "max": dim.max_points}
+    ok = bool(report.get("gates", {}).get("product_tests", {}).get("ok"))
+    for key in sorted(_PRODUCT_MUTATIONS):
         try:
-            base = dim.run()
-            clean = int(dim.check(base))
-            mutated = int(dim.check(dim.mutate(base)))
-            entry.update({"clean": clean, "mutated": mutated,
-                          "detects_regression": mutated < clean,
-                          "mutation": dim.mutation_desc})
-            detected = mutated < clean and 0 <= clean <= dim.max_points
-            ok = ok and detected
-            if dim in sealed_dimensions:
-                sealed_attempted += 1
-                sealed_detected += int(detected)
+            entry = _prove_product_mutation(key)
+            ok = ok and bool(entry["detects_regression"])
         except InfraError as exc:
+            entry = {"key": key}
             entry["error"] = str(exc)
             ok = False
-        finally:
-            _cleanup_worlds()
-        if dim not in sealed_dimensions:
-            results.append(entry)
+        results.append(entry)
     raw = synthesize_model(dd().DispatchOrder, hint="fx").model_dump_json().encode("utf-8")
     fixture_detected = not fixture_is_lossless(raw, _lossy_dict_mutation(raw))
     results.append({"key": "FIXTURE-SERIALIZATION-MUTATION",
@@ -1051,8 +1164,11 @@ def run_selftest(report: dict, as_json: bool, sealed_dimensions: list[Dimension]
     ok = ok and loader["accepted"] and loader["adversarial_rejections"] == 3 and loader["privacy_ok"]
     report["selftest"] = results
     if sealed_dimensions:
-        report["sealed_mutations"] = {"families": sealed_attempted,
-                                      "detected": sealed_detected}
+        report["sealed_mutations"] = {
+            "families": 0,
+            "detected": 0,
+            "note": "sealed cases are not read or mutated by public selftest",
+        }
     report["ok"] = ok
     emit(report, as_json)
     return 0 if ok else 4
@@ -1101,12 +1217,41 @@ def main(argv=None) -> int:
                         help="keep temp worlds for debugging")
     parser.add_argument("--worker", metavar="CFG", default=None,
                         help=argparse.SUPPRESS)
+    parser.add_argument("--internal-dimension", metavar="KEY", default=None,
+                        help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
     if args.keep_worlds:
         os.environ["CHITRA_BENCH_KEEP"] = "1"
     if args.worker:
         _worker_main(args.worker)
+        return 0
+
+    if args.internal_dimension:
+        if args.selftest or args.sealed or args.sealed_sha256 or args.keep_worlds:
+            parser.error("--internal-dimension rejects ordinary and sealed modes")
+        dimension = next(
+            (item for item in PUBLIC_DIMENSIONS if item.key == args.internal_dimension),
+            None,
+        )
+        if dimension is None:
+            parser.error("--internal-dimension requires D1, D2, D3, D4, or D5")
+        try:
+            bundle = dimension.run()
+            score = int(dimension.check(bundle))
+        finally:
+            _cleanup_worlds(force=True)
+        print(
+            json.dumps(
+                {
+                    "mode": "internal-product-mutation-probe",
+                    "key": dimension.key,
+                    "score": score,
+                    "admission_evidence": False,
+                },
+                sort_keys=True,
+            )
+        )
         return 0
 
     if bool(args.sealed) != bool(args.sealed_sha256):
