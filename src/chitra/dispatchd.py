@@ -238,9 +238,19 @@ def session_scope_violation(
     session_name = parts[1]
     denied = next((prefix for prefix in denied_session_prefixes if session_name.startswith(prefix)), None)
     if denied is not None:
-        return f"session namespace denied by prefix {denied!r}"
+        return (
+            f"session namespace {session_name!r} declined: matched configured deny prefix "
+            f"{denied!r}; the denied-session-prefix configuration maintainer can revise "
+            "this policy if the denial is unintended; otherwise the sender or router must "
+            f"target a dispatcher configured to accept namespace {session_name!r}"
+        )
     if allowed_session_prefixes and not any(session_name.startswith(prefix) for prefix in allowed_session_prefixes):
-        return "session namespace is not owned by this dispatcher"
+        return (
+            f"session namespace {session_name!r} has no ownership evidence here: this layer "
+            "has no namespace-to-dispatcher mapping; route via the sender or router that can "
+            f"select a dispatcher configured for namespace {session_name!r}, or contact the "
+            "allowed-session-prefix configuration maintainer if this dispatcher should own it"
+        )
     return None
 
 
