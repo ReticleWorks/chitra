@@ -32,6 +32,7 @@ import json
 import os
 import signal
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -46,6 +47,7 @@ from chitra.detect import (
     detect_document_dithering,
     detect_drift,
     detect_excessive_testing,
+    detect_false_blocker,
     detect_false_done,
     detect_unnecessary_steps,
 )
@@ -68,7 +70,7 @@ DEFAULT_POLL_SECONDS = 60.0
 PRESENCE_INSTANCE = "chitra-monitord"
 MONITORD_SCHEMA = "chitra.monitord.pass.v1"
 
-_DETECTOR_ORDER = ("drift", "unnecessary_steps", "excessive_testing", "document_dithering")
+_DETECTOR_ORDER = ("false_blocker", "drift", "unnecessary_steps", "excessive_testing", "document_dithering")
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +177,8 @@ def run_detectors(
     lane: str,
     goal: object,
     events: tuple[CanonicalEvent, ...],
+    *,
+    environment: Mapping[str, str] | None = None,
 ) -> list[Finding]:
     """Run the deterministic detector set over one lane's journal."""
     scope_text = str(getattr(goal, "scope", "") or "")
@@ -182,6 +186,7 @@ def run_detectors(
     goal_text = str(getattr(goal, "goal", "") or "")
     goal_is_document = "documentation" in f"{intent_text}\n{goal_text}".lower()
     findings: list[Finding] = []
+    findings.extend(detect_false_blocker(events, environment=environment))
     findings.extend(detect_drift(events, scope_text=scope_text, declared_worktree=""))
     findings.extend(detect_unnecessary_steps(events))
     findings.extend(detect_excessive_testing(events))

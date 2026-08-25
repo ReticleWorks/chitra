@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,18 @@ _COMPLETION_CLAIM_RE = re.compile(
 )
 _NEGATED_COMPLETION_RE = re.compile(
     r"\b(not done|not complete|still working|remain(?:s)? to|left to|todo|to do|pending|need(?:s)? .*run)\b",
+    re.IGNORECASE,
+)
+_MISSING_RESOURCE_RE = re.compile(
+    r"\b(?:missing|not found|does not exist|doesn't exist|unavailable|cannot find|can't find)\b",
+    re.IGNORECASE,
+)
+_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w])/(?P<path>[A-Za-z0-9._~+%=-]+(?:/[A-Za-z0-9._~+%=-]+)*)")
+_ENVIRONMENT_VARIABLE_RE = re.compile(
+    r"(?:\b(?:environment|env)\s+variable\s+|\$)(?P<name>[A-Z][A-Z0-9_]*)\b"
+)
+_CONDITIONAL_OR_REPORTED_RE = re.compile(
+    r"\b(?:if|when|unless|whether|assuming|reported|reports|said|says|claimed|claims|according to|told)\b",
     re.IGNORECASE,
 )
 
@@ -80,6 +93,83 @@ def _first_unmet_item(enrolled_items: Sequence[object]) -> str:
         if isinstance(item_id, str):
             return item_id
     return ""
+
+
+def _claim_text(event: CanonicalEvent) -> str:
+    if event.normalized_type is not CanonicalType.FINAL_RESPONSE:
+        return ""
+    value = event.payload.get("text")
+    return value if isinstance(value, str) else ""
+
+
+def _resource_claim_is_direct(text: str) -> bool:
+    """Accept only a direct, affirmative missing-resource claim."""
+    return (
+        bool(_MISSING_RESOURCE_RE.search(text))
+        and "?" not in text
+        and _CONDITIONAL_OR_REPORTED_RE.search(text) is None
+    )
+
+
+def detect_false_blocker(
+    events: Sequence[CanonicalEvent],
+    *,
+    environment: Mapping[str, str] | None = None,
+    enrolled_items: Sequence[object] = (),
+) -> list[Finding]:
+    """Find explicit missing-resource claims contradicted by local evidence.
+
+    The detector probes only named absolute paths and named environment
+    variables. It never opens a path or includes an environment value in a
+    finding. Ambiguous language and probe errors abstain.
+    """
+    env = os.environ if environment is None else environment
+    unmet = _first_unmet_item(enrolled_items)
+    findings: list[Finding] = []
+    for event in events:
+        text = _claim_text(event)
+        if not text or not _resource_claim_is_direct(text):
+            continue
+        for match in _ABSOLUTE_PATH_RE.finditer(text):
+            raw_path = ("/" + match.group("path")).rstrip(".,;:!?)]}")
+            if not raw_path:
+                continue
+            path = Path(raw_path)
+            try:
+                path.stat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
+            findings.append(
+                Finding(
+                    detector="false_blocker",
+                    fingerprint_seed={"resource_kind": "absolute_path", "resource": raw_path},
+                    event_refs=(event.event_id,),
+                    unmet_item=unmet,
+                    expected_next_progress="use the named existing resource and record its observed result",
+                    detail=f"an explicit missing-resource claim was contradicted by the named path {raw_path}",
+                )
+            )
+        for match in _ENVIRONMENT_VARIABLE_RE.finditer(text):
+            name = match.group("name")
+            try:
+                value = env.get(name)
+            except OSError:
+                continue
+            if not isinstance(value, str) or not value:
+                continue
+            findings.append(
+                Finding(
+                    detector="false_blocker",
+                    fingerprint_seed={"resource_kind": "environment_variable", "resource": name},
+                    event_refs=(event.event_id,),
+                    unmet_item=unmet,
+                    expected_next_progress="use the named environment resource and record its observed result",
+                    detail=f"an explicit missing-resource claim was contradicted by the nonempty environment variable {name}",
+                )
+            )
+    return findings
 
 
 def _joined_results(events: Sequence[CanonicalEvent]) -> dict[str, CanonicalEvent]:
@@ -612,6 +702,7 @@ __all__ = [
     "detect_document_dithering",
     "detect_drift",
     "detect_excessive_testing",
+    "detect_false_blocker",
     "detect_false_done",
     "detect_unnecessary_steps",
 ]

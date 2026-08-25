@@ -6,6 +6,7 @@ from .detectors import (
     detect_document_dithering,
     detect_drift,
     detect_excessive_testing,
+    detect_false_blocker,
     detect_false_done,
     detect_unnecessary_steps,
 )
@@ -43,6 +44,7 @@ __all__ = [
     "detect_document_dithering",
     "detect_drift",
     "detect_excessive_testing",
+    "detect_false_blocker",
     "detect_false_done",
     "detect_unnecessary_steps",
     "generate_relaunch_brief",
