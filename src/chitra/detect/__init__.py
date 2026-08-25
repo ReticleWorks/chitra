@@ -7,6 +7,7 @@ from .detectors import (
     detect_drift,
     detect_excessive_testing,
     detect_false_done,
+    detect_stuck,
     detect_unnecessary_steps,
 )
 from .ladder import (
@@ -14,6 +15,7 @@ from .ladder import (
     ConsumptionProof,
     IncidentRecord,
     IncidentStore,
+    LadderActionRecord,
     LadderDecision,
     ResponseLadder,
 )
@@ -36,6 +38,7 @@ __all__ = [
     "Finding",
     "IncidentRecord",
     "IncidentStore",
+    "LadderActionRecord",
     "LadderDecision",
     "RescueBundle",
     "ResponseLadder",
@@ -44,6 +47,7 @@ __all__ = [
     "detect_drift",
     "detect_excessive_testing",
     "detect_false_done",
+    "detect_stuck",
     "detect_unnecessary_steps",
     "generate_relaunch_brief",
     "write_checkpoint_receipt",

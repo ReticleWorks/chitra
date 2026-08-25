@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from _goal_fixtures import enrollment_fields
 
+from chitra.detect import Finding
 from chitra.goals import GoalRecord, GoalStatus, upsert_goal
 from chitra.journal import ByteRange, CanonicalEvent, CanonicalType, Client, TranscriptIdentity
 from chitra.journal.store import EventJournal, classify_progress
@@ -152,6 +153,56 @@ def test_run_once_excludes_per_lane_progress_journal_from_lane_discovery(tmp_pat
     assert [record["lane"] for record in finding_records] == [SEEDED_LANE]
     presence_lines = (tmp_path / "presence" / "chitra-monitord.jsonl").read_text(encoding="utf-8").splitlines()
     assert all(json.loads(line)["lanes"] == [SEEDED_LANE] for line in presence_lines)
+
+
+def test_stuck_action_ladder_records_nudge_without_acting_in_shadow_mode(tmp_path: Path) -> None:
+    from chitra.monitord import evaluate_findings
+
+    finding = Finding(
+        detector="stuck",
+        fingerprint_seed={"case": "shadow-nudge"},
+        event_refs=("final-1", "final-2", "final-3"),
+        unmet_item="item-1",
+        expected_next_progress="record explicit progress",
+        detail="completed turns did not advance the item",
+    )
+    config = resolve_config(state_dir=tmp_path, shadow_mode=True)
+    actions = evaluate_findings(config, "lane-a.0.0", [finding])
+
+    assert actions == ["nudge"]
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "actions" / "lane-a.0.0.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert records[-1]["action"] == "nudge"
+    assert records[-1]["acted"] is False
+    assert not (tmp_path / "queue" / "orders").exists()
+
+
+def test_stuck_action_ladder_enqueues_nudge_only_outside_shadow_mode(tmp_path: Path) -> None:
+    from chitra.monitord import evaluate_findings
+
+    finding = Finding(
+        detector="stuck",
+        fingerprint_seed={"case": "live-nudge"},
+        event_refs=("final-1", "final-2", "final-3"),
+        unmet_item="item-1",
+        expected_next_progress="record explicit progress",
+        detail="completed turns did not advance the item",
+    )
+    queue = tmp_path / "queue"
+    config = resolve_config(state_dir=tmp_path, dispatch_queue_dir=queue, shadow_mode=False)
+    actions = evaluate_findings(config, "lane-a.0.0", [finding])
+
+    assert actions == ["nudge"]
+    orders = list((queue / "orders").glob("*.json"))
+    assert len(orders) == 1
+    assert json.loads(orders[0].read_text(encoding="utf-8"))["session_ref"] == "lane-a.0.0"
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "actions" / "lane-a.0.0.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert records[-1]["acted"] is True
 
 
 def _goal(session_ref: str, *, status: GoalStatus = "working") -> GoalRecord:

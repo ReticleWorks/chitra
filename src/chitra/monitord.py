@@ -28,10 +28,12 @@ one ``monitord`` process per instance instead of the three-daemon chain.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,22 +43,29 @@ import structlog
 
 from chitra.detect import (
     Finding,
+    IncidentRecord,
     IncidentStore,
+    LadderActionRecord,
     ResponseLadder,
     detect_document_dithering,
     detect_drift,
     detect_excessive_testing,
     detect_false_done,
+    detect_stuck,
     detect_unnecessary_steps,
 )
+from chitra.dispatch import enqueue_dispatch_order
 from chitra.goals import get_goal, list_goals
 from chitra.journal import (
     CanonicalEvent,
     CanonicalType,
     JournalIngestor,
     NormalizationContext,
+    ProgressClassification,
+    classify_progress,
 )
 from chitra.journal.store import EventJournal
+from chitra.orders import DispatchOrder
 from chitra.presence import append_presence
 from chitra.state_paths import state_dir as default_state_dir
 from chitra.systemd_notify import notify_ready, notify_watchdog
@@ -68,7 +77,7 @@ DEFAULT_POLL_SECONDS = 60.0
 PRESENCE_INSTANCE = "chitra-monitord"
 MONITORD_SCHEMA = "chitra.monitord.pass.v1"
 
-_DETECTOR_ORDER = ("drift", "unnecessary_steps", "excessive_testing", "document_dithering")
+_DETECTOR_ORDER = ("stuck", "drift", "unnecessary_steps", "excessive_testing", "document_dithering")
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +89,7 @@ class MonitordConfig:
     findings_path: Path
     poll_seconds: float
     shadow_mode: bool
+    dispatch_queue_dir: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +111,7 @@ def resolve_config(
     findings_path: Path | None = None,
     poll_seconds: float | None = None,
     shadow_mode: bool | None = None,
+    dispatch_queue_dir: Path | None = None,
 ) -> MonitordConfig:
     """Resolve CLI arguments, then explicit environment overrides, then defaults."""
     resolved_state_dir = state_dir or default_state_dir()
@@ -121,6 +132,7 @@ def resolve_config(
         findings_path=resolved_findings_path,
         poll_seconds=poll_seconds,
         shadow_mode=shadow_mode,
+        dispatch_queue_dir=dispatch_queue_dir,
     )
 
 
@@ -175,13 +187,38 @@ def run_detectors(
     lane: str,
     goal: object,
     events: tuple[CanonicalEvent, ...],
+    *,
+    progress_rows: tuple[ProgressClassification, ...] | None = None,
 ) -> list[Finding]:
     """Run the deterministic detector set over one lane's journal."""
     scope_text = str(getattr(goal, "scope", "") or "")
     intent_text = str(getattr(goal, "intent", "") or "")
     goal_text = str(getattr(goal, "goal", "") or "")
     goal_is_document = "documentation" in f"{intent_text}\n{goal_text}".lower()
+    if progress_rows is None:
+        try:
+            journal = EventJournal(config.state_dir, lane)
+        except ValueError:
+            # Direct detector callers may use an in-memory lane label that is
+            # not a durable journal filename. They still get the same derived
+            # classifications, but there is no safe path to persist them.
+            journal = None
+            progress_rows = ()
+        else:
+            progress_rows = tuple(journal.load_progress())
+        goal_version = str(getattr(goal, "goal_version", 0) or 0)
+        derived = tuple(
+            classify_progress(event, goal_version=goal_version, related_events=events)
+            for event in events
+        )
+        if derived and journal is not None:
+            journal.append_progress(derived)
+            known = {row.derivation_id for row in progress_rows}
+            progress_rows = progress_rows + tuple(row for row in derived if row.derivation_id not in known)
+        elif derived:
+            progress_rows = derived
     findings: list[Finding] = []
+    findings.extend(detect_stuck(events, progress_rows=progress_rows))
     findings.extend(detect_drift(events, scope_text=scope_text, declared_worktree=""))
     findings.extend(detect_unnecessary_steps(events))
     findings.extend(detect_excessive_testing(events))
@@ -195,13 +232,69 @@ def evaluate_findings(
     findings: list[Finding],
     *,
     order_marker: str = "[M] monitord",
+    journal_events: tuple[CanonicalEvent, ...] = (),
+    governed_restart: Callable[[Finding, IncidentRecord], bool] | None = None,
+    relaunch: Callable[[Finding, IncidentRecord], bool] | None = None,
 ) -> list[str]:
-    """Feed every finding through the response ladder and return its actions."""
-    ladder = ResponseLadder(IncidentStore(config.state_dir, lane))
+    """Log every finding's ladder action and execute only outside shadow mode.
+
+    The nudge uses the existing dispatch queue contract. Restart and relaunch
+    callbacks are explicit seams for the governed rescue and checkpoint
+    owner; without them, monitord records the required action but fails closed.
+    """
+    store = IncidentStore(config.state_dir, lane)
+    ladder = ResponseLadder(store, journal_events=journal_events)
     actions: list[str] = []
     for finding in findings:
         decision = ladder.evaluate(lane=lane, finding=finding, order_marker=order_marker)
-        actions.append(decision.action)
+        action = ladder.action_for(decision)
+        acted = False
+        action_reason = "shadow mode records the action without acting"
+        if not config.shadow_mode:
+            if action == "nudge":
+                if config.dispatch_queue_dir is None:
+                    action_reason = "dispatch queue is not configured"
+                else:
+                    order_id = f"monitord-{hashlib.sha256(f'{lane}:{finding.fingerprint}'.encode()).hexdigest()[:24]}"
+                    enqueue_dispatch_order(
+                        config.dispatch_queue_dir,
+                        DispatchOrder(
+                            order_id=order_id,
+                            session_ref=lane,
+                            nudge=finding.expected_next_progress,
+                            task_type="stuck-nudge",
+                        ),
+                    )
+                    acted = True
+                    action_reason = "nudge enqueued through the dispatch contract"
+            elif action == "governed_restart":
+                if governed_restart is not None:
+                    acted = governed_restart(finding, decision.record)
+                    action_reason = "governed restart callback completed" if acted else "governed restart callback declined"
+                else:
+                    action_reason = "governed restart requires the rescue and checkpoint owner"
+            elif action == "relaunch":
+                if relaunch is not None:
+                    acted = relaunch(finding, decision.record)
+                    action_reason = "relaunch callback completed" if acted else "relaunch callback declined"
+                else:
+                    action_reason = "relaunch requires a governed rescue bundle and checkpoint receipt"
+            elif action == "mark_and_surface":
+                acted = True
+                action_reason = "relaunch-stage recurrence was durably marked and surfaced"
+        store.record_action(
+            LadderActionRecord(
+                lane=lane,
+                fingerprint=finding.fingerprint,
+                detector=finding.detector,
+                stage=decision.stage,
+                action=action,
+                acted=acted,
+                reason=action_reason,
+                recorded_at=datetime.now(UTC).isoformat(),
+            )
+        )
+        actions.append(action)
         logger.info(
             "monitord_ladder_decision",
             lane=lane,
@@ -209,6 +302,8 @@ def evaluate_findings(
             action=decision.action,
             stage=decision.stage,
             reason=decision.reason,
+            action_reason=action_reason,
+            acted=acted,
             shadow_mode=config.shadow_mode,
         )
     return actions
@@ -296,7 +391,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
         findings = detection_findings + [
             finding for finding in enrollment_findings if finding.detector == "false_done"
         ]
-        actions = evaluate_findings(config, lane, findings)
+        actions = evaluate_findings(config, lane, findings, journal_events=events)
         append_finding_records(config, lane, findings)
         results.append(
             LanePassResult(
@@ -361,6 +456,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--transcript-root", type=Path, default=None)
     parser.add_argument("--findings-path", type=Path, default=None)
     parser.add_argument("--poll-seconds", type=float, default=None)
+    parser.add_argument("--dispatch-queue-dir", type=Path, default=None)
     parser.add_argument("--no-shadow-mode", dest="shadow_mode", action="store_false", help="Record findings outside shadow mode.")
     parser.add_argument("--once", action="store_true", help="Run one pass and exit.")
     return parser
@@ -375,6 +471,7 @@ def main(argv: list[str] | None = None) -> int:
         findings_path=args.findings_path,
         poll_seconds=args.poll_seconds,
         shadow_mode=args.shadow_mode,
+        dispatch_queue_dir=args.dispatch_queue_dir,
     )
     if args.once:
         print(json.dumps(run_once(config), indent=2, sort_keys=True))

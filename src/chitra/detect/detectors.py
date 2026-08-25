@@ -123,6 +123,48 @@ def _has_progress_between(
     return False
 
 
+def detect_stuck(
+    events: Sequence[CanonicalEvent],
+    *,
+    progress_rows: Sequence[ProgressClassification] = (),
+    threshold: int = 3,
+    enrolled_items: Sequence[object] = (),
+) -> list[Finding]:
+    """Find completed turns with no durable progress between their boundaries.
+
+    Only an explicit ``PROGRESS`` classification between two final responses
+    resets the streak. Tool calls, unknown rows, and non-progress rows do not
+    establish progress.
+    """
+    if threshold < 1:
+        raise ValueError("stuck threshold must be at least 1")
+    unmet = _first_unmet_item(enrolled_items)
+    completed = [
+        (position, event)
+        for position, event in enumerate(events)
+        if event.normalized_type is CanonicalType.FINAL_RESPONSE
+    ]
+    streak: list[tuple[int, CanonicalEvent]] = []
+    for position, event in completed:
+        if streak and _has_progress_between(events, progress_rows, streak[-1][0], position):
+            streak = []
+        streak.append((position, event))
+        if len(streak) != threshold:
+            continue
+        refs = tuple(boundary.event_id for _, boundary in streak)
+        return [
+            Finding(
+                detector="stuck",
+                fingerprint_seed={"pattern": "completed-turns-without-progress", "threshold": threshold},
+                event_refs=refs,
+                unmet_item=unmet,
+                expected_next_progress="consume the next action and record explicit progress toward the enrolled item",
+                detail=f"{threshold} completed turns ended without durable progress between their boundaries",
+            )
+        ]
+    return []
+
+
 def _strings_from(value: object) -> tuple[str, ...]:
     strings: list[str] = []
     if isinstance(value, str):
@@ -613,5 +655,6 @@ __all__ = [
     "detect_drift",
     "detect_excessive_testing",
     "detect_false_done",
+    "detect_stuck",
     "detect_unnecessary_steps",
 ]

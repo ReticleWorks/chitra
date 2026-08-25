@@ -22,6 +22,7 @@ from chitra.detect import (
     detect_drift,
     detect_excessive_testing,
     detect_false_done,
+    detect_stuck,
     detect_unnecessary_steps,
     generate_relaunch_brief,
     write_checkpoint_receipt,
@@ -47,6 +48,7 @@ from chitra.journal import (
     NormalizationContext,
     ProgressClass,
     ProgressClassification,
+    classify_progress,
 )
 from chitra.journal.models import ByteRange, TranscriptIdentity
 from chitra.ledger import LedgerEntry, append_entry, message_hash, sign
@@ -188,6 +190,79 @@ def test_control_long_healthy_tool_call_stays_clear(event_sets: dict[str, tuple[
     assert detect_excessive_testing(events) == []
     assert detect_drift(events, scope_text="read-only inspection only", declared_worktree="") == []
     assert detect_document_dithering(events, goal_is_document=False) == []
+
+
+def test_stuck_requires_the_threshold_of_completed_turns() -> None:
+    events = tuple(
+        _event(f"final-{index}", CanonicalType.FINAL_RESPONSE, payload={"text": "still working"})
+        for index in range(1, 4)
+    )
+
+    findings = detect_stuck(events, threshold=3)
+
+    assert len(findings) == 1
+    assert findings[0].detector == "stuck"
+    assert findings[0].event_refs == ("final-1", "final-2", "final-3")
+
+
+def test_progress_between_final_boundaries_resets_the_stuck_streak() -> None:
+    progress_source = _event(
+        "progress-source",
+        CanonicalType.TOOL_RESULT,
+        payload={"progress_evidence": {"artifact_changed": True}},
+    )
+    events = (
+        _event("final-1", CanonicalType.FINAL_RESPONSE, payload={"text": "first"}),
+        progress_source,
+        _event("final-2", CanonicalType.FINAL_RESPONSE, payload={"text": "second"}),
+        _event("final-3", CanonicalType.FINAL_RESPONSE, payload={"text": "third"}),
+        _event("final-4", CanonicalType.FINAL_RESPONSE, payload={"text": "fourth"}),
+    )
+    progress = classify_progress(progress_source, goal_version="goal-1")
+
+    findings = detect_stuck(events, progress_rows=(progress,), threshold=3)
+
+    assert len(findings) == 1
+    assert findings[0].event_refs == ("final-2", "final-3", "final-4")
+
+
+def test_non_progress_and_unknown_rows_do_not_reset_stuck_streak() -> None:
+    tool_call = _event("tool-call", CanonicalType.TOOL_CALL, payload={"tool_name": "Bash", "input": {}})
+    tool_result = _event("tool-result", CanonicalType.TOOL_RESULT, payload={"content": "unchanged"})
+    events = (
+        _event("final-1", CanonicalType.FINAL_RESPONSE, payload={"text": "first"}),
+        tool_call,
+        tool_result,
+        _event("final-2", CanonicalType.FINAL_RESPONSE, payload={"text": "second"}),
+        _event("final-3", CanonicalType.FINAL_RESPONSE, payload={"text": "third"}),
+    )
+    rows = (
+        classify_progress(tool_call, goal_version="goal-1"),
+        classify_progress(tool_result, goal_version="goal-1"),
+    )
+
+    assert detect_stuck(events, progress_rows=rows, threshold=3)
+
+
+def test_stuck_fingerprint_does_not_depend_on_later_events() -> None:
+    events = tuple(
+        _event(f"final-{index}", CanonicalType.FINAL_RESPONSE, payload={"text": "same"})
+        for index in range(1, 4)
+    )
+
+    first = detect_stuck(events, threshold=3)[0]
+    later = detect_stuck(events + (_event("later-tool", CanonicalType.TOOL_CALL),), threshold=3)[0]
+
+    assert first.fingerprint == later.fingerprint
+
+
+def test_in_flight_tool_call_and_short_turn_history_stay_clear() -> None:
+    events = (
+        _event("final-1", CanonicalType.FINAL_RESPONSE, payload={"text": "first"}),
+        _event("long-tool", CanonicalType.TOOL_CALL, payload={"tool_name": "Bash", "input": {}}),
+    )
+
+    assert detect_stuck(events, threshold=3) == []
 
 
 def test_required_final_validation_and_document_goal_controls_stay_clear(

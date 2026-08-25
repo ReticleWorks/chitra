@@ -28,6 +28,7 @@ from chitra.ledger import LedgerEntry, message_hash, verify_entry
 from .detectors import Finding
 
 LADDER_STAGES: tuple[str, ...] = ("nudge", "redirect", "rescue", "relaunch")
+LADDER_ACTIONS: tuple[str, ...] = ("nudge", "governed_restart", "relaunch", "mark_and_surface", "hold")
 
 CONSUMED_CHECKPOINT_SCHEMA = "chitra.detect.consumed-checkpoint.v1"
 
@@ -37,6 +38,7 @@ _SAFE_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _PROCESS_IDENTITY_KEYS = ("target_pid", "target_uid", "target_gid", "target_start_time", "target_comm", "target_exe")
 
 IncidentStage = Literal["nudge", "redirect", "rescue", "relaunch"]
+LadderActionName = Literal["nudge", "governed_restart", "relaunch", "mark_and_surface", "hold"]
 
 
 class ConsumptionProof(BaseModel):
@@ -89,6 +91,27 @@ class LadderDecision(BaseModel):
     reason: str
 
 
+class LadderActionRecord(BaseModel):
+    """Durable record of the action selected for one ladder decision.
+
+    The record is separate from :class:`IncidentRecord` so a shadow pass can
+    preserve the exact action it would have taken without changing incident
+    stage or pretending that an external action ran.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    schema_name: str = "chitra.detect.ladder-action.v1"
+    lane: str
+    fingerprint: str
+    detector: str
+    stage: IncidentStage
+    action: LadderActionName
+    acted: bool
+    reason: str
+    recorded_at: str
+
+
 class IncidentStore:
     """Append-only per-lane incident log under ``<state_root>/incidents``."""
 
@@ -100,6 +123,9 @@ class IncidentStore:
         self.directory = state_root / "incidents"
         self.path = self.directory / f"{lane}.jsonl"
         self.lock_path = self.directory / f"{lane}.lock"
+        self.action_directory = state_root / "actions"
+        self.action_path = self.action_directory / f"{lane}.jsonl"
+        self.action_lock_path = self.action_directory / f"{lane}.lock"
 
     def load(self) -> list[IncidentRecord]:
         if not self.path.exists():
@@ -145,6 +171,29 @@ class IncidentStore:
             os.fsync(fd)
         finally:
             os.close(fd)
+        return record
+
+    def record_action(self, record: LadderActionRecord) -> LadderActionRecord:
+        """Durably append one planned or executed action for this lane."""
+        self.action_directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.action_directory, 0o700)
+        with self.action_lock_path.open("a", encoding="utf-8") as lock:
+            os.chmod(self.action_lock_path, 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                fd = os.open(self.action_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+                try:
+                    os.fchmod(fd, 0o600)
+                    encoded = (record.model_dump_json() + "\n").encode()
+                    view = memoryview(encoded)
+                    while view:
+                        written = os.write(fd, view)
+                        view = view[written:]
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         return record
 
     def open_incident(self, *, lane: str, finding: Finding, order_marker: str) -> IncidentRecord:
@@ -329,6 +378,23 @@ class ResponseLadder:
         return LadderDecision(
             action="advance", stage=advanced.stage, record=advanced, reason="same fingerprint recurred after proven consumption"
         )
+
+    @staticmethod
+    def action_for(decision: LadderDecision) -> LadderActionName:
+        """Map a durable ladder decision to one logged action.
+
+        ``redirect`` and ``rescue`` remain governed stages. They do not permit
+        a caller to skip their delivery, rescue, or checkpoint evidence; the
+        monitor records the restart action and leaves execution to the
+        configured action boundary.
+        """
+        if decision.action == "open":
+            return "nudge"
+        if decision.action == "advance":
+            return "relaunch" if decision.stage == "relaunch" else "governed_restart"
+        if decision.stage == "relaunch":
+            return "mark_and_surface"
+        return "hold"
 
     def _consumption_proven(self, record: IncidentRecord) -> bool:
         proof = record.consumption
