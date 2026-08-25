@@ -474,7 +474,10 @@ def test_dispatchd_blocks_orders_outside_its_owned_session_namespace(tmp_path: P
     )
 
     assert [result.status for result in results] == [DispatchStatus.BLOCKED, DispatchStatus.SENT]
-    assert "not owned by this dispatcher" in results[0].reason
+    assert "monitor" in results[0].reason
+    assert "ownership evidence" in results[0].reason
+    assert "sender" in results[0].reason
+    assert "router" in results[0].reason
     assert calls == ["localhost:boomtown-design-a:0.0"]
     assert (queue_dir / "processed" / "wrong-lane.json").exists()
     assert (queue_dir / "results" / "wrong-lane.json").exists()
@@ -498,7 +501,10 @@ def test_dispatchd_deny_namespace_overrides_an_allow_prefix(tmp_path: Path, monk
     )[0]
 
     assert result.status == DispatchStatus.BLOCKED
-    assert "denied by prefix" in result.reason
+    reason = result.reason
+    assert "session namespace 'boomtown' declined: matched configured deny prefix 'boomtown'" in reason
+    assert "the denied-session-prefix configuration maintainer can revise this policy if the denial is unintended" in reason
+    assert "otherwise the sender or router must target a dispatcher configured to accept namespace 'boomtown'" in reason
 
 
 def test_dispatchd_session_namespace_environment_is_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
