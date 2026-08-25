@@ -6,16 +6,18 @@ stated goal, completion condition, and current state.
 
 from __future__ import annotations
 
+import base64
 import json
+import os
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
 
 import structlog
-from pydantic import ConfigDict, SkipValidation, TypeAdapter, ValidationInfo, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SkipValidation, TypeAdapter, ValidationInfo, model_validator
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 from chitra._fsio import locked_json_store, parse_iso8601, write_json_atomic
@@ -70,7 +72,11 @@ INTERVIEW_QUESTIONS: dict[str, str] = {
     "out_of_scope": "What work is explicitly out of scope?",
     "constraints": "What constraints apply, including tools, order, spend, and approvals?",
 }
+INTERVIEW_QUESTION_SET_ID = "chitra.goals.interview.v1"
+INTERVIEW_ATTESTATION_SCHEMA = "chitra.goals.interview-attestation.v1"
+INTERVIEW_TRUST_STORE_ENV_VAR = "CHITRA_INTERVIEW_TRUST_STORE"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_LEGACY_INTERVIEW_NAME_RE = re.compile(r"interview:[A-Za-z0-9_.-]+\Z")
 
 # Shared hold_reason convention: a hold_reason starting with this prefix
 # (e.g. "rate-limit:5h") marks a timed pause driven by provider usage
@@ -105,6 +111,36 @@ class GoalsSchemaNewerError(ValueError):
     """Raised when a write would rewrite a goals.json newer than this package."""
 
 
+class InterviewAttestation(BaseModel):
+    """A producer-signed binding for one interview answer set."""
+
+    model_config = ConfigDict(frozen=True, populate_by_name=True)
+
+    schema_name: Literal["chitra.goals.interview-attestation.v1"] = Field(
+        default=INTERVIEW_ATTESTATION_SCHEMA,
+        alias="schema",
+        serialization_alias="schema",
+    )
+    producer_id: str
+    session_ref: str
+    request_nonce: str
+    question_set_id: str
+    answer_digest: str
+    signature: str
+
+    def signing_bytes(self) -> bytes:
+        """Return the canonical bytes an independent producer signs."""
+        payload = {
+            "answer_digest": self.answer_digest,
+            "producer_id": self.producer_id,
+            "question_set_id": self.question_set_id,
+            "request_nonce": self.request_nonce,
+            "schema": self.schema_name,
+            "session_ref": self.session_ref,
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
 @pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True))
 class InterviewReceipt:
     """Immutable proof that all four enrollment questions were answered."""
@@ -113,6 +149,66 @@ class InterviewReceipt:
     completed_at: str
     answers_sha256: str
     provenance: tuple[str, ...]
+    request_nonce: str = ""
+    attestation: InterviewAttestation | None = None
+
+
+def load_interview_trust_store(path: Path | None = None) -> dict[str, bytes]:
+    """Load producer public keys from the protected verifier configuration."""
+    resolved = path
+    if resolved is None:
+        configured = os.environ.get(INTERVIEW_TRUST_STORE_ENV_VAR, "").strip()
+        resolved = Path(configured) if configured else None
+    if resolved is None:
+        return {}
+    payload = json.loads(resolved.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("schema") != "chitra.goals.interview-trust.v1":
+        raise ValueError("interview trust store schema is invalid")
+    producers = payload.get("producers")
+    if not isinstance(producers, dict):
+        raise ValueError("interview trust store producers must be an object")
+    public_keys: dict[str, bytes] = {}
+    for producer_id, entry in producers.items():
+        if not isinstance(producer_id, str) or not producer_id.strip() or not isinstance(entry, dict):
+            raise ValueError("interview trust store producer entries are invalid")
+        encoded = entry.get("public_key")
+        if not isinstance(encoded, str):
+            raise ValueError("interview trust store public keys must be base64 strings")
+        try:
+            public_key = base64.b64decode(encoded, validate=True)
+        except (ValueError, base64.binascii.Error) as exc:
+            raise ValueError("interview trust store public key is not valid base64") from exc
+        if len(public_key) != 32:
+            raise ValueError("interview trust store public keys must be 32 bytes")
+        public_keys[producer_id] = public_key
+    return public_keys
+
+
+def verify_interview_attestation(
+    attestation: InterviewAttestation,
+    *,
+    trusted_public_keys: Mapping[str, bytes] | None = None,
+) -> bool:
+    """Verify one attestation against an independently provisioned key."""
+    if attestation.schema_name != INTERVIEW_ATTESTATION_SCHEMA:
+        return False
+    if not attestation.producer_id.strip() or not attestation.session_ref.strip() or not attestation.request_nonce.strip():
+        return False
+    if attestation.question_set_id != INTERVIEW_QUESTION_SET_ID or _SHA256_RE.fullmatch(attestation.answer_digest) is None:
+        return False
+    keys = dict(trusted_public_keys) if trusted_public_keys is not None else load_interview_trust_store()
+    public_key = keys.get(attestation.producer_id)
+    if public_key is None:
+        return False
+    try:
+        signature = base64.b64decode(attestation.signature, validate=True)
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        Ed25519PublicKey.from_public_bytes(public_key).verify(signature, attestation.signing_bytes())
+    except (ValueError, TypeError, base64.binascii.Error, InvalidSignature):
+        return False
+    return True
 
 
 @pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True))
@@ -322,6 +418,26 @@ def validate_enrollment_contract(rec: GoalRecord, *, root: Path | None = None) -
             issues.append(str(exc))
         if _SHA256_RE.fullmatch(receipt.answers_sha256) is None:
             issues.append("interview_receipt answers_sha256 must be a lowercase SHA-256 digest")
+        attestation = receipt.attestation
+        if receipt.request_nonce.strip() or attestation is not None:
+            if not receipt.request_nonce.strip():
+                issues.append("interview_receipt request_nonce must be non-empty")
+            if attestation is None:
+                issues.append("interview_receipt attestation is required")
+        elif _LEGACY_INTERVIEW_NAME_RE.fullmatch(receipt.name) is None:
+            # Pre-attestation records remain readable only when they carry the
+            # issued receipt-name shape. New enrollments use the signed path
+            # above; arbitrary caller-authored labels never establish truth.
+            issues.append("interview_receipt attestation is required")
+        if attestation is not None:
+            if attestation.session_ref != rec.session_ref:
+                issues.append("interview attestation session_ref does not match the goal")
+            if attestation.request_nonce != receipt.request_nonce:
+                issues.append("interview attestation request_nonce does not match the receipt")
+            if attestation.answer_digest != receipt.answers_sha256:
+                issues.append("interview attestation answer_digest does not match the receipt")
+            if not verify_interview_attestation(attestation):
+                issues.append("interview attestation signature is not trusted")
         if len(receipt.provenance) != len(INTERVIEW_QUESTION_IDS) or any(
             not item.startswith(("operator:", "source:")) or not item.partition(":")[2].strip() for item in receipt.provenance
         ):

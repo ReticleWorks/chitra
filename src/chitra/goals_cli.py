@@ -202,11 +202,24 @@ def _parse_interview_result(root: Path, args: argparse.Namespace) -> tuple[
     answers_sha256 = hashlib.sha256(
         json.dumps(ordered_answers, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+    raw_attestation = payload.get("attestation")
+    attestation: goal_store.InterviewAttestation | None = None
+    request_nonce = ""
+    if raw_attestation is not None:
+        if not isinstance(raw_attestation, dict):
+            raise ValueError("interview result attestation must be an object")
+        try:
+            attestation = goal_store.InterviewAttestation.model_validate(raw_attestation)
+        except ValueError as exc:
+            raise ValueError(f"invalid interview attestation: {exc}") from exc
+        request_nonce = str(nonce_record["nonce"])
     receipt = goal_store.InterviewReceipt(
         name=str(nonce_record["receipt_name"]),
         completed_at=datetime.now(UTC).isoformat(),
         answers_sha256=answers_sha256,
         provenance=tuple(entry["provenance"] for entry in ordered_answers),
+        request_nonce=request_nonce,
+        attestation=attestation,
     )
     answer_values = {entry["question"]: entry["answer"] for entry in ordered_answers}
     return receipt, items, answer_values, nonce_path, nonce_record
