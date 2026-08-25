@@ -385,9 +385,11 @@ def _complete_existing_result(
 ) -> None:
     """Recover a claimed order whose result was written by an earlier pass.
 
-    A result file is not itself a queue acknowledgment. SENT results from the
-    old behavior can exist without ledger proof, so recovery retries signing
-    the already-recorded delivery and never calls the pane transport again.
+    A result file is not itself a queue acknowledgment. Any terminal result
+    keyed by the same order id absorbs the queued twin even when the stored
+    session differs. SENT results from the old behavior can exist without
+    ledger proof, so recovery retries signing the delivery under the claimed
+    order and never calls the pane transport again.
     """
     try:
         stored_result = DispatchResult.model_validate_json(existing_result_path.read_text(encoding="utf-8"))
@@ -395,7 +397,7 @@ def _complete_existing_result(
         logger.error("dispatchd_existing_result_unreadable", order_id=order.order_id, error=str(exc))
         return
 
-    if stored_result.order_id != order.order_id or stored_result.session_ref != order.session_ref:
+    if stored_result.order_id != order.order_id:
         logger.error(
             "dispatchd_existing_result_mismatch",
             order_id=order.order_id,
@@ -405,16 +407,23 @@ def _complete_existing_result(
         )
         return
 
+    session_twins = stored_result.session_ref != order.session_ref
+
     if stored_result.status == DispatchStatus.SENT:
+        signed_result = (
+            stored_result.model_copy(update={"session_ref": order.session_ref})
+            if session_twins
+            else stored_result
+        )
         try:
             _ensure_delivery_ledger(
                 order,
-                stored_result,
+                signed_result,
                 ledger_path=ledger_path,
                 ledger_key_path=ledger_key_path,
             )
-            stored_result.delivery_ledger_verified = True
-            _write_result_atomic(results_dir, stored_result)
+            signed_result.delivery_ledger_verified = True
+            _write_result_atomic(results_dir, signed_result)
         except Exception as exc:  # noqa: BLE001 -- retry on the next daemon pass
             logger.error(
                 "dispatchd_delivery_ledger_pending",
