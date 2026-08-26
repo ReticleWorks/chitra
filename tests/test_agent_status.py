@@ -88,6 +88,92 @@ Trust recorded; the task cannot be cancelled now.
     assert result.blocker_kind is None
 
 
+def test_broker_classifies_a_frozen_spinner_below_a_real_prompt_as_blocked(tmp_path: Path) -> None:
+    broker = AgentStatusBroker(tmp_path, ManifestRepository())
+    snapshot = """Do you trust the contents of this directory?
+  1. Yes
+  2. No
+Trust recorded; the task cannot be cancelled now.
+• Working (12s • esc to interrupt)
+"""
+    first = broker.observe(
+        pane_id="%1",
+        target="lane:0.0",
+        session_ref="host:lane:0.0",
+        lane_id="lane",
+        detected_agent="codex",
+        snapshot=snapshot,
+        tmux_socket=None,
+    )
+    second = broker.observe(
+        pane_id="%1",
+        target="lane:0.0",
+        session_ref="host:lane:0.0",
+        lane_id="lane",
+        detected_agent="codex",
+        snapshot=snapshot,
+        tmux_socket=None,
+    )
+
+    assert first is not None and first.pane.state == "working"
+    assert second is not None and second.pane.state == "blocked"
+    assert second.pane.explain.blocker_kind == "approval"
+
+
+def test_broker_keeps_a_changing_spinner_working(tmp_path: Path) -> None:
+    broker = AgentStatusBroker(tmp_path, ManifestRepository())
+    common = """Do you trust the contents of this directory?
+  1. Yes
+  2. No
+Trust recorded; the task cannot be cancelled now.
+"""
+    snapshots = (common + "• Working (12s • esc to interrupt)\n", common + "• Working (13s • esc to interrupt)\n")
+
+    results = [
+        broker.observe(
+            pane_id="%1",
+            target="lane:0.0",
+            session_ref="host:lane:0.0",
+            lane_id="lane",
+            detected_agent="codex",
+            snapshot=snapshot,
+            tmux_socket=None,
+        )
+        for snapshot in snapshots
+    ]
+
+    assert results[0] is not None and results[0].pane.state == "working"
+    assert broker.statuses()[0].state == "working"
+
+
+def test_broker_does_not_carry_stability_across_session_identity_change(tmp_path: Path) -> None:
+    broker = AgentStatusBroker(tmp_path, ManifestRepository())
+    snapshot = """Do you trust the contents of this directory?
+  1. Yes
+  2. No
+Trust recorded; the task cannot be cancelled now.
+• Working (12s • esc to interrupt)
+"""
+
+    def observe(session_ref: str):
+        return broker.observe(
+            pane_id="%1",
+            target=f"{session_ref}:0.0",
+            session_ref=session_ref,
+            lane_id="lane",
+            detected_agent="codex",
+            snapshot=snapshot,
+            tmux_socket=None,
+        )
+
+    observe("host:old-lane")
+    changed_session = observe("host:new-lane")
+    stable_new_session = observe("host:new-lane")
+
+    assert changed_session is not None and changed_session.pane.state == "working"
+    assert stable_new_session is not None and stable_new_session.pane.state == "blocked"
+
+
 def test_echoed_claude_permission_text_with_live_spinner_is_not_blocked() -> None:
     result = classify_snapshot(
         """I will ask: Do you want to proceed with this change?
