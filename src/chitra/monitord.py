@@ -205,7 +205,7 @@ def run_detectors(
             journal = None
             progress_rows = ()
         else:
-            progress_rows = tuple(journal.load_progress())
+            progress_rows = tuple(journal.load_progress()) if journal is not None else ()
         goal_version = str(getattr(goal, "goal_version", 0) or 0)
         derived = tuple(
             classify_progress(event, goal_version=goal_version, related_events=events)
