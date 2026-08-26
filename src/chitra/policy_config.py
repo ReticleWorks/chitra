@@ -11,6 +11,7 @@ import structlog
 import yaml
 from pydantic import BaseModel, Field, model_validator
 
+from chitra.canonical_choices import CanonicalChoicesPolicy
 from chitra.lexicon import COMPLETION_DEFERRAL_PHRASES
 from chitra.merge import DEFAULT_HOLD_LABELS, DEFAULT_MAX_AGE_HOURS
 
@@ -338,6 +339,7 @@ class PolicyConfig(BaseModel):
     dispatch: DispatchPolicy = Field(default_factory=DispatchPolicy)
     usage: UsagePolicy = Field(default_factory=UsagePolicy)
     guidance: GuidancePolicy = Field(default_factory=GuidancePolicy)
+    canonical_choices: CanonicalChoicesPolicy = Field(default_factory=CanonicalChoicesPolicy)
     pause: PausePolicy = Field(default_factory=PausePolicy)
     load: LoadPolicy = Field(default_factory=LoadPolicy)
     pr_review: PRReviewPolicy = Field(default_factory=PRReviewPolicy)
