@@ -7,6 +7,7 @@ stated goal, completion condition, and current state.
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import os
 import re
@@ -72,8 +73,8 @@ INTERVIEW_QUESTIONS: dict[str, str] = {
     "out_of_scope": "What work is explicitly out of scope?",
     "constraints": "What constraints apply, including tools, order, spend, and approvals?",
 }
-INTERVIEW_QUESTION_SET_ID = "chitra.goals.interview.v1"
-INTERVIEW_ATTESTATION_SCHEMA = "chitra.goals.interview-attestation.v1"
+INTERVIEW_QUESTION_SET_ID: Literal["chitra.goals.interview.v1"] = "chitra.goals.interview.v1"
+INTERVIEW_ATTESTATION_SCHEMA: Literal["chitra.goals.interview-attestation.v1"] = "chitra.goals.interview-attestation.v1"
 INTERVIEW_TRUST_STORE_ENV_VAR = "CHITRA_INTERVIEW_TRUST_STORE"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _LEGACY_INTERVIEW_NAME_RE = re.compile(r"interview:[A-Za-z0-9_.-]+\Z")
@@ -176,7 +177,7 @@ def load_interview_trust_store(path: Path | None = None) -> dict[str, bytes]:
             raise ValueError("interview trust store public keys must be base64 strings")
         try:
             public_key = base64.b64decode(encoded, validate=True)
-        except (ValueError, base64.binascii.Error) as exc:
+        except (ValueError, binascii.Error) as exc:
             raise ValueError("interview trust store public key is not valid base64") from exc
         if len(public_key) != 32:
             raise ValueError("interview trust store public keys must be 32 bytes")
@@ -206,7 +207,7 @@ def verify_interview_attestation(
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
         Ed25519PublicKey.from_public_bytes(public_key).verify(signature, attestation.signing_bytes())
-    except (ValueError, TypeError, base64.binascii.Error, InvalidSignature):
+    except (ValueError, TypeError, binascii.Error, InvalidSignature):
         return False
     return True
 
