@@ -33,6 +33,7 @@ _PANE_ID_RE = re.compile(r"^%[0-9]+$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_HANDOFF_RULES = 128
 MAX_HANDOFF_MATCHERS = 32
+AMBIGUOUS_SNAPSHOT_STABILITY_THRESHOLD = 2
 
 StatusAuthority = Literal["integration", "manifest", "fallback", "completion"]
 
@@ -225,6 +226,16 @@ class ValidatedHandoffSnapshot:
     lifecycle_reports: tuple[LifecycleReport, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _SnapshotEvidence:
+    """In-memory freshness evidence for one pane and session identity."""
+
+    session_ref: str | None
+    agent: str
+    snapshot_sha256: str
+    consecutive_identical: int
+
+
 def _object(payload: object, *, name: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"{name} must be an object")
@@ -387,6 +398,7 @@ class AgentStatusBroker:
         self._statuses: dict[str, PaneStatus] = {}
         self._lifecycle: dict[str, LifecycleReport] = {}
         self._events: list[StatusEvent] = []
+        self._snapshot_evidence: dict[str, _SnapshotEvidence] = {}
         self._seq = 0
         self._frozen = False
 
@@ -443,6 +455,7 @@ class AgentStatusBroker:
         now = datetime.now(UTC).isoformat()
         with self._condition:
             self._ensure_mutable()
+            self._snapshot_evidence.pop(pane_id, None)
             existing = self._statuses.get(pane_id)
             if existing is not None and session_ref is not None and existing.session_ref not in (None, session_ref):
                 raise StatusRuntimeError("lifecycle report session_ref does not match the observed pane")
@@ -475,6 +488,7 @@ class AgentStatusBroker:
             if report is None or (source is not None and source != report.source):
                 return False
             del self._lifecycle[pane_id]
+            self._snapshot_evidence.pop(pane_id, None)
             self._persist()
             return True
 
@@ -501,7 +515,33 @@ class AgentStatusBroker:
                 explain = integration_explain(agent=agent, state=report.state, source=report.source)
             else:
                 agent = detected_agent
-                explain = classify_snapshot(snapshot, agent=agent, repository=self.repository)
+                snapshot_sha256 = hashlib.sha256(snapshot.encode("utf-8", errors="replace")).hexdigest()
+                previous = self._snapshot_evidence.get(pane_id)
+                if (
+                    previous is not None
+                    and previous.session_ref == session_ref
+                    and previous.agent == agent
+                    and previous.snapshot_sha256 == snapshot_sha256
+                ):
+                    consecutive_identical = previous.consecutive_identical + 1
+                else:
+                    consecutive_identical = 1
+                self._snapshot_evidence[pane_id] = _SnapshotEvidence(
+                    session_ref=session_ref,
+                    agent=agent,
+                    snapshot_sha256=snapshot_sha256,
+                    consecutive_identical=consecutive_identical,
+                )
+                explain = classify_snapshot(
+                    snapshot,
+                    agent=agent,
+                    repository=self.repository,
+                    snapshot_live=(
+                        False
+                        if consecutive_identical >= AMBIGUOUS_SNAPSHOT_STABILITY_THRESHOLD
+                        else None
+                    ),
+                )
             existing = self._statuses.get(pane_id)
             if existing is not None and existing.state == "done" and explain.state == "idle":
                 return None

@@ -451,8 +451,19 @@ class ManifestRepository:
         return manifest
 
 
-def classify_snapshot(snapshot: str, *, agent: str, repository: ManifestRepository) -> DetectionExplain:
-    """Classify a bottom-buffer snapshot, biased to idle on every ambiguity."""
+def classify_snapshot(
+    snapshot: str,
+    *,
+    agent: str,
+    repository: ManifestRepository,
+    snapshot_live: bool | None = None,
+) -> DetectionExplain:
+    """Classify one snapshot, with optional caller-supplied freshness evidence.
+
+    ``None`` preserves the one-snapshot behavior. The broker supplies ``False``
+    only after it has observed the same snapshot repeatedly for the same pane
+    and session, so this function never guesses freshness from screen layout.
+    """
     bounded_snapshot = snapshot[-MAX_SNAPSHOT_CHARS:]
     try:
         manifest = repository.load(agent)
@@ -503,7 +514,7 @@ def classify_snapshot(snapshot: str, *, agent: str, repository: ManifestReposito
     rate_limited = next((rule for rule in matched_rules if rule.state in RATE_LIMITED_STATES), None)
     if rate_limited is not None:
         matched_rule = rate_limited
-    elif matched_rule is not None and matched_rule.state == "blocked":
+    elif matched_rule is not None and matched_rule.state == "blocked" and snapshot_live is not False:
         # A live working footer is newer evidence than blocker-shaped text
         # retained above it in the bounded capture. Working rules therefore
         # suppress a simultaneous screen-derived blocker match regardless of
