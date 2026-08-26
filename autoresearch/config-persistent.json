@@ -1,0 +1,62 @@
+{
+  "campaign_id": "chitra-persistent-v9-longrun",
+  "active_goal": "PERSISTENT",
+  "champion_branch": "HEAD",
+  "objective_command": "python3 goal_bench_persistent.py --repo <checkout>",
+  "selftest_command": "python3 goal_bench_persistent.py --selftest",
+  "suite_command": "PYTHONPATH=src python3 -m pytest tests/ -q",
+  "score_pattern": "CHITRA HEAD SCORE:\\s*([0-9]+(?:\\.[0-9]+)?)",
+  "batch_size": 6,
+  "worker_timeout_seconds": 7200,
+  "orb_agent_mode": "low",
+  "orb_size": "a1.small",
+  "minimum_runtime_seconds": 43200,
+  "status_check_interval_seconds": 10800,
+  "poll_interval_seconds": 0.25,
+  "commit_epoch": 0,
+  "max_changed_files": 2,
+  "max_source_changed_lines": 48,
+  "max_source_changed_ratio": 0.50,
+  "diagnostic_slots": [
+    "progress claim without artifact",
+    "easier substitute instead of requested artifact",
+    "abandonment and dead-lane recovery",
+    "false block contradicted by lane state",
+    "compliance only after repeated nudges",
+    "reversion after an intermediate pass"
+  ],
+  "worker_prompt_template": "You are one bounded proposal worker in campaign {campaign_id}, batch {batch_id}, slot {slot_id}. The immutable parent SHA is {parent_sha}. Work only in this fresh checkout: {checkout}. Do not write any canonical checkout, merge another proposal, run a private optimization loop, declare a winner, or declare completion. Diagnostic lens: {lens}. Unique seed: {unique_seed}. Parent goal scores: {parent_scores_json}. Parent fixture traces: {fixture_traces_json}. Recent tried fingerprints: {tried_fingerprints_json}. Produce exactly one bounded hypothesis affecting one function and one behavior, one regression test, and one applicable unified diff. The orchestrator will run the four-condition gate and objective. Return exactly one JSON object with candidate_id, parent_sha, diff, new_test_id, hypothesis, changed_files, and changed_functions. If you cannot produce a valid proposal, return generation_status GENERATION_FAILED with a reason.",
+  "launch_conditions": {
+    "PERSISTENT": {
+      "met": true,
+      "description": "The persistent instrument self-test is available and the measured Chitra HEAD score is 23.611/100."
+    },
+    "RELIABLE": {
+      "met": false,
+      "description": "Reliable headroom must first be settled by tools/goal_bench_reliable.py."
+    },
+    "AUTONOMOUS": {
+      "met": false,
+      "description": "A Chitra adapter score must first be settled by tools/chitra_goal_bench.py --goal autonomous."
+    }
+  },
+  "launch_condition_command": "python3 goal_bench_persistent.py --selftest",
+  "target_scores": {
+    "PERSISTENT": 100.0
+  },
+  "stop_rule": {
+    "plateau_batches": 14,
+    "min_valid_evaluations": 80,
+    "consecutive_non_improvements": 80,
+    "require_all_slots": true,
+    "zero_valid_recovery_after_batches": 3
+  },
+  "baseline_scores": {
+    "RELIABLE": 100.0,
+    "PERSISTENT": 23.611,
+    "AUTONOMOUS": null
+  },
+  "naive_reference_scores": {
+    "PERSISTENT": 66.667
+  }
+}
