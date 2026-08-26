@@ -39,6 +39,7 @@ from typing import Any
 
 import structlog
 
+from chitra.canonical_choices import CanonicalChoicesPolicy, detect_canonical_choices
 from chitra.detect import (
     Finding,
     IncidentStore,
@@ -57,6 +58,7 @@ from chitra.journal import (
     NormalizationContext,
 )
 from chitra.journal.store import EventJournal
+from chitra.policy_config import load_policy_config
 from chitra.presence import append_presence
 from chitra.state_paths import state_dir as default_state_dir
 from chitra.systemd_notify import notify_ready, notify_watchdog
@@ -68,7 +70,13 @@ DEFAULT_POLL_SECONDS = 60.0
 PRESENCE_INSTANCE = "chitra-monitord"
 MONITORD_SCHEMA = "chitra.monitord.pass.v1"
 
-_DETECTOR_ORDER = ("drift", "unnecessary_steps", "excessive_testing", "document_dithering")
+_DETECTOR_ORDER = (
+    "canonical_choices.deprecated_path",
+    "drift",
+    "unnecessary_steps",
+    "excessive_testing",
+    "document_dithering",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,13 +183,17 @@ def run_detectors(
     lane: str,
     goal: object,
     events: tuple[CanonicalEvent, ...],
+    *,
+    canonical_choices_policy: CanonicalChoicesPolicy | None = None,
 ) -> list[Finding]:
     """Run the deterministic detector set over one lane's journal."""
     scope_text = str(getattr(goal, "scope", "") or "")
     intent_text = str(getattr(goal, "intent", "") or "")
     goal_text = str(getattr(goal, "goal", "") or "")
     goal_is_document = "documentation" in f"{intent_text}\n{goal_text}".lower()
+    policy = canonical_choices_policy or load_policy_config().canonical_choices
     findings: list[Finding] = []
+    findings.extend(detect_canonical_choices(events, policy))
     findings.extend(detect_drift(events, scope_text=scope_text, declared_worktree=""))
     findings.extend(detect_unnecessary_steps(events))
     findings.extend(detect_excessive_testing(events))
