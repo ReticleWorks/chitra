@@ -29,6 +29,7 @@ from chitra.watchd import (
     _pane_backend,
     append_event,
     build_arg_parser,
+    find_live_tool_consumptions,
     list_panes,
     normalize,
     resolve_config,
@@ -727,6 +728,95 @@ def test_current_turn_journal_tool_event_does_not_trigger_zero_tool_review(tmp_p
         assert reviewer.calls == []
     finally:
         watcher.shutdown()
+
+
+def test_live_browser_result_is_consumed_only_by_a_later_non_browser_call(tmp_path: Path) -> None:
+    token = "nonce_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    observed = datetime.now(UTC).isoformat()
+
+    def event(
+        event_id: str,
+        kind: CanonicalType,
+        join_id: str,
+        payload: dict[str, object],
+        *,
+        session: str = "session-1",
+    ) -> CanonicalEvent:
+        return CanonicalEvent(
+            event_id=event_id,
+            instance="watchd-live-tool-regression",
+            lane="fleet",
+            client=Client.CODEX,
+            client_version="0.149.0",
+            process_id="process-1",
+            transcript=TranscriptIdentity(path="/tmp/fleet-transcript.jsonl", device=1, inode=1),
+            session_id=session,
+            resume_id=None,
+            observed_at=observed,
+            native_time=None,
+            native_type=kind.value,
+            native_join_id=join_id,
+            raw_byte_range=None,
+            raw_sha256=None,
+            normalized_type=kind,
+            payload_digest="0" * 64,
+            normalizer_version="test",
+            payload=payload,
+            raw_record=None,
+        )
+
+    browser_call = event(
+        "browser-call",
+        CanonicalType.TOOL_CALL,
+        "browser-1",
+        {"tool_name": "playwright.open", "input": {"url": "http://127.0.0.1/challenge"}},
+    )
+    browser_result = event("browser-result", CanonicalType.TOOL_RESULT, "browser-1", {"output": {"nonce": token}})
+    consumer_call = event(
+        "consumer-call",
+        CanonicalType.TOOL_CALL,
+        "consumer-1",
+        {"tool_name": "non-browser-consumer", "input": {"argv": ["consume", token]}},
+    )
+
+    matches = find_live_tool_consumptions([browser_call, browser_result, consumer_call])
+    assert len(matches) == 1
+    assert matches[0].token_sha256 == hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    EventJournal(tmp_path, "fleet").append([browser_call, browser_result, consumer_call])
+    watcher = Watchd(
+        WatchdConfig(
+            state_dir=tmp_path,
+            events_log=tmp_path / "events.log",
+            journal_root=tmp_path,
+        )
+    )
+    try:
+        assert watcher._turn_made_tool_calls(
+            "host:fleet:0.0",
+            Pane(pane_id="pane-1", target="fleet:0.0"),
+            since=(datetime.now(UTC) - timedelta(seconds=60)).isoformat(),
+        ) is True
+        assert watcher.live_tool_consumptions["host:fleet:0.0"] == matches
+    finally:
+        watcher.shutdown()
+
+    wrong_session = event(
+        "wrong-session-consumer",
+        CanonicalType.TOOL_CALL,
+        "consumer-2",
+        {"tool_name": "shell", "input": {"argv": ["consume", token]}},
+        session="session-2",
+    )
+    assert find_live_tool_consumptions([browser_call, browser_result, wrong_session]) == ()
+    assert find_live_tool_consumptions([browser_call, consumer_call, browser_result]) == ()
+    embedded_token = event(
+        "embedded-token-consumer",
+        CanonicalType.TOOL_CALL,
+        "consumer-3",
+        {"tool_name": "shell", "input": {"command": f"consume --token={token}"}},
+    )
+    assert find_live_tool_consumptions([browser_call, browser_result, embedded_token]) == ()
 
 
 def test_unicode_bullet_answer_without_tool_calls_gets_reviewed(tmp_path: Path) -> None:

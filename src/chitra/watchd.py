@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import json
 import os
 import re
 import signal
@@ -74,7 +75,7 @@ from chitra.goals import (
 from chitra.goals import (
     SCHEMA as GOALS_INSTALLED_SCHEMA,
 )
-from chitra.journal import CanonicalType, EventJournal
+from chitra.journal import CanonicalEvent, CanonicalType, EventJournal
 from chitra.lane_activity import LaneActivity, LaneBackend, load_lane_activity, upsert_lane_activity
 from chitra.lane_config import enabled_lanes
 from chitra.live_handoff import perform_live_handoff
@@ -168,6 +169,7 @@ _TIMING_CHROME_RE = re.compile(r"\([0-9]+m? ?[0-9]*s?[^)]*\)")
 _RENDERED_TOOL_CALL_RE = re.compile(r"^\s*(?:⏺\s*\S|⎿\s*\S|•\s*(?:ran|read|edited|search|bash|shell|exec|patch)\b)")
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 ReviewKey = tuple[str, str]
+_LIVE_TOOL_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{32,128}(?![A-Za-z0-9_-])")
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +238,81 @@ class PendingCompletionReview:
     completion_evidence: tuple[CompletionEvidence, ...]
     last_verified: str
     future: Future[SessionReviewSignal]
+
+
+@dataclass(frozen=True, slots=True)
+class LiveToolConsumption:
+    """Journal proof that a later non-browser call consumed browser output."""
+
+    browser_call_event_id: str
+    browser_result_event_id: str
+    consumer_call_event_id: str
+    token_sha256: str
+
+
+def find_live_tool_consumptions(events: Sequence[CanonicalEvent]) -> tuple[LiveToolConsumption, ...]:
+    """Match successful browser results to later calls that consume their token.
+
+    The canonical journal, not pane text or a lane claim, supplies the evidence.
+    A match requires one joined browser call/result pair and a later non-browser
+    call in the same native session whose structured input contains the exact
+    high-entropy token. Only the token digest is retained by ``watchd``.
+    """
+    def is_browser_tool(name: str) -> bool:
+        lowered = name.casefold()
+        return "playwright" in lowered or ("browser" in lowered and "non-browser" not in lowered and "non_browser" not in lowered)
+
+    def scalar_strings(value: object) -> tuple[str, ...]:
+        if isinstance(value, str):
+            return (value,)
+        if isinstance(value, dict):
+            return tuple(text for item in value.values() for text in scalar_strings(item))
+        if isinstance(value, (list, tuple)):
+            return tuple(text for item in value for text in scalar_strings(item))
+        return ()
+
+    calls: dict[tuple[str, str], tuple[int, CanonicalEvent]] = {}
+    matches: list[LiveToolConsumption] = []
+    for index, event in enumerate(events):
+        session_id = str(getattr(event, "session_id", ""))
+        join_id = getattr(event, "native_join_id", None)
+        kind = getattr(event, "normalized_type", None)
+        payload = getattr(event, "payload", {})
+        if kind is CanonicalType.TOOL_CALL and isinstance(join_id, str):
+            calls[(session_id, join_id)] = (index, event)
+            continue
+        if kind is not CanonicalType.TOOL_RESULT or not isinstance(join_id, str):
+            continue
+        joined = calls.get((session_id, join_id))
+        if joined is None:
+            continue
+        call_index, browser_call = joined
+        browser_name = str(getattr(browser_call, "payload", {}).get("tool_name", "")).casefold()
+        if not is_browser_tool(browser_name):
+            continue
+        result_text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        for token in dict.fromkeys(_LIVE_TOOL_TOKEN_RE.findall(result_text)):
+            for consumer in events[max(index, call_index) + 1 :]:
+                if getattr(consumer, "normalized_type", None) is not CanonicalType.TOOL_CALL:
+                    continue
+                if str(getattr(consumer, "session_id", "")) != session_id:
+                    continue
+                consumer_payload = getattr(consumer, "payload", {})
+                consumer_name = str(consumer_payload.get("tool_name", "")).casefold()
+                if is_browser_tool(consumer_name):
+                    continue
+                if token not in scalar_strings(consumer_payload.get("input")):
+                    continue
+                matches.append(
+                    LiveToolConsumption(
+                        browser_call_event_id=str(getattr(browser_call, "event_id", "")),
+                        browser_result_event_id=str(getattr(event, "event_id", "")),
+                        consumer_call_event_id=str(getattr(consumer, "event_id", "")),
+                        token_sha256=hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                    )
+                )
+                break
+    return tuple(matches)
 
 
 def normalize(content: str) -> list[str]:
@@ -521,6 +598,7 @@ class Watchd:
     clock: Callable[[], float] = time.monotonic
     reviewed_turns: set[ReviewKey] = field(default_factory=set)
     pending_reviews: dict[ReviewKey, PendingCompletionReview] = field(default_factory=dict)
+    live_tool_consumptions: dict[str, tuple[LiveToolConsumption, ...]] = field(default_factory=dict)
     # pane_id -> ISO timestamp of that pane's previous reviewed turn end. A
     # dispatch order sent after this watermark preceded the current turn.
     turn_end_watermarks: dict[str, str] = field(default_factory=dict)
@@ -742,6 +820,9 @@ class Watchd:
                     if event.normalized_type in (CanonicalType.TOOL_CALL, CanonicalType.TOOL_RESULT, CanonicalType.TOOL_ERROR)
                     and (event.observed_at or "") > since
                 ]
+                consumptions = find_live_tool_consumptions(recent)
+                if consumptions:
+                    self.live_tool_consumptions[session_ref] = consumptions
                 return bool(recent)
         return None
 
