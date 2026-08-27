@@ -20,7 +20,7 @@ from chitra.dispatchd import build_arg_parser, main, process_one_order, requeue_
 from chitra.goals import GOALS_SCHEMA_NEWER_MESSAGE, GoalRecord, hold_goal, redirect_goal, upsert_goal
 from chitra.policy_config import PolicyConfig
 from chitra.question_handler import handle_question
-from chitra.reasoning import DecisionAttestation
+from chitra.reasoning import DecisionAttestation, DelegatedAuthority
 from chitra.routing_config import ROUTING_CONFIG_ENV_VAR, RoutingConfig
 from chitra.supervision import goal_digest
 
@@ -650,6 +650,64 @@ def test_reasoned_order_logs_attestation_our_side_without_leaking_metadata_into_
     assert seen_nudges == [approved]
     assert attestation.attestation_id not in seen_nudges[0]
     assert "reviewer" not in seen_nudges[0]
+
+
+def test_dispatch_accepts_exact_kai_delegation_and_records_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen_nudges: list[str] = []
+
+    def fake_dispatch(order: DispatchOrder, **kwargs: Any) -> DispatchResult:
+        seen_nudges.append(order.nudge)
+        return DispatchResult(order_id=order.order_id, session_ref=order.session_ref, status=DispatchStatus.SENT)
+
+    monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", fake_dispatch)
+    approved = "Apply Kai's verified ruling and continue the lane."
+    attestation = DecisionAttestation.create(
+        outcome="answer",
+        message_kind="reasoned_answer",
+        approved_text=approved,
+        source="kai-delegate",
+        delegated_authority=DelegatedAuthority(
+            principal="kai",
+            grant_id="sha256:" + "1" * 64,
+            grant_sha256="2" * 64,
+            satisfaction_sha256="3" * 64,
+            request_id="sha256:" + "4" * 64,
+        ),
+        goal_contract_id="sha256:" + "5" * 64,
+        goal_version=1,
+        goal_fields=("questions", "pursuit"),
+        corpus_id="sha256:" + "6" * 64,
+        confidence_basis="Kai supplied a current verified grant and exact ruling.",
+        autonomy="autonomous",
+        operator_confirmation_required=False,
+    )
+    queue_dir = tmp_path / "queue"
+    _write_order(
+        queue_dir / "orders",
+        DispatchOrder(
+            order_id="kai-attested",
+            session_ref="localhost:s:0.0",
+            nudge=approved,
+            message_kind="reasoned_answer",
+            decision_attestation=attestation,
+        ),
+    )
+
+    result = run_once(
+        queue_dir,
+        lock_dir=tmp_path / "locks",
+        ledger_path=tmp_path / "delivery.jsonl",
+        ledger_key_path=tmp_path / "ledger.key",
+        attestation_ledger_path=tmp_path / "attestations.jsonl",
+    )[0]
+
+    entry = ledger_mod.AttestationLedgerEntry.model_validate_json(
+        (tmp_path / "attestations.jsonl").read_text(encoding="utf-8")
+    )
+    assert result.status is DispatchStatus.SENT
+    assert entry.attestation.source == "kai-delegate"
+    assert entry.attestation.delegated_authority == attestation.delegated_authority
+    assert seen_nudges == [approved]
 
 
 def test_remote_delivery_writes_a_ledger_entry_same_as_local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
