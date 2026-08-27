@@ -141,7 +141,7 @@ def test_question_delivery_requires_signed_consumption_before_progress(tmp_path:
     assert record["turn_boundary_event_id"] == "turn-1"
 
 
-def test_question_terminal_failures_advance_deterministic_retry_ids(tmp_path: Path) -> None:
+def test_question_terminal_failures_keep_advancing_retry_ids(tmp_path: Path) -> None:
     goal = _goal()
     question = handle_question(goal, "What proves the goal is done?")
     kwargs = {
@@ -151,12 +151,11 @@ def test_question_terminal_failures_advance_deterministic_retry_ids(tmp_path: Pa
         "goal": goal,
         "question_result": question,
         "retry_delay_seconds": 0,
-        "max_action_attempts": 3,
     }
     first = reconcile_question_action(**kwargs)  # type: ignore[arg-type]
     assert first.enqueued is True
     order_ids = [first.order_id]
-    for retry in (1, 2, 3):
+    for _retry in range(6):
         _write_result(
             tmp_path / "queue",
             DispatchResult(
@@ -169,14 +168,12 @@ def test_question_terminal_failures_advance_deterministic_retry_ids(tmp_path: Pa
         failed = reconcile_question_action(**kwargs)  # type: ignore[arg-type]
         assert failed.state == "blocked"
         assert failed.order_id == order_ids[-1]
-        if retry < 3:
-            resumed = reconcile_question_action(**kwargs)  # type: ignore[arg-type]
-            assert resumed.enqueued is True
-            order_ids.append(resumed.order_id)
-            assert resumed.order_id != order_ids[-2]
-        else:
-            assert "exhausted" in failed.reason
-    assert len(order_ids) == 3
+        assert "retry scheduled" in failed.reason
+        resumed = reconcile_question_action(**kwargs)  # type: ignore[arg-type]
+        assert resumed.enqueued is True
+        order_ids.append(resumed.order_id)
+        assert resumed.order_id != order_ids[-2]
+    assert len(order_ids) == 7
 
 
 def test_question_is_processed_even_when_detectors_open_a_finding(

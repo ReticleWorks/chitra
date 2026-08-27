@@ -62,6 +62,7 @@ from chitra.goals import (
     GoalsSchemaNewerError,
     GoalValidationError,
     add_ask,
+    add_foreground_task,
     get_goal,
     hold_goal,
     list_goals,
@@ -79,6 +80,7 @@ from chitra.journal.store import EventJournal
 from chitra.policy_config import load_policy_config
 from chitra.presence import append_presence
 from chitra.question_handler import handle_question
+from chitra.recovery import get_lane_lifecycle
 from chitra.state_paths import state_dir as default_state_dir
 from chitra.supervision import SupervisionLedger, goal_digest
 from chitra.supervisor import reconcile_corrective_action, reconcile_question_action, record_observing
@@ -91,16 +93,7 @@ logger = structlog.get_logger(__name__)
 DEFAULT_POLL_SECONDS = 60.0
 PRESENCE_INSTANCE = "chitra-monitord"
 MONITORD_SCHEMA = "chitra.monitord.pass.v1"
-SCHEDULER_SCHEMA = "chitra.monitord.finding-scheduler.v1"
 IDLE_PURSUIT_SCHEMA = "chitra.monitord.idle-pursuit.v1"
-# Three consecutive clean monitor passes are enough evidence of a quiet lane
-# to request one next-step action, while a single quiet pass remains benign.
-IDLE_PURSUIT_PASSES = 3
-# One durable corrective action per lane per pass keeps the monitor bounded.
-# The persisted round-robin cursor ensures that this bound does not turn the
-# first detector in the list into a permanent priority queue.
-MAX_ACTIONS_PER_PASS = 1
-
 _DETECTOR_ORDER = (
     "canonical_choices.deprecated_path",
     "drift",
@@ -123,7 +116,6 @@ class MonitordConfig:
     dispatch_queue_dir: Path | None = None
     ledger_path: Path | None = None
     ledger_key_path: Path | None = None
-    max_action_attempts: int = 3
     retry_delay_seconds: float = 60.0
 
 
@@ -152,7 +144,6 @@ def resolve_config(
     dispatch_queue_dir: Path | None = None,
     ledger_path: Path | None = None,
     ledger_key_path: Path | None = None,
-    max_action_attempts: int = 3,
     retry_delay_seconds: float = 60.0,
 ) -> MonitordConfig:
     """Resolve CLI arguments, then explicit environment overrides, then defaults."""
@@ -162,8 +153,6 @@ def resolve_config(
         poll_seconds = DEFAULT_POLL_SECONDS
     if poll_seconds <= 0:
         raise ValueError("poll_seconds must be a positive number")
-    if max_action_attempts < 1:
-        raise ValueError("max_action_attempts must be at least 1")
     if retry_delay_seconds < 0:
         raise ValueError("retry_delay_seconds cannot be negative")
     if shadow_mode is None:
@@ -189,7 +178,6 @@ def resolve_config(
         dispatch_queue_dir=dispatch_queue_dir or resolved_state_dir / "queue",
         ledger_path=ledger_path or resolved_state_dir / "ledger.jsonl",
         ledger_key_path=ledger_key_path or resolved_state_dir / "ledger.key",
-        max_action_attempts=max_action_attempts,
         retry_delay_seconds=retry_delay_seconds,
     )
 
@@ -394,7 +382,8 @@ def _idle_pursuit_finding(
             },
             fsync=True,
         )
-    if count < IDLE_PURSUIT_PASSES:
+    idle_pursuit_passes = goal.autonomy_policy.idle_pursuit_passes
+    if count < idle_pursuit_passes:
         return None
     first_item = goal.enrolled_done_when_items[0]
     return Finding(
@@ -407,7 +396,7 @@ def _idle_pursuit_finding(
         event_refs=tuple(event.event_id for event in events[-3:]),
         unmet_item=first_item.id,
         expected_next_progress=f"take the next reversible in-scope action toward: {first_item.text}",
-        detail=f"the enrolled goal produced no new scoped progress for {IDLE_PURSUIT_PASSES} clean monitor passes",
+        detail=f"the enrolled goal produced no new scoped progress for {idle_pursuit_passes} clean monitor passes",
     )
 
 
@@ -506,73 +495,6 @@ def evaluate_findings(
             shadow_mode=config.shadow_mode,
         )
     return actions
-
-
-def schedule_findings(
-    config: MonitordConfig,
-    lane: str,
-    findings: list[Finding],
-) -> list[Finding]:
-    """Rotate findings from a durable cursor before evaluating ladder actions.
-
-    Detector order remains the deterministic tie-breaker, while the first
-    finding served by each pass advances through the active fingerprints. This
-    matters because a lane intentionally emits at most one corrective order
-    per pass: a held or already-queued incident must not starve its siblings
-    forever. The cursor is monitor-owned state and is safe to recover after a
-    restart; an unknown or corrupt cursor fails closed rather than guessing.
-    """
-    if not findings:
-        return []
-
-    fingerprints = list(dict.fromkeys(finding.fingerprint for finding in findings))
-    if not fingerprints:
-        return list(findings)
-
-    schedule_path = config.state_dir / "finding-scheduler" / f"{lane}.json"
-    with locked_json_store(schedule_path):
-        next_fingerprint = ""
-        if schedule_path.is_file():
-            try:
-                payload = json.loads(schedule_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:
-                raise ValueError(f"invalid finding scheduler state: {schedule_path}") from exc
-            if (
-                not isinstance(payload, dict)
-                or payload.get("schema") != SCHEDULER_SCHEMA
-                or payload.get("lane") != lane
-                or not isinstance(payload.get("next_fingerprint"), str)
-            ):
-                raise ValueError(f"invalid finding scheduler state: {schedule_path}")
-            next_fingerprint = payload["next_fingerprint"]
-
-        start = fingerprints.index(next_fingerprint) if next_fingerprint in fingerprints else 0
-        selected = fingerprints[start]
-        next_cursor = fingerprints[(start + 1) % len(fingerprints)]
-        write_json_atomic(
-            schedule_path,
-            {
-                "schema": SCHEDULER_SCHEMA,
-                "lane": lane,
-                "next_fingerprint": next_cursor,
-                "served_fingerprint": selected,
-            },
-            fsync=True,
-        )
-
-    rank = {
-        fingerprint: offset
-        for offset, fingerprint in enumerate(
-            fingerprints[start:] + fingerprints[:start]
-        )
-    }
-    return [
-        finding
-        for _index, finding in sorted(
-            enumerate(findings),
-            key=lambda indexed: (rank[indexed[1].fingerprint], indexed[0]),
-        )
-    ]
 
 
 def check_enrollment_and_receipts(
@@ -690,11 +612,12 @@ def handle_agent_question(
     journal_events: tuple[CanonicalEvent, ...] = (),
     lane: str | None = None,
 ) -> str:
-    """Answer one routine frozen-goal question or persist its hard gate.
+    """Answer one routine frozen-goal question or record a foreground residual.
 
     The answer order is deterministic and dispatchd recomputes it from the
-    current goal before any pane write. Multiple questions, ambiguous text,
-    and protected authority classes are never guessed.
+    current goal before any pane write. Ambiguous questions become a durable
+    foreground-reasoning task. Protected authority classes remain explicit
+    operator gates.
     """
     if final_response is None:
         return "none"
@@ -712,13 +635,25 @@ def handle_agent_question(
         question = " ".join(question_lines)
         result = None
 
-    if result is None or result.disposition == "operator_required":
+    if result is None or result.disposition == "residual":
         if not config.shadow_mode:
             reason = (
                 "the completed turn asked multiple material questions"
                 if result is None
-                else f"the frozen contract cannot answer the question autonomously: {result.reason}"
+                else result.reason
             )
+            add_foreground_task(
+                config.state_dir,
+                goal.session_ref,
+                kind="question",
+                text=f"{reason}. Question: {question}",
+                source="monitord",
+            )
+        return "reasoning_required"
+
+    if result.disposition == "operator_required":
+        if not config.shadow_mode:
+            reason = f"the question requests operator-controlled authority: {result.reason}"
             add_ask(config.state_dir, goal.session_ref, f"{reason}. Question: {question}")
             hold_goal(config.state_dir, goal.session_ref, reason=f"operator-required question: {reason}")
         return "operator_required"
@@ -737,7 +672,6 @@ def handle_agent_question(
         journal_events=journal_events,
         ledger_path=config.ledger_path,
         ledger_key_path=config.ledger_key_path,
-        max_action_attempts=config.max_action_attempts,
         retry_delay_seconds=config.retry_delay_seconds,
     )
     if action.state == "action_queued":
@@ -832,6 +766,21 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
             continue
         session_ref = binding.session_ref if binding is not None else lane
         goal = goals_by_session.get(binding.session_ref) if binding is not None else None
+        lifecycle = get_lane_lifecycle(config.state_dir, session_ref)
+        if lifecycle is not None and not lifecycle.enforcement_enabled:
+            results.append(
+                LanePassResult(
+                    lane=lane,
+                    ingested_events=len(events),
+                    findings_opened=0,
+                    ladder_actions=(),
+                    completion_disputed=False,
+                    completion_verified=False,
+                    question_outcome="none",
+                    validator_receipts_recorded=0,
+                )
+            )
+            continue
         if binding is not None and goal is not None and (not goal.lane_id or goal.lane_id != binding.lane):
             logger.warning(
                 "monitord_goal_binding_mismatch",
@@ -929,17 +878,14 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
             findings.append(idle_finding)
         if goal is not None:
             findings = _bind_findings_to_goal(findings, goal)
-        action_count = 0
-
-        def supervise_first_finding(
+        def supervise_finding(
             finding: Finding,
             decision: LadderDecision,
             active_goal: GoalRecord | None = goal,
             active_lane: str = lane,
             active_events: tuple[CanonicalEvent, ...] = events,
         ) -> None:
-            nonlocal action_count
-            if action_count >= MAX_ACTIONS_PER_PASS or active_goal is None:
+            if active_goal is None:
                 return
             if active_goal.status in {"held", "done-pending-verification", "done-pending-close"}:
                 return
@@ -956,10 +902,8 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                 journal_events=active_events,
                 ledger_path=config.ledger_path,
                 ledger_key_path=config.ledger_key_path,
-                max_action_attempts=config.max_action_attempts,
                 retry_delay_seconds=config.retry_delay_seconds,
             )
-            action_count += 1
 
         if goal is None:
             # The journal remains observable for diagnosis, but an unresolved
@@ -968,15 +912,13 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
             scheduled_findings = []
             actions: list[str] = []
         else:
-            # Rotate all active identities to choose the fair first slot, then
-            # evaluate only the bounded prefix. Evaluating the remainder would
-            # open incidents before their scheduled pass and starve them.
-            scheduled_findings = schedule_findings(config, lane, findings)[:MAX_ACTIONS_PER_PASS]
+            # Every present finding is pursued in deterministic detector order.
+            scheduled_findings = findings
             actions = evaluate_findings(
                 config,
                 lane,
                 scheduled_findings,
-                on_decision=supervise_first_finding,
+                on_decision=supervise_finding,
                 journal_events=events,
                 ledger_key=(
                     config.ledger_key_path.read_bytes()
@@ -1020,6 +962,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
         "completion_disputed": any(result.completion_disputed for result in results),
         "completion_verified": any(result.completion_verified for result in results),
         "question_answers_queued": sum(result.question_outcome == "answer_queued" for result in results),
+        "questions_reasoning_required": sum(result.question_outcome == "reasoning_required" for result in results),
         "questions_operator_required": sum(result.question_outcome == "operator_required" for result in results),
         "validator_receipts_recorded": sum(result.validator_receipts_recorded for result in results),
         "shadow_mode": config.shadow_mode,
@@ -1064,7 +1007,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dispatch-queue-dir", type=Path, default=None)
     parser.add_argument("--ledger-path", type=Path, default=None)
     parser.add_argument("--ledger-key-path", type=Path, default=None)
-    parser.add_argument("--max-action-attempts", type=int, default=3)
     parser.add_argument("--retry-delay-seconds", type=float, default=60.0)
     parser.add_argument("--findings-path", type=Path, default=None)
     parser.add_argument("--poll-seconds", type=float, default=None)
@@ -1083,7 +1025,6 @@ def main(argv: list[str] | None = None) -> int:
         dispatch_queue_dir=args.dispatch_queue_dir,
         ledger_path=args.ledger_path,
         ledger_key_path=args.ledger_key_path,
-        max_action_attempts=args.max_action_attempts,
         retry_delay_seconds=args.retry_delay_seconds,
         findings_path=args.findings_path,
         poll_seconds=args.poll_seconds,

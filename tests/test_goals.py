@@ -13,6 +13,7 @@ import pytest
 from _goal_fixtures import enrollment_fields, ingest_passing_receipt, passing_completion_evidence
 
 from chitra.artifacts import ARTIFACT_URL_PREFIX, ArtifactRecord, upsert_artifact
+from chitra.autonomy import AutonomyPolicy, CapabilityGrant, autonomy_policy_json
 from chitra.goals import (
     EnrolledScopeImmutableError,
     GoalNotFoundError,
@@ -22,6 +23,7 @@ from chitra.goals import (
     GoalStatus,
     GoalValidationError,
     add_ask,
+    add_foreground_task,
     check_specification,
     close_goal,
     descope_delta,
@@ -35,6 +37,7 @@ from chitra.goals import (
     mark_completion_gate_passed,
     redirect_goal,
     resolve_ask,
+    resolve_foreground_task,
     resume_goal,
     schema_is_newer_than_installed,
     session_host,
@@ -176,6 +179,31 @@ def test_open_asks_round_trip_and_set_preserves_them_until_explicitly_cleared(tm
     assert cleared.open_asks == ()
 
 
+def test_foreground_tasks_are_durable_deduplicated_and_separate_from_operator_asks(tmp_path: Path) -> None:
+    stored = upsert_goal(tmp_path, _record())
+    first = add_foreground_task(
+        tmp_path,
+        stored.session_ref,
+        kind="question",
+        text="Inspect the repository and settle the unresolved schema choice.",
+        source="monitord",
+    )
+    repeated = add_foreground_task(
+        tmp_path,
+        stored.session_ref,
+        kind="question",
+        text="Inspect the repository and settle the unresolved schema choice.",
+        source="monitord",
+    )
+
+    assert repeated.foreground_tasks == first.foreground_tasks
+    assert repeated.open_asks == ()
+    tactical = upsert_goal(tmp_path, replace(repeated, now="foreground investigating", foreground_tasks=()))
+    assert tactical.foreground_tasks == repeated.foreground_tasks
+    resolved = resolve_foreground_task(tmp_path, stored.session_ref, task_id=first.foreground_tasks[0].task_id)
+    assert resolved.foreground_tasks == ()
+
+
 def test_add_ask_deduplicates_and_resolve_supports_text_index_and_all(tmp_path: Path) -> None:
     stored = upsert_goal(tmp_path, _record())
     one = "1. Approve the first irreversible step?"
@@ -270,6 +298,7 @@ def test_load_old_record_without_optional_fields_is_backward_compatible(tmp_path
     assert record.scope == ""
     assert record.goal_version == 1
     assert record.goal_history == ()
+    assert record.autonomy_policy.initiative == "aggressive"
     assert record.lane_id == "lane"
     assert record.enrolled_done_when == record.done_when
     assert record.enrolled_at == payload["updated_at"]
@@ -341,6 +370,23 @@ def test_plain_upsert_preserves_strategic_version_and_history(tmp_path: Path) ->
     assert revised.now == "running checks"
     assert revised.goal_version == 2
     assert revised.goal_history == redirected.goal_history
+
+
+def test_enrolled_autonomy_policy_changes_only_through_redirect(tmp_path: Path) -> None:
+    stored = upsert_goal(tmp_path, _record())
+    restricted = AutonomyPolicy(grants=(CapabilityGrant(grant_id="replan-only", capability="replan"),))
+
+    with pytest.raises(GoalRedirectRequiredError, match="redirect"):
+        upsert_goal(tmp_path, replace(stored, autonomy_policy=restricted))
+    redirected = redirect_goal(
+        tmp_path,
+        stored.session_ref,
+        reason="revise the frozen authority contract",
+        autonomy_policy=restricted,
+    )
+    assert redirected.autonomy_policy == restricted
+    assert redirected.goal_version == stored.goal_version + 1
+    assert json.loads(redirected.goal_history[-1]["autonomy_policy"]) == stored.autonomy_policy.model_dump(mode="json")
 
 
 def test_enrolled_scope_is_write_once_and_carried_through_later_writes(tmp_path: Path) -> None:
@@ -427,6 +473,7 @@ def test_redirect_records_prior_strategic_values_and_preserves_tactical_state(tm
             "scope": asked.scope,
             "revised_at": redirected.updated_at,
             "reason": "operator expanded the stated scope",
+            "autonomy_policy": autonomy_policy_json(asked.autonomy_policy),
         },
     )
     assert redirected.now == asked.now
@@ -685,6 +732,64 @@ def test_goal_cli_set_preserves_needs_when_omitted(tmp_path: Path, capsys: pytes
 
     assert stored is not None
     assert stored.needs == "you: run the interview"
+
+
+@pytest.mark.parametrize("delivery", ["file", "inline"])
+def test_goal_cli_freezes_strict_autonomy_policy_at_enrollment(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    delivery: str,
+) -> None:
+    record = _record()
+    policy = AutonomyPolicy(
+        initiative="steady",
+        grants=(CapabilityGrant(grant_id="spend-usd", capability="spend", max_amount="20", currency="USD"),),
+    )
+    raw_policy = policy.model_dump_json()
+    if delivery == "file":
+        policy_path = tmp_path / "autonomy.json"
+        policy_path.write_text(raw_policy, encoding="utf-8")
+        policy_args = ["--autonomy-policy", str(policy_path)]
+    else:
+        policy_args = ["--autonomy-policy-json", raw_policy]
+    set_args = [
+        "set",
+        "--root",
+        str(tmp_path),
+        "--session-ref",
+        record.session_ref,
+        "--goal",
+        record.goal,
+        "--source",
+        record.source,
+        *_done_item_args(record),
+        *policy_args,
+    ]
+
+    enrolled = _cli_enroll(tmp_path, capsys, set_args, done_when=record.done_when)
+    assert enrolled.autonomy_policy == policy
+
+
+def test_goal_cli_rejects_unknown_autonomy_policy_fields(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    record = _record()
+    result = main(
+        [
+            "set",
+            "--root",
+            str(tmp_path),
+            "--session-ref",
+            record.session_ref,
+            "--goal",
+            record.goal,
+            "--source",
+            record.source,
+            "--autonomy-policy-json",
+            '{"schema":"chitra.autonomy.v1","initiative":"aggressive","grants":[],"model_grant":true}',
+        ]
+    )
+
+    assert result == 1
+    assert "Extra inputs are not permitted" in capsys.readouterr().err
 
 
 def test_goal_cli_set_redirect_now_and_check_paths(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

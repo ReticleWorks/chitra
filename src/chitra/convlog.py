@@ -31,7 +31,9 @@ import structlog
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from chitra._fsio import parse_iso8601
+from chitra.autonomy import AuthorizationDecision, Capability, CapabilityUse, authorize_action, capability_target_from_text
 from chitra.evidence import EvidenceHandle, EvidenceResolver, FilesystemEvidenceResolver
+from chitra.goals import GoalNotFoundError, GoalRecord, add_foreground_task, get_goal
 from chitra.plain_english import require_plain_english
 from chitra.state_paths import default_convlog_path
 
@@ -42,6 +44,7 @@ type EntryKind = Literal["session_msg", "operator_brief", "operator_ruling", "la
 type ConversationResolution = Literal["moot", "superseded"]
 type BriefCategory = Literal["decision", "incident", "milestone", "fyi"]
 type RecommendationBasis = Literal["research", "operator-preference"]
+type BriefRouteDisposition = Literal["pass_through", "allowed", "foreground_residual", "operator_required"]
 _BARE_CODENAME = re.compile(r"(?:[A-Za-z]*-?\d+|\d+-\d+)", re.IGNORECASE)
 type ExhaustionReason = Literal["credential", "irreversible_consent", "operator_decision", "attempts_exhausted"]
 _BLOCKER_MIN_LENGTH = 20
@@ -56,6 +59,26 @@ class BriefValidationError(ValueError):
 
 class ConversationNotFoundError(KeyError):
     """Raised when an operation requires a conversation thread that is absent."""
+
+
+@dataclass(frozen=True, slots=True)
+class BriefRouting:
+    """The policy result for a legacy categorical operator brief.
+
+    ``pass_through`` is used for ordinary status briefs and preserves the old
+    convlog API. ``allowed`` means the enrolled goal policy authorizes the
+    reported capability, so the operator brief is suppressed and the lane can
+    continue. ``foreground_residual`` records a durable task when a goal is
+    available; it never creates an operator ask. ``operator_required`` is the
+    only result that permits the brief to be appended.
+    """
+
+    disposition: BriefRouteDisposition
+    authorization: AuthorizationDecision | None = None
+    goal_found: bool = False
+    foreground_recorded: bool = False
+    verified_denial: bool = False
+    reason: str = ""
 
 
 class BriefOption(BaseModel):
@@ -366,6 +389,188 @@ def read_stored_brief(payload: object) -> OperatorBrief:
         raise BriefValidationError(str(exc)) from exc
 
 
+_LEGACY_CAPABILITY_BY_REASON: dict[ExhaustionReason, Capability] = {
+    "credential": "credential_use",
+    "irreversible_consent": "irreversible_action",
+}
+
+
+def _brief_authority_text(brief: OperatorBrief) -> str:
+    """Return the legacy brief's text for target inference.
+
+    The old brief contract did not carry typed capability requirements.  The
+    categorical route therefore infers only the narrow target understood by
+    :func:`capability_target_from_text`; callers that have stronger evidence
+    can pass explicit ``authority_requirements`` to
+    :func:`route_operator_brief`.
+    """
+    values: list[str] = [brief.subject, brief.progress, brief.stage, brief.decision or "", brief.recommendation]
+    values.extend(brief.source_quote)
+    if brief.exhaustion is not None:
+        values.append(brief.exhaustion.residual_blocker)
+        values.extend(attempt.action for attempt in brief.exhaustion.attempts)
+        values.extend(attempt.result for attempt in brief.exhaustion.attempts)
+    return " ".join(value for value in values if value.strip())
+
+
+def _legacy_capability_requirements(brief: OperatorBrief) -> tuple[CapabilityUse, ...]:
+    """Translate the pre-policy categorical exhaustion reason to one use."""
+    record = brief.exhaustion
+    if record is None:
+        return ()
+    capability = _LEGACY_CAPABILITY_BY_REASON.get(record.reason)
+    if capability is None:
+        return ()
+    return (
+        CapabilityUse(
+            capability=capability,
+            target=capability_target_from_text(_brief_authority_text(brief)),
+        ),
+    )
+
+
+def _has_verified_denial(brief: OperatorBrief, resolver: EvidenceResolver) -> bool:
+    """Return whether the legacy record has independently resolved evidence.
+
+    A no-goal compatibility path may preserve a categorical brief only when
+    its reported attempts are all anchored to evidence that the resolver can
+    read.  A bare category or residual prose cannot establish a denial.
+    """
+    record = brief.exhaustion
+    if record is None or not record.attempts:
+        return False
+    if record.reason not in (*_LEGACY_CAPABILITY_BY_REASON, "attempts_exhausted"):
+        return False
+    return all(attempt.evidence is not None and resolver.resolve(attempt.evidence) is None for attempt in record.attempts)
+
+
+def _resolve_brief_goal(goal_root: Path | None, session_ref: str) -> GoalRecord | None:
+    """Read a goal for routing, treating an unavailable store as unresolved."""
+    try:
+        return get_goal(goal_root, session_ref)
+    except (OSError, ValueError) as exc:
+        logger.warning("convlog_goal_unavailable", session_ref=session_ref, reason=str(exc))
+        return None
+
+
+def _record_brief_foreground_task(goal_root: Path | None, goal: GoalRecord, brief: OperatorBrief, reason: str) -> bool:
+    """Persist one deduplicated foreground investigation for a residual brief."""
+    question = brief.decision or brief.subject or "the unresolved session issue"
+    text = f"Investigate the unresolved operator-brief route for {question}. {reason}"
+    try:
+        add_foreground_task(
+            goal_root,
+            goal.session_ref,
+            kind="investigate",
+            text=text,
+            source="convlog",
+        )
+    except GoalNotFoundError:
+        # The goal can disappear between the read and this write.  The route
+        # remains a foreground residual; never turn that race into an ask.
+        logger.warning("convlog_goal_disappeared_before_foreground_task", session_ref=goal.session_ref)
+        return False
+    return True
+
+
+def route_operator_brief(
+    brief: OperatorBrief,
+    *,
+    goal_root: Path | None = None,
+    evidence_resolver: EvidenceResolver | None = None,
+    authority_requirements: Sequence[CapabilityUse] | None = None,
+    authority_evidence_complete: bool = True,
+    changes_frozen_outcome: bool | None = None,
+) -> BriefRouting:
+    """Route a legacy categorical brief through the enrolled goal policy.
+
+    ``validate_brief`` remains a pure shape-and-evidence validator.  This
+    function is the side-effecting route used immediately before persistence:
+
+    * an active grant returns ``allowed`` and no operator brief is written;
+    * incomplete authority evidence returns ``foreground_residual`` and adds
+      one durable investigation task to the goal;
+    * a verified denial or frozen-outcome change returns
+      ``operator_required`` so the brief may be written;
+    * an unresolved goal returns a foreground residual unless the legacy
+      record contains independently resolved denial evidence.
+
+    Ordinary status briefs and older callers without a categorical authority
+    reason return ``pass_through`` unchanged.
+    """
+    resolver = evidence_resolver or FilesystemEvidenceResolver()
+    record = brief.exhaustion
+    inferred_requirements = authority_requirements is None
+    requirements = tuple(authority_requirements or _legacy_capability_requirements(brief))
+    frozen_change = (
+        record is not None and record.reason == "operator_decision"
+        if changes_frozen_outcome is None
+        else changes_frozen_outcome
+    )
+    exhaustion_residual = record is not None and record.reason == "attempts_exhausted" and inferred_requirements
+    if not requirements and not frozen_change and not exhaustion_residual:
+        return BriefRouting(disposition="pass_through")
+
+    goal = _resolve_brief_goal(goal_root, brief.session_ref)
+    verified_denial = _has_verified_denial(brief, resolver)
+    if goal is None:
+        if verified_denial:
+            return BriefRouting(
+                disposition="operator_required",
+                goal_found=False,
+                verified_denial=True,
+                reason="the legacy categorical denial is anchored to resolved evidence but no goal record is available",
+            )
+        return BriefRouting(
+            disposition="foreground_residual",
+            goal_found=False,
+            reason="no goal record is available; foreground reasoning must investigate before asking the operator",
+        )
+
+    authority = authorize_action(
+        goal.autonomy_policy,
+        requirements,
+        evidence_complete=authority_evidence_complete,
+        changes_frozen_outcome=frozen_change,
+    )
+    if exhaustion_residual:
+        reason = (
+            "the categorical exhaustion report is not an authority decision; foreground reasoning must investigate and continue pursuit"
+        )
+        recorded = _record_brief_foreground_task(goal_root, goal, brief, reason)
+        return BriefRouting(
+            disposition="foreground_residual",
+            authorization=authority,
+            goal_found=True,
+            foreground_recorded=recorded,
+            reason=reason,
+        )
+    if authority.disposition == "allowed":
+        return BriefRouting(
+            disposition="allowed",
+            authorization=authority,
+            goal_found=True,
+            reason="the enrolled goal policy authorizes the reported capability; continue without an operator brief",
+        )
+    if authority.disposition == "foreground_residual":
+        reason = "; ".join(authority.reasons) or "authority evidence is incomplete; investigate and replan"
+        recorded = _record_brief_foreground_task(goal_root, goal, brief, reason)
+        return BriefRouting(
+            disposition="foreground_residual",
+            authorization=authority,
+            goal_found=True,
+            foreground_recorded=recorded,
+            reason=reason,
+        )
+    return BriefRouting(
+        disposition="operator_required",
+        authorization=authority,
+        goal_found=True,
+        verified_denial=verified_denial,
+        reason="; ".join(authority.reasons) or "the enrolled goal policy requires operator authority",
+    )
+
+
 def _validated_payload(entry: ConversationEntry) -> dict[str, Any]:
     """Validate one kind-specific envelope payload before exposing it to readers."""
     match entry.kind:
@@ -545,10 +750,34 @@ def append_session_message(convlog_path: Path, *, thread_id: str, session_ref: s
 
 
 def append_operator_brief(
-    convlog_path: Path, *, thread_id: str, brief: OperatorBrief, evidence_resolver: EvidenceResolver | None = None
-) -> ConversationEntry:
-    """Record a validated brief and its deterministic rendering."""
+    convlog_path: Path,
+    *,
+    thread_id: str,
+    brief: OperatorBrief,
+    evidence_resolver: EvidenceResolver | None = None,
+    goal_root: Path | None = None,
+    authority_requirements: Sequence[CapabilityUse] | None = None,
+    authority_evidence_complete: bool = True,
+    changes_frozen_outcome: bool | None = None,
+) -> ConversationEntry | None:
+    """Record a validated brief unless policy routes it elsewhere.
+
+    ``None`` means the brief was either authorized for autonomous continuation
+    or recorded as a foreground residual.  The route result is available to
+    callers that need to distinguish those cases through
+    :func:`route_operator_brief`.
+    """
     brief = validate_brief(brief, evidence_resolver=evidence_resolver)
+    route = route_operator_brief(
+        brief,
+        goal_root=goal_root if goal_root is not None else convlog_path.parent,
+        evidence_resolver=evidence_resolver,
+        authority_requirements=authority_requirements,
+        authority_evidence_complete=authority_evidence_complete,
+        changes_frozen_outcome=changes_frozen_outcome,
+    )
+    if route.disposition in ("allowed", "foreground_residual"):
+        return None
     _require_thread(convlog_path, thread_id)
     rendered = render_brief(brief)
     return append_entry(
@@ -560,12 +789,43 @@ def append_operator_brief(
     )
 
 
-def open_thread(convlog_path: Path, *, brief: OperatorBrief, raw_text: str, evidence_resolver: EvidenceResolver | None = None) -> str:
-    """Open a new thread by recording its raw message before its first brief."""
+def open_thread(
+    convlog_path: Path,
+    *,
+    brief: OperatorBrief,
+    raw_text: str,
+    evidence_resolver: EvidenceResolver | None = None,
+    goal_root: Path | None = None,
+    authority_requirements: Sequence[CapabilityUse] | None = None,
+    authority_evidence_complete: bool = True,
+    changes_frozen_outcome: bool | None = None,
+) -> str | None:
+    """Open a thread after policy routing the first brief.
+
+    A policy-authorized capability or foreground residual does not open an
+    operator conversation, so those routes return ``None``.
+    """
+    brief = validate_brief(brief, evidence_resolver=evidence_resolver)
+    route = route_operator_brief(
+        brief,
+        goal_root=goal_root if goal_root is not None else convlog_path.parent,
+        evidence_resolver=evidence_resolver,
+        authority_requirements=authority_requirements,
+        authority_evidence_complete=authority_evidence_complete,
+        changes_frozen_outcome=changes_frozen_outcome,
+    )
+    if route.disposition in ("allowed", "foreground_residual"):
+        return None
     thread_id = uuid.uuid4().hex[:12]
-    validate_brief(brief, evidence_resolver=evidence_resolver)
     append_session_message(convlog_path, thread_id=thread_id, session_ref=brief.session_ref, text=raw_text, source_ref=brief.source_ref)
-    append_operator_brief(convlog_path, thread_id=thread_id, brief=brief, evidence_resolver=evidence_resolver)
+    rendered = render_brief(brief)
+    append_entry(
+        convlog_path,
+        thread_id=thread_id,
+        kind="operator_brief",
+        session_ref=brief.session_ref,
+        payload={"brief": brief.model_dump(mode="json"), "rendered": rendered},
+    )
     return thread_id
 
 
@@ -762,16 +1022,21 @@ def main(argv: list[str] | None = None) -> int:
                 if raw_text is None:
                     raise ValueError("--raw or --raw-file is required when opening a new thread")
                 thread_id = open_thread(args.convlog_path, brief=brief, raw_text=raw_text, evidence_resolver=resolver)
+                brief_recorded = thread_id is not None
             else:
                 _require_thread(args.convlog_path, args.thread)
                 if raw_text is not None:
                     append_session_message(
                         args.convlog_path, thread_id=args.thread, session_ref=brief.session_ref, text=raw_text, source_ref=brief.source_ref
                     )
-                append_operator_brief(args.convlog_path, thread_id=args.thread, brief=brief, evidence_resolver=resolver)
+                entry = append_operator_brief(args.convlog_path, thread_id=args.thread, brief=brief, evidence_resolver=resolver)
                 thread_id = args.thread
-            print(render_brief(brief))
-            print(f"thread={thread_id}", file=sys.stderr)
+                brief_recorded = entry is not None
+            if brief_recorded:
+                print(render_brief(brief))
+                print(f"thread={thread_id}", file=sys.stderr)
+            else:
+                print("operator brief suppressed; work remains with foreground Chitra", file=sys.stderr)
         elif args.command == "rule":
             for thread_id in args.thread:
                 append_ruling(args.convlog_path, thread_id=thread_id, text=args.text, via=args.via)

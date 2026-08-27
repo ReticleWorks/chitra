@@ -136,7 +136,7 @@ def test_injected_unnecessary_steps_produces_its_finding(event_sets: dict[str, t
     findings = detect_unnecessary_steps(event_sets["claude-unnecessary-steps"])
     assert len(findings) == 1
     assert findings[0].detector == "unnecessary_steps"
-    assert len(findings[0].event_refs) == 3
+    assert len(findings[0].event_refs) == 2
     assert all(ref for ref in findings[0].event_refs)
 
 
@@ -144,7 +144,7 @@ def test_injected_excessive_testing_produces_its_finding(event_sets: dict[str, t
     findings = detect_excessive_testing(event_sets["claude-excessive-testing"])
     assert len(findings) == 1
     assert findings[0].detector == "excessive_testing"
-    assert len(findings[0].event_refs) == 3
+    assert len(findings[0].event_refs) == 2
 
 
 def test_injected_goal_drift_produces_its_finding(event_sets: dict[str, tuple[CanonicalEvent, ...]]) -> None:
@@ -234,7 +234,7 @@ def test_repeat_detectors_reset_on_canonical_progress_event_ids() -> None:
     assert detect_excessive_testing(events, progress_rows=(progress,)) == []
 
 
-def test_repeat_detectors_reset_complete_recurrence_after_first_duplicate() -> None:
+def test_repeat_detectors_reset_then_detect_the_next_duplicate() -> None:
     calls = tuple(
         _event(
             f"early-call-{index}",
@@ -263,8 +263,8 @@ def test_repeat_detectors_reset_complete_recurrence_after_first_duplicate() -> N
         classifier_version="v1",
     )
     events = (calls[0], results[0], calls[1], results[1], calls[2], results[2])
-    assert detect_unnecessary_steps(events, progress_rows=(progress,)) == []
-    assert detect_excessive_testing(events, progress_rows=(progress,)) == []
+    assert len(detect_unnecessary_steps(events, progress_rows=(progress,))) == 1
+    assert len(detect_excessive_testing(events, progress_rows=(progress,))) == 1
 
 
 def test_drift_enforces_real_worktree_containment_for_all_work_calls() -> None:

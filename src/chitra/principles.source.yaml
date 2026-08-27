@@ -12,7 +12,7 @@ principles:
       - internal adapter runbook (private monorepo)
   - principle_id: G02
     title: Fill gaps without inventing direction
-    guidance: Choose the smallest reversible step necessary for the recorded outcome; escalate only when the missing fact changes scope, authority, spend, schema, dependency, irreversibility, or success.
+    guidance: Investigate missing facts and replan within the frozen outcome; continue when the enrolled autonomy policy grants the required target and limits, and escalate only a verified policy denial or a change to the frozen outcome.
     scope: [core, goal]
     answer_categories: [answer, nudge]
     keywords: [next, step, gap, reversible, scope, authority, spend, schema, dependency, success]
@@ -109,8 +109,8 @@ principles:
       - CLAUDE.md#Git-Workflow
       - rules/github-integration.md
   - principle_id: C02
-    title: Ask before changing governance
-    guidance: New dependencies, schemas, hooks, pre-commit policy, root directories, spend, or authorization boundaries require explicit operator approval.
+    title: Apply enrolled authority to governance changes
+    guidance: New dependencies, schemas, hooks, pre-commit policy, root directories, spend, and authorization boundaries may proceed when an active enrolled grant covers the target and limits; investigate incomplete evidence, and escalate only a verified policy denial or frozen-outcome change.
     scope: [core, governance]
     answer_categories: [answer, nudge, action]
     keywords: [dependency, schema, hook, policy, directory, spend, authorization, approval, governance]

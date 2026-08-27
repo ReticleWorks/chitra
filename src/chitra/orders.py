@@ -14,6 +14,12 @@ from chitra.reasoning import DecisionAttestation
 
 _ORDER_ID_PATTERN = r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,191}\z"
 
+# This is deliberately a separate task type from the ordinary native-control
+# orders.  Dispatchd uses the distinction as the only exception to a paused
+# lane's delivery gate: the control removes a recurring Claude enforcement
+# hook after a pause, and is never allowed to steer ordinary work.
+NATIVE_CONTROL_PAUSE_PRUNE_TASK_TYPE = "native-control-pause-prune"
+
 
 class DispatchStatus(enum.StrEnum):
     """Outcome of a dispatch attempt."""
@@ -26,10 +32,10 @@ class DispatchStatus(enum.StrEnum):
     # order was never delivered -- a disputed completion claim must never
     # silently pass through as "sent". See dispatchd.process_one_order.
     COMPLETION_DISPUTE = "completion_dispute"
-    # The order's session is rate-limit- or load-shed-held: parked in the durable
-    # deferred/ subqueue (no pane I/O, no result file persisted) rather than
-    # discarded. dispatchd.run_once/requeue_deferred_for_session return it
-    # to orders/ FIFO once the hold clears, so it is delivered exactly once,
+    # The order's session is rate-limit- or load-shed-held, or its lane is
+    # paused/shelved: parked in the durable deferred/ subqueue (no pane I/O,
+    # no result file persisted) rather than discarded. A lifecycle or guard
+    # resume returns it to orders/ FIFO, so it is delivered exactly once,
     # never silently dropped. This status is for in-process visibility only
     # (a caller inspecting run_once's return value) -- it is never written
     # to results/, since a persisted terminal result would block the later
@@ -42,10 +48,10 @@ class DispatchStatus(enum.StrEnum):
     # scrollback. Pane capture cannot distinguish a genuinely-started turn
     # from a scrollback echo or an unsubmitted composer row, so it is never
     # treated as a terminal SENT result on its own. dispatchd retries
-    # consumption verification using the same durable retry-attempts sidecar
-    # the lane-lock timeout path uses (chitra.dispatchd._process_claimed_order),
-    # without pasting again; after the retry budget is exhausted it becomes a
-    # terminal FAILED "retry-exhausted" result.
+    # consumption verification using the same durable attempt sidecar the
+    # lane-lock timeout path uses (chitra.dispatchd._process_claimed_order),
+    # without pasting again. A transient failure never becomes terminal merely
+    # because it recurred.
     # Like DEFERRED, this status is for in-process visibility only -- it is
     # never written to results/.
     DELIVERY_UNCONFIRMED = "delivery_unconfirmed"

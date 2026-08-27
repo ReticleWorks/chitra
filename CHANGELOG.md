@@ -20,6 +20,44 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.18.0] - 2026-08-27
+
+### Added
+
+- Add frozen, per-goal autonomy policies with typed capabilities, targets,
+  expiry and quantitative limits. Matching grants now authorize goal-scoped
+  action without a second topic-based operator gate.
+- Add exact `active`, `paused`, `shelved`, and independently verified `closed`
+  lane states, bound worktree and transcript checkpoints, idempotent lifecycle
+  transitions, and unfinished-work restoration on resume.
+- Add user-supplied canonical knowledge bundles and provider setup receipts.
+  Codex uses a profile beside its existing configuration; Claude receives a
+  native goal and a session-scoped recurring pursuit loop.
+
+### Changed
+
+- Pursue every actionable finding per monitor pass and retry true transport
+  failures without a fixed abandonment count. Deterministic goal, policy,
+  scope, and schema rejections now become foreground replanning work.
+- Pursue an idle lane after one clean monitor pass by default. Per-goal policy
+  can set a different threshold after evidence supports it.
+- Run Claude's recurring in-session enforcement hook every five minutes by
+  default, with a per-goal interval override.
+- Flag repeated identical tool outcomes and unchanged test runs on their second
+  occurrence, the first point where a loop exists.
+- Grant every goal-scoped capability by default, including spending. A goal
+  can still freeze narrower targets, amounts, units, expiry, or capabilities.
+- Gate Dispatchd on the authoritative lane lifecycle while keeping it the sole
+  terminal writer. A typed pause-prune control is the only paused-lane write.
+
+### Removed
+
+- Remove the persisted round-robin finding cursor, per-pass action cap,
+  terminal retry exhaustion, duplicate lifecycle constants, and the unused
+  standalone checkpoint writer.
+- Remove the legacy archive alias. Lane state is exactly active, paused,
+  shelved, or closed.
+
 ## [0.17.0] - 2026-08-27
 
 ### Added

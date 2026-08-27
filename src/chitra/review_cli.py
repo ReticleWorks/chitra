@@ -18,6 +18,7 @@ from typing import Literal
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from chitra.autonomy import DEFAULT_AUTONOMY_POLICY, AutonomyPolicy
 from chitra.goal_enforcement import (
     REVIEWER_ATTEMPTS,
     ClaudeProcessReviewer,
@@ -49,7 +50,7 @@ class ReviewEnvelope(BaseModel):
 
 
 def _frozen_goal_from_envelope(goal: dict[str, object]) -> FrozenGoal:
-    """Strict-validate the seven goal fields and recompute their contract id.
+    """Strict-validate the goal fields and recompute their contract id.
 
     A caller-supplied ``contract_id`` is never trusted: the snapshot is
     content-addressed here so a forged binding cannot cross the CLI boundary.
@@ -58,7 +59,12 @@ def _frozen_goal_from_envelope(goal: dict[str, object]) -> FrozenGoal:
     missing = [name for name in fields if name not in goal]
     if missing:
         raise GoalReviewError("lane goal envelope is missing required fields: " + ", ".join(missing))
+    try:
+        autonomy_policy = AutonomyPolicy.model_validate(goal.get("autonomy_policy", DEFAULT_AUTONOMY_POLICY))
+    except ValueError as exc:
+        raise GoalReviewError(f"lane goal envelope carries an invalid autonomy policy: {exc}") from exc
     payload = {name: goal[name] for name in fields}
+    payload["autonomy_policy"] = autonomy_policy.model_dump(mode="json")
     supplied = goal.get("contract_id")
     if isinstance(supplied, str) and supplied != contract_id_for(payload):
         raise GoalReviewError(

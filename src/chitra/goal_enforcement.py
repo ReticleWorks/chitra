@@ -20,6 +20,7 @@ from typing import Literal, Protocol, Self
 import structlog
 from pydantic import Field, model_validator
 
+from chitra.autonomy import DEFAULT_AUTONOMY_POLICY, AutonomyPolicy
 from chitra.goals import (
     GoalNotFoundError,
     GoalRecord,
@@ -133,6 +134,7 @@ class FrozenGoal(_FrozenModel):
     scope: str
     source: str
     goal_version: int = Field(ge=1)
+    autonomy_policy: AutonomyPolicy = DEFAULT_AUTONOMY_POLICY
     contract_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
 
@@ -149,6 +151,7 @@ def freeze_goal(record: GoalRecord) -> FrozenGoal:
         "scope": record.scope,
         "source": record.source,
         "goal_version": record.goal_version,
+        "autonomy_policy": record.autonomy_policy.model_dump(mode="json"),
     }
     return FrozenGoal.model_validate({**payload, "contract_id": contract_id_for(payload)})
 

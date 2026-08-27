@@ -180,6 +180,23 @@ def test_run_once_excludes_per_lane_progress_journal_from_lane_discovery(tmp_pat
     assert all(json.loads(line)["lanes"] == [SEEDED_LANE] for line in presence_lines)
 
 
+def test_run_once_skips_a_non_active_lifecycle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    journal = EventJournal(tmp_path, SEEDED_LANE)
+    journal.append(tuple(_event(f"e{i}", CanonicalType.TOOL_CALL, lane=SEEDED_LANE) for i in range(1, 4)))
+    monkeypatch.setattr(monitord_mod, "get_lane_lifecycle", lambda *_args: SimpleNamespace(enforcement_enabled=False))
+    monkeypatch.setattr(
+        monitord_mod,
+        "run_detectors",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("detectors must not run for paused lanes")),
+    )
+
+    summary = run_once(resolve_config(state_dir=tmp_path, shadow_mode=False))
+
+    assert summary["lanes_observed"] == 1
+    assert summary["findings_opened"] == 0
+    assert not (tmp_path / "monitord-findings.jsonl").exists()
+
+
 def test_run_once_stays_alive_but_takes_no_action_on_newer_goal_schema(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -308,6 +325,30 @@ def test_protected_question_holds_the_goal_without_queueing_an_answer(
     assert stored is not None
     assert stored.status == "held"
     assert stored.open_asks
+    assert not list((tmp_path / "queue").glob("**/*.json"))
+
+
+def test_residual_question_stays_active_for_foreground_reasoning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_registry(tmp_path, monkeypatch)
+    goal = upsert_goal(tmp_path, _goal("session-1"))
+    final_response = _event("question-residual", CanonicalType.FINAL_RESPONSE).model_copy(
+        update={"payload": {"text": "Should I redesign the workflow?"}}
+    )
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+
+    outcome = handle_agent_question(config, goal, final_response)
+
+    assert outcome == "reasoning_required"
+    stored = get_goal(tmp_path, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "working"
+    assert stored.open_asks == ()
+    assert len(stored.foreground_tasks) == 1
+    assert stored.foreground_tasks[0].kind == "question"
+    assert stored.foreground_tasks[0].source == "monitord"
+    assert "Should I redesign the workflow?" in stored.foreground_tasks[0].text
     assert not list((tmp_path / "queue").glob("**/*.json"))
 
 

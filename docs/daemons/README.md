@@ -7,7 +7,7 @@ deployments. The rest are periodic, ad-hoc, or observation-only services.
 
 ## The Composed Monitor
 
-- **[monitord](monitord.md)** — Persistent, exact goal-bound supervision: transcript ingestion, deterministic detectors, crash-safe corrective orders, completion receipts, bounded question answers, and presence. `watchd`, `triaged`, and `sweepd` are deprecated by it.
+- **[monitord](monitord.md)** — Persistent, exact goal-bound supervision: transcript ingestion, deterministic detectors, crash-safe corrective orders, completion receipts, foreground investigation, and presence. `watchd`, `triaged`, and `sweepd` are deprecated by it.
 
 ## Delivery Systems
 

@@ -8,7 +8,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _goal_fixtures import enrollment_fields
 
+from chitra.autonomy import AutonomyPolicy, CapabilityGrant
 from chitra.convlog import (
     BriefValidationError,
     OperatorBrief,
@@ -27,9 +29,11 @@ from chitra.convlog import (
     read_stored_brief,
     render_brief,
     render_group,
+    route_operator_brief,
     validate_brief,
 )
 from chitra.evidence import EvidenceHandle
+from chitra.goals import GoalRecord, get_goal, upsert_goal
 
 
 class _AcceptingResolver:
@@ -118,6 +122,21 @@ def _payload(**changes: object) -> dict[str, object]:
 
 def _brief(**changes: object) -> OperatorBrief:
     return validate_brief(_payload(**changes), evidence_resolver=_AcceptingResolver())
+
+
+def _policy_goal(tmp_path: Path, *, policy: AutonomyPolicy | None = None) -> GoalRecord:
+    goal = GoalRecord(
+        session_ref="host-b:feeds:0.0",
+        goal="Deliver the feed redesign with proof",
+        done_when="The focused feed tests pass and the redesign artifact exists",
+        source="operator:test",
+        status="working",
+        intent="Complete the feed redesign",
+        scope="feed source and focused tests",
+        autonomy_policy=policy or AutonomyPolicy(),
+        **enrollment_fields("The focused feed tests pass and the redesign artifact exists"),
+    )
+    return upsert_goal(tmp_path, goal)
 
 
 def test_valid_brief_round_trip_render_log_and_read_back(tmp_path: Path) -> None:
@@ -302,6 +321,112 @@ def test_valid_attempts_exhausted_brief_passes_and_renders_tried() -> None:
     assert "TRIED:" in rendered
     assert "- Shipped the combined-feed prototype to the reader test -> it passed the preference check." in rendered
     assert "Only the operator can pick between one combined feed and separate feeds." in rendered
+
+
+def test_granted_legacy_credential_brief_is_suppressed_for_an_enrolled_goal(tmp_path: Path) -> None:
+    _policy_goal(
+        tmp_path,
+        policy=AutonomyPolicy(
+            grants=(CapabilityGrant(grant_id="feed-credential", capability="credential_use"),),
+        ),
+    )
+    path = tmp_path / "conversation.jsonl"
+
+    brief = _brief(
+        exhaustion={
+            "reason": "credential",
+            "attempts": [
+                _attempt(
+                    "Presented the retry token to the registry",
+                    "the registry refused it outright.",
+                    {"kind": "verb_refusal", "ref": "chitra-registry-push"},
+                )
+            ],
+            "residual_blocker": "Only a human account can approve this access today.",
+        }
+    )
+    assert (
+        open_thread(path, brief=brief, raw_text="raw", evidence_resolver=_AcceptingResolver(), goal_root=tmp_path)
+        is None
+    )
+    assert read_entries(path) == []
+    stored = get_goal(tmp_path, "host-b:feeds:0.0")
+    assert stored is not None
+    assert stored.foreground_tasks == ()
+
+
+def test_incomplete_legacy_authority_evidence_becomes_a_durable_foreground_task(tmp_path: Path) -> None:
+    _policy_goal(
+        tmp_path,
+        policy=AutonomyPolicy(
+            grants=(CapabilityGrant(grant_id="feed-credential", capability="credential_use"),),
+        ),
+    )
+    path = tmp_path / "conversation.jsonl"
+    brief = _brief(
+        exhaustion={
+            "reason": "credential",
+            "attempts": [_attempt(
+                "Presented the retry token to the registry",
+                "the registry refused it outright.",
+                {"kind": "verb_refusal", "ref": "chitra-registry-push"},
+            )],
+            "residual_blocker": "The authority evidence is incomplete for this route.",
+        }
+    )
+
+    route = route_operator_brief(
+        brief,
+        goal_root=tmp_path,
+        evidence_resolver=_AcceptingResolver(),
+        authority_evidence_complete=False,
+    )
+
+    assert route.disposition == "foreground_residual"
+    assert route.foreground_recorded is True
+    assert read_entries(path) == []
+    stored = get_goal(tmp_path, "host-b:feeds:0.0")
+    assert stored is not None
+    assert len(stored.foreground_tasks) == 1
+    assert stored.foreground_tasks[0].kind == "investigate"
+    assert stored.foreground_tasks[0].source == "convlog"
+
+
+def test_verified_denial_without_a_goal_keeps_the_legacy_operator_brief(tmp_path: Path) -> None:
+    path = tmp_path / "conversation.jsonl"
+    brief = _brief(
+        exhaustion={
+            "reason": "credential",
+            "attempts": [_attempt(
+                "Presented the retry token to the registry",
+                "the registry refused it outright.",
+                {"kind": "verb_refusal", "ref": "chitra-registry-push"},
+            )],
+            "residual_blocker": "Only a human account can approve this access today.",
+        }
+    )
+
+    thread_id = open_thread(path, brief=brief, raw_text="raw", evidence_resolver=_AcceptingResolver(), goal_root=tmp_path)
+
+    assert thread_id is not None
+    assert [entry.kind for entry in entries_for_thread(path, thread_id)] == ["session_msg", "operator_brief"]
+
+
+def test_unverified_legacy_irreversible_brief_without_a_goal_stays_foreground(tmp_path: Path) -> None:
+    path = tmp_path / "conversation.jsonl"
+    brief = _brief(
+        exhaustion={
+            "reason": "irreversible_consent",
+            "attempts": [],
+            "residual_blocker": "Sending the announcement cannot be undone once it leaves the outbox.",
+        }
+    )
+
+    route = route_operator_brief(brief, goal_root=tmp_path, evidence_resolver=_AcceptingResolver())
+
+    assert route.disposition == "foreground_residual"
+    assert route.goal_found is False
+    assert read_entries(path) == []
 
 
 def test_single_attempt_attempts_exhausted_fails() -> None:
@@ -614,6 +739,63 @@ def test_render_group_numbers_briefs(tmp_path: Path) -> None:
     assert grouped.startswith("[1] — open 0m\n  This is")
     assert "\n  🔴" in grouped
     assert "\n\n[2] — open 0m\n  This is" in grouped
+
+
+def test_cli_does_not_render_a_policy_suppressed_operator_brief(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _policy_goal(
+        tmp_path,
+        policy=AutonomyPolicy(
+            grants=(CapabilityGrant(grant_id="feed-credential", capability="credential_use"),),
+        ),
+    )
+    capsys.readouterr()
+    transcript = tmp_path / "self-transcript.jsonl"
+    _write_self_transcript(transcript, command="chitra-registry-push", exit_code=1)
+    brief_path = tmp_path / "credential-brief.json"
+    brief_path.write_text(
+        json.dumps(
+            _payload(
+                exhaustion={
+                    "reason": "credential",
+                    "attempts": [
+                        _attempt(
+                            "Presented the retry token to the registry",
+                            "the registry refused it outright.",
+                            {"kind": "verb_refusal", "ref": "chitra-registry-push"},
+                        )
+                    ],
+                    "residual_blocker": "Only a human account can approve this access today.",
+                }
+            )
+        ),
+        encoding="utf-8",
+    )
+    convlog_path = tmp_path / "conversation.jsonl"
+
+    result = main(
+        [
+            "brief",
+            "--convlog-path",
+            str(convlog_path),
+            "--session-ref",
+            "host-b:feeds:0.0",
+            "--json",
+            str(brief_path),
+            "--raw",
+            "raw",
+            "--self-transcript",
+            str(transcript),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert captured.out == ""
+    assert "operator brief suppressed" in captured.err
+    assert not convlog_path.exists()
 
 
 def test_cli_four_rung_lifecycle_show_list_and_pending(

@@ -114,20 +114,24 @@ def test_oracle_is_called_only_after_goal_and_principles_are_insufficient() -> N
 
     assert decision.source == "oracle-escalated"
     assert decision.oracle_escalated is True
-    assert decision.autonomy == "operator_required"
-    assert decision.operator_confirmation_required is True
-    assert "oracle escalation" in decision.operator_gate_reasons
+    assert decision.autonomy == "autonomous"
+    assert decision.operator_confirmation_required is False
+    assert decision.operator_gate_reasons == ()
     assert len(calls) == 1
     assert all(match.confidence < 0.75 for match in calls[0].principle_matches)
     assert len(decision.insufficiency_reasons) == 2
 
 
-def test_routine_insufficiency_abstains_without_oracle() -> None:
+def test_routine_insufficiency_uses_foreground_oracle_when_available() -> None:
     calls: list[OracleRequest] = []
 
     def oracle(request: OracleRequest) -> OracleVerdict:
         calls.append(request)
-        raise AssertionError("oracle must not be called for routine residuals")
+        return OracleVerdict(
+            verdict="Use the repository's existing frobnicator name and continue.",
+            evidence_refs=["src/frobnicator.py:1"],
+            confidence_basis="Foreground inspection found the established name.",
+        )
 
     decision = DecisionReasoner(PrinciplesIndex()).decide(
         _goal(),
@@ -136,9 +140,23 @@ def test_routine_insufficiency_abstains_without_oracle() -> None:
         oracle=oracle,
     )
 
+    assert decision.outcome == "answer"
+    assert decision.source == "oracle-escalated"
+    assert decision.autonomy == "autonomous"
+    assert len(calls) == 1
+
+
+def test_missing_oracle_returns_a_foreground_residual_not_a_user_gate() -> None:
+    decision = DecisionReasoner(PrinciplesIndex()).decide(
+        _goal(),
+        _undetermined(),
+        DecisionQuestion(text="Which frobnicator nickname should we use?"),
+    )
+
     assert decision.outcome == "abstain"
-    assert decision.source == "abstained"
-    assert calls == []
+    assert decision.source == "foreground-residual"
+    assert decision.autonomy == "foreground_residual"
+    assert decision.operator_confirmation_required is False
 
 
 def test_corrupt_principles_lock_fails_closed(tmp_path: Path) -> None:
@@ -181,13 +199,12 @@ def test_reasoned_dispatch_requires_exact_answer_and_attestation() -> None:
         DecisionQuestion(text="Should this be deployed?"),
     )
 
-    confirmed = decision.with_operator_confirmation()
     order = DispatchOrder(
         order_id="reasoned-1",
         session_ref="localhost:lane:0.0",
-        nudge=confirmed.approved_text,
+        nudge=decision.approved_text,
         message_kind="reasoned_answer",
-        decision_attestation=confirmed,
+        decision_attestation=decision,
     )
     assert order.decision_attestation is not None
     assert order.decision_attestation.source == "goal"
@@ -198,7 +215,7 @@ def test_reasoned_dispatch_requires_exact_answer_and_attestation() -> None:
             session_ref="localhost:lane:0.0",
             nudge="mutated after review",
             message_kind="reasoned_answer",
-            decision_attestation=confirmed,
+            decision_attestation=decision,
         )
 
 
@@ -224,7 +241,7 @@ def _accepted_review(goal: GoalRecord) -> SessionReviewSignal:
     )
 
 
-def test_unanimous_in_scope_technical_answer_is_autonomous_but_sensitive_actions_are_operator_gated() -> None:
+def test_default_goal_policy_releases_goal_scoped_actions() -> None:
     goal = _goal()
     judgment = GoalJudgment(
         determines_answer=True,
@@ -245,8 +262,8 @@ def test_unanimous_in_scope_technical_answer_is_autonomous_but_sensitive_actions
     assert autonomous.autonomy == "autonomous"
     assert autonomous.operator_confirmation_required is False
 
-    for flag in ("spend", "credentials", "irreversible", "strategy_redirect"):
-        gated = DecisionReasoner(PrinciplesIndex()).decide(
+    for flag in ("credentials", "irreversible", "strategy_redirect", "spend"):
+        released = DecisionReasoner(PrinciplesIndex()).decide(
             goal,
             judgment,
             DecisionQuestion(
@@ -256,10 +273,10 @@ def test_unanimous_in_scope_technical_answer_is_autonomous_but_sensitive_actions
                 **{flag: True},
             ),
         )
-        assert gated.autonomy == "operator_required"
-        assert gated.operator_confirmation_required is True
+        assert released.autonomy == "autonomous"
+        assert released.operator_confirmation_required is False
 
-    textually_gated = DecisionReasoner(PrinciplesIndex()).decide(
+    textually_released = DecisionReasoner(PrinciplesIndex()).decide(
         goal,
         judgment,
         DecisionQuestion(
@@ -268,10 +285,11 @@ def test_unanimous_in_scope_technical_answer_is_autonomous_but_sensitive_actions
             session_review=review,
         ),
     )
-    assert set(textually_gated.operator_gate_reasons) >= {"credentials", "spend"}
+    assert textually_released.autonomy == "autonomous"
+    assert textually_released.operator_gate_reasons == ()
 
 
-def test_default_authority_class_is_operator_required() -> None:
+def test_default_authority_class_is_routine_and_autonomous() -> None:
     decision = DecisionReasoner(PrinciplesIndex()).decide(
         _goal(),
         GoalJudgment(
@@ -283,12 +301,27 @@ def test_default_authority_class_is_operator_required() -> None:
         DecisionQuestion(text="May the lane use the existing typed boundary?"),
     )
 
-    assert decision.authority_class == "operator_required"
-    assert decision.autonomy == "operator_required"
-    assert decision.operator_confirmation_required is True
+    assert decision.authority_class == "routine"
+    assert decision.autonomy == "autonomous"
+    assert decision.operator_confirmation_required is False
+
+    text_only_gate = DecisionReasoner(PrinciplesIndex()).decide(
+        _goal(),
+        GoalJudgment(
+            determines_answer=True,
+            answer="Use the existing typed boundary.",
+            goal_fields=["scope"],
+            inference="The scope settles this bounded answer.",
+        ),
+        DecisionQuestion(
+            text="The model labels this operator required, but no capability is missing.",
+            authority_class="operator_required",
+        ),
+    )
+    assert text_only_gate.autonomy == "autonomous"
 
 
-def test_small_delta_requires_verification_and_rejects_governance_changes() -> None:
+def test_small_delta_and_goal_scoped_replanning_use_enrolled_grants() -> None:
     goal = _goal()
     judgment = GoalJudgment(
         determines_answer=True,
@@ -303,8 +336,7 @@ def test_small_delta_requires_verification_and_rejects_governance_changes() -> N
         judgment,
         DecisionQuestion(authority_class="small_delta", session_review=review, text="Make the small change."),
     )
-    assert missing_verification.autonomy == "operator_required"
-    assert "missing small-delta verification references" in missing_verification.operator_gate_reasons
+    assert missing_verification.autonomy == "autonomous"
 
     for flag in (
         "new_dependency",
@@ -324,10 +356,10 @@ def test_small_delta_requires_verification_and_rejects_governance_changes() -> N
                 **{flag: True},
             ),
         )
-        assert gated.autonomy == "operator_required"
+        assert gated.autonomy == "autonomous"
 
 
-def test_corrective_authority_requires_rejected_recognized_cited_review() -> None:
+def test_legacy_corrective_review_class_does_not_override_goal_policy() -> None:
     goal = _goal()
     judgment = GoalJudgment(
         determines_answer=True,
@@ -341,7 +373,8 @@ def test_corrective_authority_requires_rejected_recognized_cited_review() -> Non
         judgment,
         DecisionQuestion(authority_class="corrective", session_review=accepted, text="Correct the rejected turn."),
     )
-    assert gated.autonomy == "operator_required"
+    assert gated.autonomy == "autonomous"
+    assert gated.operator_confirmation_required is False
 
     rejected = SessionReviewSignal.create(
         session_ref=goal.session_ref,
@@ -349,17 +382,15 @@ def test_corrective_authority_requires_rejected_recognized_cited_review() -> Non
         behavior_sha256="1" * 64,
         verdict="reject",
         reviewer_ids=("reviewer-1",),
-        findings=(
-            ReviewFinding(code="other", detail="Unclassified finding.", citation="The lane stopped."),
-        ),
+        findings=(ReviewFinding(code="other", detail="Unclassified finding.", citation="The lane stopped."),),
     )
     unrecognized = DecisionReasoner(PrinciplesIndex()).decide(
         goal,
         judgment,
         DecisionQuestion(authority_class="corrective", session_review=rejected, text="Correct the rejected turn."),
     )
-    assert unrecognized.autonomy == "operator_required"
-    assert "unrecognized or uncited" in " ".join(unrecognized.operator_gate_reasons)
+    assert unrecognized.autonomy == "autonomous"
+    assert unrecognized.operator_confirmation_required is False
 
 
 def test_none_cannot_be_hashed_or_attested_as_approved_text() -> None:

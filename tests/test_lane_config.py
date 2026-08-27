@@ -15,9 +15,19 @@ from _goal_fixtures import enrollment_fields
 from chitra.goals import EnrolledScopeImmutableError, GoalRecord, hold_goal, redirect_goal, upsert_goal
 from chitra.lane_anchor import LaneLaunchRefused, LaneStartupFailed, _pane_pythonpath, ingestion_gate, start_lane
 from chitra.lane_config import load_lanes
+from chitra.recovery import get_lane_lifecycle
 
 
 def _manifest(tmp_path):
+    workdir = tmp_path / "worktree"
+    if not workdir.exists():
+        workdir.mkdir()
+        subprocess.run(["git", "-C", str(workdir), "init"], check=True, capture_output=True, text=True)
+        subprocess.run(["git", "-C", str(workdir), "config", "user.email", "lane-test@example.test"], check=True)
+        subprocess.run(["git", "-C", str(workdir), "config", "user.name", "Lane Test"], check=True)
+        (workdir / "README.md").write_text("lane test\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(workdir), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(workdir), "commit", "-m", "initial"], check=True, capture_output=True, text=True)
     return {
         "lanes": [
             {
@@ -25,7 +35,7 @@ def _manifest(tmp_path):
                 "account": "alpha",
                 "uid": 2109,
                 "home": "/home/alpha",
-                "workdir": "/srv/chitra/lanes/alpha",
+                "workdir": str(workdir),
                 "config_dir": "/home/alpha/.claude-alpha",
                 "state_dir": str(tmp_path / "alpha-state"),
                 "tmux_socket": str(tmp_path / "alpha.sock"),
@@ -101,64 +111,64 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
     # need: it is checking the command the launcher builds, and the self-test
     # has its own tests in test_lane_permissions.py.
     assert start_lane(lane, runner=runner, socket_path=control_socket, self_test=False)
-    assert calls[:2] == [
-        [
-            "runuser",
-            "--user",
-            "alpha",
-            "--",
-            "env",
-            "HOME=/home/alpha",
-            "CLAUDE_CONFIG_DIR=/home/alpha/.claude-alpha",
-            "tmux",
-            "-S",
-            str(tmp_path / "alpha.sock"),
-            "has-session",
-            "-t",
-            "alpha",
-        ],
-        [
-            "runuser",
-            "--user",
-            "alpha",
-            "--",
-            "env",
-            "HOME=/home/alpha",
-            "CLAUDE_CONFIG_DIR=/home/alpha/.claude-alpha",
-            "tmux",
-            "-S",
-            str(tmp_path / "alpha.sock"),
-            "new-session",
-            "-d",
-            "-e",
-            "CHITRA_LANE_ID=alpha",
-            "-e",
-            "CHITRA_SESSION_REF=tophand:alpha:0.0",
-            "-e",
-            "CHITRA_PANE_TARGET=alpha:0.0",
-            "-e",
-            f"CHITRA_SOCKET_PATH={control_socket}",
-            "-e",
-            f"PYTHONPATH={_pane_pythonpath()}",
-            "-s",
-            "alpha",
-            "-c",
-            "/srv/chitra/lanes/alpha",
-            __import__("sys").executable,
-            "-m",
-            "chitra.pane_exec",
-            "--",
-            "claude",
-            "--model",
-            "sonnet",
-            "--effort",
-            "high",
-            # A governed lane runs at full permissions. Without this flag the
-            # lane falls back to the config directory's permissions.defaultMode
-            # and its own work gets refused; see test_lane_permissions.py.
-            "--dangerously-skip-permissions",
-        ],
+    assert calls[0] == [
+        "runuser",
+        "--user",
+        "alpha",
+        "--",
+        "env",
+        "HOME=/home/alpha",
+        "CLAUDE_CONFIG_DIR=/home/alpha/.claude-alpha",
+        "tmux",
+        "-S",
+        str(tmp_path / "alpha.sock"),
+        "has-session",
+        "-t",
+        "alpha",
     ]
+    expected_new_session = [
+        "runuser",
+        "--user",
+        "alpha",
+        "--",
+        "env",
+        "HOME=/home/alpha",
+        "CLAUDE_CONFIG_DIR=/home/alpha/.claude-alpha",
+        "tmux",
+        "-S",
+        str(tmp_path / "alpha.sock"),
+        "new-session",
+        "-d",
+        "-e",
+        "CHITRA_LANE_ID=alpha",
+        "-e",
+        "CHITRA_SESSION_REF=tophand:alpha:0.0",
+        "-e",
+        "CHITRA_PANE_TARGET=alpha:0.0",
+        "-e",
+        f"CHITRA_SOCKET_PATH={control_socket}",
+        "-e",
+        f"PYTHONPATH={_pane_pythonpath()}",
+        "-s",
+        "alpha",
+        "-c",
+        str(tmp_path / "worktree"),
+        __import__("sys").executable,
+        "-m",
+        "chitra.pane_exec",
+        "--",
+        "claude",
+        "--model",
+        "sonnet",
+        "--effort",
+        "high",
+        # A governed lane runs at full permissions. Without this flag the
+        # lane falls back to the config directory's permissions.defaultMode
+        # and its own work gets refused; see test_lane_permissions.py.
+        "--dangerously-skip-permissions",
+    ]
+    assert calls[1][:-2] == expected_new_session
+    assert calls[1][-2:] == ["--append-system-prompt-file", str(lane.state_dir / "session-setup.md")]
     assert calls[2:-1] == [calls[0]] * 5
     # The launch arms the transcript pipe before it writes the receipt, so a
     # lane is never recorded as governed while nothing is recording it.
@@ -170,6 +180,7 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
         f"cat >> {lane.state_dir / 'tmux-transcript.log'}",
     ]
     receipt = __import__("json").loads((lane.state_dir / "lane-launch.json").read_text())
+    assert receipt["schema"] == "chitra.lane-launch.v2"
     assert receipt["session_ref"] == "tophand:alpha:0.0"
     assert receipt["goal_snapshot"]["source"] == "task-file:lane-architecture"
     assert "rate_limit_guard" in receipt["lifecycle"]
@@ -181,6 +192,10 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
         "CHITRA_PANE_TARGET": "alpha:0.0",
         "CHITRA_SOCKET_PATH": str(control_socket),
     }
+    assert receipt["knowledge_bundle_sha256"] == lane.knowledge_bundle.sha256
+    assert receipt["native_session_identity"]["lane_session_ref"] == "tophand:alpha:0.0"
+    assert (lane.state_dir / "session-setup.md").exists()
+    assert (lane.state_dir / "native-controls.json").exists()
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required for the environment delivery proof")
@@ -203,6 +218,12 @@ def test_lane_identity_reaches_a_new_session_on_an_existing_tmux_server(
     )
     for directory in (tmp_path / "home", tmp_path / "workdir", tmp_path / "config"):
         directory.mkdir()
+    subprocess.run(["git", "-C", str(tmp_path / "workdir"), "init"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(tmp_path / "workdir"), "config", "user.email", "lane-test@example.test"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path / "workdir"), "config", "user.name", "Lane Test"], check=True)
+    (tmp_path / "workdir" / "README.md").write_text("lane test\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path / "workdir"), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path / "workdir"), "commit", "-m", "initial"], check=True, capture_output=True, text=True)
     path = tmp_path / "lanes.yaml"
     path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
     lane = load_lanes(path)[0]
@@ -341,6 +362,7 @@ def test_lane_startup_death_returns_temporary_failure_without_receipt(tmp_path, 
     with pytest.raises(LaneStartupFailed, match="no launch receipt was written; retry is safe"):
         start_lane(lane, runner=lambda _command: next(results))
     assert not (lane.state_dir / "lane-launch.json").exists()
+    assert get_lane_lifecycle(lane.state_dir, "tophand:alpha:0.0") is None
 
     monkeypatch.setattr(lane_anchor, "start_lane", lambda *_args, **_kwargs: (_ for _ in ()).throw(LaneStartupFailed("locked")))
     assert lane_anchor.main(["--lanes-file", str(path), "--lane", "alpha", "start"]) == 75
@@ -452,7 +474,7 @@ def test_governed_claude_model_selection(model, tmp_path):
         return subprocess.CompletedProcess(command, 1 if len(calls) == 1 else 0, "", "")
     assert start_lane(lane, backend="claude", model=model, effort="max", runner=runner, self_test=False)
     new_session = next(command for command in calls if "new-session" in command)
-    assert new_session[-6:] == [
+    assert new_session[-8:-2] == [
         "claude",
         "--model",
         model,
@@ -460,15 +482,21 @@ def test_governed_claude_model_selection(model, tmp_path):
         "max",
         "--dangerously-skip-permissions",
     ]
+    assert new_session[-2:] == ["--append-system-prompt-file", str(lane.state_dir / "session-setup.md")]
 
 
-def test_governed_codex_effort_is_explicit_and_receipted(tmp_path):
+def test_governed_codex_effort_is_explicit_and_receipted(tmp_path, monkeypatch: pytest.MonkeyPatch):
     import json
 
     import yaml
 
+    manifest = _manifest(tmp_path)
+    manifest["lanes"][0]["home"] = str(tmp_path / "home")
+    (tmp_path / "home").mkdir()
+    inherited_codex_home = tmp_path / "existing-codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(inherited_codex_home))
     path = tmp_path / "lanes.yaml"
-    path.write_text(yaml.safe_dump(_manifest(tmp_path)), encoding="utf-8")
+    path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
     lane = load_lanes(path)[0]
     upsert_goal(
         lane.state_dir,
@@ -498,7 +526,7 @@ def test_governed_codex_effort_is_explicit_and_receipted(tmp_path):
         self_test=False,
     )
     new_session = next(command for command in calls if "new-session" in command)
-    assert new_session[-6:] == [
+    assert new_session[-8:-2] == [
         "codex",
         "--model",
         "gpt-5.6-sol",
@@ -508,6 +536,12 @@ def test_governed_codex_effort_is_explicit_and_receipted(tmp_path):
         # governed lane never stops on an approval nobody is there to answer.
         "--dangerously-bypass-approvals-and-sandbox",
     ]
+    assert new_session[-2:] == ["--profile", "chitra-alpha"]
+    assert "CODEX_HOME=" not in new_session
+    assert "--profile" in new_session
+    codex_config = (inherited_codex_home / "chitra-alpha.config.toml").read_text(encoding="utf-8")
+    assert "developer_instructions" in codex_config
+    assert "/goal Exercise one explicit governed Codex model route" in codex_config
     receipt = json.loads((lane.state_dir / "lane-launch.json").read_text())
     assert receipt["model"] == "gpt-5.6-sol"
     assert receipt["effort"] == "xhigh"

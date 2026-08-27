@@ -1,6 +1,6 @@
 {
   "compiler_version": "1",
-  "corpus_id": "sha256:0a6d11174dc05f608b032a4d269cf589bb342deb033b88cc8830d80223adb714",
+  "corpus_id": "sha256:01afd9cddb927ca9696619245a359b1c6c85801e9f385961e14732868ace5610",
   "principles": [
     {
       "answer_categories": [
@@ -128,7 +128,7 @@
       "citations": [
         "CLAUDE.md#Boundaries"
       ],
-      "guidance": "New dependencies, schemas, hooks, pre-commit policy, root directories, spend, or authorization boundaries require explicit operator approval.",
+      "guidance": "New dependencies, schemas, hooks, pre-commit policy, root directories, spend, and authorization boundaries may proceed when an active enrolled grant covers the target and limits; investigate incomplete evidence, and escalate only a verified policy denial or frozen-outcome change.",
       "keywords": [
         "dependency",
         "schema",
@@ -146,7 +146,7 @@
         "governance"
       ],
       "status": "binding",
-      "title": "Ask before changing governance"
+      "title": "Apply enrolled authority to governance changes"
     },
     {
       "answer_categories": [
@@ -271,7 +271,7 @@
         "AGENTS.md",
         "CLAUDE.md"
       ],
-      "guidance": "Choose the smallest reversible step necessary for the recorded outcome; escalate only when the missing fact changes scope, authority, spend, schema, dependency, irreversibility, or success.",
+      "guidance": "Investigate missing facts and replan within the frozen outcome; continue when the enrolled autonomy policy grants the required target and limits, and escalate only a verified policy denial or a change to the frozen outcome.",
       "keywords": [
         "next",
         "step",

@@ -6,6 +6,7 @@ stated goal, completion condition, and current state.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Iterable, Iterator, Sequence
@@ -20,6 +21,7 @@ from pydantic import ConfigDict, SkipValidation, TypeAdapter, ValidationInfo, mo
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 from chitra._fsio import locked_json_store, parse_iso8601, write_json_atomic
+from chitra.autonomy import DEFAULT_AUTONOMY_POLICY, AutonomyPolicy, autonomy_policy_json
 from chitra.close_gate import RequiredItem, _recorded_descopes, require_structured_close_inventory
 from chitra.completion_gate import CompletionEvidence, require_completion_receipts
 from chitra.plain_english import require_plain_english
@@ -84,6 +86,7 @@ RATE_LIMIT_HOLD_REASON_PREFIX = "rate-limit:"
 LOAD_SHED_HOLD_REASON_PREFIX = "load-shed:"
 DONE_STATUSES = frozenset(("done-pending-verification", "done-pending-close"))
 LEGACY_ENROLLED_AT = "1970-01-01T00:00:00+00:00"
+ForegroundTaskKind = Literal["question", "investigate", "replan"]
 
 
 class GoalValidationError(ValueError):
@@ -155,6 +158,18 @@ class EnrolledDoneWhenItem:
     required_receipt: str
 
 
+@pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True))
+class ForegroundTask:
+    """One durable, goal-version-bound item for Chitra's foreground agent."""
+
+    task_id: str
+    kind: ForegroundTaskKind
+    text: str
+    source: str
+    goal_version: int
+    created_at: str
+
+
 @pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True, extra="ignore"))
 class GoalRecord:
     """The five canonical fields plus monitor-maintained tactical metadata.
@@ -193,6 +208,8 @@ class GoalRecord:
     interview_receipt: InterviewReceipt | None = None
     enrolled_done_when_items: tuple[EnrolledDoneWhenItem, ...] = ()
     completion_proofs: tuple[CompletionEvidence, ...] = ()
+    autonomy_policy: AutonomyPolicy = DEFAULT_AUTONOMY_POLICY
+    foreground_tasks: tuple[ForegroundTask, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return cast(dict[str, object], _GOAL_RECORD_ADAPTER.dump_python(self, mode="json"))
@@ -281,6 +298,7 @@ class GoalRecord:
         if not isinstance(raw_history, list):
             raise ValueError("goal record goal_history must be a list of objects")
         strategic_fields = {"goal", "done_when", "intent", "scope", "revised_at", "reason"}
+        strategic_fields_with_autonomy = {*strategic_fields, "autonomy_policy"}
         review_restart_fields = {
             "event",
             "previous_contract_id",
@@ -290,7 +308,11 @@ class GoalRecord:
             "reason",
         }
         for entry in raw_history:
-            if not isinstance(entry, dict) or set(entry) not in (strategic_fields, review_restart_fields):
+            if not isinstance(entry, dict) or set(entry) not in (
+                strategic_fields,
+                strategic_fields_with_autonomy,
+                review_restart_fields,
+            ):
                 raise ValueError("goal record goal_history entries must contain strategic prior values or a review restart event")
             if not all(isinstance(value, str) for value in entry.values()):
                 raise ValueError("goal record goal_history entries must contain strings")
@@ -301,6 +323,38 @@ class GoalRecord:
             if not isinstance(raw_items, list):
                 raise ValueError(f"goal record {field} must be a list")
             normalized[field] = raw_items
+        raw_foreground_tasks = payload.get("foreground_tasks", [])
+        foreground_fields = {"task_id", "kind", "text", "source", "goal_version", "created_at"}
+        if not isinstance(raw_foreground_tasks, list):
+            raise ValueError("goal record foreground_tasks must be a list")
+        for task in raw_foreground_tasks:
+            if not isinstance(task, dict) or set(task) != foreground_fields:
+                raise ValueError("goal record foreground_tasks entries must contain the complete foreground task")
+            if task["kind"] not in ("question", "investigate", "replan"):
+                raise ValueError("goal record foreground task kind is invalid")
+            if not all(isinstance(task[field], str) for field in ("task_id", "text", "source", "created_at")):
+                raise ValueError("goal record foreground task text fields must be strings")
+            if not isinstance(task["goal_version"], int) or isinstance(task["goal_version"], bool) or task["goal_version"] < 1:
+                raise ValueError("goal record foreground task goal_version must be a positive integer")
+            if not task["text"].strip() or not task["source"].strip():
+                raise ValueError("goal record foreground task text and source must be non-empty")
+            expected_task_id = _foreground_task_id(
+                session_ref,
+                task["goal_version"],
+                cast(ForegroundTaskKind, task["kind"]),
+                task["text"],
+                task["source"],
+            )
+            if task["task_id"] != expected_task_id:
+                raise ValueError("goal record foreground task_id does not match its contents")
+            parse_iso8601(
+                task["created_at"],
+                invalid_message="goal record foreground task created_at must be an ISO8601 datetime",
+                timezone_message="goal record foreground task created_at must include a timezone",
+                require_timezone=True,
+            )
+        normalized["foreground_tasks"] = raw_foreground_tasks
+        normalized["autonomy_policy"] = payload.get("autonomy_policy", DEFAULT_AUTONOMY_POLICY.model_dump(mode="json"))
         return normalized
 
 
@@ -487,6 +541,45 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _foreground_task_id(
+    session_ref: str,
+    goal_version: int,
+    kind: ForegroundTaskKind,
+    text: str,
+    source: str,
+) -> str:
+    payload = json.dumps(
+        [session_ref, goal_version, kind, text.strip(), source.strip()],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+def make_foreground_task(
+    session_ref: str,
+    goal_version: int,
+    *,
+    kind: ForegroundTaskKind,
+    text: str,
+    source: str,
+    created_at: str | None = None,
+) -> ForegroundTask:
+    """Build one stable foreground work item without granting it authority."""
+    if not text.strip() or not source.strip():
+        raise ValueError("foreground task text and source must be non-empty")
+    if goal_version < 1:
+        raise ValueError("foreground task goal_version must be positive")
+    return ForegroundTask(
+        task_id=_foreground_task_id(session_ref, goal_version, kind, text, source),
+        kind=kind,
+        text=text.strip(),
+        source=source.strip(),
+        goal_version=goal_version,
+        created_at=created_at or _utc_now(),
+    )
+
+
 def load_goals_document(root: Path | None = None, *, allow_newer: bool = False) -> tuple[list[GoalRecord], str]:
     """Load records plus the file's own ``file_schema``, backfilling legacy anchors.
 
@@ -593,6 +686,7 @@ def _upsert_goal_locked(
     allow_done_transition: bool = False,
     allow_completion_proofs: bool = False,
     allow_legacy_administrative: bool = False,
+    clear_foreground_tasks: bool = False,
     mutation_time: str | None = None,
     migrate: bool = False,
 ) -> GoalRecord:
@@ -657,6 +751,9 @@ def _upsert_goal_locked(
     open_asks = rec.open_asks
     if existing is not None and not open_asks and existing.open_asks and not clear_open_asks:
         open_asks = existing.open_asks
+    foreground_tasks = rec.foreground_tasks
+    if existing is not None and not foreground_tasks and existing.foreground_tasks and not clear_foreground_tasks:
+        foreground_tasks = existing.foreground_tasks
     hold_reason = rec.hold_reason
     resume_at = rec.resume_at
     if existing is not None and rec.status == existing.status and not hold_reason and not resume_at:
@@ -694,6 +791,8 @@ def _upsert_goal_locked(
         interview_receipt=rec.interview_receipt,
         enrolled_done_when_items=rec.enrolled_done_when_items,
         completion_proofs=rec.completion_proofs,
+        autonomy_policy=rec.autonomy_policy,
+        foreground_tasks=foreground_tasks,
     )
     records = [record for record in records if record.session_ref != rec.session_ref]
     records.append(stored)
@@ -703,7 +802,7 @@ def _upsert_goal_locked(
 
 def _strategic_fields_match(left: GoalRecord, right: GoalRecord) -> bool:
     """Compare strategic fields while treating whitespace-only revisions alike."""
-    return all(
+    return left.autonomy_policy == right.autonomy_policy and all(
         getattr(left, field).strip() == getattr(right, field).strip() for field in ("goal", "done_when", "intent", "scope", "source")
     )
 
@@ -718,6 +817,7 @@ def redirect_goal(
     intent: str | None = None,
     scope: str | None = None,
     source: str | None = None,
+    autonomy_policy: AutonomyPolicy | None = None,
     lock_dir: Path | None = None,
 ) -> GoalRecord:
     """Replace strategic values after recording the prior operator direction."""
@@ -736,8 +836,10 @@ def redirect_goal(
             intent=existing.intent if intent is None else intent,
             scope=existing.scope if scope is None else scope,
             source=existing.source if source is None else source,
+            autonomy_policy=existing.autonomy_policy if autonomy_policy is None else autonomy_policy,
             status="working" if existing.status in DONE_STATUSES else existing.status,
             last_verified="" if existing.status in DONE_STATUSES else existing.last_verified,
+            foreground_tasks=(),
         )
         if _strategic_fields_match(existing, redirected):
             raise ValueError("redirect must change at least one strategic field")
@@ -752,6 +854,7 @@ def redirect_goal(
             "scope": existing.scope,
             "revised_at": revised_at,
             "reason": reason,
+            "autonomy_policy": autonomy_policy_json(existing.autonomy_policy),
         }
         candidate = replace(
             redirected,
@@ -766,6 +869,7 @@ def redirect_goal(
             allow_strategic_change=True,
             allow_goal_metadata_change=True,
             allow_legacy_administrative=True,
+            clear_foreground_tasks=True,
             mutation_time=revised_at,
         )
     logger.info("goal_mutated", session_ref=session_ref, action="administrative-redirect-not-done", reason=reason)
@@ -838,6 +942,59 @@ def update_now(
             migrate=migrate,
         )
     logger.info("goal_mutated", session_ref=stored.session_ref, action="upsert")
+    return stored
+
+
+def add_foreground_task(
+    root: Path | None,
+    session_ref: str,
+    *,
+    kind: ForegroundTaskKind,
+    text: str,
+    source: str,
+    lock_dir: Path | None = None,
+) -> GoalRecord:
+    """Persist one deduplicated residual for the foreground Chitra agent."""
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
+        existing = get_goal(root, session_ref)
+        if existing is None:
+            raise GoalNotFoundError(session_ref)
+        task = make_foreground_task(
+            session_ref,
+            existing.goal_version,
+            kind=kind,
+            text=text,
+            source=source,
+        )
+        tasks = existing.foreground_tasks
+        if all(item.task_id != task.task_id for item in tasks):
+            tasks = (*tasks, task)
+        stored = _upsert_goal_locked(root, replace(existing, foreground_tasks=tasks))
+    logger.info("goal_foreground_task_added", session_ref=session_ref, task_id=task.task_id, kind=kind)
+    return stored
+
+
+def resolve_foreground_task(
+    root: Path | None,
+    session_ref: str,
+    *,
+    task_id: str,
+    lock_dir: Path | None = None,
+) -> GoalRecord:
+    """Remove one completed foreground task without touching operator asks."""
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
+        existing = get_goal(root, session_ref)
+        if existing is None:
+            raise GoalNotFoundError(session_ref)
+        tasks = tuple(task for task in existing.foreground_tasks if task.task_id != task_id)
+        if len(tasks) == len(existing.foreground_tasks):
+            raise ValueError(f"foreground task not found: {task_id}")
+        stored = _upsert_goal_locked(
+            root,
+            replace(existing, foreground_tasks=tasks),
+            clear_foreground_tasks=True,
+        )
+    logger.info("goal_foreground_task_resolved", session_ref=session_ref, task_id=task_id)
     return stored
 
 
@@ -986,6 +1143,18 @@ def transfer_goal(
             scope=existing.scope,
             interview_receipt=existing.interview_receipt,
             enrolled_done_when_items=existing.enrolled_done_when_items,
+            autonomy_policy=existing.autonomy_policy,
+            foreground_tasks=tuple(
+                make_foreground_task(
+                    successor_ref,
+                    1,
+                    kind=task.kind,
+                    text=task.text,
+                    source=task.source,
+                    created_at=task.created_at,
+                )
+                for task in existing.foreground_tasks
+            ),
             successor_of=session_ref,
             now=f"scaffolded by transfer to {to_backend}: {reason}",
         )

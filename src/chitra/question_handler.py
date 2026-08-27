@@ -1,9 +1,10 @@
-"""Bounded, deterministic answers to routine questions about one goal.
+"""Deterministic answers and residuals for questions about one goal.
 
 The handler is intentionally smaller than a conversational agent.  It can
-answer only facts that are present in the enrolled goal contract.  Every
-other question produces an operator-gated result, which a monitor may later
-place on its queue without treating the result as permission to act.
+answer only facts that are present in the enrolled goal contract. Questions
+the contract does not settle become residuals for the foreground Chitra
+reasoning path. Only questions that request protected authority are
+operator-gated.
 
 There is no model call and there is no inferred reviewer or approval source in
 this module.  The ``request_id`` binds the result to the exact question and
@@ -16,16 +17,18 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from chitra.autonomy import Capability, CapabilityUse, authorize_action, capability_target_from_text
 from chitra.goals import GoalRecord, done_when_with_delta
 from chitra.supervision import goal_digest
 
-QuestionDisposition = Literal["answered", "operator_required"]
+QuestionDisposition = Literal["answered", "residual", "operator_required"]
 QuestionKind = Literal["next", "scope", "done_when", "small_delta", "unknown"]
-QuestionSource = Literal["frozen_goal", "operator_required"]
+QuestionSource = Literal["frozen_goal", "foreground_reasoning", "operator_required"]
 GateReason = Literal[
     "credentials",
     "spend",
@@ -41,7 +44,7 @@ GateReason = Literal[
 
 
 class QuestionHandlerResult(BaseModel):
-    """A queue-safe answer or an explicit operator-gated question."""
+    """A queue-safe answer, foreground residual, or protected authority gate."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -121,17 +124,23 @@ _IRREVERSIBLE_RE = re.compile(
     re.I,
 )
 _SECURITY_RE = re.compile(
-    r"\b(?:security\s+boundary|auth(?:entication|orization|n|z)?|permissions?|access\s+control|"
-    r"identity\s+(?:provider|boundary)|privilege(?:s)?|sandbox|firewall|production\s+access|"
+    r"\b(?:security\s+boundary|authorization|authz|permissions?|access\s+control|"
+    r"identity\s+boundary|privilege(?:s)?|sandbox|firewall|production\s+access|"
     r"root\s+access|public\s+exposure|encrypt(?:ion|ed)?|signing\s+key)\b",
     re.I,
 )
+_AUTHENTICATION_RE = re.compile(r"\b(?:authentication|authenticate|authn|oauth|login|identity\s+provider)\b", re.I)
 _DEPENDENCY_RE = re.compile(r"\b(?:new\s+)?dependenc(?:y|ies)|\b(?:install|add)\s+(?:a\s+)?(?:package|library)\b", re.I)
 _SCHEMA_RE = re.compile(r"\b(?:new\s+)?schema|\bschema\s+(?:change|migration)|\bmigration\b", re.I)
 _HOOK_RE = re.compile(r"\b(?:new\s+)?hook(?:s)?|\b(?:plugin|integration|endpoint)\b", re.I)
 _STRATEGIC_SCOPE_RE = re.compile(
     r"\b(?:change|expand|narrow|redirect|revise|redefine|replace|pivot|add|remove)\b[^?\n]{0,80}\b(?:scope|goal|strategy|objective)\b|"
     r"\b(?:scope|goal|strategy|objective)\b[^?\n]{0,80}\b(?:change|expand|narrow|redirect|revise|redefine|replace|pivot)\b",
+    re.I,
+)
+_FROZEN_OUTCOME_RE = re.compile(
+    r"\b(?:change|redirect|revise|redefine|replace|pivot)\b[^?\n]{0,80}\b(?:goal|objective|outcome|done\s+condition)\b|"
+    r"\b(?:goal|objective|outcome|done\s+condition)\b[^?\n]{0,80}\b(?:change|redirect|revise|redefine|replace|pivot)\b",
     re.I,
 )
 _NEGATIVE_SCOPE_RE = re.compile(
@@ -184,23 +193,64 @@ def _scope_match(scope: str, item: str) -> bool | None:
     return matches[0]
 
 
-def _gate_reasons(question: str, *, scope_query: bool) -> tuple[GateReason, ...]:
-    reasons: list[GateReason] = []
-    checks: tuple[tuple[GateReason, re.Pattern[str]], ...] = (
-        ("credentials", _CREDENTIAL_RE),
+_CAPABILITY_GATE_REASON: dict[Capability, GateReason] = {
+    "replan": "strategic_scope_change",
+    "small_redesign": "strategic_scope_change",
+    "dependency_change": "new_dependency",
+    "schema_change": "new_schema",
+    "hook_change": "new_hook",
+    "credential_use": "credentials",
+    "authentication": "security_boundary",
+    "security_change": "security_boundary",
+    "irreversible_action": "irreversible",
+    "spend": "spend",
+}
+_SPEND_AMOUNT_RE = re.compile(r"\$\s*(?P<amount>\d+(?:\.\d{1,2})?)")
+
+
+def _capability_uses(
+    question: str,
+    *,
+    scope_query: bool,
+    small_delta: bool,
+) -> tuple[tuple[CapabilityUse, ...], bool]:
+    capabilities: list[Capability] = []
+    checks: tuple[tuple[Capability, re.Pattern[str]], ...] = (
+        ("credential_use", _CREDENTIAL_RE),
         ("spend", _SPEND_RE),
-        ("irreversible", _IRREVERSIBLE_RE),
-        ("security_boundary", _SECURITY_RE),
-        ("new_dependency", _DEPENDENCY_RE),
-        ("new_schema", _SCHEMA_RE),
-        ("new_hook", _HOOK_RE),
+        ("irreversible_action", _IRREVERSIBLE_RE),
+        ("authentication", _AUTHENTICATION_RE),
+        ("security_change", _SECURITY_RE),
+        ("dependency_change", _DEPENDENCY_RE),
+        ("schema_change", _SCHEMA_RE),
+        ("hook_change", _HOOK_RE),
     )
-    for reason, pattern in checks:
-        if pattern.search(question):
-            reasons.append(reason)
-    if not scope_query and _STRATEGIC_SCOPE_RE.search(question):
-        reasons.append("strategic_scope_change")
-    return tuple(reasons)
+    if not scope_query or small_delta:
+        for capability, pattern in checks:
+            if pattern.search(question):
+                capabilities.append(capability)
+    if small_delta:
+        capabilities.append("small_redesign")
+    changes_frozen_outcome = not scope_query and _FROZEN_OUTCOME_RE.search(question) is not None
+    if not scope_query and _STRATEGIC_SCOPE_RE.search(question) and not changes_frozen_outcome:
+        capabilities.append("replan")
+
+    uses: list[CapabilityUse] = []
+    target = capability_target_from_text(question)
+    for capability in dict.fromkeys(capabilities):
+        if capability == "spend":
+            amount_match = _SPEND_AMOUNT_RE.search(question)
+            uses.append(
+                CapabilityUse(
+                    capability="spend",
+                    target=target,
+                    amount=None if amount_match is None else Decimal(amount_match.group("amount")),
+                    currency=None if amount_match is None else "USD",
+                )
+            )
+        else:
+            uses.append(CapabilityUse(capability=capability, target=target))
+    return tuple(uses), changes_frozen_outcome
 
 
 def _request_id(question: str, digest: str) -> str:
@@ -242,7 +292,7 @@ def _result(
 
 
 def handle_question(goal: GoalRecord, question: str) -> QuestionHandlerResult:
-    """Answer a narrow frozen-goal question or return an operator gate.
+    """Answer a frozen-goal question or return a foreground residual.
 
     The function never guesses what an absent scope item means, never uses
     mutable tactical state as authority, and never returns an action approval.
@@ -252,18 +302,49 @@ def handle_question(goal: GoalRecord, question: str) -> QuestionHandlerResult:
             goal,
             "<empty question>",
             kind="unknown",
-            disposition="operator_required",
-            source="operator_required",
+            disposition="residual",
+            source="foreground_reasoning",
             answer=None,
-            reason="The question is empty or not text.",
+            reason="The question is empty or not text; foreground reasoning must inspect the current lane state.",
             gate_reasons=("unknown_or_ambiguous",),
         )
     text = question.strip()
     scope_match = _SCOPE_RE.fullmatch(text) or _SCOPE_LISTED_RE.fullmatch(text)
     small_delta_match = _SMALL_DELTA_RE.fullmatch(text)
     scope_query = scope_match is not None or small_delta_match is not None
-    reasons = _gate_reasons(text, scope_query=scope_query)
-    if reasons:
+    if small_delta_match is not None and not _invalid_contract(goal, needs_scope=True):
+        item = small_delta_match.group("item")
+        if _scope_match(goal.scope, item) is False:
+            return _result(
+                goal,
+                text,
+                kind="small_delta",
+                disposition="answered",
+                source="frozen_goal",
+                answer=(
+                    f"Do not change {item.strip()}; it is explicitly out of the frozen scope. "
+                    f"Continue the frozen goal and prove completion with: {done_when_with_delta(goal)}"
+                ),
+                reason="The exact design surface is explicitly excluded by the frozen contract.",
+            )
+    capability_uses, changes_frozen_outcome = _capability_uses(
+        text,
+        scope_query=scope_query,
+        small_delta=small_delta_match is not None,
+    )
+    authority = authorize_action(
+        goal.autonomy_policy,
+        capability_uses,
+        changes_frozen_outcome=changes_frozen_outcome,
+    )
+    if authority.disposition == "operator_required":
+        reasons = tuple(
+            dict.fromkeys(
+                ("strategic_scope_change" if changes_frozen_outcome else _CAPABILITY_GATE_REASON[use.capability]) for use in capability_uses
+            )
+        )
+        if not reasons:
+            reasons = ("strategic_scope_change",)
         return _result(
             goal,
             text,
@@ -271,8 +352,19 @@ def handle_question(goal: GoalRecord, question: str) -> QuestionHandlerResult:
             disposition="operator_required",
             source="operator_required",
             answer=None,
-            reason="This question requests an operator-controlled change or authority.",
+            reason="The frozen goal policy has no valid grant for this action, exceeds its limit, or the action changes the outcome.",
             gate_reasons=reasons,
+        )
+    if authority.disposition == "foreground_residual":
+        return _result(
+            goal,
+            text,
+            kind="scope" if scope_query else "unknown",
+            disposition="residual",
+            source="foreground_reasoning",
+            answer=None,
+            reason="The grant may cover this action, but its limits cannot be checked from current evidence; investigate and replan.",
+            gate_reasons=("unknown_or_ambiguous",),
         )
 
     if scope_match is not None:
@@ -281,10 +373,10 @@ def handle_question(goal: GoalRecord, question: str) -> QuestionHandlerResult:
                 goal,
                 text,
                 kind="scope",
-                disposition="operator_required",
-                source="operator_required",
+                disposition="residual",
+                source="foreground_reasoning",
                 answer=None,
-                reason="The frozen goal does not contain a valid scope to inspect.",
+                reason="The frozen goal does not contain a valid scope to inspect; foreground reasoning must repair or replan it.",
                 gate_reasons=("invalid_frozen_goal",),
             )
         item = scope_match.group("item")
@@ -294,10 +386,13 @@ def handle_question(goal: GoalRecord, question: str) -> QuestionHandlerResult:
                 goal,
                 text,
                 kind="scope",
-                disposition="operator_required",
-                source="operator_required",
+                disposition="residual",
+                source="foreground_reasoning",
                 answer=None,
-                reason="The frozen scope does not settle that exact item.",
+                reason=(
+                    "The frozen scope does not settle that exact item; foreground reasoning must "
+                    "investigate and choose the next in-scope path."
+                ),
                 gate_reasons=("unknown_or_ambiguous",),
             )
         return _result(
@@ -316,10 +411,12 @@ def handle_question(goal: GoalRecord, question: str) -> QuestionHandlerResult:
                 goal,
                 text,
                 kind="small_delta",
-                disposition="operator_required",
-                source="operator_required",
+                disposition="residual",
+                source="foreground_reasoning",
                 answer=None,
-                reason="The frozen goal does not contain a valid scope for a bounded design change.",
+                reason=(
+                    "The frozen goal does not contain a valid scope for this design change; foreground reasoning must repair or replan it."
+                ),
                 gate_reasons=("invalid_frozen_goal",),
             )
         item = small_delta_match.group("item")
@@ -329,10 +426,12 @@ def handle_question(goal: GoalRecord, question: str) -> QuestionHandlerResult:
                 goal,
                 text,
                 kind="small_delta",
-                disposition="operator_required",
-                source="operator_required",
+                disposition="residual",
+                source="foreground_reasoning",
                 answer=None,
-                reason="The frozen scope does not settle that exact design surface.",
+                reason=(
+                    "The frozen scope does not settle that exact design surface; foreground reasoning must investigate before changing it."
+                ),
                 gate_reasons=("unknown_or_ambiguous",),
             )
         if not explicit:
@@ -343,8 +442,8 @@ def handle_question(goal: GoalRecord, question: str) -> QuestionHandlerResult:
         else:
             answer = (
                 f"A small reversible change to {item.strip()} is within the frozen scope. "
-                "Keep the change bounded, avoid new dependencies, schemas, hooks, and authorization boundaries, "
-                f"then verify it against: {done_when_with_delta(goal)}"
+                "Pursue the redesign through the successive steps needed for the outcome, "
+                f"and verify it against: {done_when_with_delta(goal)}"
             )
         return _result(
             goal,
@@ -362,10 +461,10 @@ def handle_question(goal: GoalRecord, question: str) -> QuestionHandlerResult:
                 goal,
                 text,
                 kind="done_when",
-                disposition="operator_required",
-                source="operator_required",
+                disposition="residual",
+                source="foreground_reasoning",
                 answer=None,
-                reason="The frozen goal does not contain a valid completion condition.",
+                reason="The frozen goal does not contain a valid completion condition; foreground reasoning must repair or replan it.",
                 gate_reasons=("invalid_frozen_goal",),
             )
         return _result(
@@ -384,10 +483,13 @@ def handle_question(goal: GoalRecord, question: str) -> QuestionHandlerResult:
                 goal,
                 text,
                 kind="next",
-                disposition="operator_required",
-                source="operator_required",
+                disposition="residual",
+                source="foreground_reasoning",
                 answer=None,
-                reason="The frozen goal is not complete enough to determine the next bounded direction.",
+                reason=(
+                    "The frozen goal is not complete enough to determine the next direction; "
+                    "foreground reasoning must investigate and replan it."
+                ),
                 gate_reasons=("invalid_frozen_goal",),
             )
         return _result(
@@ -407,10 +509,12 @@ def handle_question(goal: GoalRecord, question: str) -> QuestionHandlerResult:
         goal,
         text,
         kind="unknown",
-        disposition="operator_required",
-        source="operator_required",
+        disposition="residual",
+        source="foreground_reasoning",
         answer=None,
-        reason="The frozen goal does not deterministically settle this question.",
+        reason=(
+            "The frozen goal does not deterministically settle this question; foreground reasoning must investigate and continue pursuit."
+        ),
         gate_reasons=("unknown_or_ambiguous",),
     )
 
