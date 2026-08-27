@@ -43,7 +43,7 @@ from chitra.supervision import goal_digest
 
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 SANCTIONED_HOST = "tophand"
-SANCTIONED_HOSTS = frozenset({"tophand", "trinity"})
+SANCTIONED_HOSTS = frozenset({"tophand", "trinity", "twinridge"})
 # The name chitra.watchd's transcript-pipe liveness check looks for. The two
 # must agree: the watcher reads this file to decide whether a governed lane is
 # still being recorded.
@@ -95,7 +95,8 @@ def session_ref(lane: LaneSpec, host: str = SANCTIONED_HOST) -> str:
 def ingestion_gate(lane: LaneSpec, *, host: str = SANCTIONED_HOST) -> GoalRecord:
     """Return the frozen goal source only when every launch gate passes."""
     if host not in SANCTIONED_HOSTS:
-        raise LaneLaunchRefused("lane launch refused: governed lanes must run on tophand or trinity")
+        allowed = ", ".join(sorted(SANCTIONED_HOSTS))
+        raise LaneLaunchRefused(f"lane launch refused: governed lanes must run on one of: {allowed}")
     ref = session_ref(lane, host)
     try:
         goal = get_goal(lane.state_dir, ref)
