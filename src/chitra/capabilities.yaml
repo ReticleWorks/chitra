@@ -62,22 +62,29 @@ capabilities:
 
   - name: monitord
     kind: daemon
-    purpose: Compose journal ingestion, failure-mode detectors and response ladder, enrollment receipts, and presence into one supervised observation daemon.
+    purpose: Persistently supervise explicitly bound agent sessions against exact frozen goals through independently verified completion.
     when_to_use: Declare one monitord process per instance instead of the deprecated watchd/triaged/sweepd chain.
     authority:
-      level: record
+      level: act
       grants:
-        - Ingest lane transcripts into durable journals and run deterministic detectors over observed events.
-        - Read enrolled goal contracts, execute registered completion validators, verify receipts, and write incident records.
-        - Publish advisory presence records.
+        - Ingest explicitly bound transcripts, run deterministic detectors, and persist per-lane supervision state.
+        - Publish goal-bound corrective orders to dispatchd after recording durable intent.
+        - Answer questions that the exact frozen contract settles and approve only explicit small reversible changes within its scope.
+        - Execute enrolled completion validators after a structured claim and close only from session-isolated verified receipts.
       excludes:
-        - Capture tmux pane content itself, dispatch orders, restart or steer lanes.
+        - Write to tmux directly or bypass dispatchd's single-writer, goal-contract, and authority checks.
+        - Supply credentials, approve spending, take irreversible action, change an authorization boundary, or redirect strategy.
         - Merge, approve, or modify pull requests.
     default_enabled: true
     commands:
       - name: monitord
-        description: Start the composed Chitra monitor daemon.
+        description: Start the persistent Chitra goal supervisor through its compatibility command.
         argv: [monitord]
+        params: []
+        mutates: true
+      - name: chitra-monitord
+        description: Start the persistent Chitra goal supervisor.
+        argv: [chitra-monitord]
         params: []
         mutates: true
 

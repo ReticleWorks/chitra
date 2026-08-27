@@ -6,14 +6,14 @@
 - [Migration from Watchd screen-change inference](watchd-status-migration.md)
 - [Agent detection manifest format](agent-detection-manifests.md)
 
-Chitra delivers messages to long-running LLM agent sessions in tmux and watches their state. Everything on the delivery, queueing, ledger, and state-tracking path is deterministic — Python with zero LLM calls. The one deliberate exception is goal enforcement: when a watched session claims it is done, chitra launches isolated Claude reviewer processes to check that claim against the session's frozen goal. The reviewers never draft chitra's messages, and their verdicts stay in chitra's own logs.
+Chitra delivers messages to long-running LLM agent sessions in tmux and persistently supervises each explicitly bound transcript against its frozen goal. `monitord` detects drift and stalls, persists corrective intent and retries across restarts, answers only contract-settled questions, and executes enrolled completion validators. `dispatchd` remains the sole terminal writer. Protected or ambiguous choices remain operator-gated.
 
 ## Getting started
 
 Start here if you're new to chitra:
 
 - **[Quickstart](quickstart/)** — Install chitra and run your first dispatch.
-- **[Concepts](concepts/)** — Understand chitra's two layers: the deterministic core (delivery, ledger, rate-limiting, routing, ownership) and the LLM-judgment layer (goal enforcement via watchd).
+- **[Concepts](concepts/)** — Understand deterministic delivery and the persistent goal-bound supervision layer.
 
 ## Core reference
 

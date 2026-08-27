@@ -122,9 +122,7 @@ def _cli_enroll(
                     "out_of_scope": {"answer": "Unrelated board changes are excluded.", "provenance": "operator:test"},
                     "constraints": {"answer": "Keep the change small and tested.", "provenance": "operator:test"},
                 },
-                "enrolled_done_when_items": [
-                    {"id": "done-1", "text": done_when, "validator": "pytest", "required_receipt": "tests-green"}
-                ],
+                "enrolled_done_when_items": [{"id": "done-1", "text": done_when, "validator": "pytest", "required_receipt": "tests-green"}],
             }
         ),
         encoding="utf-8",
@@ -277,12 +275,15 @@ def test_load_old_record_without_optional_fields_is_backward_compatible(tmp_path
     assert record.enrolled_at == payload["updated_at"]
     with pytest.raises(GoalValidationError, match="legacy goals are display-only"):
         upsert_goal(tmp_path, record)
-    assert close_goal(
-        tmp_path,
-        record.session_ref,
-        administrative=True,
-        administrative_reason="retire the pre-interview record without claiming completion",
-    ) == record
+    assert (
+        close_goal(
+            tmp_path,
+            record.session_ref,
+            administrative=True,
+            administrative_reason="retire the pre-interview record without claiming completion",
+        )
+        == record
+    )
 
 
 @pytest.mark.parametrize(
@@ -314,6 +315,17 @@ def test_new_optional_goal_fields_are_strictly_validated(tmp_path: Path, field: 
     (tmp_path / "goals.json").write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(ValueError, match=message):
+        load_goals(tmp_path)
+
+
+@pytest.mark.parametrize("invalid_status", ["finished", "", None, 1])
+def test_persisted_goal_status_fails_closed(tmp_path: Path, invalid_status: object) -> None:
+    record_payload = _record().to_dict()
+    record_payload["status"] = invalid_status
+    payload = {"schema": "chitra.goals.v3", "goals": [record_payload]}
+    (tmp_path / "goals.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="goal record status"):
         load_goals(tmp_path)
 
 
@@ -832,9 +844,7 @@ def test_done_transition_and_close_require_the_exact_named_receipt(tmp_path: Pat
     assert get_goal(tmp_path, completed.session_ref) == completed
 
 
-def test_one_interviewed_item_with_named_receipt_succeeds_end_to_end(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_one_interviewed_item_with_named_receipt_succeeds_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     record = _record()
     set_args = [
         "set",
@@ -930,9 +940,7 @@ def test_administrative_discard_requires_reason_and_is_not_completion(tmp_path: 
     assert get_goal(tmp_path, stored.session_ref) is None
 
 
-def test_goal_cli_first_set_requires_typed_interview_without_writing_goal(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_goal_cli_first_set_requires_typed_interview_without_writing_goal(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     record = _record()
     command = [
         "set",
@@ -1106,20 +1114,14 @@ def _write_schema_document(root: Path, schema: str, *, extra_document_field: boo
     (root / "goals.json").write_text(json.dumps(document), encoding="utf-8")
 
 
-def test_load_accepts_any_chitra_goals_version_and_ignores_unknown_fields(tmp_path: Path) -> None:
-    """A file written by a newer package (chitra.goals.v4+) loads here: any
-    chitra.goals.v<N> label is accepted and unknown top-level or per-record
-    fields are dropped in memory instead of crashing the reader -- the
-    outage class where an installed daemon died at load on a newer store."""
+def test_load_rejects_newer_chitra_goals_versions(tmp_path: Path) -> None:
+    """A newer writer's contract is not readable by this package."""
     _write_schema_document(tmp_path, "chitra.goals.v4", extra_document_field=True, extra_record_field=True)
 
-    records, file_schema = load_goals_document(tmp_path)
-
-    assert file_schema == "chitra.goals.v4"
-    assert [record.session_ref for record in records] == [_record().session_ref]
-    assert records[0].goal == _record().goal
-    assert not hasattr(records[0], "future_v4_field")
-    assert load_goals(tmp_path) == records
+    with pytest.raises(GoalsSchemaNewerError, match="newer than installed package schema"):
+        load_goals_document(tmp_path)
+    with pytest.raises(GoalsSchemaNewerError, match="newer than installed package schema"):
+        load_goals(tmp_path)
 
 
 def test_load_still_refuses_a_label_outside_the_chitra_goals_family(tmp_path: Path) -> None:
@@ -1172,12 +1174,8 @@ def test_schema_version_comparisons(schema: str) -> None:
     assert schema_is_newer_than_installed(schema) == (version > 3)
 
 
-def test_goal_cli_set_against_a_newer_store_exits_3_with_the_migrate_hint(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """The v4-outage CLI contract: a write against a store labeled newer than
-    this package exits 3 with the --migrate hint, and the store's schema
-    label is untouched so a newer package can still read its own file."""
+def test_goal_cli_set_against_a_newer_store_exits_3_with_the_migrate_hint(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """The CLI refuses to inspect a store written by a newer package."""
     document = {"schema": "chitra.goals.v4", "updated_at": "2026-08-22T00:00:00+00:00", "goals": []}
     (tmp_path / "goals.json").write_text(json.dumps(document), encoding="utf-8")
     record = _record()
@@ -1194,41 +1192,7 @@ def test_goal_cli_set_against_a_newer_store_exits_3_with_the_migrate_hint(
         "--source",
         record.source,
     ]
-    assert main(set_args) == 2
-    required = json.loads(capsys.readouterr().out)
-    assert required["type"] == "INTERVIEW_REQUIRED"
-    result_path = tmp_path / "interview-result.json"
-    result_path.write_text(
-        json.dumps(
-            {
-                "type": "INTERVIEW_RESULT",
-                "nonce": required["nonce"],
-                "receipt_name": required["receipt_name"],
-                "answers": {
-                    "intent": {
-                        "answer": "Deliver the requested deterministic goal behavior safely for operators.",
-                        "provenance": "operator:test",
-                    },
-                    "done_when": {"answer": record.done_when, "provenance": "operator:test"},
-                    "out_of_scope": {"answer": "Unrelated board changes are excluded.", "provenance": "operator:test"},
-                    "constraints": {"answer": "Keep the change small and tested.", "provenance": "operator:test"},
-                },
-                "enrolled_done_when_items": [
-                    {
-                        "id": "done-1",
-                        "text": record.done_when,
-                        "validator": "pytest",
-                        "required_receipt": "tests-green",
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    exit_code = main([*set_args, "--interview-result", str(result_path)])
-
-    assert exit_code == 3
+    assert main(set_args) == 3
     captured = capsys.readouterr()
     assert "newer than installed package schema" in captured.err
     assert "--migrate" in captured.err

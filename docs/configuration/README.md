@@ -157,7 +157,7 @@ Every daemon accepts `--help` to list its flags. Common patterns:
 
 ```bash
 dispatchd --queue-dir /var/lib/chitra/queue --once
-watchd --session-prefix agent --interval-seconds 5
+chitra-monitord --state-dir /var/lib/chitra --once
 rate-limit-guard --policy-config /etc/chitra/policy.yaml
 ```
 
@@ -167,14 +167,15 @@ The Debian package installs the shared daemon units from
 `packaging/systemd/`. The checked-in units are the canonical service contract:
 
 - `chitra-dispatchd.service`
-- `chitra-watchd.service`
-- `chitra-triaged.service`
-- `chitra-sweepd.service`
+- `chitra-monitord@.service.example`
 
 They use the released virtual environment at `/opt/chitra/venv` and the
 declaration at `/etc/chitra/lanes.yaml`. A fleet deployment that uses isolated
 instance templates owns those templates in the fleet repository; do not copy a
 shared unit into an instance-specific service name.
+
+Legacy `watchd`, `triaged`, and `sweepd` units remain shipped for existing
+declarations. New deployments use monitord and dispatchd.
 
 ## Example policy walkthrough
 
@@ -182,9 +183,9 @@ To understand how policy works, walk through a scenario:
 
 1. **Session enrolls with goal:** "Implement user authentication."
 2. **Dispatchd delivers messages:** Updates go into the session queue; policy.dispatch.banned_attribution_patterns checks that nudges don't falsely claim operator authorship.
-3. **Session finishes and claims completion:** Watchd launches reviewers to check the output.
-4. **Reviewer scans output:** Policy.completion_gate.deferral_phrases checks for "you'll need to", "future work", etc. If found, the verdict is reject.
-5. **Operator reviews verdict:** Via convlog, the operator decides to accept or redirect.
+3. **Session finishes and claims completion:** Monitord runs the enrolled validators and checks the stored receipts.
+4. **Completion evidence fails:** The goal stays disputed and monitord continues supervision.
+5. **Protected choice remains:** The operator decides only the gated choice through the existing decision path.
 6. **Rate-limit-guard runs:** Checks account usage against policy.usage thresholds. If Claude usage is >92% of 5-hour window, pauses the session.
 7. **Host load spike:** Memory drops below policy.load.l2_mem_available_pct (15%). Sessions are capped at l2_max_running (4 instead of 8).
 

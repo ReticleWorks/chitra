@@ -365,13 +365,15 @@ def build_snapshot(
     current = datetime.now(UTC) if now is None else now
     if current.tzinfo is None:
         raise ValueError("now must be timezone-aware")
-    goals = _index_goals(list_goals(state_dir))
+    # Sweepd publishes a read-only digest. It may display fields understood by
+    # this package from a newer store, but it never uses this opt-in to write.
+    goals = _index_goals(list_goals(state_dir, allow_newer=True))
     transactions = _index_transactions(load_transactions(state_dir))
     registry = _index_registry(load_registry(state_dir))
     load_states = {state.host: state for state in load_load_states(state_dir)}
     load_levels = {host: state.load_level for host, state in sorted(load_states.items())}
     shed_lanes = tuple(session_ref for host in sorted(load_states) for session_ref in load_states[host].shed_lanes)
-    due_refs = {record.session_ref for record in due_goals(state_dir, now=current)}
+    due_refs = {record.session_ref for record in due_goals(state_dir, now=current, allow_newer=True)}
     lanes: dict[str, LaneState] = {}
     for session_ref in sorted(set(goals) | set(transactions)):
         lanes[session_ref] = _lane_state(

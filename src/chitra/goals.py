@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -55,11 +56,11 @@ SCHEMA = "chitra.goals.v3"
 # disposal, but their missing v3 enrollment contract can never pass launch,
 # enter a done state, or use completion close.
 SUPPORTED_SCHEMAS = (SCHEMA, "chitra.goals.v2", "chitra.goals.v1")
-# Reads tolerate every chitra.goals.v<N> document (unknown fields are ignored
-# on load), so a file written by a newer package can never crash a daemon at
-# load time; GOALS_SCHEMA_RE is the read gate, not SUPPORTED_SCHEMAS. Writes
-# keep the file's own schema label and refuse a file newer than SCHEMA unless
-# the caller explicitly migrates (see GoalsSchemaNewerError).
+# Reads accept this package's schema and older versions only. A newer package
+# may have changed the meaning of fields this package cannot verify, so every
+# load/read fails closed with GoalsSchemaNewerError. Writes keep the file's own
+# older schema label and refuse a newer file unless the caller explicitly
+# migrates (see GoalsSchemaNewerError).
 GOALS_SCHEMA_RE = re.compile(r"^chitra\.goals\.v([0-9]+)$")
 GOALS_SCHEMA_NEWER_MESSAGE = "goals schema newer than installed package"
 
@@ -105,6 +106,35 @@ class GoalsSchemaNewerError(ValueError):
     """Raised when a write would rewrite a goals.json newer than this package."""
 
 
+@contextmanager
+def goal_lane_lock(
+    root: Path | None,
+    session_ref: str,
+    *,
+    lock_dir: Path | None = None,
+) -> Iterator[None]:
+    """Hold the dispatch lane lock before touching this lane's goal state.
+
+    Dispatch takes the lane lock before its final goal recheck and keeps it
+    through the terminal paste. Goal writers use the same order, then take
+    the goals-file lock. When a root is supplied, both sides default to its
+    ``locks`` directory; callers with an explicit dispatch ``--lock-dir``
+    pass that directory here as well.
+    """
+    from chitra.dispatch import LaneLock
+
+    resolved_lock_dir = lock_dir if lock_dir is not None else (root / "locks" if root is not None else None)
+    lane_lock = LaneLock(session_ref, lock_dir=resolved_lock_dir)
+    # A delivery keeps this lock while it waits for the target transcript to
+    # flush. Goal mutations wait out that bounded verification window rather
+    # than failing after LaneLock's shorter transport-oriented default.
+    lane_lock.acquire(blocking=True, timeout_seconds=60.0)
+    try:
+        yield
+    finally:
+        lane_lock.release()
+
+
 @pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True))
 class InterviewReceipt:
     """Immutable proof that all four enrollment questions were answered."""
@@ -129,9 +159,9 @@ class EnrolledDoneWhenItem:
 class GoalRecord:
     """The five canonical fields plus monitor-maintained tactical metadata.
 
-    ``extra="ignore"`` is the persisted-read contract: fields this package
-    does not know (written by a newer schema) are dropped in memory instead
-    of failing the load.
+    ``extra="ignore"`` preserves compatibility with older records and
+    harmless extension fields in records at this schema. The document schema
+    gate in ``load_goals_document`` rejects newer writers before records load.
     """
 
     session_ref: str
@@ -200,6 +230,8 @@ class GoalRecord:
             if not isinstance(value, str):
                 raise ValueError(f"goal record {field} must be a string")
             normalized[field] = value
+        if normalized["status"] not in GOAL_STATUSES:
+            raise ValueError(f"goal record status must be one of {', '.join(GOAL_STATUSES)}")
         for field in (
             "lane_id",
             "enrolled_done_when",
@@ -455,14 +487,17 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def load_goals_document(root: Path | None = None) -> tuple[list[GoalRecord], str]:
+def load_goals_document(root: Path | None = None, *, allow_newer: bool = False) -> tuple[list[GoalRecord], str]:
     """Load records plus the file's own ``file_schema``, backfilling legacy anchors.
 
-    Any ``chitra.goals.v<N>`` document loads; unknown top-level and per-record
-    fields are ignored in memory so a newer writer's file stays readable here
-    instead of crashing the reader. The returned second element is the file's
-    own schema label, which writers must keep unless an explicit migration
-    upgrades it (see ``GoalsSchemaNewerError``).
+    Installed and older ``chitra.goals.v<N>`` documents load. A newer schema
+    fails closed because unknown fields may change the meaning of the goal or
+    its authority gates. The returned second element is the file's own schema
+    label, which writers keep unless an explicit migration upgrades it.
+
+    ``allow_newer`` is reserved for explicit read-only observation and
+    operator-approved migration. Ordinary and authoritative reads fail closed
+    on a newer schema.
 
     Records written before enrollment anchors existed use their current
     ``done_when`` once, and persist that normalized anchor on their next write.
@@ -477,6 +512,8 @@ def load_goals_document(root: Path | None = None) -> tuple[list[GoalRecord], str
     schema = payload.get("schema")
     if not isinstance(schema, str) or _schema_version(schema) is None:
         raise ValueError(f"goals.json schema must match {GOALS_SCHEMA_RE.pattern}, got {schema!r}")
+    if schema_is_newer_than_installed(schema) and not allow_newer:
+        raise GoalsSchemaNewerError(f"goals.json file schema {schema} is newer than installed package schema {SCHEMA}; refusing to read it")
     raw_goals = payload.get("goals")
     if not isinstance(raw_goals, list):
         raise ValueError("goals.json goals must be a list")
@@ -487,13 +524,13 @@ def load_goals_document(root: Path | None = None) -> tuple[list[GoalRecord], str
     return records, schema
 
 
-def load_goals(root: Path | None = None) -> list[GoalRecord]:
+def load_goals(root: Path | None = None, *, allow_newer: bool = False) -> list[GoalRecord]:
     """Load records, backfilling legacy enrollment anchors in memory.
 
     Records written before enrollment anchors existed use their current
     ``done_when`` once, and persist that normalized anchor on their next write.
     """
-    records, _ = load_goals_document(root)
+    records, _ = load_goals_document(root, allow_newer=allow_newer)
     return records
 
 
@@ -527,6 +564,7 @@ def upsert_goal(
     *,
     clear_open_asks: bool = False,
     migrate: bool = False,
+    lock_dir: Path | None = None,
 ) -> GoalRecord:
     """Validate and atomically insert or update one record by ``session_ref``.
 
@@ -539,7 +577,7 @@ def upsert_goal(
     issues = validate_goal(rec, require_enrollment=False)
     if issues:
         raise GoalValidationError("; ".join(issues))
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, rec.session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         stored = _upsert_goal_locked(root, rec, clear_open_asks=clear_open_asks, migrate=migrate)
     logger.info("goal_mutated", session_ref=stored.session_ref, action="upsert")
     return stored
@@ -569,7 +607,7 @@ def _upsert_goal_locked(
     leave a real window between the caller's own read and the write. See
     docs/SOL-ADVERSARIAL-REVIEW finding #9.
     """
-    records = load_goals(root)
+    records = load_goals(root, allow_newer=migrate)
     existing = next((record for record in records if record.session_ref == rec.session_ref), None)
     if existing is not None and validate_enrollment_contract(existing) and not allow_legacy_administrative:
         raise GoalValidationError("legacy goals are display-only; use a reasoned administrative redirect or discard")
@@ -680,11 +718,12 @@ def redirect_goal(
     intent: str | None = None,
     scope: str | None = None,
     source: str | None = None,
+    lock_dir: Path | None = None,
 ) -> GoalRecord:
     """Replace strategic values after recording the prior operator direction."""
     if not reason.strip():
         raise ValueError("redirect reason must be non-empty")
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
@@ -740,6 +779,7 @@ def record_review_restart(
     previous_contract_id: str,
     restarted_contract_id: str,
     behavior_sha256: str,
+    lock_dir: Path | None = None,
 ) -> GoalRecord:
     """Append the required revert trail for an automatic redirect restart.
 
@@ -747,7 +787,7 @@ def record_review_restart(
     deliberately leaves every strategic field and the goal version unchanged;
     ``redirect_goal`` already recorded the strategic revision itself.
     """
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
@@ -778,12 +818,13 @@ def update_now(
     status: GoalStatus | None = None,
     last_verified: str | None = None,
     migrate: bool = False,
+    lock_dir: Path | None = None,
 ) -> GoalRecord:
     """Update only the current tactical state of an existing goal record."""
     if status in DONE_STATUSES:
         raise GoalValidationError("update_now cannot set a done-* status; use the completion-gate path")
-    with locked_json_store(goals_path(root)):
-        existing = get_goal(root, session_ref)
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
+        existing = get_goal(root, session_ref, allow_newer=migrate)
         if existing is None:
             raise GoalNotFoundError(session_ref)
         stored = _upsert_goal_locked(
@@ -807,9 +848,10 @@ def mark_completion_gate_passed(
     now: str,
     last_verified: str,
     completion_evidence: Sequence[CompletionEvidence],
+    lock_dir: Path | None = None,
 ) -> GoalRecord:
     """Record Watchd's already-passed completion audit and goal review."""
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
@@ -842,7 +884,14 @@ def mark_completion_gate_passed(
     return stored
 
 
-def hold_goal(root: Path | None, session_ref: str, *, reason: str, resume_at: str = "") -> GoalRecord:
+def hold_goal(
+    root: Path | None,
+    session_ref: str,
+    *,
+    reason: str,
+    resume_at: str = "",
+    lock_dir: Path | None = None,
+) -> GoalRecord:
     """Mark an existing lane held while retaining its re-arm payload."""
     if not reason.strip():
         raise ValueError("hold reason must be non-empty")
@@ -853,7 +902,7 @@ def hold_goal(root: Path | None, session_ref: str, *, reason: str, resume_at: st
             timezone_message="resume_at must be an ISO8601 datetime with timezone",
             require_timezone=True,
         )
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
@@ -885,6 +934,7 @@ def transfer_goal(
     digest: str,
     reason: str,
     resume_at: str = "",
+    lock_dir: Path | None = None,
 ) -> tuple[GoalRecord, GoalRecord]:
     """Hold a lane and scaffold its successor on the other backend, atomically.
 
@@ -914,7 +964,7 @@ def transfer_goal(
             timezone_message="resume_at must be an ISO8601 datetime with timezone",
             require_timezone=True,
         )
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
@@ -963,9 +1013,9 @@ def transfer_goal(
     return held, stored_successor
 
 
-def resume_goal(root: Path | None, session_ref: str) -> GoalRecord:
+def resume_goal(root: Path | None, session_ref: str, *, lock_dir: Path | None = None) -> GoalRecord:
     """Return an explicitly held lane to working state and clear hold metadata."""
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
@@ -976,13 +1026,18 @@ def resume_goal(root: Path | None, session_ref: str) -> GoalRecord:
     return resumed
 
 
-def due_goals(root: Path | None = None, *, now: datetime | None = None) -> list[GoalRecord]:
+def due_goals(
+    root: Path | None = None,
+    *,
+    now: datetime | None = None,
+    allow_newer: bool = False,
+) -> list[GoalRecord]:
     """Return timed held lanes due at or before ``now`` in stable operator order."""
     current = datetime.now(UTC) if now is None else now
     if current.tzinfo is None:
         raise ValueError("now must be timezone-aware")
     due: list[tuple[datetime, GoalRecord]] = []
-    for record in load_goals(root):
+    for record in load_goals(root, allow_newer=allow_newer):
         if record.status != "held" or not record.resume_at:
             continue
         resume_at = parse_iso8601(
@@ -996,9 +1051,9 @@ def due_goals(root: Path | None = None, *, now: datetime | None = None) -> list[
     return [record for _, record in sorted(due, key=lambda item: (item[0], item[1].session_ref))]
 
 
-def add_ask(root: Path | None, session_ref: str, ask: str) -> GoalRecord:
+def add_ask(root: Path | None, session_ref: str, ask: str, *, lock_dir: Path | None = None) -> GoalRecord:
     """Persist one exact open operator ask for an existing lane, once only."""
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
@@ -1020,12 +1075,13 @@ def resolve_ask(
     basis: str = "Operator answered the ask.",
     citation: str = "operator-ruling",
     authority: str = "operator",
+    lock_dir: Path | None = None,
 ) -> GoalRecord:
     """Retire asks while preserving who decided and the cited basis."""
     selector_count = int(ask is not None) + int(index is not None) + int(all)
     if selector_count != 1:
         raise ValueError("select exactly one of ask, index, or all")
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
@@ -1063,14 +1119,14 @@ def resolve_ask(
     return stored
 
 
-def get_goal(root: Path | None, session_ref: str) -> GoalRecord | None:
+def get_goal(root: Path | None, session_ref: str, *, allow_newer: bool = False) -> GoalRecord | None:
     """Return the record for ``session_ref``, if the monitor has stored one."""
-    return next((record for record in load_goals(root) if record.session_ref == session_ref), None)
+    return next((record for record in load_goals(root, allow_newer=allow_newer) if record.session_ref == session_ref), None)
 
 
-def list_goals(root: Path | None = None) -> list[GoalRecord]:
+def list_goals(root: Path | None = None, *, allow_newer: bool = False) -> list[GoalRecord]:
     """Return all current goal records in their persisted order."""
-    return load_goals(root)
+    return load_goals(root, allow_newer=allow_newer)
 
 
 def descope_delta(record: GoalRecord) -> tuple[RequiredItem, ...]:
@@ -1100,6 +1156,7 @@ def close_goal(
     operator_acknowledged_items: Sequence[str] = (),
     administrative: bool = False,
     administrative_reason: str = "",
+    lock_dir: Path | None = None,
 ) -> GoalRecord:
     """Remove a record.
 
@@ -1108,7 +1165,7 @@ def close_goal(
     (e.g. a superseded hold being reconciled by the sweep janitor), NOT a
     completion claim, so the delivery-inventory gate does not apply to it.
     """
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         records = load_goals(root)
         closed = next((record for record in records if record.session_ref == session_ref), None)
         if closed is None:

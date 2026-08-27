@@ -7,7 +7,7 @@ import pytest
 from _goal_fixtures import enrollment_fields
 
 from chitra.dispatch import DispatchOrder
-from chitra.goal_enforcement import SessionReviewSignal, WatchedSessionBehavior, freeze_goal
+from chitra.goal_enforcement import ReviewFinding, SessionReviewSignal, WatchedSessionBehavior, freeze_goal
 from chitra.goals import GoalRecord
 from chitra.reasoning import (
     DecisionQuestion,
@@ -114,6 +114,9 @@ def test_oracle_is_called_only_after_goal_and_principles_are_insufficient() -> N
 
     assert decision.source == "oracle-escalated"
     assert decision.oracle_escalated is True
+    assert decision.autonomy == "operator_required"
+    assert decision.operator_confirmation_required is True
+    assert "oracle escalation" in decision.operator_gate_reasons
     assert len(calls) == 1
     assert all(match.confidence < 0.75 for match in calls[0].principle_matches)
     assert len(decision.insufficiency_reasons) == 2
@@ -233,7 +236,11 @@ def test_unanimous_in_scope_technical_answer_is_autonomous_but_sensitive_actions
     autonomous = DecisionReasoner(PrinciplesIndex()).decide(
         goal,
         judgment,
-        DecisionQuestion(text="May the lane use the existing typed boundary?", session_review=review),
+        DecisionQuestion(
+            text="May the lane use the existing typed boundary?",
+            authority_class="routine",
+            session_review=review,
+        ),
     )
     assert autonomous.autonomy == "autonomous"
     assert autonomous.operator_confirmation_required is False
@@ -244,6 +251,7 @@ def test_unanimous_in_scope_technical_answer_is_autonomous_but_sensitive_actions
             judgment,
             DecisionQuestion(
                 text="May the lane take this sensitive action?",
+                authority_class="routine",
                 session_review=review,
                 **{flag: True},
             ),
@@ -254,9 +262,104 @@ def test_unanimous_in_scope_technical_answer_is_autonomous_but_sensitive_actions
     textually_gated = DecisionReasoner(PrinciplesIndex()).decide(
         goal,
         judgment,
-        DecisionQuestion(text="May the lane use an API key to purchase a paid plan?", session_review=review),
+        DecisionQuestion(
+            text="May the lane use an API key to purchase a paid plan?",
+            authority_class="routine",
+            session_review=review,
+        ),
     )
     assert set(textually_gated.operator_gate_reasons) >= {"credentials", "spend"}
+
+
+def test_default_authority_class_is_operator_required() -> None:
+    decision = DecisionReasoner(PrinciplesIndex()).decide(
+        _goal(),
+        GoalJudgment(
+            determines_answer=True,
+            answer="Use the existing typed boundary.",
+            goal_fields=["scope"],
+            inference="The scope settles this bounded answer.",
+        ),
+        DecisionQuestion(text="May the lane use the existing typed boundary?"),
+    )
+
+    assert decision.authority_class == "operator_required"
+    assert decision.autonomy == "operator_required"
+    assert decision.operator_confirmation_required is True
+
+
+def test_small_delta_requires_verification_and_rejects_governance_changes() -> None:
+    goal = _goal()
+    judgment = GoalJudgment(
+        determines_answer=True,
+        answer="Make the bounded implementation change.",
+        goal_fields=["scope"],
+        inference="The scope settles the bounded change.",
+    )
+    review = _accepted_review(goal)
+
+    missing_verification = DecisionReasoner(PrinciplesIndex()).decide(
+        goal,
+        judgment,
+        DecisionQuestion(authority_class="small_delta", session_review=review, text="Make the small change."),
+    )
+    assert missing_verification.autonomy == "operator_required"
+    assert "missing small-delta verification references" in missing_verification.operator_gate_reasons
+
+    for flag in (
+        "new_dependency",
+        "new_schema",
+        "new_hook",
+        "new_authorization_boundary",
+        "out_of_scope_path",
+    ):
+        gated = DecisionReasoner(PrinciplesIndex()).decide(
+            goal,
+            judgment,
+            DecisionQuestion(
+                authority_class="small_delta",
+                session_review=review,
+                text="Make the small change.",
+                verification_refs=["test:small-delta"],
+                **{flag: True},
+            ),
+        )
+        assert gated.autonomy == "operator_required"
+
+
+def test_corrective_authority_requires_rejected_recognized_cited_review() -> None:
+    goal = _goal()
+    judgment = GoalJudgment(
+        determines_answer=True,
+        answer="Take the corrective action.",
+        goal_fields=["goal", "scope"],
+        inference="The rejected review identifies a corrective action.",
+    )
+    accepted = _accepted_review(goal)
+    gated = DecisionReasoner(PrinciplesIndex()).decide(
+        goal,
+        judgment,
+        DecisionQuestion(authority_class="corrective", session_review=accepted, text="Correct the rejected turn."),
+    )
+    assert gated.autonomy == "operator_required"
+
+    rejected = SessionReviewSignal.create(
+        session_ref=goal.session_ref,
+        goal_contract_id=freeze_goal(goal).contract_id,
+        behavior_sha256="1" * 64,
+        verdict="reject",
+        reviewer_ids=("reviewer-1",),
+        findings=(
+            ReviewFinding(code="other", detail="Unclassified finding.", citation="The lane stopped."),
+        ),
+    )
+    unrecognized = DecisionReasoner(PrinciplesIndex()).decide(
+        goal,
+        judgment,
+        DecisionQuestion(authority_class="corrective", session_review=rejected, text="Correct the rejected turn."),
+    )
+    assert unrecognized.autonomy == "operator_required"
+    assert "unrecognized or uncited" in " ".join(unrecognized.operator_gate_reasons)
 
 
 def test_none_cannot_be_hashed_or_attested_as_approved_text() -> None:

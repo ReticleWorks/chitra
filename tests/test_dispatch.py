@@ -350,6 +350,68 @@ def test_transcript_confirms_nudge_excludes_given_path(tmp_path: Path) -> None:
     assert path is None
 
 
+def test_transcript_confirms_nudge_expected_path_ignores_newer_unrelated_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bound transcript without the marker must not fall back to a newer
+    unrelated transcript that happens to contain the same marker."""
+    projects_root = tmp_path / "projects"
+    bound_dir = projects_root / "bound-lane"
+    unrelated_dir = projects_root / "unrelated-lane"
+    bound_dir.mkdir(parents=True)
+    unrelated_dir.mkdir(parents=True)
+    bound = bound_dir / "bound.jsonl"
+    unrelated = unrelated_dir / "newer.jsonl"
+    bound.write_text(user_turn_jsonl("a different nudge"), encoding="utf-8")
+    unrelated.write_text(user_turn_jsonl("check the bound lane"), encoding="utf-8")
+    newer = time.time() + 1
+    os.utime(unrelated, (newer, newer))
+
+    def unexpected_discovery() -> str:
+        raise AssertionError("expected transcript verification must not glob")
+
+    monkeypatch.setattr("chitra.dispatch.transcript_glob", unexpected_discovery)
+    confirmed, path = transcript_confirms_nudge(
+        "check the bound lane",
+        projects_root=projects_root,
+        expected_transcript_path=bound,
+        now_ts=time.time(),
+    )
+
+    assert confirmed is False
+    assert path is None
+
+
+def test_transcript_confirms_nudge_expected_path_accepts_only_bound_match(tmp_path: Path) -> None:
+    projects_root = tmp_path / "projects"
+    bound_dir = projects_root / "bound-lane"
+    wrong_dir = projects_root / "wrong-lane"
+    bound_dir.mkdir(parents=True)
+    wrong_dir.mkdir(parents=True)
+    bound = bound_dir / "bound.jsonl"
+    wrong = wrong_dir / "wrong.jsonl"
+    bound.write_text(user_turn_jsonl("check the bound lane"), encoding="utf-8")
+    wrong.write_text(user_turn_jsonl("a different nudge"), encoding="utf-8")
+
+    confirmed, path = transcript_confirms_nudge(
+        "check the bound lane",
+        projects_root=projects_root,
+        expected_transcript_path=bound,
+        now_ts=time.time(),
+    )
+    assert confirmed is True
+    assert path == bound
+
+    confirmed, path = transcript_confirms_nudge(
+        "check the bound lane",
+        projects_root=projects_root,
+        expected_transcript_path=wrong,
+        now_ts=time.time(),
+    )
+    assert confirmed is False
+    assert path is None
+
+
 def test_find_recent_transcript_searches_multiple_pathsep_separated_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A session under a non-default CLAUDE_CONFIG_DIR (e.g. chitra's own
     monitor/harness identity, which runs under ~/.claude-chitra rather than
@@ -401,6 +463,45 @@ def test_find_recent_transcript_remote_matches_tail_from_ssh_output() -> None:
 
     path = find_recent_transcript_remote("otherhost", "please check lane f3 status now", runner=runner)
     assert path == "/home/ubuntu/.claude/projects/foo/abc.jsonl"
+
+
+def test_find_recent_transcript_remote_expected_path_skips_discovery() -> None:
+    expected = "/remote/projects/bound/abc.jsonl"
+    calls: list[list[str]] = []
+
+    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        assert "find " not in cmd[-1]
+        return fake_completed(0, user_turn_jsonl("check the bound lane"), "")
+
+    path = find_recent_transcript_remote(
+        "otherhost",
+        "check the bound lane",
+        expected_transcript_path=expected,
+        runner=runner,
+    )
+
+    assert path == expected
+    assert len(calls) == 1
+    assert expected in calls[0][-1]
+
+
+def test_find_recent_transcript_remote_expected_path_rejects_nonmatching_tail() -> None:
+    expected = "/remote/projects/bound/abc.jsonl"
+
+    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+        assert "find " not in cmd[-1]
+        return fake_completed(0, user_turn_jsonl("a different nudge"), "")
+
+    assert (
+        find_recent_transcript_remote(
+            "otherhost",
+            "check the bound lane",
+            expected_transcript_path=expected,
+            runner=runner,
+        )
+        is None
+    )
 
 
 def test_find_recent_transcript_remote_matches_json_escaped_quote_and_whitespace() -> None:
@@ -1082,9 +1183,15 @@ def test_unconfigured_policy_path_matches_explicit_shipped_policy() -> None:
 def test_dispatch_to_tmux_sends_a_clean_order(tmp_path: Path) -> None:
     projects_root = tmp_path / "projects"
     session_dir = projects_root / "some-project"
+    unrelated_dir = projects_root / "unrelated-project"
     session_dir.mkdir(parents=True)
+    unrelated_dir.mkdir(parents=True)
     transcript = session_dir / "abc123.jsonl"
+    unrelated = unrelated_dir / "newer.jsonl"
     transcript.write_text(user_turn_jsonl("Stop editing main and open a PR."), encoding="utf-8")
+    unrelated.write_text(user_turn_jsonl("Stop editing main and open a PR."), encoding="utf-8")
+    newer = time.time() + 1
+    os.utime(unrelated, (newer, newer))
 
     def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
         if cmd[:2] == ["tmux", "capture-pane"]:
@@ -1101,9 +1208,11 @@ def test_dispatch_to_tmux_sends_a_clean_order(tmp_path: Path) -> None:
         input_runner=input_runner,
         local_extra={"localhost"},
         projects_root=projects_root,
+        expected_transcript_path=transcript,
         sleep=lambda _seconds: None,
     )
     assert result.status == DispatchStatus.SENT
+    assert result.transcript_path == str(transcript)
 
 
 def test_dispatch_to_tmux_uses_governed_remote_capture_and_steer(monkeypatch: pytest.MonkeyPatch) -> None:

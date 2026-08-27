@@ -16,8 +16,8 @@ Queue layout (default ``queue_dir``, overridable per call/CLI):
                                      guard-held, or because a lane lock
                                      timed out (see below); no terminal
                                      result file exists for it yet
-    queue_dir/results/<id>.json  -- DispatchResult JSON; a SENT result may be
-                                     written before ledger proof is available
+    queue_dir/results/<id>.json  -- DispatchResult JSON; a SENT result exists
+                                     only after delivery ledger proof verifies
     queue_dir/processed/*.json   -- the order file, moved here only after a
                                      terminal result, and for SENT only after
                                      a matching signed ledger entry
@@ -27,9 +27,9 @@ Crash-safety:
 - **Idempotent redelivery.** Once a result file exists for an order id, that
   order is never redispatched -- ``process_one_order`` checks for an
   existing result file (both before and again immediately after acquiring
-  the lane lock -- see "Lane-lock recheck" below). A SENT result is recovered
-  by retrying its ledger proof, not by pasting again; the order moves to
-  ``processed/`` only after that proof exists.
+  the lane lock -- see "Lane-lock recheck" below). A SENT result is accepted
+  during recovery only when an already-existing signed ledger row proves the
+  exact delivery; recovery never creates proof from the result itself.
 - **Atomic reservation and claim.** Before moving an order file from
   ``orders/`` into ``in_flight/``, dispatchd creates its owner marker with
   exclusive-create semantics. Two workers racing the same order can each
@@ -106,7 +106,7 @@ import contextlib
 import json
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import structlog
@@ -137,18 +137,24 @@ from .goals import (
 from .journal import native_session_identity
 from .orders import DispatchOrder, DispatchResult, DispatchStatus
 from .policy_config import PolicyConfig, load_policy_config
+from .question_handler import handle_question
 from .queue_state import (
     LaneLockRetryTracker,
     QueueLayout,
     QueueSubdir,
     StoredResult,
     TerminalFinalization,
+    _move_without_replace,
+    _require_real_directory,
+    _validate_pending_order_path,
     reclaim_stale_claims,
     requeue_deferred_to_orders,
     reserve_claim,
 )
 from .routing_config import RoutingConfig, load_routing_config, resolve_route, resolve_routing_hint
 from .state_paths import default_attestation_ledger_path, default_ledger_key_path, default_ledger_path, default_queue_dir
+from .supervision import goal_digest
+from .transcript_bindings import DEFAULT_FILENAME, load_transcript_bindings
 
 logger = structlog.get_logger(__name__)
 
@@ -162,11 +168,11 @@ _SCHEMA_NOTICED_ROOTS: set[str] = set()
 
 
 def note_goals_schema_state(goals_root: Path | None) -> None:
-    """Journal one read-only notice when this store's file schema is newer.
+    """Journal one fail-closed notice when this store's file schema is newer.
 
-    A newer goals.json never stops the queue: goal state is treated as
-    read-only and the daemon keeps running instead of exiting into a
-    supervisor restart loop (the chitra.goals.v4 outage class).
+    The daemon process keeps running instead of entering a supervisor restart
+    loop, but every goal-bound order is blocked because this package cannot
+    verify a newer writer's contract.
     """
     file_schema = goals_schema_newer_than_installed(goals_root)
     if file_schema is None:
@@ -175,10 +181,45 @@ def note_goals_schema_state(goals_root: Path | None) -> None:
     if key in _SCHEMA_NOTICED_ROOTS:
         return
     _SCHEMA_NOTICED_ROOTS.add(key)
-    print(
-        f"{GOALS_SCHEMA_NEWER_MESSAGE} goals_root={key} file_schema={file_schema} "
-        f"installed_schema={GOALS_INSTALLED_SCHEMA}"
-    )
+    print(f"{GOALS_SCHEMA_NEWER_MESSAGE} goals_root={key} file_schema={file_schema} installed_schema={GOALS_INSTALLED_SCHEMA}")
+
+
+def _goal_contract_rejection(order: DispatchOrder, goals_root: Path | None) -> str | None:
+    """Return a pre-delivery rejection for a stale or non-actionable order."""
+    if order.goal_digest is None and order.goal_version is None:
+        return None
+    try:
+        current_goal = get_goal(goals_root, order.session_ref)
+    except GoalsSchemaNewerError:
+        # A newer writer's store cannot be verified by this package.  A goal-
+        # bound order must not be delivered on an unverifiable contract, and
+        # this rejection must happen in both the pre-lock and under-lock
+        # checks so the claimed file is finalized rather than wedged in
+        # ``in_flight/``.
+        note_goals_schema_state(goals_root)
+        return "goals-schema-newer-than-installed"
+    if (
+        current_goal is None
+        or order.goal_digest is None
+        or order.goal_version is None
+        or current_goal.goal_version != order.goal_version
+        or goal_digest(current_goal) != order.goal_digest
+    ):
+        return "stale-goal-contract"
+    if current_goal.status in {"held", "done-pending-verification", "done-pending-close"}:
+        return "goal-not-actionable"
+    if order.message_kind == "goal_contract_answer":
+        expected_question_result = (
+            handle_question(current_goal, order.question_result.question) if order.question_result is not None else None
+        )
+        if (
+            expected_question_result is None
+            or expected_question_result != order.question_result
+            or expected_question_result.disposition != "answered"
+            or expected_question_result.answer != order.nudge
+        ):
+            return "invalid-goal-contract-answer"
+    return None
 
 
 class _ConfigNotPreloaded:
@@ -201,6 +242,7 @@ _RATE_LIMIT_GUARD_TASK_TYPES = frozenset(
         "load-shed-resume",
     }
 )
+_STRICT_AUTONOMOUS_TASK_TYPES = frozenset({"persistent-oversight"})
 SESSION_ALLOW_PREFIXES_ENV_VAR = "CHITRA_ALLOWED_SESSION_PREFIXES"
 SESSION_DENY_PREFIXES_ENV_VAR = "CHITRA_DENIED_SESSION_PREFIXES"
 
@@ -252,11 +294,10 @@ def _write_result_atomic(
 ) -> Path:
     """Publish one result without clobbering a prior writer by default.
 
-    The first durable result is the queue's idempotency record. The only
-    allowed replacement is the later ``delivery_ledger_verified`` proof-bit
-    update after dispatchd has validated the existing result. Keeping those
-    operations explicit prevents the pre-ledger SENT write from undoing the
-    single-writer guarantee in ``TerminalFinalization``.
+    The first durable result is the queue's idempotency record. Replacement
+    is reserved for recovery after dispatchd validates an old SENT result
+    against an already-existing signed ledger row. New SENT results are
+    always ledger-proven before their first write.
     """
     stored = StoredResult(order_id=result.order_id, path=results_dir / f"{result.order_id}.json")
     payload = result.model_dump(mode="json")
@@ -307,6 +348,8 @@ def _ensure_delivery_ledger(
     *,
     ledger_path: Path | None,
     ledger_key_path: Path | None,
+    expected_transcript_path: Path | None = None,
+    require_native_session_id: bool = False,
 ) -> ledger_mod.LedgerEntry:
     """Return signed proof for a SENT order, appending it when needed.
 
@@ -320,12 +363,19 @@ def _ensure_delivery_ledger(
     normalizers and bound into the signed row (signature version 5). The
     value never comes from ``routing_hint``, which stays opaque audit
     metadata. A transcript that yields no fixture-gated native identity
-    still gets a valid v4 row; consumption then fails closed instead of
-    trusting an unbound session.
+    still gets a valid v4 row for legacy orders; strict autonomous orders
+    fail closed instead of trusting an unbound session.
     """
     resolved_ledger_path = ledger_path or default_ledger_path()
     resolved_key_path = ledger_key_path or (ledger_path.with_name("ledger.key") if ledger_path is not None else default_ledger_key_path())
     key = ledger_mod.load_or_create_signing_key(resolved_key_path)
+    expected_native_session_id: str | None = None
+    if require_native_session_id:
+        if expected_transcript_path is None:
+            raise OSError(f"strict delivery has no exact bound transcript for order {order.order_id}")
+        expected_native_session_id = native_session_identity(expected_transcript_path)
+        if not expected_native_session_id:
+            raise OSError(f"strict bound transcript has no fixture-gated native session identity for order {order.order_id}")
     existing = ledger_mod.verify_delivery(
         resolved_ledger_path,
         key=key,
@@ -334,9 +384,22 @@ def _ensure_delivery_ledger(
         nudge=order.nudge,
     )
     if existing is not None:
+        if require_native_session_id and existing.native_session_id != expected_native_session_id:
+            raise OSError(f"strict delivery ledger proof names another native session for order {order.order_id}")
         return existing
 
-    if not result.native_session_id and result.transcript_path:
+    if require_native_session_id:
+        if expected_transcript_path is None or not result.transcript_path:
+            raise OSError(f"strict SENT result has no exact bound transcript for order {order.order_id}")
+        try:
+            expected_path = expected_transcript_path.expanduser().resolve()
+            result_path = Path(result.transcript_path).expanduser().resolve()
+        except (OSError, RuntimeError) as exc:
+            raise OSError(f"strict SENT result transcript path cannot be resolved for order {order.order_id}") from exc
+        if result_path != expected_path:
+            raise OSError(f"strict SENT result transcript path is not the bound path for order {order.order_id}")
+        result.native_session_id = expected_native_session_id
+    elif not result.native_session_id and result.transcript_path:
         result.native_session_id = native_session_identity(Path(result.transcript_path))
     ledger_mod.append_entry(
         resolved_ledger_path,
@@ -359,7 +422,48 @@ def _ensure_delivery_ledger(
     )
     if verified is None:
         raise OSError(f"delivery ledger append did not produce proof for order {order.order_id}")
+    if require_native_session_id and verified.native_session_id != expected_native_session_id:
+        raise OSError(f"strict delivery ledger proof names another native session for order {order.order_id}")
     return verified
+
+
+def _verify_existing_delivery_ledger(
+    order: DispatchOrder,
+    *,
+    ledger_path: Path | None,
+    ledger_key_path: Path | None,
+) -> ledger_mod.LedgerEntry | None:
+    """Verify an already-written delivery row without appending one."""
+    resolved_ledger_path = ledger_path or default_ledger_path()
+    resolved_key_path = ledger_key_path or (ledger_path.with_name("ledger.key") if ledger_path is not None else default_ledger_key_path())
+    key = ledger_mod.load_or_create_signing_key(resolved_key_path)
+    return ledger_mod.verify_delivery(
+        resolved_ledger_path,
+        key=key,
+        order_id=order.order_id,
+        session_ref=order.session_ref,
+        nudge=order.nudge,
+    )
+
+
+def _strict_autonomous_order(order: DispatchOrder) -> bool:
+    """Return whether this order requires an exact transcript binding."""
+    return order.task_type in _STRICT_AUTONOMOUS_TASK_TYPES or order.message_kind == "goal_contract_answer"
+
+
+def _load_transcript_binding_paths(
+    bindings_path: Path | None,
+    *,
+    transcript_root: Path | None,
+    default_path: Path,
+) -> dict[str, Path]:
+    """Load one v1 binding manifest and resolve its paths for this pass."""
+    manifest_path = bindings_path or (transcript_root / DEFAULT_FILENAME if transcript_root is not None else default_path)
+    bindings = load_transcript_bindings(manifest_path, transcript_root=transcript_root)
+    return {
+        binding.session_ref: binding.resolved_path(manifest_path=manifest_path, transcript_root=transcript_root)
+        for binding in bindings
+    }
 
 
 def _complete_existing_result(
@@ -372,13 +476,19 @@ def _complete_existing_result(
     deferred_dir: Path,
     ledger_path: Path | None,
     ledger_key_path: Path | None,
+    transcript_binding_path: Path | None,
+    strict_autonomous: bool,
 ) -> None:
     """Recover a claimed order whose result was written by an earlier pass.
 
     A result file is not itself a queue acknowledgment. SENT results from the
-    old behavior can exist without ledger proof, so recovery retries signing
-    the already-recorded delivery and never calls the pane transport again.
+    old behavior can exist without ledger proof. Such a result remains
+    claimed until an already-existing signed ledger row proves this exact
+    order; recovery never creates a row from the result and never calls the
+    pane transport again.
     """
+    if existing_result_path.is_symlink():
+        raise ValueError(f"result path must not be a symlink: {existing_result_path}")
     try:
         stored_result = DispatchResult.model_validate_json(existing_result_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -397,12 +507,51 @@ def _complete_existing_result(
 
     if stored_result.status == DispatchStatus.SENT:
         try:
-            _ensure_delivery_ledger(
+            existing_ledger = _verify_existing_delivery_ledger(
                 order,
-                stored_result,
                 ledger_path=ledger_path,
                 ledger_key_path=ledger_key_path,
             )
+            if existing_ledger is None:
+                logger.error(
+                    "dispatchd_existing_sent_result_without_ledger_proof",
+                    order_id=order.order_id,
+                    session_ref=order.session_ref,
+                )
+                return
+            if strict_autonomous:
+                bound_native_id = (
+                    native_session_identity(transcript_binding_path)
+                    if transcript_binding_path is not None
+                    else None
+                )
+                try:
+                    stored_transcript_path = (
+                        Path(stored_result.transcript_path).expanduser().resolve()
+                        if stored_result.transcript_path
+                        else None
+                    )
+                    bound_transcript_path = (
+                        transcript_binding_path.expanduser().resolve()
+                        if transcript_binding_path is not None
+                        else None
+                    )
+                except (OSError, RuntimeError):
+                    stored_transcript_path = None
+                    bound_transcript_path = None
+                if (
+                    not bound_native_id
+                    or existing_ledger.native_session_id != bound_native_id
+                    or stored_transcript_path is None
+                    or stored_transcript_path != bound_transcript_path
+                ):
+                    logger.error(
+                        "dispatchd_existing_strict_result_without_exact_transcript_proof",
+                        order_id=order.order_id,
+                        session_ref=order.session_ref,
+                    )
+                    return
+            stored_result.native_session_id = existing_ledger.native_session_id
             stored_result.delivery_ledger_verified = True
             _write_result_atomic(results_dir, stored_result, overwrite=True)
         except Exception as exc:  # noqa: BLE001 -- retry on the next daemon pass
@@ -537,6 +686,7 @@ def process_one_order(
     goals_root: Path | None = None,
     dispatch_runner: TmuxRunner | None = None,
     projects_root: Path | None = None,
+    transcript_binding_paths: Mapping[str, Path] | None = None,
     local_extra: set[str] | None = None,
     tmux_socket: Path | None = None,
     allowed_session_prefixes: tuple[str, ...] = (),
@@ -549,9 +699,9 @@ def process_one_order(
 
     Crash-safe: if a result file already exists for this order id, the order
     is never re-dispatched. A non-SENT result is moved to ``processed/``. A
-    SENT result is first reconciled with its signed delivery ledger; if the
-    proof is absent, dispatchd retries only the ledger write and leaves the
-    order unacknowledged until that succeeds.
+    SENT result is reconciled only with an already-existing signed delivery
+    ledger row. If proof is absent, dispatchd leaves the order claimed and
+    never invents proof from the result.
 
     ``routing_config``, if given, maps ``task_type`` to a routing selection
     (see ``chitra.routing_config``). If the order's ``routing_hint`` is not
@@ -580,6 +730,11 @@ def process_one_order(
     """
     if lane_lock_retry_attempts < 1:
         raise ValueError("lane_lock_retry_attempts must be at least 1")
+    _validate_pending_order_path(orders_dir, order_path)
+    _require_real_directory(results_dir, label="results directory")
+    _require_real_directory(processed_dir, label="processed directory")
+    if invalid_dir is not None:
+        _require_real_directory(invalid_dir, label="invalid directory")
     policy = policy or PolicyConfig()
     tuning = tuning or DispatchTuning()
     layout = QueueLayout(orders_dir.parent)
@@ -627,6 +782,7 @@ def process_one_order(
             goals_root=goals_root,
             dispatch_runner=dispatch_runner,
             projects_root=projects_root,
+            transcript_binding_paths=transcript_binding_paths,
             local_extra=local_extra,
             tmux_socket=tmux_socket,
             allowed_session_prefixes=allowed_session_prefixes,
@@ -655,6 +811,7 @@ def _process_claimed_order(
     goals_root: Path | None,
     dispatch_runner: TmuxRunner | None,
     projects_root: Path | None,
+    transcript_binding_paths: Mapping[str, Path] | None,
     local_extra: set[str] | None,
     tmux_socket: Path | None,
     allowed_session_prefixes: tuple[str, ...],
@@ -704,9 +861,16 @@ def _process_claimed_order(
             if resolved_hint is not None:
                 order.routing_hint = resolved_hint
 
+    strict_autonomous = _strict_autonomous_order(order)
+    transcript_binding_path = (
+        transcript_binding_paths.get(order.session_ref) if transcript_binding_paths is not None else None
+    )
+    attestation_id = order.decision_attestation.attestation_id if order.decision_attestation is not None else None
     # The caller-supplied results directory stays authoritative for the
     # idempotency lookup, matching where _write_result_atomic persists.
     existing_result = results_dir / f"{order.order_id}.json"
+    if existing_result.is_symlink():
+        raise ValueError(f"result path must not be a symlink: {existing_result}")
     if existing_result.exists():
         logger.info("dispatchd_order_already_processed", order_id=order.order_id)
         _complete_existing_result(
@@ -718,10 +882,31 @@ def _process_claimed_order(
             deferred_dir=deferred_dir,
             ledger_path=ledger_path,
             ledger_key_path=ledger_key_path,
+            transcript_binding_path=transcript_binding_path,
+            strict_autonomous=strict_autonomous,
         )
         return None
 
-    attestation_id = order.decision_attestation.attestation_id if order.decision_attestation is not None else None
+    goal_contract_rejection = _goal_contract_rejection(order, goals_root)
+    if goal_contract_rejection is not None:
+        result = DispatchResult(
+            order_id=order.order_id,
+            session_ref=order.session_ref,
+            status=DispatchStatus.BLOCKED,
+            reason=goal_contract_rejection,
+            routing_hint=order.routing_hint,
+            task_type=order.task_type,
+            resolved_zdr=resolved_zdr,
+            decision_attestation_id=attestation_id,
+        )
+        return _finalize_claimed_order(
+            claimed_path,
+            results_dir=results_dir,
+            destination_dir=processed_dir,
+            result=result,
+            retry_state_dir=deferred_dir,
+            retry_order_id=order.order_id,
+        )
     if retry_tracker.attempts(order.order_id, retry_limit=lane_lock_retry_attempts) >= lane_lock_retry_attempts:
         logger.error(
             "dispatchd_lane_lock_retry_exhausted",
@@ -865,7 +1050,12 @@ def _process_claimed_order(
             summary=audit.summary,
         )
 
-    lock = LaneLock(order.session_ref, lock_dir=lock_dir)
+    # Goal writers default to ``<goals_root>/locks``. Keep dispatch on that
+    # same directory when no explicit ``--lock-dir`` was supplied, so a goal
+    # hold, redirect, or completion cannot land between this lock's final
+    # recheck and the paste.
+    effective_lock_dir = lock_dir if lock_dir is not None else (goals_root / "locks" if goals_root is not None else None)
+    lock = LaneLock(order.session_ref, lock_dir=effective_lock_dir)
     try:
         lock.acquire(blocking=True, timeout_seconds=tuning.lane_lock_timeout_seconds)
     except LaneLockError as exc:
@@ -922,7 +1112,7 @@ def _process_claimed_order(
         )
         deferred_dir.mkdir(parents=True, exist_ok=True)
         try:
-            claimed_path.replace(deferred_dir / claimed_path.name)
+            _move_without_replace(claimed_path, deferred_dir / claimed_path.name)
         except OSError as move_error:
             # The owner marker is removed by process_one_order's finally;
             # the next pass will reclaim the claimed file into orders/. The
@@ -951,8 +1141,54 @@ def _process_claimed_order(
                 deferred_dir=deferred_dir,
                 ledger_path=ledger_path,
                 ledger_key_path=ledger_key_path,
+                transcript_binding_path=transcript_binding_path,
+                strict_autonomous=strict_autonomous,
             )
             return None
+
+        # Recheck the exact goal contract while holding the same lane lock
+        # used for delivery. Completion, hold, redirect, or question-answer
+        # changes that land after the queue claim cannot race a stale paste.
+        goal_contract_rejection = _goal_contract_rejection(order, goals_root)
+        if goal_contract_rejection is not None:
+            result = DispatchResult(
+                order_id=order.order_id,
+                session_ref=order.session_ref,
+                status=DispatchStatus.BLOCKED,
+                reason=goal_contract_rejection,
+                routing_hint=order.routing_hint,
+                task_type=order.task_type,
+                resolved_zdr=resolved_zdr,
+                decision_attestation_id=attestation_id,
+            )
+            return _finalize_claimed_order(
+                claimed_path,
+                results_dir=results_dir,
+                destination_dir=processed_dir,
+                result=result,
+                retry_state_dir=deferred_dir,
+                retry_order_id=order.order_id,
+            )
+
+        if strict_autonomous and transcript_binding_path is None:
+            result = DispatchResult(
+                order_id=order.order_id,
+                session_ref=order.session_ref,
+                status=DispatchStatus.BLOCKED,
+                reason="missing-transcript-binding",
+                routing_hint=order.routing_hint,
+                task_type=order.task_type,
+                resolved_zdr=resolved_zdr,
+                decision_attestation_id=attestation_id,
+            )
+            return _finalize_claimed_order(
+                claimed_path,
+                results_dir=results_dir,
+                destination_dir=processed_dir,
+                result=result,
+                retry_state_dir=deferred_dir,
+                retry_order_id=order.order_id,
+            )
 
         # Rate-limit freeze/defer check, UNDER the lane lock (TOCTOU fix --
         # see this module's docstring). bypass_rate_limit_freeze only takes
@@ -985,7 +1221,7 @@ def _process_claimed_order(
             # into orders while the hold remains active.
             retry_tracker.clear(order.order_id)
             with contextlib.suppress(OSError):
-                claimed_path.replace(deferred_dir / claimed_path.name)
+                _move_without_replace(claimed_path, deferred_dir / claimed_path.name)
             return DispatchResult(
                 order_id=order.order_id,
                 session_ref=order.session_ref,
@@ -1013,6 +1249,7 @@ def _process_claimed_order(
                 order.nudge,
                 host=host,
                 projects_root=projects_root,
+                expected_transcript_path=transcript_binding_path,
                 recency_seconds=tuning.transcript_recency_seconds,
                 runner=dispatch_runner,
                 local_extra=local_extra,
@@ -1046,6 +1283,7 @@ def _process_claimed_order(
                 tuning=tuning,
                 runner=dispatch_runner,
                 projects_root=projects_root,
+                expected_transcript_path=transcript_binding_path,
                 local_extra=local_extra,
                 tmux_socket=tmux_socket,
             )
@@ -1111,22 +1349,23 @@ def _process_claimed_order(
             )
         deferred_dir.mkdir(parents=True, exist_ok=True)
         with contextlib.suppress(OSError):
-            claimed_path.replace(deferred_dir / claimed_path.name)
+            _move_without_replace(claimed_path, deferred_dir / claimed_path.name)
         return result
     if result.status == DispatchStatus.SENT:
-        # Persist the successful transport result before attempting the ledger
-        # write. If the ledger is temporarily unavailable, the next pass can
-        # retry the proof from this durable result without pasting twice.
-        _write_result_atomic(results_dir, result)
+        # Sign and verify the delivery before publishing the result. If the
+        # ledger is unavailable, leave the claim and nonce recoverable without
+        # creating an untrusted SENT result.
         try:
             _ensure_delivery_ledger(
                 order,
                 result,
                 ledger_path=ledger_path,
                 ledger_key_path=ledger_key_path,
+                expected_transcript_path=transcript_binding_path,
+                require_native_session_id=strict_autonomous,
             )
             result.delivery_ledger_verified = True
-            _write_result_atomic(results_dir, result, overwrite=True)
+            _write_result_atomic(results_dir, result)
         except Exception as exc:  # noqa: BLE001 -- keep the order pending for the next pass
             logger.error(
                 "dispatchd_delivery_ledger_pending",
@@ -1160,6 +1399,8 @@ def run_once(
     goals_root: Path | None = None,
     dispatch_runner: TmuxRunner | None = None,
     projects_root: Path | None = None,
+    transcript_root: Path | None = None,
+    transcript_bindings_path: Path | None = None,
     local_extra: set[str] | None = None,
     tmux_socket: Path | None = None,
     allowed_session_prefixes: tuple[str, ...] = (),
@@ -1191,6 +1432,11 @@ def run_once(
         raise ValueError("lane_lock_retry_attempts must be at least 1")
     queue_dir = queue_dir or default_queue_dir()
     orders_dir, results_dir, processed_dir = _ensure_queue_dirs(queue_dir)
+    transcript_binding_paths = _load_transcript_binding_paths(
+        transcript_bindings_path,
+        transcript_root=transcript_root,
+        default_path=queue_dir.parent / DEFAULT_FILENAME,
+    )
     _reclaim_stale_in_flight(queue_dir)
     note_goals_schema_state(goals_root)
     if isinstance(_preloaded_routing_config, _ConfigNotPreloaded):
@@ -1231,6 +1477,7 @@ def run_once(
             goals_root=goals_root,
             dispatch_runner=dispatch_runner,
             projects_root=projects_root,
+            transcript_binding_paths=transcript_binding_paths,
             local_extra=local_extra,
             tmux_socket=tmux_socket,
             allowed_session_prefixes=allowed_session_prefixes,
@@ -1255,6 +1502,8 @@ def run_forever(
     invalid_dir: Path | None = None,
     tuning: DispatchTuning | None = None,
     goals_root: Path | None = None,
+    transcript_root: Path | None = None,
+    transcript_bindings_path: Path | None = None,
     tmux_socket: Path | None = None,
     allowed_session_prefixes: tuple[str, ...] = (),
     denied_session_prefixes: tuple[str, ...] = (),
@@ -1307,6 +1556,8 @@ def run_forever(
             invalid_dir=invalid_dir,
             tuning=tuning,
             goals_root=goals_root,
+            transcript_root=transcript_root,
+            transcript_bindings_path=transcript_bindings_path,
             tmux_socket=tmux_socket,
             allowed_session_prefixes=allowed_session_prefixes,
             denied_session_prefixes=denied_session_prefixes,
@@ -1325,6 +1576,8 @@ def run_lanes_once(
     invalid_dir_name: str = "invalid",
     tuning: DispatchTuning | None = None,
     dispatch_runner: TmuxRunner | None = None,
+    transcript_root: Path | None = None,
+    transcript_bindings_path: Path | None = None,
 ) -> dict[str, list[DispatchResult]]:
     """Drain every enabled lane from one rendered declaration."""
     from chitra.lane_config import enabled_lanes
@@ -1344,6 +1597,8 @@ def run_lanes_once(
             goals_root=lane.state_dir,
             dispatch_runner=dispatch_runner,
             projects_root=lane.config_dir / "projects",
+            transcript_root=transcript_root or lane.config_dir / "projects",
+            transcript_bindings_path=transcript_bindings_path or lane.state_dir / DEFAULT_FILENAME,
             tmux_socket=lane.tmux_socket,
         )
     return results
@@ -1356,6 +1611,8 @@ def run_lanes_forever(
     routing_config_path: Path | None = None,
     policy_config_path: Path | None = None,
     tuning: DispatchTuning | None = None,
+    transcript_root: Path | None = None,
+    transcript_bindings_path: Path | None = None,
 ) -> None:
     """Run one shared dispatchd process over all enabled lane queues."""
     while True:
@@ -1364,6 +1621,8 @@ def run_lanes_forever(
             routing_config_path=routing_config_path,
             policy_config_path=policy_config_path,
             tuning=tuning,
+            transcript_root=transcript_root,
+            transcript_bindings_path=transcript_bindings_path,
         )
         time.sleep(poll_seconds)
 
@@ -1411,6 +1670,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="chitra.goals store root consulted for the guard freeze check (default: CHITRA_STATE_DIR).",
     )
     parser.add_argument(
+        "--transcript-root",
+        type=Path,
+        default=None,
+        help="Root used to resolve relative transcript paths in the binding manifest.",
+    )
+    parser.add_argument(
+        "--transcript-bindings-path",
+        type=Path,
+        default=None,
+        help="Strict chitra.transcript-bindings.v1 manifest for autonomous deliveries.",
+    )
+    parser.add_argument(
         "--allow-session-prefix",
         action="append",
         default=None,
@@ -1455,6 +1726,8 @@ def main(argv: list[str] | None = None) -> int:
                 routing_config_path=args.routing_config_path,
                 policy_config_path=args.policy_config_path,
                 tuning=tuning,
+                transcript_root=args.transcript_root,
+                transcript_bindings_path=args.transcript_bindings_path,
             )
             print(json.dumps({key: [item.model_dump(mode="json") for item in value] for key, value in lane_results.items()}, indent=2))
             return 0
@@ -1464,6 +1737,8 @@ def main(argv: list[str] | None = None) -> int:
             routing_config_path=args.routing_config_path,
             policy_config_path=args.policy_config_path,
             tuning=tuning,
+            transcript_root=args.transcript_root,
+            transcript_bindings_path=args.transcript_bindings_path,
         )
         return 0
     if args.once:
@@ -1478,6 +1753,8 @@ def main(argv: list[str] | None = None) -> int:
             invalid_dir=args.invalid_orders_dir,
             tuning=tuning,
             goals_root=args.goals_root,
+            transcript_root=args.transcript_root,
+            transcript_bindings_path=args.transcript_bindings_path,
             allowed_session_prefixes=allowed_session_prefixes,
             denied_session_prefixes=denied_session_prefixes,
             lane_lock_retry_attempts=args.lane_lock_retry_attempts,
@@ -1496,6 +1773,8 @@ def main(argv: list[str] | None = None) -> int:
         invalid_dir=args.invalid_orders_dir,
         tuning=tuning,
         goals_root=args.goals_root,
+        transcript_root=args.transcript_root,
+        transcript_bindings_path=args.transcript_bindings_path,
         allowed_session_prefixes=allowed_session_prefixes,
         denied_session_prefixes=denied_session_prefixes,
         lane_lock_retry_attempts=args.lane_lock_retry_attempts,

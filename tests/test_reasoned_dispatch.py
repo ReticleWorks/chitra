@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 import pytest
 from _goal_fixtures import enrollment_fields
 
+from chitra.dispatch import directive_voice_violation
 from chitra.goal_enforcement import ReviewFinding, SessionReviewSignal, freeze_goal
 from chitra.goals import GoalRecord
 from chitra.reasoned_dispatch import build_reasoned_dispatch
@@ -67,7 +68,9 @@ def test_rejected_completion_builds_reasoned_action_with_valid_attestation() -> 
     assert order.decision_attestation is not None
     assert order.decision_attestation.review_signal_id == review.signal_id
     assert order.decision_attestation.review_verdict == "reject"
-    assert order.decision_attestation.operator_confirmed is True
+    assert order.decision_attestation.authority_class == "corrective"
+    assert order.decision_attestation.autonomy == "autonomous"
+    assert order.decision_attestation.operator_confirmed is False
     assert order.nudge == order.decision_attestation.approved_text
 
 
@@ -115,7 +118,27 @@ def test_rejected_persistence_finding_builds_dispatch(code: str) -> None:
     assert order.decision_attestation is not None
     assert order.decision_attestation.outcome == "answer"
     assert order.decision_attestation.source == "goal"
+    assert order.decision_attestation.authority_class == "corrective"
+    assert order.decision_attestation.operator_confirmed is False
     assert order.decision_attestation.goal_fields == ("goal", "scope")
+
+
+def test_persistence_correction_passes_directive_voice_guard() -> None:
+    goal = _goal()
+    review = _review(
+        goal,
+        verdict="reject",
+        finding=ReviewFinding(
+            code="false_blocker",
+            detail="The turn declared a false blocker.",
+            citation="I cannot proceed with this task.",
+        ),
+    )
+
+    order = build_reasoned_dispatch(goal, review, principles=PrinciplesIndex())
+
+    assert order is not None
+    assert directive_voice_violation(order.nudge) is None
 
 
 def test_mixed_drift_and_persistence_findings_take_persistence_branch() -> None:

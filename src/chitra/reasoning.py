@@ -25,8 +25,23 @@ from chitra.lexicon import OPERATOR_GATE_PATTERNS
 logger = structlog.get_logger(__name__)
 
 RiskClass = Literal["a0", "a1", "a2", "a3"]
+AuthorityClass = Literal["routine", "diagnostic", "small_delta", "corrective", "operator_required"]
 DecisionSource = Literal["goal", "principle", "oracle-escalated", "abstained"]
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+_REVIEW_ACCEPTED_AUTHORITIES: frozenset[AuthorityClass] = frozenset({"routine", "diagnostic", "small_delta"})
+_CORRECTIVE_AUTHORITIES: frozenset[str] = frozenset(
+    {
+        "goal_drift",
+        "smuggled_redirect",
+        "hedged_completion",
+        "unsupported_completion",
+        "false_blocker",
+        "deferred_to_operator",
+        "idle_no_action",
+        "unverified_claim",
+    }
+)
 
 
 class ReasoningContractError(ValueError):
@@ -51,6 +66,7 @@ class DecisionQuestion(BaseModel):
 
     text: str = Field(min_length=1)
     answer_category: Literal["answer", "nudge", "action"] = "answer"
+    authority_class: AuthorityClass = "operator_required"
     risk_class: RiskClass = "a1"
     genuinely_ambiguous: bool = False
     expensive_to_reverse: bool = False
@@ -58,6 +74,12 @@ class DecisionQuestion(BaseModel):
     credentials: bool = False
     irreversible: bool = False
     strategy_redirect: bool = False
+    new_dependency: bool = False
+    new_schema: bool = False
+    new_hook: bool = False
+    new_authorization_boundary: bool = False
+    out_of_scope_path: bool = False
+    verification_refs: list[str] = Field(default_factory=list)
     evidence_refs: list[str] = Field(default_factory=list)
     session_review: SessionReviewSignal | None = None
 
@@ -108,6 +130,7 @@ class DecisionAttestation(BaseModel):
     approved_text: str = Field(min_length=1)
     approved_text_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source: DecisionSource
+    authority_class: AuthorityClass = "operator_required"
     goal_contract_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     goal_version: int = Field(ge=1)
     goal_fields: tuple[str, ...]
@@ -132,7 +155,20 @@ class DecisionAttestation(BaseModel):
             raise ValueError("approved_text_sha256 does not match approved_text")
         if self.operator_confirmed and not self.operator_confirmation_required:
             raise ValueError("operator confirmation cannot be attached to an autonomous decision")
-        if self.autonomy == "autonomous" and (self.operator_confirmation_required or self.review_verdict != "accept"):
+        if self.authority_class == "operator_required" and (
+            self.autonomy != "operator_required" or not self.operator_confirmation_required
+        ):
+            raise ValueError("operator_required authority must remain operator-gated")
+        if self.autonomy == "autonomous":
+            if self.authority_class in _REVIEW_ACCEPTED_AUTHORITIES and self.review_verdict != "accept":
+                raise ValueError("accepted review is required for autonomous routine authority")
+            if self.authority_class == "corrective" and self.review_verdict != "reject":
+                raise ValueError("rejected review is required for autonomous corrective authority")
+        if (
+            self.autonomy == "autonomous"
+            and self.authority_class != "corrective"
+            and (self.operator_confirmation_required or self.review_verdict != "accept")
+        ):
             raise ValueError("autonomous release requires unanimous watched-session acceptance and no operator gate")
         payload = self.model_dump(mode="json", exclude={"attestation_id"})
         expected = f"sha256:{hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}"
@@ -157,6 +193,7 @@ class DecisionAttestation(BaseModel):
             "reviewer_count": 0,
             "operator_gate_reasons": (),
             "operator_confirmed": False,
+            "authority_class": "operator_required",
             **values,
             "approved_text": approved_text,
             "approved_text_sha256": hashlib.sha256(approved_text.encode("utf-8")).hexdigest(),
@@ -332,10 +369,23 @@ class DecisionReasoner:
         selected = principles or []
         review = question.session_review
         gate_reasons: list[str] = []
-        if review is None:
-            gate_reasons.append("missing unanimous watched-session review")
-        elif review.verdict != "accept":
-            gate_reasons.append("watched-session review rejected the lane behavior")
+        if question.authority_class == "operator_required":
+            gate_reasons.append("operator-required authority class")
+        elif question.authority_class in _REVIEW_ACCEPTED_AUTHORITIES:
+            if review is None:
+                gate_reasons.append("missing current accepted watched-session review")
+            elif review.verdict != "accept":
+                gate_reasons.append("current watched-session review is not accepted")
+        elif question.authority_class == "corrective":
+            if review is None:
+                gate_reasons.append("missing current rejected watched-session review")
+            elif review.verdict != "reject":
+                gate_reasons.append("corrective authority requires a rejected watched-session review")
+            elif not review.findings or any(
+                finding.code not in _CORRECTIVE_AUTHORITIES or not finding.citation.strip()
+                for finding in review.findings
+            ):
+                gate_reasons.append("corrective review findings are unrecognized or uncited")
         if question.spend:
             gate_reasons.append("spend")
         if question.credentials:
@@ -346,6 +396,21 @@ class DecisionReasoner:
             gate_reasons.append("strategy redirect")
         if question.risk_class == "a3":
             gate_reasons.append("a3 consequence")
+        if source == "oracle-escalated":
+            gate_reasons.append("oracle escalation")
+        for flag, reason in (
+            (question.new_dependency, "new dependency"),
+            (question.new_schema, "new schema"),
+            (question.new_hook, "new hook"),
+            (question.new_authorization_boundary, "new authorization boundary"),
+            (question.out_of_scope_path, "out-of-scope path"),
+        ):
+            if flag:
+                gate_reasons.append(reason)
+        if question.authority_class == "small_delta" and not question.verification_refs:
+            gate_reasons.append("missing small-delta verification references")
+        if any(not ref.strip() for ref in question.verification_refs):
+            gate_reasons.append("blank verification reference")
         combined_text = f"{question.text}\n{answer}"
         for reason, pattern in OPERATOR_GATE_PATTERNS:
             if pattern.search(combined_text):
@@ -363,6 +428,7 @@ class DecisionReasoner:
             message_kind=message_kind,
             approved_text=answer,
             source=source,
+            authority_class=question.authority_class,
             goal_contract_id=freeze_goal(goal).contract_id,
             goal_version=goal.goal_version,
             goal_fields=tuple(goal_fields),

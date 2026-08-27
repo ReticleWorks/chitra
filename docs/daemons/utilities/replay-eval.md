@@ -127,4 +127,4 @@ Replay-eval reports:
 ## See Also
 
 - **[Concepts — Completion Gating](../../concepts/README.md#goals-and-completion-gating)** — How completion review works in production.
-- **[Watchd](../operator-tools/watchd.md)** — The production completion-review daemon.
+- **[Monitord](../monitord.md)** — The current persistent completion supervisor.

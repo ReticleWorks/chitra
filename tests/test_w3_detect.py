@@ -27,7 +27,7 @@ from chitra.detect import (
     write_checkpoint_receipt,
     write_rescue_bundle,
 )
-from chitra.detect.ladder import CONSUMED_CHECKPOINT_SCHEMA
+from chitra.detect.ladder import CONSUMED_CHECKPOINT_SCHEMA, discover_consumption_proof
 from chitra.detect.rescue import (
     CHECKPOINT_PROVENANCE_KIND,
     CHECKPOINT_SCHEMA_VERSION,
@@ -415,13 +415,15 @@ def test_ladder_advances_only_after_proven_consumption(tmp_path: Path) -> None:
         turn_event("turn-2"),
         user_event("user-3", "rescue-1"),
         turn_event("turn-3"),
+        user_event("user-4", "post-rescue-1"),
+        turn_event("turn-4"),
     )
     store = IncidentStore(tmp_path, LANE)
     ladder = ResponseLadder(store, journal_events=journal, ledger_key=key)
     finding = Finding(
         detector="excessive_testing",
         fingerprint_seed={"signature": "suite"},
-        event_refs=("evt-a",),
+        event_refs=("user-2", "user-3", "user-4"),
         unmet_item="done-1",
         expected_next_progress="change something before rerunning",
         detail="suite repeated unchanged",
@@ -468,6 +470,152 @@ def test_ladder_advances_only_after_proven_consumption(tmp_path: Path) -> None:
     relaunched = ladder.evaluate(lane=LANE, finding=finding, order_marker="relaunch-1")
     assert relaunched.action == "advance"
     assert relaunched.stage == "relaunch"
+
+
+def test_discover_consumption_proof_requires_exact_payload_identity_and_boundary() -> None:
+    key = b"k" * 32
+    session_ref = f"host:{LANE}:0.0"
+    text = "[C] nudge-exact please continue"
+    entry = LedgerEntry(
+        order_id="order-exact",
+        session_ref=session_ref,
+        tag="[C]",
+        sig_v=4,
+        message_hash=message_hash(text),
+        sent_at="2026-08-21T15:00:00+00:00",
+        signature=sign(
+            key,
+            session_ref=session_ref,
+            tag="[C]",
+            digest=message_hash(text),
+            sent_at="2026-08-21T15:00:00+00:00",
+        ),
+    )
+    record = IncidentRecord(
+        lane=LANE,
+        fingerprint="f" * 64,
+        detector="unnecessary_steps",
+        stage="nudge",
+        order_marker="nudge-exact",
+        opened_at="2026-08-21T15:00:00+00:00",
+        event_refs=("after",),
+        unmet_item="done-1",
+        expected_next_progress="continue",
+        detail="repeat",
+    )
+    user = _event("exact-user", CanonicalType.UNKNOWN, native_type="user", payload={"text": text}, session_id=session_ref)
+    final = _event("exact-final", CanonicalType.FINAL_RESPONSE, payload={"text": "working"}, session_id=session_ref)
+    after = _event("after", CanonicalType.UNKNOWN, payload={"text": "more work"}, session_id=session_ref)
+    events = (user, final, after)
+
+    proof = discover_consumption_proof(record, events, entry, key)
+    assert proof is not None
+    assert proof.user_event_id == "exact-user"
+    assert proof.turn_event_id == "exact-final"
+
+    wrong_hash = entry.model_copy(update={"message_hash": message_hash("different")})
+    wrong_hash = wrong_hash.model_copy(
+        update={
+            "signature": sign(
+                key,
+                session_ref=session_ref,
+                tag="[C]",
+                digest=wrong_hash.message_hash,
+                sent_at=wrong_hash.sent_at,
+            )
+        }
+    )
+    assert discover_consumption_proof(record, events, wrong_hash, key) is None
+    wrong_session = tuple(event.model_copy(update={"session_id": "host:claude:other"}) for event in events)
+    assert discover_consumption_proof(record, wrong_session, entry, key) is None
+    assert discover_consumption_proof(record.model_copy(update={"order_marker": "nudge-missing"}), events, entry, key) is None
+    assert discover_consumption_proof(record, (user,), entry, key) is None
+
+
+def test_discover_consumption_proof_accepts_bare_session_ref_but_keeps_lane_exact() -> None:
+    key = b"k" * 32
+    session_ref = "session-1"
+    text = "[C] nudge-bare please continue"
+    entry = LedgerEntry(
+        order_id="order-bare",
+        session_ref=session_ref,
+        tag="[C]",
+        sig_v=4,
+        message_hash=message_hash(text),
+        sent_at="2026-08-21T15:00:00+00:00",
+        signature=sign(
+            key,
+            session_ref=session_ref,
+            tag="[C]",
+            digest=message_hash(text),
+            sent_at="2026-08-21T15:00:00+00:00",
+        ),
+    )
+    record = IncidentRecord(
+        lane=LANE,
+        fingerprint="b" * 64,
+        detector="unnecessary_steps",
+        stage="nudge",
+        order_marker="nudge-bare",
+        opened_at="2026-08-21T15:00:00+00:00",
+        event_refs=(),
+        unmet_item="done-1",
+        expected_next_progress="continue",
+        detail="repeat",
+    )
+    events = (
+        _event("bare-user", CanonicalType.UNKNOWN, native_type="user", payload={"text": text}, lane=LANE, session_id=session_ref),
+        _event("bare-final", CanonicalType.FINAL_RESPONSE, payload={"text": "working"}, lane=LANE, session_id=session_ref),
+    )
+
+    proof = discover_consumption_proof(record, events, entry, key)
+
+    assert proof is not None
+    assert proof.session_ref == session_ref
+    wrong_lane_events = tuple(event.model_copy(update={"lane": "other-lane"}) for event in events)
+    assert discover_consumption_proof(record, wrong_lane_events, entry, key) is None
+
+
+def test_ladder_does_not_advance_from_historical_finding_after_consumption(tmp_path: Path) -> None:
+    key = b"k" * 32
+    session_ref = f"host:{LANE}:0.0"
+    text = "[C] nudge-history please continue"
+    entry = LedgerEntry(
+        order_id="order-history",
+        session_ref=session_ref,
+        tag="[C]",
+        sig_v=4,
+        message_hash=message_hash(text),
+        sent_at="2026-08-21T15:00:00+00:00",
+        signature=sign(key, session_ref=session_ref, tag="[C]", digest=message_hash(text), sent_at="2026-08-21T15:00:00+00:00"),
+    )
+    journal = (
+        _event("history-user", CanonicalType.UNKNOWN, native_type="user", payload={"text": text}, session_id=session_ref),
+        _event("history-final", CanonicalType.FINAL_RESPONSE, payload={"text": "working"}, session_id=session_ref),
+    )
+    finding = Finding(
+        detector="unnecessary_steps",
+        fingerprint_seed={"signature": "history"},
+        event_refs=("history-user",),
+        unmet_item="done-1",
+        expected_next_progress="continue",
+        detail="repeat",
+    )
+    store = IncidentStore(tmp_path, LANE)
+    ladder = ResponseLadder(store, journal_events=journal, ledger_key=key)
+    assert ladder.evaluate(lane=LANE, finding=finding, order_marker="nudge-history").action == "open"
+    store.attach_consumption(
+        fingerprint=finding.fingerprint,
+        order_marker="nudge-history",
+        proof=ConsumptionProof(
+            ledger_entry=entry,
+            session_ref=session_ref,
+            native_session_id=session_ref,
+            user_event_id="history-user",
+            turn_event_id="history-final",
+        ),
+    )
+    assert ladder.evaluate(lane=LANE, finding=finding, order_marker="redirect-history").action == "hold"
 
 
 def test_ladder_consumption_requires_exact_event_session(tmp_path: Path) -> None:
@@ -553,6 +701,7 @@ def test_ladder_consumption_binds_governed_session_ref_to_native_session_id(
             }
         ),
         _final(event_sets["claude-unnecessary-steps"]).model_copy(update={"event_id": "native-final"}),
+        _event("native-post", CanonicalType.UNKNOWN, session_id=native_session_id),
     )
     assert journal[0].session_id == native_session_id
     assert native_session_id != session_ref
@@ -562,7 +711,7 @@ def test_ladder_consumption_binds_governed_session_ref_to_native_session_id(
     finding = Finding(
         detector="unnecessary_steps",
         fingerprint_seed={"signature": "stable"},
-        event_refs=("evt-1",),
+        event_refs=("native-post",),
         unmet_item="done-1",
         expected_next_progress="try a different approach",
         detail="three identical reads",
@@ -658,13 +807,15 @@ def test_rescue_seal_requires_verified_bundle_and_checkpoint(tmp_path: Path) -> 
         final_event("turn-2"),
         user_event("user-3", "rescue-1"),
         final_event("turn-3"),
+        user_event("user-4", "post-rescue-1"),
+        final_event("turn-4"),
     )
     store = IncidentStore(tmp_path, LANE)
     ladder = ResponseLadder(store, journal_events=journal, ledger_key=key)
     finding = Finding(
         detector="excessive_testing",
         fingerprint_seed={"signature": "suite"},
-        event_refs=("evt-a",),
+        event_refs=("user-2", "user-3", "user-4"),
         unmet_item="done-1",
         expected_next_progress="change something before rerunning",
         detail="suite repeated unchanged",
@@ -928,6 +1079,7 @@ def test_dispatch_delivery_ledger_binds_native_session_identity(tmp_path: Path) 
             }
         ),
         _final(observed).model_copy(update={"event_id": "dispatch-final"}),
+        _event("dispatch-post", CanonicalType.UNKNOWN, session_id=native_session_id),
     )
     assert journal[0].session_id == native_session_id
     key = (tmp_path / "ledger.key").read_bytes()
@@ -936,7 +1088,7 @@ def test_dispatch_delivery_ledger_binds_native_session_identity(tmp_path: Path) 
     finding = Finding(
         detector="unnecessary_steps",
         fingerprint_seed={"signature": "stable"},
-        event_refs=("evt-1",),
+        event_refs=("dispatch-post",),
         unmet_item="done-1",
         expected_next_progress="try a different approach",
         detail="three identical reads",
@@ -1013,13 +1165,15 @@ def _rescue_stage_incident(tmp_path: Path) -> tuple[IncidentStore, Finding, str]
         final_event("turn-2"),
         user_event("user-3", "rescue-1"),
         final_event("turn-3"),
+        user_event("user-4", "post-rescue-1"),
+        final_event("turn-4"),
     )
     store = IncidentStore(tmp_path, LANE)
     ladder = ResponseLadder(store, journal_events=journal, ledger_key=key)
     finding = Finding(
         detector="excessive_testing",
         fingerprint_seed={"signature": "suite"},
-        event_refs=("evt-a",),
+        event_refs=("user-2", "user-3", "user-4"),
         unmet_item="done-1",
         expected_next_progress="change something before rerunning",
         detail="suite repeated unchanged",

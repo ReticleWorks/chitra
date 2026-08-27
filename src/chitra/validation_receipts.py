@@ -2,7 +2,9 @@
 
 Receipts are immutable, per-lane records below the instance state root.  The
 common envelope deliberately carries validator-specific details inside its
-nine fixed top-level fields.
+nine fixed top-level fields.  Validator targets and evidence remain confined
+to the explicit instance workspace supplied by the caller; receipt claims
+never select an untrusted filesystem path for execution.
 """
 
 from __future__ import annotations
@@ -80,13 +82,13 @@ def _trusted_verifier_argv(name: str, target_path: str) -> tuple[str, ...]:
     return (sys.executable, "-m", argv[0], *argv[1:], target_path)
 
 
-def _trusted_verifier_argv_or_none(name: str) -> tuple[str, ...] | None:
+def _trusted_verifier_argv_or_none(name: str, target_path: str = "<target>") -> tuple[str, ...] | None:
     """Return the mapped verifier's invocation shape, or None when unmapped."""
     trusted = _TRUSTED_VALIDATORS.get(name)
     if trusted is None:
         return None
     argv = trusted.argv
-    return (sys.executable, "-m", argv[0], *argv[1:], "<target>")
+    return (sys.executable, "-m", argv[0], *argv[1:], target_path)
 
 
 class ReceiptError(ValueError):
@@ -184,10 +186,179 @@ def receipts_root(root: Path | None = None) -> Path:
     return (state_dir() if root is None else root) / "validation-receipts"
 
 
+def _session_receipts_root(root: Path | None, session_ref: str) -> Path:
+    """Return the collision-free receipt directory for one exact goal session."""
+    if not session_ref.strip():
+        raise ReceiptError("session_ref must be non-empty")
+    session_key = hashlib.sha256(session_ref.encode("utf-8")).hexdigest()
+    return receipts_root(root) / session_key
+
+
 def receipt_path(root: Path | None, session_ref: str, receipt_name: str) -> Path:
     if _SAFE_RECEIPT_NAME_RE.fullmatch(receipt_name) is None:
         raise ReceiptError("receipt_name must be a path-safe stable name")
+    return _session_receipts_root(root, session_ref) / f"{receipt_name}.json"
+
+
+def _legacy_receipt_path(root: Path | None, receipt_name: str) -> Path:
+    """Return the pre-session-isolation receipt path.
+
+    The old layout had one receipt namespace for the whole instance.  It is
+    only a migration input; new writes always use :func:`receipt_path`.
+    """
     return receipts_root(root) / f"{receipt_name}.json"
+
+
+def _legacy_receipt_is_exactly_enrolled(root: Path | None, session_ref: str, receipt_name: str) -> bool:
+    """Prove that one and only one current goal can own a legacy receipt.
+
+    A legacy envelope has no session field.  Therefore a root-layout receipt
+    is unsafe whenever another enrolled session names the same receipt.  We
+    fail closed instead of guessing which session produced it.
+    """
+    from chitra.goals import list_goals
+
+    owners = [
+        goal.session_ref
+        for goal in list_goals(root)
+        if any(item.required_receipt == receipt_name for item in goal.enrolled_done_when_items)
+    ]
+    return owners == [session_ref]
+
+
+def _fsync_directory(path: Path) -> None:
+    """Durably publish a directory entry where the platform permits it."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _migrate_legacy_receipt(root: Path | None, session_ref: str, receipt_name: str) -> Path:
+    """Move one unambiguous root-layout receipt into its session directory.
+
+    The legacy file is locked while ownership is checked.  Receipt and
+    evidence files are first assembled and verified in a temporary directory,
+    then the complete directory is published with one ``os.replace``.  Any
+    failure before publication leaves the legacy file untouched.
+    """
+    legacy = _legacy_receipt_path(root, receipt_name)
+    destination = receipt_path(root, session_ref, receipt_name)
+    with locked_json_store(legacy):
+        if destination.exists():
+            return destination
+        if not legacy.exists():
+            raise ReceiptError(f"receipt not found: {destination}")
+        if not _legacy_receipt_is_exactly_enrolled(root, session_ref, receipt_name):
+            raise ReceiptError(
+                f"legacy receipt {receipt_name!r} is not uniquely bound to session {session_ref!r}; refusing migration"
+            )
+        receipt, raw = load_receipt_file(legacy)
+        if receipt.receipt_name != receipt_name:
+            raise ReceiptError("legacy receipt name does not match its path")
+        source_check = verify_receipt_file(
+            legacy,
+            verify_current_target=False,
+            approved_root=root if root is not None else state_dir(),
+        )
+        if not source_check.verified:
+            raise ReceiptError("legacy receipt evidence verification failed: " + "; ".join(source_check.issues))
+
+        # Stage beside, rather than inside, the final session directory.  The
+        # directory rename below then publishes the receipt and all evidence
+        # as one filesystem operation.
+        receipts_root_path = receipts_root(root)
+        receipts_root_path.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.migration-", dir=receipts_root_path))
+        published = False
+        try:
+            for artifact in receipt.artifacts:
+                relative = _safe_relative_path(artifact.path)
+                _copy_file_atomic(legacy.parent / relative, staging / relative)
+            staged_receipt = staging / destination.name
+            write_json_atomic(staged_receipt, raw, fsync=True)
+            os.chmod(staged_receipt, 0o600)
+            staged_check = verify_receipt_file(
+                staged_receipt,
+                verify_current_target=False,
+                approved_root=root if root is not None else state_dir(),
+            )
+            if not staged_check.verified:
+                raise ReceiptError("migrated receipt verification failed: " + "; ".join(staged_check.issues))
+            _fsync_directory(staging)
+            if destination.exists():
+                existing = _load_raw(destination)
+                if existing != raw:
+                    raise ReceiptError(f"session receipt {receipt_name!r} already exists and differs from legacy receipt")
+            elif not destination.parent.exists():
+                try:
+                    os.replace(staging, destination.parent)
+                except OSError:
+                    # Another receipt for this same session may have created
+                    # the hashed directory after the existence check. Merge
+                    # into that directory below, but do not hide any other
+                    # rename failure.
+                    if not destination.parent.is_dir():
+                        raise
+                else:
+                    published = True
+
+            if not published and not destination.exists():
+                # A session directory can already contain other canonical
+                # receipts. In that case publish each immutable artifact
+                # atomically, then publish the receipt envelope last as the
+                # commit marker. A crash can leave an unreferenced artifact,
+                # but never a readable receipt with incomplete evidence.
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                for artifact in receipt.artifacts:
+                    relative = _safe_relative_path(artifact.path)
+                    staged_artifact = staging / relative
+                    stored_artifact = destination.parent / relative
+                    if stored_artifact.exists():
+                        if _hash_file(stored_artifact) != artifact.sha256:
+                            raise ReceiptError(
+                                f"stored evidence path is immutable and has a different digest: {artifact.path!r}"
+                            )
+                    else:
+                        _copy_file_atomic(staged_artifact, stored_artifact)
+                write_json_atomic(destination, raw, fsync=True)
+                os.chmod(destination, 0o600)
+
+            destination_check = verify_receipt_file(
+                destination,
+                verify_current_target=False,
+                approved_root=root if root is not None else state_dir(),
+            )
+            if not destination_check.verified:
+                raise ReceiptError(
+                    "published migrated receipt verification failed: " + "; ".join(destination_check.issues)
+                )
+            _fsync_directory(destination.parent)
+            # Removing only the old receipt after publication makes a crash
+            # safe: a duplicate is harmless, while data loss is impossible.
+            legacy.unlink()
+            _fsync_directory(legacy.parent)
+            return destination
+        except OSError as exc:
+            raise ReceiptError(f"legacy receipt migration failed: {exc}") from exc
+        finally:
+            if not published:
+                shutil.rmtree(staging, ignore_errors=True)
+
+
+def _receipt_path_for_read(root: Path | None, session_ref: str, receipt_name: str) -> Path:
+    """Resolve the canonical path, migrating one safe legacy receipt if needed."""
+    destination = receipt_path(root, session_ref, receipt_name)
+    if destination.exists():
+        return destination
+    legacy = _legacy_receipt_path(root, receipt_name)
+    if not legacy.exists():
+        return destination
+    return _migrate_legacy_receipt(root, session_ref, receipt_name)
 
 
 def receipt_name(value: str) -> str:
@@ -312,6 +483,84 @@ def _safe_relative_path(value: str) -> Path:
     return path
 
 
+def _approved_root_path(root: Path) -> Path:
+    """Resolve the explicit workspace root used for receipt path checks.
+
+    Receipt verification has no portable, safe filesystem sandbox.  The
+    approved state root is therefore the boundary: every target and evidence
+    path must stay beneath it, and no path component may be a symlink.  A
+    missing or non-directory root is not an implicit permission to use the
+    process working directory; it is a verification failure.
+    """
+    if not root.is_absolute():
+        raise ReceiptError(f"approved receipt workspace must be absolute: {root}")
+    try:
+        resolved = root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ReceiptError(f"approved receipt workspace is unreadable: {exc}") from exc
+    if not resolved.is_dir():
+        raise ReceiptError(f"approved receipt workspace is not a directory: {root}")
+    return resolved
+
+
+def _confined_path(path: Path, approved_root: Path | None, *, label: str) -> Path:
+    """Return ``path`` only when it is a real, non-symlink child of ``root``.
+
+    The check is deliberately lexical *and* resolved.  Lexical confinement
+    rejects absolute aliases and ``..`` tricks; walking the components and
+    resolving the complete path rejects symlink escapes (including a symlink
+    that points back inside the workspace).  Callers must pass an explicit
+    root.  Without one, running a receipt's validator would turn its claimed
+    path into authority, so verification fails closed before subprocess use.
+    """
+    if approved_root is None:
+        raise ReceiptError(f"{label} has no approved workspace root; refusing to verify its path")
+    root = _approved_root_path(approved_root)
+    if not path.is_absolute():
+        raise ReceiptError(f"{label} path must be absolute")
+    if any(part in ("", ".", "..") for part in path.parts):
+        raise ReceiptError(f"{label} path contains traversal components")
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise ReceiptError(f"{label} path is outside the approved workspace: {path}") from exc
+
+    current = root
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise ReceiptError(f"{label} path contains a symlink: {path}")
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ReceiptError(f"{label} path is unreadable: {exc}") from exc
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ReceiptError(f"{label} path escapes the approved workspace: {path}") from exc
+    return path
+
+
+def _artifact_root(base: Path, approved_root: Path | None) -> Path:
+    """Choose the explicit container for receipt-relative evidence files.
+
+    Stored receipts live below the approved state root.  An ingest source may
+    instead be an external upload directory; that directory is a transport
+    container, not a validator registry or target-execution authority.  Keep
+    its evidence confined to itself, including symlink checks, until ingest
+    copies it into the state root.
+    """
+    if approved_root is None:
+        return base
+    try:
+        resolved_base = base.resolve(strict=True)
+        resolved_root = _approved_root_path(approved_root)
+        resolved_base.relative_to(resolved_root)
+    except (OSError, RuntimeError, ReceiptError, ValueError):
+        return base
+    return approved_root
+
+
 def _hash_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -320,13 +569,18 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _artifact_issues(receipt: ValidationReceipt, base: Path) -> list[str]:
+def _artifact_issues(receipt: ValidationReceipt, base: Path, approved_root: Path | None) -> list[str]:
     issues: list[str] = []
+    evidence_root = _artifact_root(base, approved_root)
     for artifact in receipt.artifacts:
-        path = base / _safe_relative_path(artifact.path)
         try:
+            path = _confined_path(
+                base / _safe_relative_path(artifact.path),
+                evidence_root,
+                label=f"artifact {artifact.path!r}",
+            )
             actual = _hash_file(path)
-        except (FileNotFoundError, IsADirectoryError, PermissionError) as exc:
+        except (FileNotFoundError, IsADirectoryError, PermissionError, ReceiptError) as exc:
             issues.append(f"artifact {artifact.path!r} is not readable: {exc}")
             continue
         if not hmac.compare_digest(actual, artifact.sha256):
@@ -334,15 +588,20 @@ def _artifact_issues(receipt: ValidationReceipt, base: Path) -> list[str]:
     return issues
 
 
-def _target_issues(receipt: ValidationReceipt) -> list[str]:
+def _target_issues(receipt: ValidationReceipt, base: Path, approved_root: Path | None) -> list[str]:
     issues: list[str] = []
+    # Registered validators execute only their operator-provisioned exact
+    # argv, which may name an external repository. The receipt target never
+    # selects that command, but its own digest remains evidence and must still
+    # match the current approved target so an edited stored receipt fails.
     if "artifact" in receipt.target:
         target = _object(receipt.target["artifact"], name="target.artifact")
         path = Path(_text(target, "path", parent="target.artifact"))
         expected = _text(target, "sha256", parent="target.artifact")
         try:
+            path = _confined_path(path, approved_root, label="target.artifact")
             actual = _hash_file(path)
-        except (FileNotFoundError, IsADirectoryError, PermissionError) as exc:
+        except (FileNotFoundError, IsADirectoryError, PermissionError, ReceiptError) as exc:
             return [f"current target artifact is not readable: {exc}"]
         if not hmac.compare_digest(actual, expected):
             issues.append("current target artifact digest does not match the receipt")
@@ -351,6 +610,10 @@ def _target_issues(receipt: ValidationReceipt) -> list[str]:
     target = _object(receipt.target["commit"], name="target.commit")
     repository = Path(_text(target, "repository", parent="target.commit"))
     expected = _text(target, "sha", parent="target.commit")
+    try:
+        repository = _confined_path(repository, approved_root, label="target.commit repository")
+    except ReceiptError as exc:
+        return [f"current target commit is not readable: {exc}"]
     result = subprocess.run(
         ["git", "-C", str(repository), "rev-parse", "HEAD"],
         check=False,
@@ -381,10 +644,10 @@ def _validator_identifiers(receipt: ValidationReceipt) -> set[str]:
     return identifiers
 
 
-def _validator_issues(receipt: ValidationReceipt, base: Path) -> list[str]:
+def _validator_issues(receipt: ValidationReceipt, base: Path, approved_root: Path | None) -> list[str]:
     name = _text(receipt.validator, "name", parent="validator")
     if not name.startswith("Polyvalidation Rig"):
-        return _generic_validator_issues(receipt, base)
+        return _generic_validator_issues(receipt, base, approved_root)
     report_path = receipt.validator.get("report_path")
     status = receipt.result["status"]
     if report_path is None:
@@ -395,8 +658,13 @@ def _validator_issues(receipt: ValidationReceipt, base: Path) -> list[str]:
     if report_path not in artifact_by_path:
         return ["validator.report_path must name a hash-bound artifact"]
     try:
-        report = _load_raw(base / _safe_relative_path(report_path))
-    except ReceiptError as exc:
+        report_path_on_disk = _confined_path(
+            base / _safe_relative_path(report_path),
+            _artifact_root(base, approved_root),
+            label=f"validator report {report_path!r}",
+        )
+        report = _load_raw(report_path_on_disk)
+    except (ReceiptError, OSError) as exc:
         return [str(exc)]
     required = {"schema_version", "coverage_ledger", "verdict", "findings", "run_meta"}
     issues: list[str] = []
@@ -420,7 +688,16 @@ def _validator_issues(receipt: ValidationReceipt, base: Path) -> list[str]:
     if audit is None:
         issues.append("PVR report audit digest is not bound to an artifact")
     else:
-        issues.extend(_pvr_audit_issues(base / _safe_relative_path(audit.path), report, run_meta))
+        try:
+            audit_path = _confined_path(
+                base / _safe_relative_path(audit.path),
+                _artifact_root(base, approved_root),
+                label=f"validator audit {audit.path!r}",
+            )
+        except ReceiptError as exc:
+            issues.append(str(exc))
+        else:
+            issues.extend(_pvr_audit_issues(audit_path, report, run_meta))
 
     verdict = report.get("verdict")
     accepted = _pvr_report_accepted(verdict)
@@ -500,7 +777,7 @@ def _pvr_report_accepted(verdict: object) -> bool:
     )
 
 
-def _generic_validator_issues(receipt: ValidationReceipt, base: Path) -> list[str]:
+def _generic_validator_issues(receipt: ValidationReceipt, base: Path, approved_root: Path | None) -> list[str]:
     """Fail closed on PASS claims that lack a trusted validator execution.
 
     The frozen validator identity selects Chitra's own trusted verifier; the
@@ -518,8 +795,13 @@ def _generic_validator_issues(receipt: ValidationReceipt, base: Path) -> list[st
     if report_artifact is None:
         return ["PASS requires a hash-bound validator report artifact"]
     try:
-        raw_report = json.loads((base / _safe_relative_path(report_artifact.path)).read_text(encoding="utf-8"))
-    except (ReceiptError, FileNotFoundError, json.JSONDecodeError) as exc:
+        report_path = _confined_path(
+            base / _safe_relative_path(report_artifact.path),
+            _artifact_root(base, approved_root),
+            label=f"validator report {report_artifact.path!r}",
+        )
+        raw_report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (ReceiptError, FileNotFoundError, IsADirectoryError, PermissionError, json.JSONDecodeError) as exc:
         return [f"validator report is unreadable: {exc}"]
     if not isinstance(raw_report, dict):
         return ["validator report must be a JSON object"]
@@ -532,8 +814,8 @@ def _generic_validator_issues(receipt: ValidationReceipt, base: Path) -> list[st
     issues: list[str] = []
     if raw_report["command"] != command:
         issues.append("validator report command does not match the receipt exercise")
-    issues.extend(_validator_binding_issues(receipt, base))
-    actual_exit_code = _trusted_validator_result(receipt, base)
+    issues.extend(_validator_binding_issues(receipt, base, approved_root))
+    actual_exit_code = _trusted_validator_result(receipt, base, approved_root)
     if actual_exit_code != exit_code:
         issues.append(
             f"trusted re-execution of the receipt exercise exited {actual_exit_code}; "
@@ -549,22 +831,35 @@ def _base_of(receipt: ValidationReceipt) -> Path:
     return Path(_receipt_target_artifact_path(receipt)).parent
 
 
-def _registered_validator_entry(name: str, base: Path) -> RegisteredValidator | None:
-    """Resolve the registry entry for ``name`` from the receipt's own instance.
+def _registered_validator_entry(
+    name: str,
+    base: Path,
+    approved_root: Path | None = None,
+) -> RegisteredValidator | None:
+    """Resolve a validator from the approved instance root.
 
-    ``base`` is the receipt directory, so verification reads the same
-    ``validators.json`` the producing state root holds -- never whatever a
-    process-wide environment variable or default happens to name.
+    Source receipts may live in an upload directory that contains an
+    attacker-controlled ``validators.json``.  Once verification supplies its
+    approved root, only that root may select a registered command.  The
+    canonical-layout fallback is retained for private callers without an
+    explicit root.
     """
-    return load_validators(_state_root_for_receipt_dir(base)).get(name)
+    registry_root = approved_root if approved_root is not None else _state_root_for_receipt_dir(base)
+    return load_validators(registry_root).get(name)
 
 
 def _state_root_for_receipt_dir(base: Path) -> Path:
     """Return the state root that owns a receipt directory."""
+    if base.parent.name == "validation-receipts":
+        return base.parent.parent
     return base.parent if base.name == "validation-receipts" else base
 
 
-def _validator_binding_issues(receipt: ValidationReceipt, base: Path | None = None) -> list[str]:
+def _validator_binding_issues(
+    receipt: ValidationReceipt,
+    base: Path | None = None,
+    approved_root: Path | None = None,
+) -> list[str]:
     """Reject a declared exercise that is not bound to this validator identity.
 
     ``base`` is the receipt directory when the caller knows it; without it the
@@ -575,8 +870,13 @@ def _validator_binding_issues(receipt: ValidationReceipt, base: Path | None = No
     command = cast(list[str], receipt.exercise["command"])
     if "artifact" not in receipt.target:
         return [f"{name}'s trusted verifier executes an exact artifact target; this receipt declares no artifact target"]
-    registered = _registered_validator_entry(name, base if base is not None else _base_of(receipt))
-    expected = tuple(registered.argv) if registered is not None else _trusted_verifier_argv_or_none(name)
+    resolved_base = base if base is not None else _base_of(receipt)
+    registered = _registered_validator_entry(name, resolved_base, approved_root)
+    expected = (
+        tuple(registered.argv)
+        if registered is not None
+        else _trusted_verifier_argv_or_none(name, _receipt_target_artifact_path(receipt))
+    )
     if expected is None:
         return [f"validator {name!r} has no trusted verifier invocation; its exercise cannot establish a PASS"]
     if tuple(command) != expected:
@@ -587,7 +887,7 @@ def _validator_binding_issues(receipt: ValidationReceipt, base: Path | None = No
     return []
 
 
-def _trusted_validator_target_issues(receipt: ValidationReceipt) -> list[str]:
+def _trusted_validator_target_issues(receipt: ValidationReceipt, approved_root: Path | None) -> list[str]:
     """Require the exact current target identity to match the receipt binding."""
     name = _text(receipt.validator, "name", parent="validator")
     trusted = _TRUSTED_VALIDATORS[name]
@@ -606,6 +906,7 @@ def _trusted_validator_target_issues(receipt: ValidationReceipt) -> list[str]:
         )
     )
     try:
+        repository = _confined_path(repository, approved_root, label=f"{name} target")
         current_digest = (
             subprocess.run(
                 ["git", "-C", str(repository), "rev-parse", "HEAD"],
@@ -617,14 +918,14 @@ def _trusted_validator_target_issues(receipt: ValidationReceipt) -> list[str]:
             if kind == "commit"
             else _hash_file(repository)
         )
-    except (OSError, subprocess.SubprocessError, FileNotFoundError, IsADirectoryError, PermissionError) as exc:
+    except (OSError, subprocess.SubprocessError, FileNotFoundError, IsADirectoryError, PermissionError, ReceiptError) as exc:
         return [f"current target {kind} is unreadable: {exc}"]
     if not hmac.compare_digest(current_digest, digest):
         return [f"current target {kind} does not match the receipt"]
     return []
 
 
-def _trusted_validator_result(receipt: ValidationReceipt, base: Path) -> int:
+def _trusted_validator_result(receipt: ValidationReceipt, base: Path, approved_root: Path | None) -> int:
     """Run the frozen identity's trusted verifier against the exact current target.
 
     The enrolled validator name, not the receipt author, selects the program,
@@ -637,16 +938,24 @@ def _trusted_validator_result(receipt: ValidationReceipt, base: Path) -> int:
     """
     name = _text(receipt.validator, "name", parent="validator")
     trusted = _TRUSTED_VALIDATORS.get(name)
-    registered = _registered_validator_entry(name, base)
+    registered = _registered_validator_entry(name, base, approved_root)
     if trusted is None and registered is None:
         return 125
-    if _validator_binding_issues(receipt, base):
+    if _validator_binding_issues(receipt, base, approved_root):
         return 125
     if registered is not None:
         exit_code, output = run_registered_validator(registered)
         del output
         return exit_code
-    if _trusted_validator_target_issues(receipt):
+    try:
+        target_path = _confined_path(
+            Path(_receipt_target_artifact_path(receipt)),
+            approved_root,
+            label="target.artifact",
+        )
+    except ReceiptError:
+        return 125
+    if _trusted_validator_target_issues(receipt, approved_root):
         return 125
     environment = {
         key: value
@@ -655,7 +964,7 @@ def _trusted_validator_result(receipt: ValidationReceipt, base: Path) -> int:
     }
     try:
         completed = subprocess.run(
-            [*_trusted_verifier_argv(name, _receipt_target_artifact_path(receipt))],
+            [*_trusted_verifier_argv(name, str(target_path))],
             check=False,
             capture_output=True,
             cwd=base,
@@ -667,16 +976,30 @@ def _trusted_validator_result(receipt: ValidationReceipt, base: Path) -> int:
     return completed.returncode
 
 
-def verify_receipt_file(path: Path, *, verify_current_target: bool = True) -> ReceiptVerification:
+def _infer_approved_root(path: Path) -> Path | None:
+    """Infer the state root only from the canonical stored receipt layout."""
+    parent = path.parent
+    if parent.parent.name != "validation-receipts" or len(parent.name) != 64:
+        return None
+    return parent.parent.parent
+
+
+def verify_receipt_file(
+    path: Path,
+    *,
+    verify_current_target: bool = True,
+    approved_root: Path | None = None,
+) -> ReceiptVerification:
     """Verify one stored or source receipt without trusting caller status text."""
+    root = approved_root if approved_root is not None else _infer_approved_root(path)
     try:
         receipt, _raw = load_receipt_file(path)
     except ReceiptError as exc:
         return ReceiptVerification("", "invalid", False, False, (str(exc),), path)
-    issues = _artifact_issues(receipt, path.parent)
-    issues.extend(_validator_issues(receipt, path.parent))
+    issues = _artifact_issues(receipt, path.parent, root)
+    issues.extend(_validator_issues(receipt, path.parent, root))
     if verify_current_target:
-        issues.extend(_target_issues(receipt))
+        issues.extend(_target_issues(receipt, path.parent, root))
     verified = not issues
     status = cast(str, receipt.result["status"])
     eligible = verified and status == "PASS" and receipt.result["validator_acceptance"] is True and not receipt.not_exercised
@@ -690,10 +1013,12 @@ def verify_receipt(
     *,
     verify_current_target: bool = True,
 ) -> ReceiptVerification:
-    return verify_receipt_file(
-        receipt_path(root, session_ref, receipt_name),
-        verify_current_target=verify_current_target,
-    )
+    path = receipt_path(root, session_ref, receipt_name)
+    try:
+        path = _receipt_path_for_read(root, session_ref, receipt_name)
+    except ReceiptError as exc:
+        return ReceiptVerification("", "invalid", False, False, (str(exc),), path)
+    return verify_receipt_file(path, verify_current_target=verify_current_target, approved_root=root)
 
 
 def _copy_file_atomic(source: Path, destination: Path) -> None:
@@ -729,7 +1054,7 @@ def ingest_receipt(root: Path | None, session_ref: str, source: Path) -> Path:
     mismatched = [item.id for item in matching if item.validator not in identifiers]
     if mismatched:
         raise ReceiptError(f"receipt validator does not match enrolled item(s): {mismatched!r}")
-    source_check = verify_receipt_file(source, verify_current_target=False)
+    source_check = verify_receipt_file(source, verify_current_target=False, approved_root=root or state_dir())
     if not source_check.verified:
         raise ReceiptError("receipt evidence verification failed: " + "; ".join(source_check.issues))
 
@@ -739,7 +1064,7 @@ def ingest_receipt(root: Path | None, session_ref: str, source: Path) -> Path:
             existing = _load_raw(destination)
             if existing != raw:
                 raise ReceiptError(f"stored receipt {receipt.receipt_name!r} is immutable and differs from the source")
-            stored_check = verify_receipt_file(destination, verify_current_target=False)
+            stored_check = verify_receipt_file(destination, verify_current_target=False, approved_root=root or state_dir())
             if not stored_check.verified:
                 raise ReceiptError("stored receipt verification failed: " + "; ".join(stored_check.issues))
             return destination
@@ -753,14 +1078,20 @@ def ingest_receipt(root: Path | None, session_ref: str, source: Path) -> Path:
                 _copy_file_atomic(source.parent / relative, stored_artifact)
         write_json_atomic(destination, raw, fsync=True)
         os.chmod(destination, 0o600)
-        stored_check = verify_receipt_file(destination, verify_current_target=False)
+        stored_check = verify_receipt_file(destination, verify_current_target=False, approved_root=root or state_dir())
         if not stored_check.verified:
             raise ReceiptError("stored receipt verification failed: " + "; ".join(stored_check.issues))
     return destination
 
 
 def list_receipts(root: Path | None, session_ref: str) -> list[ValidationReceipt]:
-    directory = receipts_root(root)
+    directory = _session_receipts_root(root, session_ref)
+    from chitra.goals import get_goal
+
+    goal = get_goal(root, session_ref)
+    required_names = () if goal is None else tuple(item.required_receipt for item in goal.enrolled_done_when_items)
+    for name in required_names:
+        _receipt_path_for_read(root, session_ref, name)
     receipts: list[ValidationReceipt] = []
     for path in sorted(directory.glob("*.json")):
         receipt, _raw = load_receipt_file(path)
@@ -788,14 +1119,14 @@ def require_verified_completion_receipts(
             and candidate.validator == item.validator
             and candidate.validator_result == "pass"
         )
-        path = receipt_path(root, session_ref, item.required_receipt)
+        path = _receipt_path_for_read(root, session_ref, item.required_receipt)
         try:
             receipt, _raw = load_receipt_file(path)
         except ReceiptError as exc:
             raise ReceiptError(f"done item {item.id!r} receipt is unavailable: {exc}") from exc
         if item.validator not in _validator_identifiers(receipt):
             raise ReceiptError(f"done item {item.id!r} receipt validator does not match {item.validator!r}")
-        verification = verify_receipt_file(path)
+        verification = verify_receipt_file(path, approved_root=root or state_dir())
         if not verification.verified:
             raise ReceiptError(f"done item {item.id!r} receipt is not verified: {'; '.join(verification.issues)}")
         if not verification.completion_eligible:
@@ -838,9 +1169,9 @@ def record_registered_run(
     """Run one registered validator, store its receipt, and return its proof.
 
     Chitra — never the lane — executes the registry argv and writes the W12
-    envelope to ``validation-receipts/<required_receipt>.json`` with the
-    observed exit code as the result. A rerun overwrites both the evidence
-    artifacts and the receipt atomically; the newest execution is the proof.
+    envelope below the exact session's receipt directory with the observed
+    exit code as the result. A rerun overwrites both the evidence artifacts
+    and the receipt atomically; the newest execution is the proof.
     A missing registry entry (``entry=None``) fails closed as exit 125 so an
     enrolled item whose validator later vanishes still leaves a stored FAIL.
     """
@@ -849,7 +1180,8 @@ def record_registered_run(
         exit_code, output = UNRUNNABLE_EXIT_CODE, (f"registered validator {item.validator!r} is not in this instance's validators.json")
     else:
         exit_code, output = run_registered_validator(entry)
-    directory = receipts_root(root)
+    destination = receipt_path(root, session_ref, item.required_receipt)
+    directory = destination.parent
     directory.mkdir(parents=True, exist_ok=True)
     output_path = directory / f"{item.required_receipt}.output.log"
     report_path = directory / f"{item.required_receipt}.report.json"
@@ -899,7 +1231,6 @@ def record_registered_run(
     }
     integrity = cast("dict[str, object]", payload["integrity"])
     integrity["digest"] = _canonical_digest(payload)
-    destination = receipt_path(root, session_ref, item.required_receipt)
     with locked_json_store(destination):
         write_json_atomic(destination, payload, fsync=True)
         os.chmod(destination, 0o600)

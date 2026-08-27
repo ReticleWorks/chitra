@@ -70,7 +70,8 @@ Capabilities have authority levels:
 - **record:** Append to logs and queues (dispatch orders, goals, artifacts).
 - **act:** Execute control commands (pause, resume, redirect).
 
-Daemon capabilities (dispatchd, triaged, watchd) are not user-toggleable; they ship enabled.
+Daemon capabilities (`monitord`, `dispatchd`, and the legacy `triaged` and
+`watchd` daemons) are not user-toggleable; they ship enabled.
 
 ## Common tasks
 
@@ -168,7 +169,8 @@ Every enable/disable/reset is logged to an append-only audit file:
 Daemons check capability state before acting:
 
 - **dispatchd** checks `dispatch_control`. If disabled, it skips delivery.
-- **watchd** checks `goal_enforcement`. If disabled, completion reviews are not run.
+- **monitord** has a declared bounded `act` authority and defaults to shadow mode until explicitly armed.
+- **watchd** retains the legacy `goal_enforcement` check for existing deployments.
 - **rate-limit-guard** checks `rate_limit_control`. If disabled, pause/resume nudges are not sent.
 
 If a required capability is missing or unknown, the daemon fails safely (does not act, logs error).

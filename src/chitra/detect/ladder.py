@@ -89,6 +89,108 @@ class LadderDecision(BaseModel):
     reason: str
 
 
+def discover_consumption_proof(
+    record: IncidentRecord,
+    journal_events: Sequence[CanonicalEvent],
+    ledger_entry: LedgerEntry,
+    ledger_key: bytes,
+) -> ConsumptionProof | None:
+    """Find the exact journal turn that consumed a signed ladder order.
+
+    Discovery is deliberately fail-closed. The signed ledger row must verify,
+    identify this lane, and match one user payload in the canonical journal.
+    That payload must contain this incident's marker and hash in full. The
+    first following ``FINAL_RESPONSE`` must belong to the same native session
+    and lane. A stored proof, when present, constrains discovery to its exact
+    event IDs so a later or cross-session turn cannot silently replace it.
+    """
+    if not ledger_entry.session_ref:
+        return None
+    return discover_delivery_consumption_proof(
+        lane=record.lane,
+        session_ref=ledger_entry.session_ref,
+        order_marker=record.order_marker,
+        journal_events=journal_events,
+        ledger_entry=ledger_entry,
+        ledger_key=ledger_key,
+        stored=record.consumption,
+    )
+
+
+def discover_delivery_consumption_proof(
+    *,
+    lane: str,
+    session_ref: str,
+    order_marker: str,
+    journal_events: Sequence[CanonicalEvent],
+    ledger_entry: LedgerEntry,
+    ledger_key: bytes,
+    stored: ConsumptionProof | None = None,
+) -> ConsumptionProof | None:
+    """Prove that one signed delivery was consumed by its bound session.
+
+    This is the generic form used by both incident corrections and routine
+    frozen-goal answers.  It requires the signed order, exact session and lane,
+    the full delivered text in a canonical user event, and a following final
+    response boundary.  ``stored`` pins recovery to the same event pair after
+    the first proof; a later or cross-session response cannot replace it.
+    """
+    if (
+        not ledger_key
+        or not order_marker
+        or not verify_entry(ledger_entry, key=ledger_key)
+        or ledger_entry.session_ref != session_ref
+    ):
+        return None
+    native_session_id = ledger_entry.native_session_id or ledger_entry.session_ref
+    if not native_session_id:
+        return None
+    if stored is not None:
+        if stored.ledger_entry != ledger_entry:
+            return None
+        if stored.ledger_key_hex and stored.ledger_key_hex != hashlib.sha256(ledger_key).hexdigest():
+            return None
+        if stored.session_ref != ledger_entry.session_ref or stored.native_session_id != native_session_id:
+            return None
+
+    events = tuple(journal_events)
+    events_by_id = {event.event_id: event for event in events}
+    for position, user_event in enumerate(events):
+        if stored is not None and user_event.event_id != stored.user_event_id:
+            continue
+        if user_event.lane != lane or user_event.session_id != native_session_id:
+            continue
+        if user_event.native_type != "user" or user_event.normalized_type in {
+            CanonicalType.TOOL_CALL,
+            CanonicalType.TOOL_RESULT,
+            CanonicalType.TOOL_ERROR,
+            CanonicalType.FINAL_RESPONSE,
+        }:
+            continue
+        user_text = _payload_text(user_event)
+        if not user_text or order_marker not in user_text:
+            continue
+        if ledger_entry.message_hash != message_hash(user_text):
+            continue
+        turn_event_id = _next_final_boundary(events, position)
+        if not turn_event_id:
+            continue
+        turn_event = events_by_id.get(turn_event_id)
+        if turn_event is None or turn_event.lane != lane or turn_event.session_id != native_session_id:
+            continue
+        if stored is not None and turn_event_id != stored.turn_event_id:
+            continue
+        return ConsumptionProof(
+            ledger_entry=ledger_entry,
+            ledger_key_hex=hashlib.sha256(ledger_key).hexdigest(),
+            session_ref=ledger_entry.session_ref,
+            native_session_id=native_session_id,
+            user_event_id=user_event.event_id,
+            turn_event_id=turn_event_id,
+        )
+    return None
+
+
 class IncidentStore:
     """Append-only per-lane incident log under ``<state_root>/incidents``."""
 
@@ -311,7 +413,7 @@ class ResponseLadder:
             return LadderDecision(action="open", stage=record.stage, record=record, reason="first sighting of this finding fingerprint")
         if existing.stage == "relaunch":
             return LadderDecision(action="hold", stage=existing.stage, record=existing, reason="incident already reached relaunch")
-        if existing.consumption is None or not self._consumption_proven(existing):
+        if existing.consumption is None or not self._consumption_proven(existing, finding):
             return LadderDecision(
                 action="hold",
                 stage=existing.stage,
@@ -330,59 +432,21 @@ class ResponseLadder:
             action="advance", stage=advanced.stage, record=advanced, reason="same fingerprint recurred after proven consumption"
         )
 
-    def _consumption_proven(self, record: IncidentRecord) -> bool:
+    def _consumption_proven(self, record: IncidentRecord, finding: Finding) -> bool:
         proof = record.consumption
         if proof is None:
             return False
         if self._ledger_key is None:
             return False
-        if proof.ledger_key_hex and proof.ledger_key_hex != hashlib.sha256(self._ledger_key).hexdigest():
+        discovered = discover_consumption_proof(record, self._events, proof.ledger_entry, self._ledger_key)
+        if discovered is None:
             return False
-        if not verify_entry(proof.ledger_entry, key=self._ledger_key):
+        turn_position = _position_of(self._events, discovered.turn_event_id)
+        if turn_position < 0:
             return False
-        if proof.session_ref and proof.ledger_entry.session_ref != proof.session_ref:
-            return False
-        if not proof.session_ref:
-            return False
-        if proof.native_session_id != proof.session_ref:
-            if proof.ledger_entry.native_session_id != proof.native_session_id:
-                return False
-        elif proof.ledger_entry.native_session_id and proof.ledger_entry.native_session_id != proof.native_session_id:
-            return False
-        if f":{record.lane}:" not in proof.ledger_entry.session_ref:
-            return False
-        events_by_id = {event.event_id: event for event in self._events}
-        user_event = events_by_id.get(proof.user_event_id)
-        turn_event = events_by_id.get(proof.turn_event_id)
-        if user_event is None or turn_event is None:
-            return False
-        if user_event.lane != record.lane or turn_event.lane != record.lane:
-            return False
-        if not proof.native_session_id:
-            return False
-        if user_event.session_id != proof.native_session_id or turn_event.session_id != proof.native_session_id:
-            return False
-        if user_event.native_type != "user" or user_event.normalized_type in {
-            CanonicalType.TOOL_CALL,
-            CanonicalType.TOOL_RESULT,
-            CanonicalType.TOOL_ERROR,
-            CanonicalType.FINAL_RESPONSE,
-        }:
-            return False
-        user_text = _payload_text(user_event)
-        if record.order_marker not in user_text:
-            return False
-        if proof.ledger_entry.message_hash != message_hash(user_text):
-            return False
-        if turn_event.normalized_type is not CanonicalType.FINAL_RESPONSE:
-            return False
-        if not self._events:
-            return False
-        user_position = _position_of(self._events, user_event.event_id)
-        turn_position = _position_of(self._events, turn_event.event_id)
-        if turn_position <= user_position:
-            return False
-        return _next_final_boundary(self._events, user_position) == turn_event.event_id
+        # A historical finding must not advance the ladder. The detector must
+        # report at least one event strictly after the consumed turn boundary.
+        return any(_position_of(self._events, event_id) > turn_position for event_id in finding.event_refs)
 
 
 def _rescue_bundle_verified(state_root: Path, record: IncidentRecord, bundle_sha256: str) -> Any | None:
@@ -651,6 +715,8 @@ def _next_final_boundary(events: tuple[CanonicalEvent, ...], start_position: int
 
 __all__ = [
     "ConsumptionProof",
+    "discover_consumption_proof",
+    "discover_delivery_consumption_proof",
     "IncidentRecord",
     "IncidentStore",
     "LADDER_STAGES",
