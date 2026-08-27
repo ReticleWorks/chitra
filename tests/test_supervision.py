@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
+from chitra.autonomy import DEFAULT_AUTONOMY_POLICY, AutonomyPolicy, CapabilityGrant
 from chitra.supervision import SupervisionLedger, SupervisionRecord, deterministic_order_id, goal_digest
 
 
@@ -118,6 +119,7 @@ class _Goal(BaseModel):
     done_when: str = "Tests pass"
     enrolled_done_when: str = "Tests pass"
     enrolled_done_when_items: tuple[_Item, ...] = (_Item(id="tests", text="Tests pass", validator="pytest", required_receipt="ok"),)
+    autonomy_policy: AutonomyPolicy = DEFAULT_AUTONOMY_POLICY
 
 
 def test_goal_digest_is_sensitive_to_frozen_contract_fields() -> None:
@@ -127,15 +129,15 @@ def test_goal_digest_is_sensitive_to_frozen_contract_fields() -> None:
     assert goal_digest(goal.model_copy(update={"goal_version": 2})) != goal_digest(goal)
     assert goal_digest(goal.model_copy(update={"done_when": "A different proof"})) != goal_digest(goal)
     assert goal_digest(goal.model_copy(update={"session_ref": "host:other:0"})) != goal_digest(goal)
+    restricted = AutonomyPolicy(grants=(CapabilityGrant(grant_id="replan-only", capability="replan"),))
+    assert goal_digest(goal.model_copy(update={"autonomy_policy": restricted})) != goal_digest(goal)
 
 
 def test_order_ids_are_deterministic_and_stage_sensitive() -> None:
     first = deterministic_order_id("host:lane_a:0", 1, "f" * 64, "nudge")
     assert first == deterministic_order_id("host:lane_a:0", 1, "f" * 64, "nudge")
     assert first != deterministic_order_id("host:lane_a:0", 1, "f" * 64, "redirect")
-    assert first != deterministic_order_id(
-        "host:lane_a:0", 1, "f" * 64, "nudge", retry_attempt=1
-    )
+    assert first != deterministic_order_id("host:lane_a:0", 1, "f" * 64, "nudge", retry_attempt=1)
 
 
 def test_action_and_consumption_lookups_survive_sibling_rows(tmp_path: Path) -> None:

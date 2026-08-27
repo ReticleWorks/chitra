@@ -123,6 +123,16 @@ def _has_progress_between(
     return False
 
 
+def _has_progress_at(
+    events: Sequence[CanonicalEvent], progress_rows: Sequence[ProgressClassification], position: int
+) -> bool:
+    event_id = events[position].event_id
+    return any(
+        row.classification is ProgressClass.PROGRESS and event_id in row.source_event_ids
+        for row in progress_rows
+    )
+
+
 def _strings_from(value: object) -> tuple[str, ...]:
     strings: list[str] = []
     if isinstance(value, str):
@@ -293,32 +303,38 @@ def detect_unnecessary_steps(
     events: Sequence[CanonicalEvent],
     *,
     progress_rows: Sequence[ProgressClassification] = (),
-    threshold: int = 3,
+    threshold: int = 2,
     enrolled_items: Sequence[object] = (),
 ) -> list[Finding]:
     """Flag one normalized tool+target+result signature repeated without progress.
 
     The recurrence counter resets on any verified progress between repeats;
     a changed result signature starts a new identity rather than extending
-    the old one. Threshold three matches DESIGN-v3 §4 ("at least three times").
+    the old one. Two identical outcomes are the first evidence of a loop.
     """
     findings: list[Finding] = []
     unmet = _first_unmet_item(enrolled_items)
     results = _joined_results(events)
+    positions = {event.event_id: position for position, event in enumerate(events)}
     seen: dict[str, list[tuple[int, str]]] = {}
     for position, event in enumerate(events):
         if event.normalized_type is not CanonicalType.TOOL_CALL:
             continue
-        signature = _result_signature(event, results.get(event.native_join_id or ""))
+        result = results.get(event.native_join_id or "")
+        signature = _result_signature(event, result)
+        outcome_position = positions.get(result.event_id, position) if result is not None else position
         occurrences = seen.setdefault(signature, [])
-        if occurrences and _has_progress_between(events, progress_rows, occurrences[-1][0], position):
+        if _has_progress_at(events, progress_rows, outcome_position):
             occurrences.clear()
-        occurrences.append((position, event.event_id))
+            continue
+        if occurrences and _has_progress_between(events, progress_rows, occurrences[-1][0], outcome_position):
+            occurrences.clear()
+        occurrences.append((outcome_position, event.event_id))
         if len(occurrences) < threshold:
             continue
         prior = [entry for entry in occurrences[:-1]]
         start_position = prior[-1][0]
-        if _has_progress_between(events, progress_rows, start_position, position):
+        if _has_progress_between(events, progress_rows, start_position, outcome_position):
             occurrences.clear()
             occurrences.append((position, event.event_id))
             continue
@@ -333,6 +349,7 @@ def detect_unnecessary_steps(
                 detail=f"identical tool, target, and result occurred {threshold} times with no intervening verified progress",
             )
         )
+        occurrences.clear()
     return findings
 
 
@@ -340,7 +357,7 @@ def detect_excessive_testing(
     events: Sequence[CanonicalEvent],
     *,
     progress_rows: Sequence[ProgressClassification] = (),
-    threshold: int = 3,
+    threshold: int = 2,
     enrolled_items: Sequence[object] = (),
 ) -> list[Finding]:
     """Flag a check suite repeating with no artifact change, new failure
@@ -348,6 +365,7 @@ def detect_excessive_testing(
     findings: list[Finding] = []
     unmet = _first_unmet_item(enrolled_items)
     results = _joined_results(events)
+    positions = {event.event_id: position for position, event in enumerate(events)}
     runs: list[tuple[int, str, CanonicalEvent]] = []
     for position, event in enumerate(events):
         if event.normalized_type is not CanonicalType.TOOL_CALL:
@@ -359,8 +377,12 @@ def detect_excessive_testing(
         elif isinstance(input_value, dict):
             text = " ".join(value for value in input_value.values() if isinstance(value, str))
         if _is_check_invocation(text):
-            signature = _result_signature(event, results.get(event.native_join_id or ""))
-            runs.append((position, signature, event))
+            result = results.get(event.native_join_id or "")
+            signature = _result_signature(event, result)
+            outcome_position = positions.get(result.event_id, position) if result is not None else position
+            if _has_progress_at(events, progress_rows, outcome_position):
+                continue
+            runs.append((outcome_position, signature, event))
     streak: list[tuple[int, str, CanonicalEvent]] = []
     for run in runs:
         if streak and streak[-1][1] == run[1] and not _has_progress_between(events, progress_rows, streak[-1][0], run[0]):
@@ -386,7 +408,7 @@ def detect_excessive_testing(
                 detail=f"an unchanged check invocation repeated {threshold} times without an artifact change or new failure signature",
             )
         )
-        streak = [run]
+        streak = []
     return findings
 
 

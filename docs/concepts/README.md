@@ -1,6 +1,6 @@
 # Chitra Concepts
 
-Chitra has two distinct layers: a deterministic delivery core and a bounded persistent supervision layer. Both keep their authority explicit; optional reviewer integrations cannot bypass operator gates.
+Chitra has two distinct layers: a deterministic delivery core and a persistent supervision layer. Both keep their authority explicit; optional reviewer integrations cannot alter the frozen goal or its autonomy policy.
 
 ## The Deterministic Core
 
@@ -65,18 +65,19 @@ On each pass, monitord:
 
 1. Ingests only transcripts declared in the exact binding manifest.
 2. Runs deterministic drift, repeated-step, repeated-test, and document-dithering detectors.
-3. Queues one fair, goal-versioned corrective action per lane and pass through dispatchd.
-4. Answers routine questions only when the frozen contract settles them.
+3. Records corrective intent and can direct successive goal-versioned actions through dispatchd while the lane still has unfinished work.
+4. Answers questions from the frozen contract when possible. Otherwise, the foreground Chitra agent investigates, gathers evidence, and replans. Only missing authority or capability reaches the user.
 5. Runs registered validators after a structured completion claim and closes only from verified, session-isolated receipts.
 
 Monitord never:
 
 - Write to tmux directly.
 - Borrow a transcript, receipt, finding, or answer from another goal.
-- Bypass operator gates for spend, credentials, or irreversible actions.
+- Treat an untyped or unverified capability as authorized outside the frozen
+  per-goal `AutonomyPolicy`.
 
 Legacy `watchd` deployments may still use isolated completion reviewers. Those
-reviewers remain advisory and cannot bypass the same authority gates.
+reviewers remain advisory and cannot change the frozen goal or its policy.
 
 ### Goals and Completion Gating
 
@@ -84,7 +85,7 @@ A goal is a statement of what the session should accomplish. Chitra stores each 
 
 - A 6-word minimum to encourage clarity.
 - Frozen structured done items, each with a validator and exact required receipt name.
-- One of 8 statuses: open, working, paused, held, complete, abandoned, redirected, or deferred.
+- One lane lifecycle state: `active`, `paused`, `shelved`, or `closed`. Internal goal and hold records may retain tactical evidence, but those records do not add lifecycle states.
 - An immutable `lane_id` once set (prevents re-enrollment of the same logical lane under a fresh session ref).
 
 The four-question interview result supplies the structured done items. Chitra generates the display `done_when` from those items and freezes the receipt, items, and enrollment time in one locked write.
@@ -96,7 +97,7 @@ When a session finishes and claims completion, the completion gate:
 3. Executes the enrolled validators and verifies their stored receipts.
 4. Persists the validated proofs before a done transition and repeats the exact check at close.
 
-An operator can still redirect strategic work or administratively discard a dead record with a reason. Those paths are labeled as not done and cannot substitute for completion proof.
+An operator can still redirect strategic work or administratively discard a dead record with a reason. Those paths are labeled as not done and cannot substitute for completion proof. A redirect may replace the frozen policy only when the redirect itself supplies the new policy.
 
 ## The Ledger and Audit Trail
 
@@ -116,12 +117,12 @@ The model for trust is "trusted host." The host running chitra is assumed to be 
 A typical session flow:
 
 1. **Enrollment (deterministic):** The first `chitra-goals set` returns four typed questions and a nonce without writing a goal. `set --interview-result <file>` verifies the complete result and atomically stores the receipt, done items, enrollment time, and lane ID.
-2. **Delivery (deterministic):** The operator (or an orchestration system) queues messages. Dispatchd drains the queue, delivers each message to the session via tmux, and logs the delivery.
+2. **Delivery (deterministic):** Monitord or an orchestration system queues messages. Dispatchd drains the queue, delivers each message to the session via tmux, and logs the delivery.
 3. **Rate limiting (deterministic):** Rate-limit-guard polls the account's usage and host load, pauses the session if thresholds are hit, and records the pause in a durable ledger.
 4. **Completion supervision:** The session ends a turn claiming completion. Monitord executes the enrolled validators and independently verifies the stored results.
 5. **Goal closure:** Chitra repeats the exact receipt check over the proofs monitord persisted. Delivered strings and operator acknowledgements cannot substitute for those receipts.
 
-The delivery and supervision layers are separate. Dispatchd alone writes the terminal. Monitord can act only within the frozen contract, and an operator retains credentials, spend, irreversible actions, security boundaries, and strategy changes.
+The delivery and supervision layers are separate. Dispatchd alone writes the terminal. Monitord can act persistently within the frozen contract, including successive replans. The foreground Chitra agent handles questions the deterministic path cannot settle. The frozen per-goal `AutonomyPolicy` authorizes typed capabilities within its grants and limits. The user is needed only for a verified missing, expired, or over-limit grant, or a change to the frozen outcome.
 
 ## See Also
 

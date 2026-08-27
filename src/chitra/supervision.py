@@ -21,6 +21,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from chitra.autonomy import DEFAULT_AUTONOMY_POLICY
+
 SCHEMA = "chitra.supervision.v1"
 SupervisionState = Literal[
     "observing",
@@ -153,6 +155,7 @@ def goal_digest(goal: object) -> str:
         "done_when": _goal_value(goal, "done_when"),
         "enrolled_done_when": _goal_value(goal, "enrolled_done_when"),
         "enrolled_done_when_items": items,
+        "autonomy_policy": _goal_value(goal, "autonomy_policy", DEFAULT_AUTONOMY_POLICY),
     }
     encoded = json.dumps(frozen, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()

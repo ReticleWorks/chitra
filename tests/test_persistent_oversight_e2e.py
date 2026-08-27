@@ -9,6 +9,7 @@ inconsistent binding must never be guessed from another goal.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -18,12 +19,13 @@ from _goal_fixtures import enrollment_fields, ingest_passing_receipt, passing_co
 import chitra.dispatchd as dispatchd_mod
 import chitra.ledger as ledger_mod
 import chitra.monitord as monitord_mod
+from chitra.autonomy import AutonomyPolicy
 from chitra.completion_gate import CompletionEvidence
 from chitra.detect import Finding, IncidentStore
 from chitra.goals import GoalRecord, add_ask, get_goal, redirect_goal, update_now, upsert_goal
 from chitra.journal import CanonicalEvent
 from chitra.journal.store import EventJournal
-from chitra.monitord import IDLE_PURSUIT_PASSES, main, resolve_config, run_once
+from chitra.monitord import main, resolve_config, run_once
 from chitra.orders import DispatchOrder, DispatchResult, DispatchStatus
 from chitra.supervision import SupervisionLedger, deterministic_order_id, goal_digest
 
@@ -256,29 +258,44 @@ def test_same_path_native_session_replacement_filters_old_events(
     assert observed == [("native-old", "native-old"), ("native-new", "native-new")]
 
 
-def test_idle_pursuit_is_persistent_and_bounded(
+def test_idle_pursuit_is_immediate_and_persists_across_restart(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state, bindings_path, queue, goal = _prepare_repeated_action_case(tmp_path)
+    assert goal.autonomy_policy.idle_pursuit_passes == 1
     monkeypatch.setattr(monitord_mod, "run_detectors", lambda *_args, **_kwargs: [])
 
     run_once(_live_config(state, bindings_path, queue))
-    run_once(_live_config(state, bindings_path, queue))
-    assert not (state / "incidents" / f"{goal.lane_id}.jsonl").exists()
-
-    # A fresh monitor process must retain the clean-pass count and emit one
-    # deterministic pursuit intent on the threshold pass.
-    restarted = _live_config(state, bindings_path, queue)
-    run_once(restarted)
     incidents = IncidentStore(state, goal.lane_id).load()
     assert len(incidents) == 1
     assert incidents[0].detector == "idle_pursuit"
+    assert "1 clean monitor pass" in incidents[0].detail
     assert incidents[0].unmet_item == goal.enrolled_done_when_items[0].id
     assert incidents[0].stage == "nudge"
 
+    # A fresh monitor process must preserve the incident instead of emitting
+    # duplicate work.
     run_once(_live_config(state, bindings_path, queue))
     assert len(IncidentStore(state, goal.lane_id).load()) == 1
+
+
+def test_idle_pursuit_uses_the_goal_idle_threshold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, bindings_path, queue, goal = _prepare_repeated_action_case(
+        tmp_path,
+        autonomy_policy=AutonomyPolicy(idle_pursuit_passes=1),
+    )
+    monkeypatch.setattr(monitord_mod, "run_detectors", lambda *_args, **_kwargs: [])
+
+    run_once(_live_config(state, bindings_path, queue))
+
+    incidents = IncidentStore(state, goal.lane_id).load()
+    assert len(incidents) == 1
+    assert incidents[0].detector == "idle_pursuit"
+    assert "1 clean monitor pass" in incidents[0].detail
 
 
 def test_idle_pursuit_does_not_fire_while_a_question_is_pending(
@@ -289,7 +306,7 @@ def test_idle_pursuit_does_not_fire_while_a_question_is_pending(
     monkeypatch.setattr(monitord_mod, "run_detectors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(monitord_mod, "handle_agent_question", lambda *_args, **_kwargs: "answer_queued")
 
-    for _ in range(IDLE_PURSUIT_PASSES + 1):
+    for _ in range(goal.autonomy_policy.idle_pursuit_passes + 1):
         run_once(_live_config(state, bindings_path, queue))
 
     assert not (state / "incidents" / f"{goal.lane_id}.jsonl").exists()
@@ -313,7 +330,7 @@ def test_idle_pursuit_does_not_compete_with_an_undelivered_action(
         order_marker="CHITRA-ORDER:existing-order",
     )
 
-    for _ in range(IDLE_PURSUIT_PASSES + 1):
+    for _ in range(goal.autonomy_policy.idle_pursuit_passes + 1):
         run_once(_live_config(state, bindings_path, queue))
 
     assert not (state / "incidents" / f"{goal.lane_id}.jsonl").exists()
@@ -328,7 +345,7 @@ def test_idle_pursuit_does_not_bypass_an_operator_ask(
     add_ask(state, goal.session_ref, "operator approval is required")
     update_now(state, goal.session_ref, now="waiting for operator approval", status="blocked")
 
-    for _ in range(IDLE_PURSUIT_PASSES + 1):
+    for _ in range(goal.autonomy_policy.idle_pursuit_passes + 1):
         run_once(_live_config(state, bindings_path, queue))
 
     assert not (state / "incidents" / f"{goal.lane_id}.jsonl").exists()
@@ -355,18 +372,25 @@ def test_idle_pursuit_waits_for_an_existing_consumed_action_to_resolve(
     ledger.transition(state="action_queued", reason="existing action queued", **common)
     ledger.transition(state="awaiting_progress", reason="existing action consumed", **common)
 
-    for _ in range(IDLE_PURSUIT_PASSES + 1):
+    for _ in range(goal.autonomy_policy.idle_pursuit_passes + 1):
         run_once(_live_config(state, bindings_path, queue))
 
     assert not (state / "incidents" / f"{goal.lane_id}.jsonl").exists()
 
 
-def _prepare_repeated_action_case(tmp_path: Path) -> tuple[Path, Path, Path, GoalRecord]:
+def _prepare_repeated_action_case(
+    tmp_path: Path,
+    *,
+    autonomy_policy: AutonomyPolicy | None = None,
+) -> tuple[Path, Path, Path, GoalRecord]:
     """Build one bound lane whose fixture has three identical tool calls."""
     state = tmp_path / "state"
     queue = tmp_path / "queue"
     bindings_path = tmp_path / "transcript-bindings.json"
-    goal = upsert_goal(state, _goal("host:alpha:0.0"))
+    goal = _goal("host:alpha:0.0")
+    if autonomy_policy is not None:
+        goal = replace(goal, autonomy_policy=autonomy_policy)
+    goal = upsert_goal(state, goal)
     transcript = tmp_path / "transcripts" / "alpha.jsonl"
     fixture = Path(__file__).parent / "fixtures" / "failure-modes" / "claude-unnecessary-steps.jsonl"
     transcript.parent.mkdir(parents=True, exist_ok=True)
@@ -398,22 +422,22 @@ def _stub_finding(name: str) -> Finding:
     )
 
 
-def test_run_once_evaluates_only_the_fair_scheduled_prefix(
+def test_run_once_evaluates_every_present_finding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Later findings must get their first ladder sighting on a later pass."""
+    """One monitor pass pursues every present obstacle in deterministic order."""
     state, bindings_path, queue, _goal_record = _prepare_repeated_action_case(tmp_path)
     findings = [_stub_finding("first"), _stub_finding("second")]
     monkeypatch.setattr(monitord_mod, "run_detectors", lambda *_args, **_kwargs: findings)
 
     first_pass = run_once(_live_config(state, bindings_path, queue))
-    assert first_pass["findings_opened"] == 1
+    assert first_pass["findings_opened"] == 2
     incidents = IncidentStore(state, "alpha").load()
-    assert [record.detector for record in incidents] == ["test-first"]
+    assert [record.detector for record in incidents] == ["test-first", "test-second"]
 
     second_pass = run_once(_live_config(state, bindings_path, queue))
-    assert second_pass["findings_opened"] == 1
+    assert second_pass["findings_opened"] == 2
     incidents = IncidentStore(state, "alpha").load()
     assert [record.detector for record in incidents] == ["test-first", "test-second"]
 
@@ -594,7 +618,7 @@ def _append_nudge_and_final_response(transcript: Path, nudge: str, *, session_id
                 "content": [
                     {
                         "type": "text",
-                        "text": "The next scoped progress is complete and independently evidenced.",
+                        "text": "I took the next scoped action and recorded its current result.",
                     }
                 ],
             },
@@ -720,7 +744,7 @@ def test_monitor_dispatchd_monitor_reconciles_signed_delivery_and_advances_only_
     assert dispatch_results[0].status is DispatchStatus.SENT
     assert dispatch_results[0].delivery_ledger_verified is True
     assert order.nudge in transcript.read_text(encoding="utf-8")
-    assert "The next scoped progress is complete" in transcript.read_text(encoding="utf-8")
+    assert "I took the next scoped action" in transcript.read_text(encoding="utf-8")
 
     ledger_lines = (state / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(ledger_lines) == 1

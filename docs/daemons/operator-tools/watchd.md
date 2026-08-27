@@ -34,9 +34,9 @@ for a completion claim. It submits a matching claim to an isolated reviewer,
 records the result in `completion_reviews.jsonl`, and publishes `done` only
 when the completion gate reaches `done-pending-close`.
 
-Reviewers never draft Chitra messages, mutate Chitra state, bypass operator
-gates, or share context with another reviewer. Watchd remains responsive while
-they run.
+Reviewers never draft Chitra messages, mutate Chitra state, alter a frozen goal
+or `AutonomyPolicy`, or share context with another reviewer. Watchd remains
+responsive while they run.
 
 ## Local coordination socket
 
@@ -153,4 +153,4 @@ after a successful handoff.
 - [Agent detection manifests](../../agent-detection-manifests.md)
 - [Watchd status migration](../../watchd-status-migration.md)
 - [Goal enforcement](../../concepts/README.md#goal-enforcement-and-completion-review)
-- [Bounded reasoning boundary](../../DESIGN.md#bounded-reasoning-boundary)
+- [Persistent reasoning boundary](../../DESIGN.md#deterministic-core-and-persistent-reasoning-boundary)

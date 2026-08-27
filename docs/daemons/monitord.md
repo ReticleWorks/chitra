@@ -13,25 +13,28 @@ enrolled goal until completion evidence verifies:
    consumption; elapsed time never advances it.
 3. **Durable action** — records corrective intent before queue publication,
    reconciles orders and signed delivery proof after restart, and advances the
-   response ladder only after the exact nudge has a completed agent turn. One
-   correction is selected per lane per pass through a durable round-robin
-   cursor, so a recurring first finding cannot starve later obstacles. Three
-   clean passes with no new scoped progress create one deterministic pursuit
-   incident, unless a delivery or question is already pending.
+   response ladder only after the exact nudge has a completed agent turn. A
+   pass may continue with successive actions when the prior action produces
+   new evidence. A transport attempt is evidence, not a terminal failure
+   count. A timeout or failed delivery returns control to pursuit so Chitra can
+   inspect state, change tactics, and continue.
 4. **Completion and questions** — runs enrolled validators only after a
    structured completion claim. Receipts are isolated by exact goal session.
    Routine goal questions and explicit small reversible changes get answers
-   derived from the frozen contract. Their intent, retries, signed delivery,
-   and consumption proof survive restart. Protected or ambiguous questions
-   hold the active goal.
+   derived from the frozen contract. An unresolved routine question becomes a
+   foreground Chitra investigation: it may inspect, replan, and direct several
+   successive actions. The frozen per-goal `AutonomyPolicy` decides whether a
+   typed capability is allowed. Only a verified missing, expired, or
+   over-limit grant, or a frozen-outcome change, reaches the user.
 5. **Presence** — appends one advisory presence record per pass so peers can
    see which instance observes which lanes (`chitra.presence`). Presence never
-   claims, waits, or grants authority.
+   claims, waits, or grants authority outside the frozen per-goal policy.
 
 `dispatchd` remains the only process allowed to write to a terminal. Monitord
 publishes goal-versioned, goal-digest-bound orders. Dispatchd recomputes a
 contract-derived answer and rejects stale, held, completed, or forged orders
-before pane I/O.
+before pane I/O. Monitord, Dispatchd, and the specialized supervisors remain
+separate roles.
 
 ## Shadow mode
 
@@ -84,5 +87,8 @@ same lane roots from `lanes.yaml` and uses the same
 
 Flags include `--state-dir`, `--transcript-root`,
 `--transcript-bindings-path`, `--dispatch-queue-dir`, `--ledger-path`,
-`--ledger-key-path`, `--max-action-attempts`, `--retry-delay-seconds`,
-`--findings-path`, `--poll-seconds`, `--no-shadow-mode`, and `--once`.
+`--ledger-key-path`, `--retry-delay-seconds`, `--findings-path`,
+`--poll-seconds`, `--no-shadow-mode`, and `--once`. There is no fixed
+attempt-count completion or failure cap: the pursuit loop continues until
+completion evidence, an authority gate, or an explicit lifecycle transition
+ends active work.

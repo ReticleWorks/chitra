@@ -11,11 +11,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
+from chitra.autonomy import autonomy_policy_sha256
 from chitra.detect import Finding, IncidentStore, LadderDecision
 from chitra.detect.ladder import discover_consumption_proof, discover_delivery_consumption_proof
 from chitra.dispatch import directive_voice_violation, enqueue_dispatch_order
-from chitra.goals import GoalRecord
+from chitra.goals import GoalRecord, add_foreground_task
 from chitra.journal import CanonicalEvent
 from chitra.ledger import verify_delivery
 from chitra.orders import DispatchOrder, DispatchResult, DispatchStatus
@@ -33,6 +35,25 @@ class CorrectiveActionResult:
     order_marker: str
     enqueued: bool
     reason: str
+
+
+DeliveryFailureDisposition = Literal["foreground_replan", "lifecycle_wait", "transport_retry"]
+
+
+def _autonomy_grant_summary(goal: GoalRecord) -> str:
+    """Render the enrolled grants compactly for the supervised foreground."""
+    grants: list[str] = []
+    for grant in goal.autonomy_policy.grants:
+        limits: list[str] = []
+        if grant.max_amount is not None:
+            limits.append(f"amount<={grant.max_amount} {grant.currency}")
+        if grant.max_units is not None:
+            limits.append(f"units<={grant.max_units}")
+        if grant.expires_at is not None:
+            limits.append(f"expires={grant.expires_at.isoformat()}")
+        suffix = f" ({', '.join(limits)})" if limits else ""
+        grants.append(f"{grant.capability}@{'|'.join(grant.targets)}{suffix}")
+    return ", ".join(grants) if grants else "none"
 
 
 def order_marker(finding: Finding) -> str:
@@ -61,9 +82,13 @@ def build_corrective_order(
         f"{marker} Continue against the frozen goal: {goal.goal} "
         f"The observed obstacle is: {finding.detail}. "
         f"Take the next in-scope action that produces this progress: {finding.expected_next_progress}. "
-        "Work through reversible, in-authority obstacles yourself. "
-        "Escalate only missing credentials, spending, an action that cannot be undone, "
-        "a security or authorization change, or a strategic choice the frozen goal does not settle. "
+        f"The frozen autonomy policy is sha256:{autonomy_policy_sha256(goal.autonomy_policy)} and grants: "
+        f"{_autonomy_grant_summary(goal)}. "
+        "Continue autonomously when an active grant covers the action target and limits, including credentials, spending, "
+        "irreversible steps, security changes, dependencies, schemas, hooks, and tactical redesigns. "
+        "When authority evidence is incomplete, investigate it and replan instead of stopping. "
+        "Request a ruling only after policy evaluation proves a missing, expired, wrong-target, or over-limit grant, "
+        "or the action would change the frozen outcome. "
         f"Do not claim completion until this condition has independent proof: {goal.done_when} "
         f"This is the {stage} correction for the cited incident. Record the command, artifact, "
         "or receipt that proves the next state."
@@ -112,6 +137,52 @@ def _retry_due(value: str) -> bool:
     return datetime.now(UTC) >= retry_at.astimezone(UTC)
 
 
+def classify_delivery_failure(result: DispatchResult) -> DeliveryFailureDisposition:
+    """Separate deterministic policy/state rejection from transport failure."""
+    reason = result.reason
+    if reason in {"goal-not-actionable", "goals-schema-newer-than-installed", "lane-lifecycle-closed"} or (
+        reason.startswith("lane-lifecycle-") and reason.endswith("-deferred")
+    ):
+        return "lifecycle_wait"
+    if result.status is DispatchStatus.COMPLETION_DISPUTE or reason.startswith(
+        (
+            "directive-voice:",
+            "stale-goal-contract",
+            "invalid-goal-contract-answer",
+            "invalid-order:",
+            "missing-transcript-binding",
+            "lane-lifecycle-unavailable:",
+            "lane-lifecycle-unknown:",
+            "session namespace denied by prefix",
+            "session namespace is not owned by this dispatcher",
+            "remote dispatch to ",
+            "unsupported session_ref ",
+        )
+    ):
+        return "foreground_replan"
+    return "transport_retry"
+
+
+def _record_foreground_replan(
+    state_root: Path,
+    goal: GoalRecord,
+    *,
+    finding: str,
+    reason: str,
+) -> None:
+    """Give the foreground supervisor a durable task instead of replaying semantics."""
+    add_foreground_task(
+        state_root,
+        goal.session_ref,
+        kind="replan",
+        source="supervisor",
+        text=(
+            f"Dispatch for {finding} was rejected semantically: {reason}. "
+            "Inspect current goal, evidence, and delivery contract; then replan or issue a corrected action."
+        ),
+    )
+
+
 def _stored_result(path: Path | None) -> DispatchResult | None:
     if path is None:
         return None
@@ -133,12 +204,14 @@ def reconcile_corrective_action(
     journal_events: tuple[CanonicalEvent, ...] = (),
     ledger_path: Path | None = None,
     ledger_key_path: Path | None = None,
-    max_action_attempts: int = 3,
     retry_delay_seconds: float = 60.0,
 ) -> CorrectiveActionResult:
-    """Persist, publish, or recover one correction without duplicate delivery."""
-    if max_action_attempts < 1:
-        raise ValueError("max_action_attempts must be at least 1")
+    """Persist, publish, or recover one correction without duplicate delivery.
+
+    A failed delivery records its attempt and returns to the durable pursuit
+    loop after the retry delay. Attempts are evidence, never a reason to
+    abandon an unfinished goal.
+    """
     if retry_delay_seconds < 0:
         raise ValueError("retry_delay_seconds cannot be negative")
     ledger = SupervisionLedger(state_root, lane)
@@ -205,23 +278,15 @@ def reconcile_corrective_action(
         latest is not None
         and _same_incident(latest, finding, stage, digest)
         and latest.state == "blocked"
+        and not _retry_due(latest.next_retry_at)
     ):
-        if latest.obstacle == "dispatch_retry_exhausted":
-            return CorrectiveActionResult(
-                "blocked",
-                latest.order_id,
-                latest.order_marker,
-                False,
-                "bounded dispatch retries are exhausted",
-            )
-        if not _retry_due(latest.next_retry_at):
-            return CorrectiveActionResult(
-                "blocked",
-                order.order_id,
-                marker,
-                False,
-                f"retry waits until {latest.next_retry_at}",
-            )
+        return CorrectiveActionResult(
+            "blocked",
+            order.order_id,
+            marker,
+            False,
+            f"retry waits until {latest.next_retry_at}",
+        )
 
     artifacts = locate_order(QueueLayout(queue_dir), order.order_id)
     result = _stored_result(artifacts.result_path)
@@ -337,15 +402,41 @@ def reconcile_corrective_action(
                 )
             return CorrectiveActionResult("awaiting_progress", order.order_id, marker, False, reason)
         reason = f"dispatch ended {result.status.value}: {result.reason or 'no reason recorded'}"
+        failure_disposition = classify_delivery_failure(result)
+        if failure_disposition != "transport_retry":
+            if failure_disposition == "foreground_replan":
+                _record_foreground_replan(
+                    state_root,
+                    goal,
+                    finding=f"corrective finding {finding.fingerprint}",
+                    reason=reason,
+                )
+            if not (
+                latest is not None
+                and _same_action(latest, order, finding, stage)
+                and latest.state == "blocked"
+                and latest.obstacle == failure_disposition
+            ):
+                ledger.transition(
+                    state="blocked",
+                    session_ref=goal.session_ref,
+                    goal_version=goal.goal_version,
+                    goal_digest_value=digest,
+                    reason=reason,
+                    finding_fingerprint=finding.fingerprint,
+                    stage=stage,
+                    order_id=order.order_id,
+                    order_marker=marker,
+                    observed_event_id="",
+                    turn_boundary_event_id="",
+                    obstacle=failure_disposition,
+                    attempt=attempt,
+                    next_retry_at="",
+                )
+            suffix = "foreground replan required" if failure_disposition == "foreground_replan" else "lifecycle wait required"
+            return CorrectiveActionResult("blocked", order.order_id, marker, False, f"{reason}; {suffix}")
         next_attempt = attempt + 1
-        non_retryable = result.reason.startswith(("directive-voice:", "stale-goal-contract"))
-        exhausted = non_retryable or next_attempt >= max_action_attempts
-        next_retry_at = ""
-        obstacle = "dispatch_retry_exhausted" if exhausted else "dispatch_terminal_failure"
-        if not exhausted:
-            next_retry_at = (
-                datetime.now(UTC) + timedelta(seconds=retry_delay_seconds)
-            ).isoformat()
+        next_retry_at = (datetime.now(UTC) + timedelta(seconds=retry_delay_seconds)).isoformat()
         if not (
             latest is not None
             and _same_action(latest, order, finding, stage)
@@ -364,16 +455,17 @@ def reconcile_corrective_action(
                 order_marker=marker,
                 observed_event_id="",
                 turn_boundary_event_id="",
-                obstacle=obstacle,
+                obstacle="dispatch_terminal_failure",
                 attempt=next_attempt,
                 next_retry_at=next_retry_at,
             )
-        result_reason = (
-            f"{reason}; bounded retry budget exhausted"
-            if exhausted
-            else f"{reason}; retry scheduled for {next_retry_at}"
+        return CorrectiveActionResult(
+            "blocked",
+            order.order_id,
+            marker,
+            False,
+            f"{reason}; retry scheduled for {next_retry_at}",
         )
-        return CorrectiveActionResult("blocked", order.order_id, marker, False, result_reason)
 
     if artifacts.order_paths:
         if (
@@ -563,19 +655,16 @@ def reconcile_question_action(
     journal_events: tuple[CanonicalEvent, ...] = (),
     ledger_path: Path | None = None,
     ledger_key_path: Path | None = None,
-    max_action_attempts: int = 3,
     retry_delay_seconds: float = 60.0,
 ) -> CorrectiveActionResult:
     """Persist, deliver, and reconcile a routine frozen-goal answer.
 
     Question answers use the same durable supervision ledger as corrective
-    actions.  A restart can recover an existing queue/result, retry a bounded
+    actions. A restart can recover an existing queue/result, retry every
     terminal failure with a new deterministic order id, and mark the answer
     consumed only after signed delivery plus a bound user turn and final
     response are present.
     """
-    if max_action_attempts < 1:
-        raise ValueError("max_action_attempts must be at least 1")
     if retry_delay_seconds < 0:
         raise ValueError("retry_delay_seconds cannot be negative")
     order = build_question_order(goal, question_result)
@@ -619,11 +708,9 @@ def reconcile_question_action(
         and latest.stage == stage
         and latest.goal_digest == digest
         and latest.state == "blocked"
+        and not _retry_due(latest.next_retry_at)
     ):
-        if latest.obstacle == "dispatch_retry_exhausted":
-            return CorrectiveActionResult("blocked", latest.order_id, latest.order_marker, False, "bounded dispatch retries are exhausted")
-        if not _retry_due(latest.next_retry_at):
-            return CorrectiveActionResult("blocked", order.order_id, marker, False, f"retry waits until {latest.next_retry_at}")
+        return CorrectiveActionResult("blocked", order.order_id, marker, False, f"retry waits until {latest.next_retry_at}")
 
     # Retries use a new deterministic queue identity. Rebuild after loading
     # the keyed action row so recovery never inspects or republishes r0.
@@ -742,11 +829,42 @@ def reconcile_question_action(
                 "signed delivery and the bound completed agent turn are proven",
             )
         reason = f"dispatch ended {result.status.value}: {result.reason or 'no reason recorded'}"
+        failure_disposition = classify_delivery_failure(result)
+        if failure_disposition != "transport_retry":
+            if failure_disposition == "foreground_replan":
+                _record_foreground_replan(
+                    state_root,
+                    goal,
+                    finding=f"question {question_result.request_id}",
+                    reason=reason,
+                )
+            if not (
+                latest is not None
+                and latest.finding_fingerprint == fingerprint
+                and latest.stage == stage
+                and latest.state == "blocked"
+                and latest.obstacle == failure_disposition
+            ):
+                ledger.transition(
+                    state="blocked",
+                    session_ref=goal.session_ref,
+                    goal_version=goal.goal_version,
+                    goal_digest_value=digest,
+                    reason=reason,
+                    finding_fingerprint=fingerprint,
+                    stage=stage,
+                    order_id=order.order_id,
+                    order_marker=marker,
+                    observed_event_id="",
+                    turn_boundary_event_id="",
+                    obstacle=failure_disposition,
+                    attempt=attempt,
+                    next_retry_at="",
+                )
+            suffix = "foreground replan required" if failure_disposition == "foreground_replan" else "lifecycle wait required"
+            return CorrectiveActionResult("blocked", order.order_id, marker, False, f"{reason}; {suffix}")
         next_attempt = attempt + 1
-        non_retryable = result.reason.startswith(("directive-voice:", "stale-goal-contract", "invalid-goal-contract-answer"))
-        exhausted = non_retryable or next_attempt >= max_action_attempts
-        next_retry_at = "" if exhausted else (datetime.now(UTC) + timedelta(seconds=retry_delay_seconds)).isoformat()
-        obstacle = "dispatch_retry_exhausted" if exhausted else "dispatch_terminal_failure"
+        next_retry_at = (datetime.now(UTC) + timedelta(seconds=retry_delay_seconds)).isoformat()
         if not (
             latest is not None
             and latest.finding_fingerprint == fingerprint
@@ -766,12 +884,11 @@ def reconcile_question_action(
                 order_marker=marker,
                 observed_event_id="",
                 turn_boundary_event_id="",
-                obstacle=obstacle,
+                obstacle="dispatch_terminal_failure",
                 attempt=next_attempt,
                 next_retry_at=next_retry_at,
             )
-        suffix = "bounded retry budget exhausted" if exhausted else f"retry scheduled for {next_retry_at}"
-        return CorrectiveActionResult("blocked", order.order_id, marker, False, f"{reason}; {suffix}")
+        return CorrectiveActionResult("blocked", order.order_id, marker, False, f"{reason}; retry scheduled for {next_retry_at}")
 
     if artifacts.order_paths:
         if not (

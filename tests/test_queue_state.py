@@ -296,7 +296,7 @@ def test_retry_tracker_reads_zero_when_no_sidecar_exists(tmp_path: Path) -> None
     tracker = LaneLockRetryTracker(tmp_path)
 
     assert tracker.state_path("ord-1") == tmp_path / ".ord-1.lane-lock-attempts"
-    assert tracker.attempts("ord-1", retry_limit=20) == 0
+    assert tracker.attempts("ord-1") == 0
 
 
 def test_retry_tracker_increments_and_persists_across_instances(tmp_path: Path) -> None:
@@ -305,33 +305,32 @@ def test_retry_tracker_increments_and_persists_across_instances(tmp_path: Path) 
     writer = LaneLockRetryTracker(tmp_path)
     reader = LaneLockRetryTracker(tmp_path)
 
-    first = writer.record_attempt("ord-1", retry_limit=20)
-    second = writer.record_attempt("ord-1", retry_limit=20)
+    first = writer.record_attempt("ord-1")
+    second = writer.record_attempt("ord-1")
 
     assert first == 1
     assert second == 2
-    assert reader.attempts("ord-1", retry_limit=20) == 2
+    assert reader.attempts("ord-1") == 2
     assert json.loads(writer.state_path("ord-1").read_text(encoding="utf-8")) == {"attempts": 2}
 
 
 @pytest.mark.parametrize("corrupt_payload", ['{"attempts": true}', '{"attempts": -3}', '{"attempts": "many"}', "not json"])
-def test_retry_tracker_fails_closed_on_a_corrupt_sidecar(tmp_path: Path, corrupt_payload: str) -> None:
-    """An externally corrupted record is treated as exhausted (retry_limit),
-    never reset to zero -- resetting would allow an unbounded retry loop."""
+def test_retry_tracker_repairs_a_corrupt_diagnostic_sidecar(tmp_path: Path, corrupt_payload: str) -> None:
     tracker = LaneLockRetryTracker(tmp_path)
     tracker.state_path("ord-1").write_text(corrupt_payload, encoding="utf-8")
 
-    assert tracker.attempts("ord-1", retry_limit=7) == 7
+    assert tracker.attempts("ord-1") == 0
+    assert tracker.record_attempt("ord-1") == 1
 
 
 def test_retry_tracker_clear_removes_the_sidecar_and_is_safe_to_repeat(tmp_path: Path) -> None:
     tracker = LaneLockRetryTracker(tmp_path)
-    tracker.record_attempt("ord-1", retry_limit=20)
+    tracker.record_attempt("ord-1")
 
     tracker.clear("ord-1")
 
     assert not tracker.state_path("ord-1").exists()
-    assert tracker.attempts("ord-1", retry_limit=20) == 0
+    assert tracker.attempts("ord-1") == 0
     tracker.clear("ord-1")  # idempotent
 
 
@@ -368,7 +367,7 @@ def test_terminal_finalization_is_idempotent_and_clears_control_markers(tmp_path
     nonce = layout.send_nonce("ord-1")
     nonce.mint()
     tracker = LaneLockRetryTracker(layout.deferred)
-    tracker.record_attempt("ord-1", retry_limit=20)
+    tracker.record_attempt("ord-1")
 
     finalization = TerminalFinalization(
         claimed_path=claimed,
@@ -426,16 +425,16 @@ def test_requeue_deferred_to_orders_is_fifo_and_does_not_reset_retry_sidecars(tm
     os.utime(older, ns=(10, 10))
     os.utime(newer, ns=(20, 20))
     tracker = LaneLockRetryTracker(deferred)
-    tracker.record_attempt("older", retry_limit=20)
-    tracker.record_attempt("newer", retry_limit=20)
+    tracker.record_attempt("older")
+    tracker.record_attempt("newer")
 
     outcome = requeue_deferred_to_orders(deferred, orders)
 
     assert [path.name for path in outcome.requeued] == ["older.json", "newer.json"]
     assert outcome.skipped_existing_target == []
     assert outcome.failed == []
-    assert tracker.attempts("older", retry_limit=20) == 1
-    assert tracker.attempts("newer", retry_limit=20) == 1
+    assert tracker.attempts("older") == 1
+    assert tracker.attempts("newer") == 1
 
 
 def test_requeue_deferred_skips_a_target_created_after_scan_without_clobbering_it(tmp_path: Path) -> None:

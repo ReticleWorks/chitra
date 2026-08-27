@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from _goal_fixtures import enrollment_fields
 
+from chitra.autonomy import AutonomyPolicy, CapabilityGrant
 from chitra.goal_enforcement import (
     REVIEWER_ATTEMPTS,
     REVIEWER_SYSTEM_PROMPT,
@@ -106,6 +107,20 @@ def test_frozen_goal_uses_immutable_structured_enrollment_condition(tmp_path: Pa
     frozen = freeze_goal(enrolled)
 
     assert frozen.done_when == enrolled.done_when
+
+
+def test_frozen_goal_contract_changes_with_enrolled_autonomy_policy(tmp_path: Path) -> None:
+    enrolled = _goal(tmp_path)
+    restricted = AutonomyPolicy(grants=(CapabilityGrant(grant_id="replan-only", capability="replan"),))
+    redirected = redirect_goal(
+        tmp_path,
+        enrolled.session_ref,
+        reason="change the enrolled authority contract",
+        autonomy_policy=restricted,
+    )
+
+    assert freeze_goal(redirected).autonomy_policy == restricted
+    assert freeze_goal(redirected).contract_id != freeze_goal(enrolled).contract_id
 
 
 def test_initial_round_can_be_configured_to_one_reviewer(tmp_path: Path) -> None:

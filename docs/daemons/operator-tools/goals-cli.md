@@ -1,6 +1,6 @@
 # chitra-goals — Goal Management CLI
 
-Chitra-goals is the user-facing CLI for managing session goals. It wraps the deterministic goals store (goals.py) and provides subcommands for enrollment, status queries, closure, holds, and ask/resolution workflows.
+Chitra-goals is the user-facing CLI for managing session goals. It wraps the deterministic goals store (goals.py) and provides subcommands for enrollment, status queries, closure, holds, and ask/resolution workflows. Enrollment freezes the goal's `AutonomyPolicy` alongside its completion contract.
 
 ## Subcommands
 
@@ -19,7 +19,32 @@ Validates:
 - Goal text is ≥6 words.
 - Every interview answer and its provenance are present.
 - At least one done item names its ID, text, validator, and required receipt.
-- Status is one of: open, working, paused, held, complete, abandoned, redirected, deferred.
+- Tactical goal status is one of the internal values accepted by the goals store. It is not the lane lifecycle. The public lane lifecycle has exactly four states: `active`, `paused`, `shelved`, and `closed`.
+
+### Autonomy policy
+
+By default, enrollment freezes the aggressive, goal-scoped `chitra.autonomy.v1`
+policy. It grants replanning, small redesign, dependency, schema, hook,
+credential, authentication, security, and irreversible capabilities against
+the goal target, including spending. It pursues after one clean idle pass, and
+Claude's recurring hook runs every five minutes. Use one of these mutually
+exclusive options to replace that default:
+
+```bash
+chitra-goals set ... --autonomy-policy /path/to/policy.json
+chitra-goals set ... --autonomy-policy-json '{"schema":"chitra.autonomy.v1","initiative":"aggressive","grants":[]}'
+```
+
+An aggressive policy can narrow the default with a quantitative spend ceiling
+and a per-goal idle threshold:
+
+```bash
+chitra-goals set ... --autonomy-policy-json '{"schema":"chitra.autonomy.v1","initiative":"aggressive","idle_pursuit_passes":2,"loop_interval_minutes":10,"grants":[{"grant_id":"replan-goal","capability":"replan","targets":["goal"]},{"grant_id":"redesign-goal","capability":"small_redesign","targets":["goal"]},{"grant_id":"spend-usd-50","capability":"spend","targets":["goal"],"max_amount":"50","currency":"USD"}]}'
+```
+
+Each grant names a capability and may restrict its target, amount, unit count,
+or expiry. A policy is frozen into the goal digest. A redirect must provide a
+replacement policy when its strategic change needs different authority.
 
 ### get — Query a goal
 
@@ -46,7 +71,7 @@ chitra-goals close \
 
 Completion close requires `done-pending-close` and repeats the exact item ID, receipt name, validator result, and citation check over Watchd's persisted proofs. `--delivered-item` and `--operator-acknowledged-item` are rejected as completion substitutes. Use `--administrative --reason "..."` to discard a dead record without claiming the work is done.
 
-### hold — Pause a goal
+### hold — Hold a goal
 
 ```bash
 chitra-goals hold \
@@ -54,7 +79,9 @@ chitra-goals hold \
   --reason "Awaiting design review feedback"
 ```
 
-Sets status to "held". Rate-limit-guard may also hold a session automatically.
+Sets the internal goal status to `held` without discarding the goal.
+Rate-limit-guard may also hold a session automatically. The lane lifecycle
+state remains one of `active`, `paused`, `shelved`, or `closed`.
 
 ### resume — Unpause a goal
 
@@ -62,7 +89,8 @@ Sets status to "held". Rate-limit-guard may also hold a session automatically.
 chitra-goals resume --session-ref agent-1
 ```
 
-Sets status back to "open" or "working".
+Returns an explicitly held goal to its working status. Lifecycle resume also
+validates the saved worktree checkpoint before active enforcement returns.
 
 ### redirect — Change goal mid-stream
 

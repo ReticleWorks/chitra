@@ -2,9 +2,9 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)]() [![PyPI](https://img.shields.io/pypi/v/chitra-monitor.svg)](https://pypi.org/project/chitra-monitor/)
 
-chitra persistently supervises `tmux`-hosted AI-agent sessions against exact frozen goals. It records transcript evidence, detects drift and stalls, publishes crash-safe corrective orders, answers bounded goal questions, and independently verifies completion. `dispatchd` remains the sole terminal writer.
+chitra persistently supervises `tmux`-hosted AI-agent sessions against exact frozen goals. It records transcript evidence, detects drift and stalls, publishes crash-safe corrective orders, investigates unresolved routine questions, and independently verifies completion. `dispatchd` remains the sole terminal writer.
 
-It was built to manage large parallel sessions with LLM coding agents, allowing the user to do more while chitra handles delivery and state tracking, applies optional LLM-backed judgment gates, and gates external harnesses such as Claude and Codex against clearly defined goals.
+It was built to manage large parallel sessions with LLM coding agents, allowing the user to do more while chitra handles delivery and state tracking, applies optional LLM-backed judgment gates, and keeps Claude and Codex sessions pursuing clearly defined goals. See [Persistent supervision](docs/persistent-supervision.md) for the lane lifecycle and recovery contract.
 
 ## Scope
 
@@ -24,7 +24,7 @@ Requires Python 3.12+ and `tmux` on the host. See [Install](#install) for local 
 
 ## Why "chitra"
 
-The name is a short form of *Chitragupta*, a figure from Hindu tradition described as the divine registrar and keeper of a complete, accurate ledger of deeds. That remains this package's contract: it observes, verifies against frozen goals and cited artifacts, and takes bounded supervisory action without doing an agent session's work or making protected decisions for the operator. The name is used respectfully as a functional reference, not as religious imagery.
+The name is a short form of *Chitragupta*, a figure from Hindu tradition described as the divine registrar and keeper of a complete, accurate ledger of deeds. That remains this package's contract: it observes, verifies against frozen goals and cited artifacts, and takes goal-scoped supervisory action without silently changing the frozen goal or its autonomy policy. The name is used respectfully as a functional reference, not as religious imagery.
 
 BrowserStack's `chitragupta-node` and `chitragupta-rails` are open-source SDKs that use the same name for structured JSON (JavaScript Object Notation) logging — attaching metadata to log lines rather than relaying or signing them. Different tool, same naming logic: the name attaches to something that records and structures what happened, not something that decides what should happen.
 
@@ -40,7 +40,7 @@ are deprecated.
 - `chitra.ledger` — an append-only, HMAC-signed log of every delivered message.
 
 **Monitoring**
-- `chitra.monitord` / `chitra.supervisor` / `chitra.supervision` — bind transcripts to exact goals, persist corrective actions across restart, prove delivery consumption, answer bounded questions, and continue until enrolled completion evidence verifies.
+- `chitra.monitord` / `chitra.supervisor` / `chitra.supervision` — bind transcripts to exact goals, persist corrective actions across restart, investigate unresolved routine questions, pursue successive actions, prove delivery consumption, and continue until enrolled completion evidence verifies.
 - `chitra.watchd` — derives semantic pane status from authoritative lifecycle reports or declarative screen manifests, serves the local coordination socket, and runs a completion audit on each finished turn.
 - `chitra.triaged` / `chitra.sweepd` — deduplicated state-change events and a compact fleet-state feed for downstream monitors.
 - `chitra.draft_scanner` — flags unsubmitted drafts left sitting in a tmux input box.
@@ -51,7 +51,7 @@ are deprecated.
 
 **Goals and completion**
 - `chitra.goals` — a per-lane goal store with atomic interview enrollment and frozen structured done items, guarded by `flock`.
-- `chitra.goal_enforcement` / `chitra.completion_gate` / `chitra.close_gate` — require exact named, validator-bearing receipts for every frozen done item; spend, credentials, and irreversible actions stay operator-gated.
+- `chitra.goal_enforcement` / `chitra.completion_gate` / `chitra.close_gate` — require exact named, validator-bearing receipts for every frozen done item; each goal also freezes an `AutonomyPolicy` with typed grants and limits for pursuit.
 
 **Rate limiting**
 - `chitra.usage` / `chitra.rate_limit_guard` / `chitra.account_registry` — read account usage and pause/resume lanes on provider limits or host load pressure, over a durable, crash-safe transaction. See [`docs/pause-recovery.md`](docs/pause-recovery.md).

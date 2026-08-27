@@ -383,12 +383,7 @@ class SendNonce:
 
 
 class LaneLockRetryTracker:
-    """Durable per-order attempt counter parked beside a deferred order.
-
-    One sidecar per order id under ``deferred/`` counts transient failures
-    (lane-lock timeouts, unconfirmed deliveries) across daemon restarts, so
-    a retry budget survives crashes and bounds a permanently-busy lane.
-    """
+    """Durable per-order attempt counter parked beside a deferred order."""
 
     def __init__(self, deferred_dir: Path) -> None:
         self.deferred_dir = deferred_dir
@@ -404,8 +399,8 @@ class LaneLockRetryTracker:
         _require_real_directory(self.deferred_dir, label="deferred directory")
         return self.deferred_dir / f".{order_id}.lane-lock-attempts"
 
-    def attempts(self, order_id: str, *, retry_limit: int) -> int:
-        """Read a retry count, failing closed if a manually-corrupt sidecar appears."""
+    def attempts(self, order_id: str) -> int:
+        """Read a retry count; repair a corrupt diagnostic sidecar on the next attempt."""
         path = self.state_path(order_id)
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -416,15 +411,15 @@ class LaneLockRetryTracker:
             return 0
         except (OSError, ValueError, TypeError, KeyError) as exc:
             # Atomic writes prevent a process crash from producing this state.
-            # Treat an externally corrupted record as exhausted rather than
-            # resetting it and allowing an unbounded retry loop.
-            logger.error("dispatchd_lane_lock_retry_state_invalid", path=str(path), error=str(exc))
-            return retry_limit
+            # The count is diagnostic, not an authority or terminal-delivery
+            # gate, so corruption must not strand an unfinished order.
+            logger.warning("dispatchd_lane_lock_retry_state_invalid", path=str(path), error=str(exc))
+            return 0
         return attempts
 
-    def record_attempt(self, order_id: str, *, retry_limit: int) -> int:
+    def record_attempt(self, order_id: str) -> int:
         """Atomically increment and persist one failure count."""
-        attempts = self.attempts(order_id, retry_limit=retry_limit) + 1
+        attempts = self.attempts(order_id) + 1
         write_json_atomic(self.state_path(order_id), {"attempts": attempts})
         return attempts
 

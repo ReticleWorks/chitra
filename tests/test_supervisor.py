@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
+import pytest
+from _goal_fixtures import enrollment_fields
+
+from chitra.autonomy import AutonomyPolicy, CapabilityGrant, autonomy_policy_sha256
 from chitra.detect import Finding, IncidentRecord, LadderDecision
-from chitra.goals import GoalRecord
+from chitra.goals import GoalRecord, get_goal, upsert_goal
 from chitra.orders import DispatchResult, DispatchStatus
 from chitra.supervision import SupervisionLedger, goal_digest
 from chitra.supervisor import (
     build_corrective_order,
+    classify_delivery_failure,
     order_marker,
     reconcile_corrective_action,
 )
@@ -83,7 +89,6 @@ def _kwargs(tmp_path: Path, goal: GoalRecord, finding: Finding, decision: Ladder
         "finding": finding,
         "decision": decision,
         "shadow_mode": False,
-        "max_action_attempts": 3,
         "retry_delay_seconds": 0,
     }
 
@@ -118,6 +123,31 @@ def _write_result(tmp_path: Path, order_id: str, *, reason: str = "lane unavaila
     )
 
 
+def test_corrective_order_uses_grants_instead_of_topic_escalation() -> None:
+    policy = AutonomyPolicy(
+        grants=(
+            CapabilityGrant(grant_id="credentials-prod", capability="credential_use", targets=("production",)),
+            CapabilityGrant(
+                grant_id="spend-usd",
+                capability="spend",
+                max_amount="25",
+                currency="USD",
+            ),
+            CapabilityGrant(grant_id="security-goal", capability="security_change"),
+            CapabilityGrant(grant_id="irreversible-goal", capability="irreversible_action"),
+        )
+    )
+    goal = replace(_goal(), autonomy_policy=policy)
+    finding = _finding()
+
+    order = build_corrective_order(goal, finding, _decision(finding, action="open"))
+
+    assert f"sha256:{autonomy_policy_sha256(policy)}" in order.nudge
+    assert "spend@goal (amount<=25 USD)" in order.nudge
+    assert "Continue autonomously when an active grant covers" in order.nudge
+    assert "Escalate only missing credentials" not in order.nudge
+
+
 def test_hold_without_matching_pending_intent_does_not_enqueue(tmp_path: Path) -> None:
     goal, finding = _goal(), _finding()
     result = reconcile_corrective_action(**_kwargs(tmp_path, goal, finding, _decision(finding)))  # type: ignore[arg-type]
@@ -149,7 +179,7 @@ def test_action_queued_missing_queue_or_result_blocks_without_repaste(tmp_path: 
     assert not list((tmp_path / "queue").glob("**/*.json"))
 
 
-def test_terminal_failed_result_schedules_attempt_specific_retry_immediately(tmp_path: Path) -> None:
+def test_goal_not_actionable_waits_for_lifecycle_instead_of_retrying_text(tmp_path: Path) -> None:
     goal, finding = _goal(), _finding()
     decision = _decision(finding, action="open")
     first = build_corrective_order(goal, finding, decision, retry_attempt=0)
@@ -158,40 +188,80 @@ def test_terminal_failed_result_schedules_attempt_specific_retry_immediately(tmp
 
     failed = reconcile_corrective_action(**_kwargs(tmp_path, goal, finding, decision))  # type: ignore[arg-type]
     assert failed.state == "blocked"
-    assert "retry scheduled" in failed.reason
+    assert "lifecycle wait required" in failed.reason
 
-    resumed = reconcile_corrective_action(**_kwargs(tmp_path, goal, finding, decision))  # type: ignore[arg-type]
-    retry = build_corrective_order(goal, finding, decision, retry_attempt=1)
-    assert resumed.enqueued is True
-    assert resumed.order_id == retry.order_id
-    assert resumed.order_id != first.order_id
-    assert (tmp_path / "queue" / "orders" / f"{retry.order_id}.json").is_file()
+    repeated = reconcile_corrective_action(**_kwargs(tmp_path, goal, finding, decision))  # type: ignore[arg-type]
+    assert repeated.enqueued is False
+    assert repeated.order_id == first.order_id
+    assert "lifecycle wait required" in repeated.reason
+    assert SupervisionLedger(tmp_path / "state", LANE).latest().obstacle == "lifecycle_wait"  # type: ignore[union-attr]
 
 
-def test_three_terminal_failures_exhaust_without_fourth_order(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("status", "reason", "expected"),
+    [
+        (DispatchStatus.BLOCKED, "goals-schema-newer-than-installed", "lifecycle_wait"),
+        (DispatchStatus.BLOCKED, "lane-lifecycle-closed", "lifecycle_wait"),
+        (DispatchStatus.BLOCKED, "lane-lifecycle-paused-deferred", "lifecycle_wait"),
+        (DispatchStatus.BLOCKED, "lane-lifecycle-unavailable: malformed recovery record", "foreground_replan"),
+        (DispatchStatus.BLOCKED, "lane-lifecycle-unknown: archived", "foreground_replan"),
+        (DispatchStatus.BLOCKED, "session namespace denied by prefix 'private-'", "foreground_replan"),
+        (DispatchStatus.BLOCKED, "session namespace is not owned by this dispatcher", "foreground_replan"),
+        (DispatchStatus.BLOCKED, "remote dispatch to host-b not in allowlist", "foreground_replan"),
+        (DispatchStatus.FAILED, "unsupported session_ref (expected host:session:pane)", "foreground_replan"),
+        (DispatchStatus.BLOCKED, "blocked: pane contains unsent draft", "transport_retry"),
+    ],
+)
+def test_delivery_failure_classification_separates_semantics_from_transport(
+    status: DispatchStatus,
+    reason: str,
+    expected: str,
+) -> None:
+    result = DispatchResult(order_id="classification", session_ref=SESSION, status=status, reason=reason)
+
+    assert classify_delivery_failure(result) == expected
+
+
+def test_terminal_failures_keep_pursuing_beyond_five_successive_actions(tmp_path: Path) -> None:
     goal, finding = _goal(), _finding()
     decision = _decision(finding, action="open")
     first = reconcile_corrective_action(**_kwargs(tmp_path, goal, finding, decision))  # type: ignore[arg-type]
     assert first.enqueued is True
 
     order_ids = [first.order_id]
-    for attempt in range(3):
+    for _attempt in range(6):
         current_id = order_ids[-1]
         _write_result(tmp_path, current_id)
         failed = reconcile_corrective_action(**_kwargs(tmp_path, goal, finding, decision))  # type: ignore[arg-type]
         assert failed.state == "blocked"
-        if attempt < 2:
-            resumed = reconcile_corrective_action(**_kwargs(tmp_path, goal, finding, decision))  # type: ignore[arg-type]
-            assert resumed.enqueued is True
-            order_ids.append(resumed.order_id)
-        else:
-            assert failed.reason.find("exhausted") >= 0
+        assert "retry scheduled" in failed.reason
+        resumed = reconcile_corrective_action(**_kwargs(tmp_path, goal, finding, decision))  # type: ignore[arg-type]
+        assert resumed.enqueued is True
+        order_ids.append(resumed.order_id)
 
-    exhausted = reconcile_corrective_action(**_kwargs(tmp_path, goal, finding, decision))  # type: ignore[arg-type]
-    assert exhausted.enqueued is False
-    assert "exhausted" in exhausted.reason
-    assert len(order_ids) == 3
-    assert len(list((tmp_path / "queue" / "orders").glob("*.json"))) == 3
+    assert len(order_ids) == 7
+    assert len(list((tmp_path / "queue" / "orders").glob("*.json"))) == 7
+
+
+def test_semantic_delivery_failure_creates_a_foreground_replan_not_a_retry(tmp_path: Path) -> None:
+    goal, finding = _goal(), _finding()
+    goal = replace(goal, goal="Ship the bounded persistent supervisor safely today.", **enrollment_fields(goal.done_when))
+    decision = _decision(finding, action="open")
+    upsert_goal(tmp_path / "state", goal)
+    first = reconcile_corrective_action(**_kwargs(tmp_path, goal, finding, decision))  # type: ignore[arg-type]
+    _write_result(tmp_path, first.order_id, reason="stale-goal-contract")
+
+    failed = reconcile_corrective_action(**_kwargs(tmp_path, goal, finding, decision))  # type: ignore[arg-type]
+
+    assert failed.state == "blocked"
+    assert "foreground replan required" in failed.reason
+    assert list((tmp_path / "queue" / "orders").glob("*.json")) == [
+        tmp_path / "queue" / "orders" / f"{first.order_id}.json"
+    ]
+    stored = get_goal(tmp_path / "state", goal.session_ref)
+    assert stored is not None
+    assert len(stored.foreground_tasks) == 1
+    assert stored.foreground_tasks[0].kind == "replan"
 
 
 def test_sibling_finding_cannot_reset_an_action_retry_cursor(tmp_path: Path) -> None:

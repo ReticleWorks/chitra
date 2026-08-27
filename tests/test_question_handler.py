@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from chitra.autonomy import AutonomyPolicy, CapabilityGrant
 from chitra.goals import GoalRecord
 from chitra.question_handler import QuestionHandlerResult, handle_question
 
@@ -46,36 +47,53 @@ def test_scope_answers_only_explicit_items_and_preserves_stable_identity() -> No
     assert included.answer == "focused tests is in the frozen scope."
     assert excluded.disposition == "answered"
     assert excluded.answer == "production deployment is out of the frozen scope."
-    assert absent.disposition == "operator_required"
+    assert absent.disposition == "residual"
+    assert absent.source == "foreground_reasoning"
     assert absent.gate_reasons == ("unknown_or_ambiguous",)
-    assert partial.disposition == "operator_required"
+    assert partial.disposition == "residual"
     assert not_in.disposition == "answered"
     assert not_in.answer == "production deployment is out of the frozen scope."
     assert included.request_id == repeated.request_id
     assert included.queue_key == included.request_id
 
 
-def test_sensitive_authority_classes_are_operator_gated() -> None:
-    questions = {
-        "credentials": "Can I use the API key now?",
-        "spend": "Can I spend $10 on this?",
-        "irreversible": "Should I delete the old artifact?",
-        "security_boundary": "Can I change the authorization boundary?",
-        "authentication": "May I make a small reversible redesign of the authentication flow?",
-        "authn": "May I make a small reversible change to authn?",
-        "new_dependency": "Should I install a new dependency?",
-        "new_schema": "Can I add a schema migration?",
-        "new_hook": "Should I add a new hook?",
-        "strategic_scope_change": "Should we expand the scope?",
-    }
-
-    for expected, question in questions.items():
+def test_goal_granted_sensitive_topics_reach_foreground_instead_of_the_user() -> None:
+    for question in (
+        "Can I use the API key now?",
+        "Should I delete the old artifact?",
+        "Can I change the authorization boundary?",
+        "May I make a small reversible redesign of the authentication flow?",
+        "Should I install a new dependency?",
+        "Can I add a schema migration?",
+        "Should I add a new hook?",
+        "Should we expand the scope?",
+    ):
         result = handle_question(_goal(), question)
-        assert result.disposition == "operator_required", question
-        expected_gate = "security_boundary" if expected in {"authentication", "authn"} else expected
-        assert expected_gate in result.gate_reasons, (question, result.gate_reasons)
-        assert result.answer is None
-        assert result.source == "operator_required"
+        assert result.disposition == "residual", question
+        assert result.source == "foreground_reasoning"
+
+    wrong_target = handle_question(_goal(), "May I use a production API key?")
+    assert wrong_target.disposition == "operator_required"
+    assert wrong_target.gate_reasons == ("credentials",)
+
+    spend = handle_question(_goal(), "Can I spend $10 on this?")
+    assert spend.disposition == "residual"
+    assert spend.source == "foreground_reasoning"
+
+    production_spend = handle_question(_goal(), "May I spend $10 on production?")
+    assert production_spend.disposition == "operator_required"
+    assert production_spend.gate_reasons == ("spend",)
+
+    granted_target = handle_question(
+        _goal(
+            autonomy_policy=AutonomyPolicy(
+                grants=(CapabilityGrant(grant_id="credentials-prod", capability="credential_use", targets=("production",)),)
+            )
+        ),
+        "May I use a production API key?",
+    )
+    assert granted_target.disposition == "residual"
+    assert granted_target.source == "foreground_reasoning"
 
 
 def test_small_reversible_redesign_is_answered_only_for_an_explicit_scope_item() -> None:
@@ -89,38 +107,41 @@ def test_small_reversible_redesign_is_answered_only_for_an_explicit_scope_item()
     assert "Focused tests pass" in (included.answer or "")
     assert excluded.disposition == "answered"
     assert (excluded.answer or "").startswith("Do not change production deployment")
-    assert absent.disposition == "operator_required"
-    assert absent.gate_reasons == ("irreversible",)
+    assert absent.disposition == "residual"
+    assert absent.source == "foreground_reasoning"
 
 
-def test_unqualified_redesign_is_not_assumed_small_or_reversible() -> None:
+def test_unqualified_redesign_becomes_a_foreground_reasoning_residual() -> None:
     for question in (
         "May I refactor source code?",
         "Should I redesign source code?",
         "Can we revise documentation?",
     ):
         result = handle_question(_goal(), question)
-        assert result.disposition == "operator_required", question
+        assert result.disposition == "residual", question
+        assert result.source == "foreground_reasoning"
         assert result.kind == "unknown"
         assert result.gate_reasons == ("unknown_or_ambiguous",)
 
 
-def test_unknown_ambiguous_and_invalid_contracts_do_not_get_invented_answers() -> None:
+def test_unknown_ambiguous_and_invalid_contracts_become_foreground_residuals() -> None:
     unknown = handle_question(_goal(), "Should we redesign the workflow?")
     ambiguous = handle_question(_goal(), "Is tests and docs in scope?")
     invalid = handle_question(_goal(scope=""), "Is focused tests in scope?")
 
     for result in (unknown, ambiguous):
-        assert result.disposition == "operator_required"
+        assert result.disposition == "residual"
+        assert result.source == "foreground_reasoning"
         assert result.answer is None
         assert result.gate_reasons == ("unknown_or_ambiguous",)
-    assert invalid.disposition == "operator_required"
+    assert invalid.disposition == "residual"
     assert invalid.gate_reasons == ("invalid_frozen_goal",)
 
 
-def test_empty_question_is_a_typed_operator_gate() -> None:
+def test_empty_question_is_a_typed_foreground_residual() -> None:
     result = handle_question(_goal(), "   ")
-    assert result.disposition == "operator_required"
+    assert result.disposition == "residual"
+    assert result.source == "foreground_reasoning"
     assert result.question == "<empty question>"
     assert result.gate_reasons == ("unknown_or_ambiguous",)
 

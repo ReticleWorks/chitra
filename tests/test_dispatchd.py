@@ -544,7 +544,6 @@ def test_nonce_reconciliation_does_not_borrow_an_unrelated_transcript(
         goals_root=goals_root,
         transcript_bindings_path=bindings,
         projects_root=tmp_path / "transcripts",
-        lane_lock_retry_attempts=2,
     )[0]
 
     assert result.status is DispatchStatus.DELIVERY_UNCONFIRMED
@@ -870,7 +869,7 @@ def test_lane_lock_defer_does_not_clobber_an_existing_deferred_target(
     deferred_target.parent.mkdir(parents=True)
     deferred_target.write_text("already-deferred", encoding="utf-8")
 
-    results = run_once(queue_dir, lock_dir=tmp_path / "locks", lane_lock_retry_attempts=5)
+    results = run_once(queue_dir, lock_dir=tmp_path / "locks")
 
     assert [result.status for result in results] == [DispatchStatus.BLOCKED]
     assert deferred_target.read_text(encoding="utf-8") == "already-deferred"
@@ -897,7 +896,7 @@ def test_delivery_unconfirmed_is_deferred_not_terminal(tmp_path: Path, monkeypat
     order = DispatchOrder(order_id="unconfirmed-1", session_ref="localhost:s:0.0", nudge="hi")
     _write_order(queue_dir / "orders", order)
 
-    results = run_once(queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl", lane_lock_retry_attempts=5)
+    results = run_once(queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl")
 
     assert [result.status for result in results] == [DispatchStatus.DELIVERY_UNCONFIRMED]
     assert not (queue_dir / "results" / "unconfirmed-1.json").exists()
@@ -906,13 +905,9 @@ def test_delivery_unconfirmed_is_deferred_not_terminal(tmp_path: Path, monkeypat
     assert dispatchd_mod._lane_lock_retry_state_path(queue_dir / "deferred", order.order_id).exists()
 
 
-def test_delivery_unconfirmed_retries_then_exhausts_with_a_crit_log(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_delivery_unconfirmed_keeps_retrying_without_a_terminal_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """After the retry budget on repeated DELIVERY_UNCONFIRMED results runs
-    out, dispatchd reports a terminal FAILED "retry-exhausted" (the same
-    exhaustion path the lane-lock timeout retry uses) and emits a CRIT-level
-    log line -- a silently-dropped delivery must never happen."""
 
     def always_unconfirmed(order: DispatchOrder, **kwargs: Any) -> DispatchResult:
         return DispatchResult(
@@ -932,7 +927,6 @@ def test_delivery_unconfirmed_retries_then_exhausts_with_a_crit_log(
         queue_dir,
         lock_dir=tmp_path / "locks",
         ledger_path=tmp_path / "ledger.jsonl",
-        lane_lock_retry_attempts=2,
         projects_root=projects_root,
     )
     assert [result.status for result in first] == [DispatchStatus.DELIVERY_UNCONFIRMED]
@@ -941,22 +935,17 @@ def test_delivery_unconfirmed_retries_then_exhausts_with_a_crit_log(
         queue_dir,
         lock_dir=tmp_path / "locks",
         ledger_path=tmp_path / "ledger.jsonl",
-        lane_lock_retry_attempts=2,
         projects_root=projects_root,
     )
 
-    assert [result.status for result in second] == [DispatchStatus.FAILED]
-    assert second[0].reason == "retry-exhausted"
-    assert (queue_dir / "processed" / "unconfirmed-2.json").exists()
-    assert not (queue_dir / "deferred" / "unconfirmed-2.json").exists()
-
-    captured = capsys.readouterr()
-    crit_lines = [line for line in captured.out.splitlines() if "dispatchd_retry_exhausted" in line]
-    assert crit_lines
-    assert any("critical" in line.lower() for line in crit_lines)
+    assert [result.status for result in second] == [DispatchStatus.DELIVERY_UNCONFIRMED]
+    assert not (queue_dir / "results" / "unconfirmed-2.json").exists()
+    assert not (queue_dir / "processed" / "unconfirmed-2.json").exists()
+    assert (queue_dir / "deferred" / "unconfirmed-2.json").exists()
+    assert dispatchd_mod._read_lane_lock_retry_attempts(queue_dir / "deferred", order.order_id) == 2
 
 
-def test_lane_lock_retry_exhaustion_writes_only_a_terminal_failed_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_lane_lock_timeout_keeps_retrying_without_a_terminal_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     def always_busy(self: LaneLock, **kwargs: Any) -> bool:
         raise LaneLockError("test lane is busy")
 
@@ -969,7 +958,6 @@ def test_lane_lock_retry_exhaustion_writes_only_a_terminal_failed_result(tmp_pat
         queue_dir,
         lock_dir=tmp_path / "locks",
         ledger_path=tmp_path / "ledger.jsonl",
-        lane_lock_retry_attempts=2,
     )
     assert [result.status for result in first] == [DispatchStatus.BLOCKED]
     assert not (queue_dir / "results" / "retry-exhausted.json").exists()
@@ -977,18 +965,15 @@ def test_lane_lock_retry_exhaustion_writes_only_a_terminal_failed_result(tmp_pat
         queue_dir,
         lock_dir=tmp_path / "locks",
         ledger_path=tmp_path / "ledger.jsonl",
-        lane_lock_retry_attempts=2,
     )
 
     retry_state = dispatchd_mod._lane_lock_retry_state_path(queue_dir / "deferred", order.order_id)
-    assert [result.status for result in second] == [DispatchStatus.FAILED]
-    assert second[0].reason == "retry-exhausted"
-    assert DispatchResult.model_validate_json((queue_dir / "results" / "retry-exhausted.json").read_text(encoding="utf-8")).reason == (
-        "retry-exhausted"
-    )
-    assert (queue_dir / "processed" / "retry-exhausted.json").exists()
-    assert not (queue_dir / "deferred" / "retry-exhausted.json").exists()
-    assert not retry_state.exists()
+    assert [result.status for result in second] == [DispatchStatus.BLOCKED]
+    assert not (queue_dir / "results" / "retry-exhausted.json").exists()
+    assert not (queue_dir / "processed" / "retry-exhausted.json").exists()
+    assert (queue_dir / "deferred" / "retry-exhausted.json").exists()
+    assert retry_state.exists()
+    assert dispatchd_mod._read_lane_lock_retry_attempts(queue_dir / "deferred", order.order_id) == 2
 
 
 def test_lane_lock_deferred_requeue_is_atomic_and_runs_after_pending_orders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1003,9 +988,7 @@ def test_lane_lock_deferred_requeue_is_atomic_and_runs_after_pending_orders(tmp_
     pending_order = DispatchOrder(order_id="already-pending", session_ref="localhost:s:0.1", nudge="pending")
     _write_order(queue_dir / "deferred", deferred_order)
     _write_order(queue_dir / "orders", pending_order)
-    dispatchd_mod._record_lane_lock_retry_attempt(
-        queue_dir / "deferred", deferred_order.order_id, retry_limit=dispatchd_mod.DEFAULT_LANE_LOCK_RETRY_ATTEMPTS
-    )
+    dispatchd_mod._record_lane_lock_retry_attempt(queue_dir / "deferred", deferred_order.order_id)
 
     seen: list[str] = []
 
@@ -1597,7 +1580,7 @@ def test_kill_point_crash_after_pane_touch_reconciles_instead_of_double_pasting(
 
 
 def test_existing_unconsumed_nonce_is_verified_without_pasting_again(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Once a nonce exists, later passes only verify consumption. They never
     inject the same order again, even if the first process died before pane
@@ -1641,22 +1624,19 @@ def test_existing_unconsumed_nonce_is_verified_without_pasting_again(
         lock_dir=tmp_path / "locks",
         ledger_path=tmp_path / "ledger.jsonl",
         projects_root=empty_projects_root,
-        lane_lock_retry_attempts=2,
     )
     second = run_once(
         queue_dir,
         lock_dir=tmp_path / "locks",
         ledger_path=tmp_path / "ledger.jsonl",
         projects_root=empty_projects_root,
-        lane_lock_retry_attempts=2,
     )
 
     assert [result.status for result in first] == [DispatchStatus.DELIVERY_UNCONFIRMED]
-    assert [result.status for result in second] == [DispatchStatus.FAILED]
-    assert second[0].reason == "retry-exhausted"
+    assert [result.status for result in second] == [DispatchStatus.DELIVERY_UNCONFIRMED]
     assert repeat_paste_calls["n"] == 0
-    assert (queue_dir / "processed" / "ord-early-crash.json").exists()
-    assert "dispatchd_retry_exhausted" in capsys.readouterr().out
+    assert not (queue_dir / "processed" / "ord-early-crash.json").exists()
+    assert (queue_dir / "deferred" / "ord-early-crash.json").exists()
 
 
 def test_stale_in_flight_claim_from_a_dead_owner_is_reclaimed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2374,8 +2354,6 @@ def test_dispatchd_parser_exposes_policy_invalid_order_and_tuning_flags() -> Non
             "120",
             "--lane-lock-timeout-seconds",
             "9",
-            "--lane-lock-retry-attempts",
-            "7",
             "--allow-session-prefix",
             "boomtown-",
             "--deny-session-prefix",
@@ -2390,7 +2368,6 @@ def test_dispatchd_parser_exposes_policy_invalid_order_and_tuning_flags() -> Non
         120.0,
         9.0,
     )
-    assert args.lane_lock_retry_attempts == 7
     assert args.allow_session_prefix == ["boomtown-"]
     assert args.deny_session_prefix == ["monitor"]
 
@@ -2399,7 +2376,6 @@ def test_dispatchd_parser_uses_the_transcript_write_allowance_by_default() -> No
     args = build_arg_parser().parse_args([])
 
     assert args.post_paste_wait_seconds == DISPATCH_VERIFY_WAIT_SECONDS == 15.0
-    assert args.lane_lock_retry_attempts == dispatchd_mod.DEFAULT_LANE_LOCK_RETRY_ATTEMPTS == 20
 
 
 def test_malformed_routing_config_raises_clearly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

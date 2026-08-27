@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from chitra.knowledge import KnowledgeBundle
 
 LANES_FILE_ENV_VAR = "CHITRA_LANES_FILE"
 DEFAULT_LANES_FILE = Path("/etc/chitra/lanes.yaml")
@@ -41,6 +43,7 @@ class LaneSpec:
     tmux_session: str
     credentials: LaneCredentials
     enabled: bool = True
+    knowledge_bundle: KnowledgeBundle = field(default_factory=KnowledgeBundle.empty)
 
     @property
     def queue_dir(self) -> Path:
@@ -103,7 +106,7 @@ def _absolute_path(mapping: dict[str, Any], key: str, *, path: str) -> Path:
     return value
 
 
-def _lane(value: Any, *, index: int) -> LaneSpec:
+def _lane(value: Any, *, index: int, default_knowledge_bundle: KnowledgeBundle) -> LaneSpec:
     path = f"manifest.lanes[{index}]"
     raw = _mapping(value, path=path)
     expected = {
@@ -118,6 +121,7 @@ def _lane(value: Any, *, index: int) -> LaneSpec:
         "tmux_session",
         "credentials",
         "enabled",
+        "knowledge_bundle",
     }
     unknown = sorted(set(raw) - expected)
     if unknown:
@@ -160,6 +164,11 @@ def _lane(value: Any, *, index: int) -> LaneSpec:
         tmux_session=tmux_session,
         credentials=credentials,
         enabled=enabled,
+        knowledge_bundle=(
+            KnowledgeBundle.from_mapping(raw["knowledge_bundle"])
+            if "knowledge_bundle" in raw
+            else default_knowledge_bundle
+        ),
     )
 
 
@@ -174,15 +183,20 @@ def load_lanes(path: Path | None = None) -> tuple[LaneSpec, ...]:
         raise ValueError(f"lane manifest cannot be read: {manifest_path}: {exc}") from exc
     _reject_model_keys(payload)
     manifest = _mapping(payload, path="manifest")
-    if set(manifest) != {"lanes"}:
-        unknown = sorted(set(manifest) - {"lanes"})
+    allowed_manifest_fields = {"lanes", "knowledge_bundle"}
+    if not set(manifest).issubset(allowed_manifest_fields) or "lanes" not in manifest:
+        unknown = sorted(set(manifest) - allowed_manifest_fields)
         missing = "lanes" if "lanes" not in manifest else ""
         detail = ", ".join(unknown) if unknown else missing
         raise ValueError(f"manifest must contain only lanes; invalid fields: {detail}")
     raw_lanes = manifest["lanes"]
     if not isinstance(raw_lanes, list) or not raw_lanes:
         raise ValueError("manifest.lanes must be a non-empty list")
-    lanes = tuple(_lane(value, index=index) for index, value in enumerate(raw_lanes))
+    default_knowledge_bundle = KnowledgeBundle.from_mapping(manifest.get("knowledge_bundle"))
+    lanes = tuple(
+        _lane(value, index=index, default_knowledge_bundle=default_knowledge_bundle)
+        for index, value in enumerate(raw_lanes)
+    )
     identifiers = [lane.identifier for lane in lanes]
     accounts = [lane.account for lane in lanes]
     uids = [lane.uid for lane in lanes]

@@ -69,11 +69,11 @@ capabilities:
       grants:
         - Ingest explicitly bound transcripts, run deterministic detectors, and persist per-lane supervision state.
         - Publish goal-bound corrective orders to dispatchd after recording durable intent.
-        - Answer questions that the exact frozen contract settles and approve only explicit small reversible changes within its scope.
+        - Answer questions that the exact frozen contract settles and direct actions covered by active enrolled autonomy grants, including successive replanning and redesign.
         - Execute enrolled completion validators after a structured claim and close only from session-isolated verified receipts.
       excludes:
         - Write to tmux directly or bypass dispatchd's single-writer, goal-contract, and authority checks.
-        - Supply credentials, approve spending, take irreversible action, change an authorization boundary, or redirect strategy.
+        - Mint authority outside the frozen goal policy, exceed an enrolled target or limit, or change the frozen outcome without a redirect.
         - Merge, approve, or modify pull requests.
     default_enabled: true
     commands:
