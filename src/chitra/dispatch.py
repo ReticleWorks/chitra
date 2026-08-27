@@ -1014,7 +1014,7 @@ def transcript_glob() -> str:
     return pattern
 
 
-def _read_transcript_tail(path: Path, max_bytes: int = 262144) -> str:
+def _read_transcript_tail(path: Path, max_bytes: int = 4 * 1024 * 1024) -> str:
     """Read the tail of a JSONL transcript file (last ``max_bytes`` bytes)."""
     try:
         size = path.stat().st_size
