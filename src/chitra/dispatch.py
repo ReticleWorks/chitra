@@ -77,7 +77,6 @@ from typing import Protocol
 
 import structlog
 
-from chitra._fsio import write_json_atomic
 from chitra.orders import DispatchOrder, DispatchResult, DispatchStatus
 from chitra.policy_config import PolicyConfig
 
@@ -150,19 +149,44 @@ _TRANSCRIPT_GLOB_DEFAULT = "*/*.jsonl"
 
 
 def enqueue_dispatch_order(queue_dir: Path, order: DispatchOrder) -> Path:
-    """Atomically enqueue one order for the already-running ``dispatchd``."""
+    """Atomically enqueue one order without replacing another producer's payload."""
     orders_dir = queue_dir / "orders"
     orders_dir.mkdir(parents=True, exist_ok=True)
     path = orders_dir / f"{order.order_id}.json"
-    write_json_atomic(
-        path,
-        order.model_dump(mode="json"),
-        temporary_path=orders_dir / f".{order.order_id}.json.tmp",
-        trailing_newline=False,
-        sort_keys=False,
-        fsync=True,
-        cleanup_on_error=False,
-    )
+    payload = order.model_dump_json().encode("utf-8")
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w+b",
+            prefix=f".{order.order_id}.",
+            suffix=".tmp",
+            dir=orders_dir,
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(payload)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        try:
+            os.link(temporary_path, path)
+        except FileExistsError:
+            if path.is_symlink():
+                raise FileExistsError(path) from None
+            try:
+                existing = DispatchOrder.model_validate_json(path.read_bytes())
+            except (OSError, ValueError):
+                raise FileExistsError(path) from None
+            if existing != order:
+                raise FileExistsError(path) from None
+        else:
+            directory_fd = os.open(orders_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
     return path
 
 

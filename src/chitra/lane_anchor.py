@@ -514,6 +514,7 @@ def _native_order_id(
     lifecycle: LaneLifecycle,
     lifecycle_id: str,
     setup_note: Path,
+    request_id: str | None = None,
 ) -> str:
     payload = {
         "lane": lane.identifier,
@@ -524,6 +525,7 @@ def _native_order_id(
         "goal": _goal_snapshot_sha256(goal),
         "knowledge": lane.knowledge_bundle.sha256,
         "setup": hashlib.sha256(setup_note.read_bytes()).hexdigest(),
+        "request_id": request_id,
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
     return f"native-{control}-{digest[:24]}"
@@ -545,7 +547,12 @@ def _load_native_controls(lane: LaneSpec) -> dict[str, Any]:
     return payload
 
 
-def enqueue_native_controls(lane: LaneSpec, goal: GoalRecord) -> tuple[str, ...]:
+def enqueue_native_controls(
+    lane: LaneSpec,
+    goal: GoalRecord,
+    *,
+    request_id: str | None = None,
+) -> tuple[str, ...]:
     """Queue provider-native controls through dispatchd; never write a pane directly."""
     controls = _load_native_controls(lane)
     if controls.get("session_ref") != goal.session_ref:
@@ -572,8 +579,11 @@ def enqueue_native_controls(lane: LaneSpec, goal: GoalRecord) -> tuple[str, ...]
             lifecycle=lifecycle,
             lifecycle_id=record.lifecycle_id,
             setup_note=setup_note,
+            request_id=request_id,
         )
         if locate_order(QueueLayout(lane.queue_dir), order_id).exists:
+            if request_id is not None:
+                queued.append(order_id)
             return
         enqueue_dispatch_order(
             lane.queue_dir,
@@ -609,6 +619,15 @@ def enqueue_native_controls(lane: LaneSpec, goal: GoalRecord) -> tuple[str, ...]
             "If it is active, this control is stale: do nothing and continue the active goal.",
         )
     return tuple(queued)
+
+
+def rearm_native_controls(lane: LaneSpec, goal: GoalRecord, *, request_id: str) -> tuple[str, ...]:
+    """Idempotently reissue the current provider goal and recurring loop controls."""
+    if not request_id.strip():
+        raise ValueError("native-control rearm requires request_id")
+    if _durable_lifecycle(lane, goal.session_ref) != "active":
+        raise LaneLaunchRefused("native controls may be rearmed only for an active lane")
+    return enqueue_native_controls(lane, goal, request_id=request_id)
 
 
 def _run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
