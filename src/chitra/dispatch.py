@@ -160,6 +160,7 @@ def enqueue_dispatch_order(queue_dir: Path, order: DispatchOrder) -> Path:
         temporary_path=orders_dir / f".{order.order_id}.json.tmp",
         trailing_newline=False,
         sort_keys=False,
+        fsync=True,
         cleanup_on_error=False,
     )
     return path
@@ -1140,22 +1141,44 @@ def find_recent_transcript(
     marker: str,
     *,
     projects_root: Path | None = None,
+    expected_transcript_path: Path | str | None = None,
     exclude_paths: set[Path] | None = None,
     recency_seconds: float = 300.0,
     now_ts: float | None = None,
 ) -> Path | None:
-    """Find the most-recently-modified transcript containing ``marker``.
+    """Find a transcript containing ``marker``.
 
-    Searches ``<root>/*/*.jsonl`` by recency + content match across one or
-    more roots (see ``_resolve_local_projects_roots``), explicitly excluding
-    any path in ``exclude_paths`` (the monitor's / dispatchd's own
-    transcript). Returns the matching path or None.
+    When ``expected_transcript_path`` is supplied, inspect only that exact
+    path. Otherwise search ``<root>/*/*.jsonl`` by recency + content match
+    across one or more roots (see ``_resolve_local_projects_roots``),
+    explicitly excluding any path in ``exclude_paths`` (the monitor's /
+    dispatchd's own transcript). Returns the matching path or None.
     """
     marker_norm = normalized_dispatch_text(marker)
     if not marker_norm:
         return None
     exclude = exclude_paths or set()
     now = now_ts if now_ts is not None else time.time()
+
+    if expected_transcript_path is not None:
+        candidate = Path(expected_transcript_path).expanduser()
+        try:
+            candidate_key = candidate.resolve()
+            excluded_keys = {Path(path).expanduser().resolve() for path in exclude}
+        except (OSError, RuntimeError):
+            return None
+        if candidate_key in excluded_keys:
+            return None
+        try:
+            mtime = candidate.stat().st_mtime
+        except OSError:
+            return None
+        if now - mtime > recency_seconds:
+            return None
+        if _structural_transcript_confirms(_read_transcript_tail(candidate), marker_norm):
+            return candidate
+        return None
+
     candidates: list[tuple[float, Path]] = []
     for root in _resolve_local_projects_roots(projects_root):
         for jsonl in root.glob(transcript_glob()):
@@ -1237,14 +1260,16 @@ def find_recent_transcript_remote(
     marker: str,
     *,
     root: str | None = None,
+    expected_transcript_path: str | None = None,
     recency_seconds: float = 300.0,
     runner: TmuxRunner | None = None,
 ) -> str | None:
     """Remote counterpart to ``find_recent_transcript`` over ssh.
 
-    Lists recent candidates remotely, then reads at most eight newest tails
-    and compares them locally with the same normalized marker semantics as
-    the local implementation.
+    When ``expected_transcript_path`` is supplied, read only that exact path
+    remotely. Otherwise list recent candidates remotely, then read at most
+    eight newest tails and compare them locally with the same normalized
+    marker semantics as the local implementation.
 
     Returns the remote path as a string (there is no local ``Path`` for it),
     or ``None`` if no match is found or the ssh call fails.
@@ -1253,6 +1278,13 @@ def find_recent_transcript_remote(
     if not marker_norm:
         return None
     run = runner or run_cmd
+
+    if expected_transcript_path is not None:
+        tail_proc = run(ssh_command(host, _remote_transcript_tail_command(expected_transcript_path)), timeout=10)
+        if tail_proc.returncode == 0 and _remote_tail_confirms_marker(tail_proc.stdout, marker_norm):
+            return expected_transcript_path
+        return None
+
     remote_root = root or _env("CHITRA_REMOTE_CLAUDE_PROJECTS", _REMOTE_CLAUDE_PROJECTS_DEFAULT)
     script = _remote_transcript_grep_command(marker, remote_root, recency_seconds)
     proc = run(ssh_command(host, script), timeout=10)
@@ -1283,6 +1315,7 @@ def transcript_confirms_nudge(
     *,
     host: str = "",
     projects_root: Path | None = None,
+    expected_transcript_path: Path | str | None = None,
     exclude_paths: set[Path] | None = None,
     recency_seconds: float = 300.0,
     now_ts: float | None = None,
@@ -1294,6 +1327,9 @@ def transcript_confirms_nudge(
 
     Replaces the source's ``pane_capture_confirms_nudge`` — pane capture is
     weaker evidence (a spinner or status line is not confirmation).
+
+    ``expected_transcript_path`` binds verification to one transcript. If it
+    is omitted, the existing recent-transcript discovery remains in use.
 
     ``host`` selects local vs remote verification: the default (``""``,
     treated as local, preserving prior behavior for existing callers) or any
@@ -1310,6 +1346,7 @@ def transcript_confirms_nudge(
             host,
             marker,
             root=remote_root,
+            expected_transcript_path=(str(expected_transcript_path) if expected_transcript_path is not None else None),
             recency_seconds=recency_seconds,
             runner=runner,
         )
@@ -1317,6 +1354,7 @@ def transcript_confirms_nudge(
     path = find_recent_transcript(
         marker,
         projects_root=projects_root,
+        expected_transcript_path=expected_transcript_path,
         exclude_paths=exclude_paths,
         recency_seconds=recency_seconds,
         now_ts=now_ts,
@@ -1485,6 +1523,7 @@ def dispatch_to_tmux(
     local_extra: set[str] | None = None,
     allowed_hosts: set[str] | None = None,
     projects_root: Path | None = None,
+    expected_transcript_path: Path | str | None = None,
     exclude_transcripts: set[Path] | None = None,
     verify_wait_seconds: float | None = None,
     tuning: DispatchTuning | None = None,
@@ -1643,6 +1682,7 @@ def dispatch_to_tmux(
         order.nudge,
         host=host,
         projects_root=projects_root,
+        expected_transcript_path=expected_transcript_path,
         exclude_paths=exclude_transcripts,
         recency_seconds=tuning.transcript_recency_seconds,
         runner=run,

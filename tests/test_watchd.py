@@ -22,6 +22,7 @@ from chitra.journal import CanonicalEvent, CanonicalType, Client, EventJournal, 
 from chitra.lane_activity import load_lane_activity
 from chitra.orders import DispatchResult, DispatchStatus
 from chitra.triaged import ReceivingOutputs, parse_event_line, run_once
+from chitra.validation_receipts import receipt_path
 from chitra.watchd import (
     Pane,
     Watchd,
@@ -517,7 +518,8 @@ def test_rejected_turn_review_enqueues_reasoned_dispatch(tmp_path: Path) -> None
         assert order.message_kind == "reasoned_action"
         assert order.decision_attestation is not None
         assert order.decision_attestation.review_verdict == "reject"
-        assert order.decision_attestation.operator_confirmed is True
+        assert order.decision_attestation.authority_class == "corrective"
+        assert order.decision_attestation.operator_confirmed is False
         assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
     finally:
         watcher.shutdown()
@@ -825,7 +827,8 @@ def test_question_turn_without_completion_word_gets_deferral_review_and_nudge(tm
         assert "in-authority" in order.nudge
         assert order.decision_attestation is not None
         assert order.decision_attestation.review_verdict == "reject"
-        assert order.decision_attestation.operator_confirmed is True
+        assert order.decision_attestation.authority_class == "corrective"
+        assert order.decision_attestation.operator_confirmed is False
         assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
         stored = get_goal(tmp_path, goal.session_ref)
         assert stored is not None
@@ -926,7 +929,7 @@ def test_watchd_survives_a_newer_goals_store_read_only(tmp_path: Path, capsys: p
         watcher.shutdown()
 
     assert emitted == 1
-    stored = get_goal(tmp_path, goal.session_ref)
+    stored = get_goal(tmp_path, goal.session_ref, allow_newer=True)
     assert stored is not None
     assert stored.status == "working"
     document = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
@@ -1224,7 +1227,7 @@ It reviews every finished lane turn before any done state is trusted.
     stored = get_goal(tmp_path, goal.session_ref)
     assert stored is not None
     assert stored.status == "completion-disputed"
-    receipt = json.loads((tmp_path / "validation-receipts" / "failing-check.json").read_text(encoding="utf-8"))
+    receipt = json.loads(receipt_path(tmp_path, goal.session_ref, "failing-check").read_text(encoding="utf-8"))
     assert receipt["result"]["status"] == "FAIL"
     review = json.loads((tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8"))
     assert review["condition"] == "completion_claim"
@@ -1289,7 +1292,7 @@ It reviews every finished lane turn before any done state is trusted.
         raise AssertionError(f"unexpected command: {command}")
 
     original_record = watchd_module.record_enrolled_validator_runs
-    receipt_file = tmp_path / "validation-receipts" / "tampered-check.json"
+    receipt_file = receipt_path(tmp_path, goal.session_ref, "tampered-check")
 
     def record_then_damage(root, session_ref, items):
         proofs = original_record(root, session_ref, items)

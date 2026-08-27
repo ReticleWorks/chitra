@@ -215,7 +215,7 @@ def test_fabricated_pass_with_failing_validator_report_cannot_close(tmp_path: Pa
     with pytest.raises(ReceiptError, match="cannot support PASS|cannot establish its PASS"):
         ingest_receipt(tmp_path, goal.session_ref, source)
 
-    stored = tmp_path / "validation-receipts" / "self-asserted-pytest-pass.json"
+    stored = receipt_path(tmp_path, goal.session_ref, "self-asserted-pytest-pass")
     stored.parent.mkdir(parents=True)
     stored.write_text(source.read_text(encoding="utf-8"))
     verification = verify_receipt(tmp_path, goal.session_ref, "self-asserted-pytest-pass")
@@ -235,8 +235,9 @@ def test_receipt_is_stored_at_the_contract_path(tmp_path: Path) -> None:
     stored = ingest_passing_receipt(tmp_path, goal.session_ref)
 
     assert stored == receipt_path(tmp_path, goal.session_ref, "tests-green")
-    assert stored == tmp_path / "validation-receipts" / "tests-green.json"
-    assert stored.parent == tmp_path / "validation-receipts"
+    assert stored.name == "tests-green.json"
+    assert stored.parent.parent == tmp_path / "validation-receipts"
+    assert len(stored.parent.name) == 64
 
 
 def test_three_w12_golden_envelopes_round_trip_exactly() -> None:
@@ -288,7 +289,11 @@ def test_record_registered_run_writes_a_pass_receipt_from_exit_zero(tmp_path: Pa
     stored = json.loads((receipt_path(tmp_path, "host:lane:0.0", "stub-receipt")).read_text(encoding="utf-8"))
     assert stored["result"] == {"status": "PASS", "validator_acceptance": True}
     assert stored["exercise"]["command"] == list(entry.argv)
-    report = json.loads((tmp_path / "validation-receipts" / "stub-receipt.report.json").read_text(encoding="utf-8"))
+    report = json.loads(
+        (receipt_path(tmp_path, "host:lane:0.0", "stub-receipt").parent / "stub-receipt.report.json").read_text(
+            encoding="utf-8"
+        )
+    )
     assert report == {"schema_version": "chitra-validator-report-v1", "command": list(entry.argv), "exit_code": 0}
 
 
@@ -309,7 +314,9 @@ def test_record_registered_run_stores_a_fail_receipt_from_exit_one(tmp_path: Pat
     stored = json.loads((receipt_path(tmp_path, "host:lane:0.0", "fail-receipt")).read_text(encoding="utf-8"))
     assert stored["result"]["status"] == "FAIL"
     assert stored["result"]["validator_acceptance"] is False
-    output_log = (tmp_path / "validation-receipts" / "fail-receipt.output.log").read_text(encoding="utf-8")
+    output_log = (
+        receipt_path(tmp_path, "host:lane:0.0", "fail-receipt").parent / "fail-receipt.output.log"
+    ).read_text(encoding="utf-8")
     assert "boom" in output_log
 
 
@@ -333,7 +340,11 @@ def test_record_enrolled_validator_runs_fails_closed_for_unregistered_validators
     stored = json.loads(receipt_path(tmp_path, "host:lane:0.0", "other-receipt").read_text(encoding="utf-8"))
     assert stored["result"]["status"] == "FAIL"
     assert stored["result"]["validator_acceptance"] is False
-    report = json.loads((tmp_path / "validation-receipts" / "other-receipt.report.json").read_text(encoding="utf-8"))
+    report = json.loads(
+        (receipt_path(tmp_path, "host:lane:0.0", "other-receipt").parent / "other-receipt.report.json").read_text(
+            encoding="utf-8"
+        )
+    )
     assert report["exit_code"] == 125
 
 

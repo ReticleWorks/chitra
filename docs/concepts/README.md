@@ -1,6 +1,6 @@
 # Chitra Concepts
 
-Chitra has two distinct layers: a deterministic core that makes zero LLM calls, and an LLM-judgment layer where specific gates make decisions about completion claims and goal enforcement.
+Chitra has two distinct layers: a deterministic delivery core and a bounded persistent supervision layer. Both keep their authority explicit; optional reviewer integrations cannot bypass operator gates.
 
 ## The Deterministic Core
 
@@ -14,7 +14,7 @@ Dispatchd drains a JSON order queue (one order per file), delivers messages to t
 2. Load the message text from the order file.
 3. Use `tmux load-buffer` and `tmux paste-buffer` to inject the text into the session's input line.
 4. Verify delivery by grepping the session's transcript for the exact text. "Looks sent" is not evidence; grep confirms it actually arrived.
-5. Write a result file and sign an entry to the ledger (HMAC-SHA256).
+5. Sign and verify the ledger entry (HMAC-SHA256), then publish the result.
 
 Dispatchd is idempotent: once a result file exists for an order, it is never redispatched, even across a restart. A crash between paste and result is reconciled with a send-nonce marker, not a blind second paste.
 
@@ -53,27 +53,30 @@ Every successful dispatch is signed and logged. The ledger is an append-only JSO
 
 This is a trusted-host model: anyone who can write to the ledger file can rewrite it. So treat "not in the ledger" as a strong signal, not tamper-proof evidence. But a reader with the signing key can prove that a given message was delivered by verifying the signature.
 
-## The LLM-Judgment Layer
+## Persistent Goal Supervision
 
-One deliberate gate lets chitra invoke an LLM: goal enforcement via watchd.
+`monitord` observes explicitly bound transcripts and keeps each lane aligned to
+its exact frozen goal. It records intent before queueing an action and recovers
+that intent, its retries, signed delivery, and consumption after restart.
 
 ### Goal Enforcement and Completion Review
 
-Watchd watches tmux panes for session activity. When a session ends a turn claiming completion (via a marker in the pane output), watchd:
+On each pass, monitord:
 
-1. Freezes the session's goal statement.
-2. Launches isolated `claude -p` reviewer processes (bounded concurrency, default max 2 at once).
-3. Each reviewer reads the goal and the session's turn output, then judges: does the output satisfy the stated goal?
-4. Records the verdict (accept/reject/unavailable) to a signed completion_reviews.jsonl log.
+1. Ingests only transcripts declared in the exact binding manifest.
+2. Runs deterministic drift, repeated-step, repeated-test, and document-dithering detectors.
+3. Queues one fair, goal-versioned corrective action per lane and pass through dispatchd.
+4. Answers routine questions only when the frozen contract settles them.
+5. Runs registered validators after a structured completion claim and closes only from verified, session-isolated receipts.
 
-These reviewer processes are isolated. They never:
+Monitord never:
 
-- Draft or review chitra's own prospective messages to the session.
-- Share context with other reviewers or with chitra's main loop.
-- Mutate chitra's state.
+- Write to tmux directly.
+- Borrow a transcript, receipt, finding, or answer from another goal.
 - Bypass operator gates for spend, credentials, or irreversible actions.
 
-The pane poll never waits for reviewers to finish; it keeps the lane non-green and collects ready verdicts on later polls. The verdicts are inputs to decision attestation, but only approved text (flagged as such by an operator via convlog) can reach the pane.
+Legacy `watchd` deployments may still use isolated completion reviewers. Those
+reviewers remain advisory and cannot bypass the same authority gates.
 
 ### Goals and Completion Gating
 
@@ -90,7 +93,7 @@ When a session finishes and claims completion, the completion gate:
 
 1. Reads the frozen structured done items.
 2. Checks each proof's item ID, receipt name, validator result, and citation.
-3. Runs the watched-session review.
+3. Executes the enrolled validators and verifies their stored receipts.
 4. Persists the validated proofs before a done transition and repeats the exact check at close.
 
 An operator can still redirect strategic work or administratively discard a dead record with a reason. Those paths are labeled as not done and cannot substitute for completion proof.
@@ -115,10 +118,10 @@ A typical session flow:
 1. **Enrollment (deterministic):** The first `chitra-goals set` returns four typed questions and a nonce without writing a goal. `set --interview-result <file>` verifies the complete result and atomically stores the receipt, done items, enrollment time, and lane ID.
 2. **Delivery (deterministic):** The operator (or an orchestration system) queues messages. Dispatchd drains the queue, delivers each message to the session via tmux, and logs the delivery.
 3. **Rate limiting (deterministic):** Rate-limit-guard polls the account's usage and host load, pauses the session if thresholds are hit, and records the pause in a durable ledger.
-4. **Completion (LLM-judgment):** The session ends a turn claiming completion. Watchd detects this, launches isolated reviewers, and collects verdicts.
-5. **Goal closure (deterministic + LLM):** The operator runs `chitra-goals close`. Chitra repeats the exact receipt check over the proofs Watchd persisted. Delivered strings and operator acknowledgements cannot substitute for those receipts.
+4. **Completion supervision:** The session ends a turn claiming completion. Monitord executes the enrolled validators and independently verifies the stored results.
+5. **Goal closure:** Chitra repeats the exact receipt check over the proofs monitord persisted. Delivered strings and operator acknowledgements cannot substitute for those receipts.
 
-The deterministic and LLM layers are separate. An LLM verdict never forces a decision; an operator always has the last word via convlog. And the core dispatch, ledger, and rate-limiting paths never call an LLM.
+The delivery and supervision layers are separate. Dispatchd alone writes the terminal. Monitord can act only within the frozen contract, and an operator retains credentials, spend, irreversible actions, security boundaries, and strategy changes.
 
 ## See Also
 

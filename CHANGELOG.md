@@ -20,6 +20,46 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.17.0] - 2026-08-27
+
+### Added
+
+- Bind every monitored transcript to one exact session, lane, client version,
+  and frozen goal through a validated manifest.
+- Persist corrective intent, queue publication, signed delivery consumption,
+  retries, progress boundaries, and verified completion in a crash-safe
+  per-lane supervision ledger. A durable round-robin cursor prevents one
+  recurring incident from starving later findings.
+- Answer routine goal questions and explicit small reversible design questions
+  from the frozen contract. Question intent, retries, delivery, and consumption
+  survive restarts. Dispatchd recomputes each answer before delivery.
+- Run completion validators only after a structured completion claim and mark
+  completion only after the exact stored results independently verify.
+- Create one bounded pursuit incident after three clean monitor passes with no
+  scoped progress, while suppressing it for pending delivery or questions.
+
+### Fixed
+
+- Stop elapsed time and historical findings from advancing the correction
+  ladder without genuine post-consumption recurrence.
+- Isolate validation receipts by exact goal session so matching receipt names
+  from another goal cannot close the lane. Safely migrate unambiguous legacy
+  receipts while rejecting same-name cross-session ambiguity.
+- Reject stale, held, completed, or forged goal-bound orders before pane I/O,
+  including a second goal check under the lane lock. Bound terminal transport
+  retries across restarts and fail closed on a newer goal-store schema.
+- Reject unsafe queue identifiers and unconfined receipt validator targets.
+  Serialize goal writers with dispatch, and never turn a pre-existing SENT
+  result into delivery proof during crash recovery.
+- Require persistent-oversight deliveries to use the exact transcript manifest
+  binding and bind their signed ledger rows to that transcript's native session
+  identity.
+- Filter historical journal rows against the complete current transcript
+  binding after a lane or native-session rebind.
+- Reject symlinked or external queue paths and ignore validator registries from
+  receipt upload directories. Connect the shipped monitor and dispatch service
+  examples to the same per-lane state, queue, ledger, and binding manifest.
+
 ## [0.16.0] - 2026-08-23
 
 ### Added

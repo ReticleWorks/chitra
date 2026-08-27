@@ -3,6 +3,7 @@ Description=Chitra shared dispatch daemon
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=/etc/chitra/lanes.yaml
+ConditionPathExists=/etc/chitra/transcript-bindings.json
 StartLimitIntervalSec=10min
 StartLimitBurst=5
 
@@ -10,7 +11,9 @@ StartLimitBurst=5
 Type=simple
 User=chitra
 Group=chitra
-ExecStart=/opt/chitra/venv/bin/python -m chitra.dispatchd --lanes-file /etc/chitra/lanes.yaml --policy-config-path /etc/chitra/policy.yaml --routing-config-path /etc/chitra/routing.yaml
+# Each lane's state_dir in lanes.yaml must be /var/lib/chitra/lane-<id>.
+# This makes dispatchd drain the queue written by chitra-monitord@<id>.
+ExecStart=/opt/chitra/venv/bin/python -m chitra.dispatchd --lanes-file /etc/chitra/lanes.yaml --policy-config-path /etc/chitra/policy.yaml --routing-config-path /etc/chitra/routing.yaml --transcript-bindings-path /etc/chitra/transcript-bindings.json
 Restart=on-failure
 RestartSec=30s
 NoNewPrivileges=yes

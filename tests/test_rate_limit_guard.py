@@ -874,7 +874,9 @@ def test_sweep_survives_a_newer_goals_store_read_only(tmp_path: Path, capsys: py
         pressure_sample=CLEAR_PRESSURE,
     )
 
-    assert get_goal(tmp_path, "host-b:lane1:0.0").status == "working"
+    stored = get_goal(tmp_path, "host-b:lane1:0.0", allow_newer=True)
+    assert stored is not None
+    assert stored.status == "working"
     assert get_transaction(tmp_path, "host-b:lane1:0.0") is None
     assert report.paused == [] and report.resumed == []
     document = json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))
