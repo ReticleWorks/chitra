@@ -73,7 +73,7 @@ jobs:
       # ReticleWorks/fleet-repo only. If minting or dispatch fails, the step
       # fails closed without touching PyPI state, and fleet-repo's weekly
       # poll enumerates every unreconciled release as the fallback path.
-      - uses: actions/create-github-app-token@v1
+      - uses: actions/create-github-app-token@v3
         id: fleet-token
         with:
           app-id: ${{ secrets.FLEET_DISPATCH_APP_ID }}
