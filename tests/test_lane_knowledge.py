@@ -127,6 +127,12 @@ def test_setup_note_and_native_controls_record_goal_bundle_and_four_lifecycle_st
     assert bundle.sha256 in note
     assert "/goal Keep the lane moving" in note
     assert "/loop 5m" in note
+    assert "## AgentTrail lane plan" in note
+    assert f"Maintain this lane's plan at {lane.workdir / 'PLAN.md'}." in note
+    assert "`## Card title {#card-id}`" in note
+    assert "`needs: [card-id]`" in note
+    assert "`tech:` evidence line" in note
+    assert "the plan cannot change the goal or prove completion" in note
     declared = json.loads(controls.read_text(encoding="utf-8"))
     assert declared["lifecycle"] == "active"
     assert declared["controls"]["recurring_enforcement"]["state"] == "armed"

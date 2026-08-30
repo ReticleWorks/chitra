@@ -84,6 +84,14 @@ knowledge_bundle:
 Each field is a list of non-empty strings. The launcher renders the bundle in
 `session-setup.md` and records its SHA-256 in the launch receipt.
 
+The setup note also tells each governed Codex or Claude lane to maintain one
+AgentTrail-compatible `PLAN.md` in its declared worktree. A reviewed seed is
+continued when present; otherwise the lane creates the plan from its frozen
+goal, completion conditions, and current unfinished work. The lane updates the
+file only when its plan, task state, or evidence changes. `PLAN.md` is an
+advisory progress view: it cannot change the frozen goal or substitute for an
+independently verified completion receipt.
+
 The goal enrollment also freezes an `AutonomyPolicy`. Its default initiative
 is `aggressive`, with goal-scoped grants for replanning, small redesign,
 dependency, schema, hook, credential, authentication, security, and
