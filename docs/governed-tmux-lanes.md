@@ -92,6 +92,24 @@ file only when its plan, task state, or evidence changes. `PLAN.md` is an
 advisory progress view: it cannot change the frozen goal or substitute for an
 independently verified completion receipt.
 
+The shared plan contract is deliberately small:
+
+```markdown
+## Card title {#stable-card-id}
+needs: [prerequisite-card-id]
+files: [src/chitra/**]
+
+- [~] Current intermediate step
+- [ ] Next intermediate step
+```
+
+Use `[ ]` for pending, `[~]` for active, `[!]` for blocked, and `[x]` for
+complete. A completed task must have an indented `tech:` line naming its
+evidence. Card IDs remain stable as the lane replans; `needs` defines card
+dependencies; and `files` defines the intended file scope. This is the common
+roadmap syntax across Chitra lanes. It does not require a separate roadmap
+service or hand-maintained duplicate state.
+
 The goal enrollment also freezes an `AutonomyPolicy`. Its default initiative
 is `aggressive`, with goal-scoped grants for replanning, small redesign,
 dependency, schema, hook, credential, authentication, security, and

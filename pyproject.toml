@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "chitra-monitor"
-version = "0.19.1"
+version = "0.19.2"
 description = "Persistent goal-bound supervision and deterministic tmux delivery for AI-agent fleets"
 readme = "README.md"
 license = "MIT"

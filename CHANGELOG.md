@@ -1,5 +1,42 @@
 # Changelog
 
+All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
+
+## [0.19.2] - 2026-08-30
+
+### Added
+
+- Tell every governed Claude and Codex lane to maintain one
+  AgentTrail-compatible `PLAN.md` in its declared worktree. The setup note
+  defines stable task IDs, dependencies, file scopes, intermediate status,
+  and evidence-only completion updates while leaving frozen goals and verified
+  receipts authoritative.
+
+### Documentation
+
+- Document the lane-plan path, update cadence, shared syntax, and authority
+  boundary in the governed-lane guide and project overview.
+
+## [0.19.1] - 2026-08-27
+
+### Fixed
+
+- Permit governed lanes on Twinridge and retain enough Codex transcript history
+  to reconcile signed Dispatchd delivery proofs.
+
+## [0.19.0] - 2026-08-27
+
+### Added
+
+- Bind delegated Kai decisions to validated authority, satisfaction, and request
+  digests in the immutable decision attestation.
+- Add request-bound, idempotent rearming of provider-native goal and recurring
+  loop controls for active lanes.
+
+### Changed
+
+- Publish dispatch orders without replacing a different producer's payload.
+
 ## 0.9.11
 
 - Normalize canonical remote pane targets at the governed grant boundary and
@@ -17,8 +54,6 @@
 - Route remote governed-lane capture and steering through the fixed codexman
   SSH grant verbs, allowing the draft guard to recognize the Codex 0.147 empty
   composer without granting raw remote tmux execution.
-
-All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
 ## [0.18.0] - 2026-08-27
 
