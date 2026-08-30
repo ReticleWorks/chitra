@@ -99,6 +99,13 @@ model at launch. It supports Claude, Codex, and OpenCode models such as
 goal-ingestion record and no active usage pause. See
 [`docs/governed-tmux-lanes.md`](docs/governed-tmux-lanes.md).
 
+At launch, each governed Claude or Codex lane receives instructions to maintain
+one AgentTrail-compatible `PLAN.md` in its declared worktree. The plan records
+stable task IDs, dependencies, file scopes, intermediate status, and completion
+evidence. It is a shared progress view; Chitra's frozen goal and verified
+receipts remain authoritative. The governed-lane guide defines the exact format
+and update rules.
+
 Provider routing remains upstream of Chitra. `oss-step` task metadata selects
 OpenRouter through Crush, the anonymous OpenCode free route, or authenticated
 OpenCode Zen. Chitra receives only the allowlisted executable backend and
