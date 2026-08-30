@@ -76,6 +76,7 @@ FULL_PERMISSION_FLAGS = {
 }
 SETUP_NOTE_NAME = "session-setup.md"
 NATIVE_CONTROLS_NAME = "native-controls.json"
+AGENTTRAIL_PLAN_NAME = "PLAN.md"
 LaneLifecycle = LaneState
 LaneLifecycleAction = Literal["pause", "shelve", "close", "resume", "relaunch"]
 
@@ -249,6 +250,7 @@ def render_session_setup_note(lane: LaneSpec, goal: GoalRecord, *, backend: str)
     bundle: KnowledgeBundle = lane.knowledge_bundle
     goal_sha256 = _goal_snapshot_sha256(goal)
     native_goal = _native_goal_command(goal)
+    agenttrail_plan = lane.workdir / AGENTTRAIL_PLAN_NAME
     lines = [
         "# Chitra session setup",
         f"Lane: {lane.identifier}",
@@ -299,6 +301,23 @@ def render_session_setup_note(lane: LaneSpec, goal: GoalRecord, *, backend: str)
         )
     elif backend == "codex":
         lines.append("- Re-establish the native goal whenever the session resumes or the goal changes.")
+    lines.extend(
+        (
+            "",
+            "## AgentTrail lane plan",
+            f"- Maintain this lane's plan at {agenttrail_plan}.",
+            "- Continue a reviewed plan already at that path. If none exists, create one from the canonical goal, "
+            "done-when conditions, and current unfinished work before the first implementation action.",
+            "- Use stable `## Card title {#card-id}` headings, `needs: [card-id]` dependencies, `files: [path/**]` scopes, "
+            "and child tasks marked `[ ]`, `[~]`, `[!]`, or `[x]`.",
+            "- Mark a task `[~]` before acting, `[!]` only for a real blocker, and `[x]` only after concrete evidence. "
+            "Give each completed task an indented `tech:` evidence line.",
+            "- Update the file only when the plan, task state, or evidence changes. Preserve stable IDs and leave an "
+            "identical plan untouched during a no-change loop.",
+            "- Treat this plan as an advisory progress view. The frozen Chitra goal and independently verified completion "
+            "receipts remain authoritative; the plan cannot change the goal or prove completion.",
+        )
+    )
     lines.extend(("", bundle.render().rstrip(), ""))
     return "\n".join(lines)
 
