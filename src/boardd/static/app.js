@@ -284,8 +284,14 @@ function renderSince() {
   }
 }
 
-async function postLaneAction(laneId, action, body) {
-  const q = currentMonitor && currentMonitor !== "all" ? `?monitor=${encodeURIComponent(currentMonitor)}` : "";
+async function postLaneAction(laneId, action, body, monitorId) {
+  // In the "all" combined view, every lane/needs-you item is tagged with
+  // its own monitor id (app.py's _combined_view) — a write must target
+  // that, not whatever monitor happens to be the discovery default, or it
+  // silently hits the wrong monitor's lane. Fall back to currentMonitor
+  // for the single-monitor view, where every item already belongs to it.
+  const target = monitorId || (currentMonitor && currentMonitor !== "all" ? currentMonitor : "");
+  const q = target ? `?monitor=${encodeURIComponent(target)}` : "";
   const r = await fetch(`/api/lanes/${encodeURIComponent(laneId)}/${action}${q}`, {
     method: "POST",
     headers: body ? { "content-type": "application/json" } : undefined,
@@ -338,7 +344,7 @@ function renderNeeds() {
     ackBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
       ackBtn.textContent = "Acking…";
-      try { await postLaneAction(item.lane_id, "ack"); connect(); }
+      try { await postLaneAction(item.lane_id, "ack", undefined, item.monitor); connect(); }
       catch (err) { ackBtn.textContent = String(err.message || err); return; }
       ackBtn.textContent = "Acked";
     });
@@ -349,7 +355,7 @@ function renderNeeds() {
       const text = answerBox.value.trim();
       if (!text) return;
       answerBtn.textContent = "Sending…";
-      try { await postLaneAction(item.lane_id, "answer", { text }); connect(); }
+      try { await postLaneAction(item.lane_id, "answer", { text }, item.monitor); connect(); }
       catch (err) { answerBtn.textContent = String(err.message || err); return; }
       answerBtn.textContent = "Sent";
     });
@@ -773,7 +779,7 @@ function mobileReviewCard(item) {
     nudgeBtn.addEventListener("click", async () => {
       nudgeBtn.disabled = true; nudgeBtn.textContent = "Sending…";
       try {
-        const result = await postLaneAction(item.lane_id, "answer", { text: DEFAULT_NUDGE_TEXT });
+        const result = await postLaneAction(item.lane_id, "answer", { text: DEFAULT_NUDGE_TEXT }, item.monitor);
         if (result.changed) removeCard();
         else fail(nudgeBtn, "Nudge", new Error("Nothing to nudge — no open ask on this lane."));
       } catch (err) { fail(nudgeBtn, "Nudge", err); }
@@ -797,7 +803,7 @@ function mobileReviewCard(item) {
   secondaryBtn.addEventListener("click", async () => {
     secondaryBtn.disabled = true; secondaryBtn.textContent = "…";
     try {
-      const result = await postLaneAction(item.lane_id, "ack");
+      const result = await postLaneAction(item.lane_id, "ack", undefined, item.monitor);
       if (result.changed) removeCard();
       else fail(secondaryBtn, secondaryLabel, new Error("Nothing to acknowledge — no open ask on this lane."));
     } catch (err) { fail(secondaryBtn, secondaryLabel, err); }
@@ -808,7 +814,7 @@ function mobileReviewCard(item) {
     if (!text) { input.focus(); return; }
     primaryBtn.disabled = true; primaryBtn.textContent = "…";
     try {
-      const result = await postLaneAction(item.lane_id, "answer", { text });
+      const result = await postLaneAction(item.lane_id, "answer", { text }, item.monitor);
       if (result.changed) removeCard();
       else fail(primaryBtn, primaryLabel, new Error("Nothing to answer — no open ask on this lane."));
     } catch (err) { fail(primaryBtn, primaryLabel, err); }

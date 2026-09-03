@@ -53,3 +53,13 @@ def test_drawer_fits_narrow_screens():
 def test_no_inline_pixel_widths_in_markup_or_js():
     for text, name in ((HTML, "index.html"), (JS, "app.js")):
         assert not re.search(r"width\s*:\s*\d{3,}px", text), f"wide inline width in {name}"
+
+
+def test_lane_writes_target_the_items_own_monitor():
+    """The "all" combined view tags every lane/needs-you item with its own
+    monitor id (app.py's _combined_view); every ack/answer call must send
+    it, or a write silently targets the default monitor's lane instead."""
+    calls = re.findall(r"postLaneAction\(item\.lane_id,[^;]*?\)(?=[;,])", JS)
+    assert len(calls) == 5
+    for call in calls:
+        assert "item.monitor" in call, call
