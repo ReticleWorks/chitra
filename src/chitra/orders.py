@@ -9,7 +9,16 @@ from typing import Literal
 from pydantic import BaseModel, Field, model_validator
 
 from chitra.completion_gate import CompletionEvidence, TodoItem
+from chitra.question_handler import QuestionHandlerResult
 from chitra.reasoning import DecisionAttestation
+
+_ORDER_ID_PATTERN = r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,191}\z"
+
+# This is deliberately a separate task type from the ordinary native-control
+# orders.  Dispatchd uses the distinction as the only exception to a paused
+# lane's delivery gate: the control removes a recurring Claude enforcement
+# hook after a pause, and is never allowed to steer ordinary work.
+NATIVE_CONTROL_PAUSE_PRUNE_TASK_TYPE = "native-control-pause-prune"
 
 
 class DispatchStatus(enum.StrEnum):
@@ -23,10 +32,10 @@ class DispatchStatus(enum.StrEnum):
     # order was never delivered -- a disputed completion claim must never
     # silently pass through as "sent". See dispatchd.process_one_order.
     COMPLETION_DISPUTE = "completion_dispute"
-    # The order's session is rate-limit- or load-shed-held: parked in the durable
-    # deferred/ subqueue (no pane I/O, no result file persisted) rather than
-    # discarded. dispatchd.run_once/requeue_deferred_for_session return it
-    # to orders/ FIFO once the hold clears, so it is delivered exactly once,
+    # The order's session is rate-limit- or load-shed-held, or its lane is
+    # paused/shelved: parked in the durable deferred/ subqueue (no pane I/O,
+    # no result file persisted) rather than discarded. A lifecycle or guard
+    # resume returns it to orders/ FIFO, so it is delivered exactly once,
     # never silently dropped. This status is for in-process visibility only
     # (a caller inspecting run_once's return value) -- it is never written
     # to results/, since a persisted terminal result would block the later
@@ -39,10 +48,10 @@ class DispatchStatus(enum.StrEnum):
     # scrollback. Pane capture cannot distinguish a genuinely-started turn
     # from a scrollback echo or an unsubmitted composer row, so it is never
     # treated as a terminal SENT result on its own. dispatchd retries
-    # consumption verification using the same durable retry-attempts sidecar
-    # the lane-lock timeout path uses (chitra.dispatchd._process_claimed_order),
-    # without pasting again; after the retry budget is exhausted it becomes a
-    # terminal FAILED "retry-exhausted" result.
+    # consumption verification using the same durable attempt sidecar the
+    # lane-lock timeout path uses (chitra.dispatchd._process_claimed_order),
+    # without pasting again. A transient failure never becomes terminal merely
+    # because it recurred.
     # Like DEFERRED, this status is for in-process visibility only -- it is
     # never written to results/.
     DELIVERY_UNCONFIRMED = "delivery_unconfirmed"
@@ -71,7 +80,7 @@ class DispatchOrder(BaseModel):
     explicit ``routing_hint`` from the caller always wins over this lookup.
     """
 
-    order_id: str
+    order_id: str = Field(pattern=_ORDER_ID_PATTERN)
     session_ref: str
     nudge: str
     """Verbatim text to inject. Convention (enforced in practice by
@@ -84,8 +93,18 @@ class DispatchOrder(BaseModel):
     tag: str = "[C]"
     routing_hint: str | None = None
     task_type: str | None = None
-    message_kind: Literal["legacy", "operator_relay", "reasoned_answer", "reasoned_nudge", "reasoned_action"] = "legacy"
+    goal_version: int | None = Field(default=None, ge=1)
+    goal_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    message_kind: Literal[
+        "legacy",
+        "operator_relay",
+        "goal_contract_answer",
+        "reasoned_answer",
+        "reasoned_nudge",
+        "reasoned_action",
+    ] = "legacy"
     decision_attestation: DecisionAttestation | None = None
+    question_result: QuestionHandlerResult | None = None
     input_baseline_hash: str | None = None
     input_seen_hash: str | None = None
     snapshot_tail_hash: str | None = None
@@ -111,12 +130,28 @@ class DispatchOrder(BaseModel):
 
     @model_validator(mode="after")
     def validate_reasoning_attestation(self) -> DispatchOrder:
-        """Bind autonomous message bytes to one pre-dispatch attestation."""
+        """Validate the bindings and attestations required for this order."""
+        if (
+            (self.task_type == "persistent-oversight" or self.message_kind == "goal_contract_answer")
+            and (self.goal_version is None or self.goal_digest is None)
+        ):
+            raise ValueError("persistent oversight and goal contract answer dispatches require an exact goal contract binding")
         reasoned_kinds = {"reasoned_answer", "reasoned_nudge", "reasoned_action"}
         if self.message_kind in reasoned_kinds and self.decision_attestation is None:
             raise ValueError(f"{self.message_kind} dispatch requires decision_attestation")
         if self.message_kind not in reasoned_kinds and self.decision_attestation is not None:
             raise ValueError(f"{self.message_kind} dispatch cannot carry a decision_attestation")
+        if self.message_kind == "goal_contract_answer":
+            if self.question_result is None:
+                raise ValueError("goal_contract_answer dispatch requires a question result")
+            if self.question_result.disposition != "answered" or self.question_result.answer != self.nudge:
+                raise ValueError("goal_contract_answer dispatch must carry its exact deterministic answer")
+            if self.session_ref != self.question_result.session_ref:
+                raise ValueError("goal_contract_answer session must match the question result")
+            if self.goal_version != self.question_result.goal_version or self.goal_digest != self.question_result.goal_digest:
+                raise ValueError("goal_contract_answer must carry the question result's exact goal contract")
+        elif self.question_result is not None:
+            raise ValueError(f"{self.message_kind} dispatch cannot carry a question result")
         if self.decision_attestation is not None:
             if self.decision_attestation.outcome != "answer":
                 raise ValueError("an abstained decision cannot be dispatched")
@@ -139,7 +174,7 @@ class DispatchResult(BaseModel):
     ``model@harness`` string and ``resolved_zdr`` records its ZDR setting.
     """
 
-    order_id: str
+    order_id: str = Field(pattern=_ORDER_ID_PATTERN)
     session_ref: str
     status: DispatchStatus
     reason: str = ""
@@ -156,10 +191,9 @@ class DispatchResult(BaseModel):
     # genuine Claude/Codex deliveries bind this value so ladder consumption
     # can reject cross-session evidence.
     native_session_id: str | None = None
-    # A SENT result can be durable before the signed delivery ledger is
-    # available so a ledger outage never causes a second paste. Such a result
-    # remains in in_flight/ until dispatchd flips this proof bit and moves the
-    # order to processed/.
+    # New SENT results are published only after the signed delivery ledger
+    # verifies. The bit remains explicit so recovery can distinguish and
+    # reject old or externally planted unproven SENT records.
     delivery_ledger_verified: bool = False
     decision_attestation_id: str | None = None
     at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())

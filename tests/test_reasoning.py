@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 from _goal_fixtures import enrollment_fields
+from pydantic import ValidationError
 
 from chitra.dispatch import DispatchOrder
-from chitra.goal_enforcement import SessionReviewSignal, WatchedSessionBehavior, freeze_goal
+from chitra.goal_enforcement import ReviewFinding, SessionReviewSignal, WatchedSessionBehavior, freeze_goal
 from chitra.goals import GoalRecord
 from chitra.reasoning import (
+    DecisionAttestation,
     DecisionQuestion,
     DecisionReasoner,
+    DelegatedAuthority,
     GoalJudgment,
     OracleRequest,
     OracleVerdict,
@@ -114,17 +118,24 @@ def test_oracle_is_called_only_after_goal_and_principles_are_insufficient() -> N
 
     assert decision.source == "oracle-escalated"
     assert decision.oracle_escalated is True
+    assert decision.autonomy == "autonomous"
+    assert decision.operator_confirmation_required is False
+    assert decision.operator_gate_reasons == ()
     assert len(calls) == 1
     assert all(match.confidence < 0.75 for match in calls[0].principle_matches)
     assert len(decision.insufficiency_reasons) == 2
 
 
-def test_routine_insufficiency_abstains_without_oracle() -> None:
+def test_routine_insufficiency_uses_foreground_oracle_when_available() -> None:
     calls: list[OracleRequest] = []
 
     def oracle(request: OracleRequest) -> OracleVerdict:
         calls.append(request)
-        raise AssertionError("oracle must not be called for routine residuals")
+        return OracleVerdict(
+            verdict="Use the repository's existing frobnicator name and continue.",
+            evidence_refs=["src/frobnicator.py:1"],
+            confidence_basis="Foreground inspection found the established name.",
+        )
 
     decision = DecisionReasoner(PrinciplesIndex()).decide(
         _goal(),
@@ -133,9 +144,23 @@ def test_routine_insufficiency_abstains_without_oracle() -> None:
         oracle=oracle,
     )
 
+    assert decision.outcome == "answer"
+    assert decision.source == "oracle-escalated"
+    assert decision.autonomy == "autonomous"
+    assert len(calls) == 1
+
+
+def test_missing_oracle_returns_a_foreground_residual_not_a_user_gate() -> None:
+    decision = DecisionReasoner(PrinciplesIndex()).decide(
+        _goal(),
+        _undetermined(),
+        DecisionQuestion(text="Which frobnicator nickname should we use?"),
+    )
+
     assert decision.outcome == "abstain"
-    assert decision.source == "abstained"
-    assert calls == []
+    assert decision.source == "foreground-residual"
+    assert decision.autonomy == "foreground_residual"
+    assert decision.operator_confirmation_required is False
 
 
 def test_corrupt_principles_lock_fails_closed(tmp_path: Path) -> None:
@@ -178,13 +203,12 @@ def test_reasoned_dispatch_requires_exact_answer_and_attestation() -> None:
         DecisionQuestion(text="Should this be deployed?"),
     )
 
-    confirmed = decision.with_operator_confirmation()
     order = DispatchOrder(
         order_id="reasoned-1",
         session_ref="localhost:lane:0.0",
-        nudge=confirmed.approved_text,
+        nudge=decision.approved_text,
         message_kind="reasoned_answer",
-        decision_attestation=confirmed,
+        decision_attestation=decision,
     )
     assert order.decision_attestation is not None
     assert order.decision_attestation.source == "goal"
@@ -195,7 +219,7 @@ def test_reasoned_dispatch_requires_exact_answer_and_attestation() -> None:
             session_ref="localhost:lane:0.0",
             nudge="mutated after review",
             message_kind="reasoned_answer",
-            decision_attestation=confirmed,
+            decision_attestation=decision,
         )
 
 
@@ -221,7 +245,7 @@ def _accepted_review(goal: GoalRecord) -> SessionReviewSignal:
     )
 
 
-def test_unanimous_in_scope_technical_answer_is_autonomous_but_sensitive_actions_are_operator_gated() -> None:
+def test_default_goal_policy_releases_goal_scoped_actions() -> None:
     goal = _goal()
     judgment = GoalJudgment(
         determines_answer=True,
@@ -233,30 +257,144 @@ def test_unanimous_in_scope_technical_answer_is_autonomous_but_sensitive_actions
     autonomous = DecisionReasoner(PrinciplesIndex()).decide(
         goal,
         judgment,
-        DecisionQuestion(text="May the lane use the existing typed boundary?", session_review=review),
+        DecisionQuestion(
+            text="May the lane use the existing typed boundary?",
+            authority_class="routine",
+            session_review=review,
+        ),
     )
     assert autonomous.autonomy == "autonomous"
     assert autonomous.operator_confirmation_required is False
 
-    for flag in ("spend", "credentials", "irreversible", "strategy_redirect"):
-        gated = DecisionReasoner(PrinciplesIndex()).decide(
+    for flag in ("credentials", "irreversible", "strategy_redirect", "spend"):
+        released = DecisionReasoner(PrinciplesIndex()).decide(
             goal,
             judgment,
             DecisionQuestion(
                 text="May the lane take this sensitive action?",
+                authority_class="routine",
                 session_review=review,
                 **{flag: True},
             ),
         )
-        assert gated.autonomy == "operator_required"
-        assert gated.operator_confirmation_required is True
+        assert released.autonomy == "autonomous"
+        assert released.operator_confirmation_required is False
 
-    textually_gated = DecisionReasoner(PrinciplesIndex()).decide(
+    textually_released = DecisionReasoner(PrinciplesIndex()).decide(
         goal,
         judgment,
-        DecisionQuestion(text="May the lane use an API key to purchase a paid plan?", session_review=review),
+        DecisionQuestion(
+            text="May the lane use an API key to purchase a paid plan?",
+            authority_class="routine",
+            session_review=review,
+        ),
     )
-    assert set(textually_gated.operator_gate_reasons) >= {"credentials", "spend"}
+    assert textually_released.autonomy == "autonomous"
+    assert textually_released.operator_gate_reasons == ()
+
+
+def test_default_authority_class_is_routine_and_autonomous() -> None:
+    decision = DecisionReasoner(PrinciplesIndex()).decide(
+        _goal(),
+        GoalJudgment(
+            determines_answer=True,
+            answer="Use the existing typed boundary.",
+            goal_fields=["scope"],
+            inference="The scope settles this bounded answer.",
+        ),
+        DecisionQuestion(text="May the lane use the existing typed boundary?"),
+    )
+
+    assert decision.authority_class == "routine"
+    assert decision.autonomy == "autonomous"
+    assert decision.operator_confirmation_required is False
+
+    text_only_gate = DecisionReasoner(PrinciplesIndex()).decide(
+        _goal(),
+        GoalJudgment(
+            determines_answer=True,
+            answer="Use the existing typed boundary.",
+            goal_fields=["scope"],
+            inference="The scope settles this bounded answer.",
+        ),
+        DecisionQuestion(
+            text="The model labels this operator required, but no capability is missing.",
+            authority_class="operator_required",
+        ),
+    )
+    assert text_only_gate.autonomy == "autonomous"
+
+
+def test_small_delta_and_goal_scoped_replanning_use_enrolled_grants() -> None:
+    goal = _goal()
+    judgment = GoalJudgment(
+        determines_answer=True,
+        answer="Make the bounded implementation change.",
+        goal_fields=["scope"],
+        inference="The scope settles the bounded change.",
+    )
+    review = _accepted_review(goal)
+
+    missing_verification = DecisionReasoner(PrinciplesIndex()).decide(
+        goal,
+        judgment,
+        DecisionQuestion(authority_class="small_delta", session_review=review, text="Make the small change."),
+    )
+    assert missing_verification.autonomy == "autonomous"
+
+    for flag in (
+        "new_dependency",
+        "new_schema",
+        "new_hook",
+        "new_authorization_boundary",
+        "out_of_scope_path",
+    ):
+        gated = DecisionReasoner(PrinciplesIndex()).decide(
+            goal,
+            judgment,
+            DecisionQuestion(
+                authority_class="small_delta",
+                session_review=review,
+                text="Make the small change.",
+                verification_refs=["test:small-delta"],
+                **{flag: True},
+            ),
+        )
+        assert gated.autonomy == "autonomous"
+
+
+def test_legacy_corrective_review_class_does_not_override_goal_policy() -> None:
+    goal = _goal()
+    judgment = GoalJudgment(
+        determines_answer=True,
+        answer="Take the corrective action.",
+        goal_fields=["goal", "scope"],
+        inference="The rejected review identifies a corrective action.",
+    )
+    accepted = _accepted_review(goal)
+    gated = DecisionReasoner(PrinciplesIndex()).decide(
+        goal,
+        judgment,
+        DecisionQuestion(authority_class="corrective", session_review=accepted, text="Correct the rejected turn."),
+    )
+    assert gated.autonomy == "autonomous"
+    assert gated.operator_confirmation_required is False
+
+    rejected = SessionReviewSignal.create(
+        session_ref=goal.session_ref,
+        goal_contract_id=freeze_goal(goal).contract_id,
+        behavior_sha256="1" * 64,
+        verdict="reject",
+        reviewer_ids=("reviewer-1",),
+        findings=(ReviewFinding(code="other", detail="Unclassified finding.", citation="The lane stopped."),),
+    )
+    unrecognized = DecisionReasoner(PrinciplesIndex()).decide(
+        goal,
+        judgment,
+        DecisionQuestion(authority_class="corrective", session_review=rejected, text="Correct the rejected turn."),
+    )
+    assert unrecognized.autonomy == "autonomous"
+    assert unrecognized.operator_confirmation_required is False
 
 
 def test_none_cannot_be_hashed_or_attested_as_approved_text() -> None:
@@ -273,3 +411,100 @@ def test_none_cannot_be_hashed_or_attested_as_approved_text() -> None:
     payload = decision.model_dump(mode="python", exclude={"attestation_id", "approved_text", "approved_text_sha256"})
     with pytest.raises(ReasoningContractError, match="approved_text"):
         type(decision).create(approved_text=None, **payload)
+
+
+def _kai_attestation(**overrides: object) -> DecisionAttestation:
+    values: dict[str, object] = {
+        "outcome": "answer",
+        "message_kind": "reasoned_answer",
+        "approved_text": "Continue with the existing repository pattern.",
+        "source": "kai-delegate",
+        "delegated_authority": DelegatedAuthority(
+            principal="kai",
+            grant_id="sha256:" + "1" * 64,
+            grant_sha256="2" * 64,
+            satisfaction_sha256="3" * 64,
+            request_id="sha256:" + "4" * 64,
+        ),
+        "goal_contract_id": "sha256:" + "5" * 64,
+        "goal_version": 1,
+        "goal_fields": ("questions", "pursuit"),
+        "corpus_id": "sha256:" + "6" * 64,
+        "confidence_basis": "Kai verified the delegated scope and current evidence.",
+        "autonomy": "autonomous",
+        "operator_confirmation_required": False,
+    }
+    values.update(overrides)
+    return DecisionAttestation.create(**values)
+
+
+def test_kai_delegate_attestation_binds_verified_delegation() -> None:
+    attestation = _kai_attestation()
+
+    assert attestation.source == "kai-delegate"
+    assert attestation.delegated_authority is not None
+    assert attestation.delegated_authority.grant_id == "sha256:" + "1" * 64
+    assert DecisionAttestation.model_validate_json(attestation.model_dump_json()) == attestation
+    tampered = attestation.model_dump(mode="python")
+    tampered["delegated_authority"]["satisfaction_sha256"] = "9" * 64
+    with pytest.raises(ValidationError, match="attestation_id"):
+        DecisionAttestation.model_validate(tampered)
+
+
+def test_kai_delegate_attestation_requires_and_exclusively_owns_delegation() -> None:
+    with pytest.raises(ValidationError, match="require delegated_authority"):
+        _kai_attestation(delegated_authority=None)
+
+    authority = _kai_attestation().delegated_authority
+    with pytest.raises(ValidationError, match="valid only for Kai"):
+        _kai_attestation(source="goal", delegated_authority=authority)
+
+
+def test_kai_delegate_mapping_input_gets_canonical_defaults() -> None:
+    authority = _kai_attestation().delegated_authority
+    assert authority is not None
+
+    attestation = _kai_attestation(delegated_authority=authority.model_dump(exclude={"principal"}))
+
+    assert attestation.delegated_authority is not None
+    assert attestation.delegated_authority.principal == "kai"
+
+
+def test_pre_019_attestation_hash_remains_readable() -> None:
+    approved_text = "Use the existing typed boundary."
+    payload: dict[str, object] = {
+        "outcome": "answer",
+        "message_kind": "reasoned_answer",
+        "approved_text": approved_text,
+        "approved_text_sha256": hashlib.sha256(approved_text.encode()).hexdigest(),
+        "source": "goal",
+        "authority_class": "routine",
+        "goal_contract_id": "sha256:" + "1" * 64,
+        "goal_version": 1,
+        "goal_fields": ("scope",),
+        "corpus_id": "sha256:" + "2" * 64,
+        "principle_ids": (),
+        "principle_citations": (),
+        "evidence_refs": (),
+        "oracle_escalated": False,
+        "confidence_basis": "the frozen goal directly determines this answer",
+        "insufficiency_reasons": (),
+        "review_signal_id": None,
+        "review_verdict": None,
+        "reviewer_count": 0,
+        "autonomy_policy_sha256": "3" * 64,
+        "capability_grant_ids": (),
+        "capability_requirements": (),
+        "autonomy": "autonomous",
+        "operator_gate_reasons": (),
+        "operator_confirmation_required": False,
+        "operator_confirmed": False,
+    }
+    attestation_id = "sha256:" + hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    parsed = DecisionAttestation.model_validate({**payload, "attestation_id": attestation_id})
+
+    assert parsed.source == "goal"
+    assert parsed.delegated_authority is None

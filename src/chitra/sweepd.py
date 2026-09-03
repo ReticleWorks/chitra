@@ -42,6 +42,8 @@ from chitra.goals import (
 )
 from chitra.lane_config import enabled_lanes
 from chitra.rate_limit_state import Transaction, TransactionPhase, load_load_states, load_transactions
+from chitra.recovery import LaneState as LifecycleState
+from chitra.recovery import get_lane_lifecycle
 from chitra.state_paths import state_dir as default_state_dir
 from chitra.systemd_notify import notify_ready, notify_watchdog
 
@@ -118,6 +120,8 @@ class LaneState(BaseModel):
     pending_decisions: tuple[str, ...]
     needs: str
     specification_failures: tuple[str, ...]
+    lifecycle: LifecycleState | None = None
+    foreground_tasks: tuple[str, ...] = ()
 
 
 class SweepSnapshot(BaseModel):
@@ -334,6 +338,7 @@ def _lane_state(
     registry_entry: RegistryEntry | None,
     due: bool,
     load_level: int,
+    lifecycle: LifecycleState | None,
 ) -> LaneState:
     """Combine canonical state records for a tracked lane without inference."""
     return LaneState(
@@ -352,6 +357,12 @@ def _lane_state(
         pending_decisions=() if goal is None else goal.open_asks,
         needs="" if goal is None else goal.needs,
         specification_failures=() if goal is None else tuple(check_specification(goal)),
+        lifecycle=lifecycle,
+        foreground_tasks=(
+            ()
+            if goal is None
+            else tuple(f"{task.kind}: {task.text}" for task in goal.foreground_tasks)
+        ),
     )
 
 
@@ -365,13 +376,15 @@ def build_snapshot(
     current = datetime.now(UTC) if now is None else now
     if current.tzinfo is None:
         raise ValueError("now must be timezone-aware")
-    goals = _index_goals(list_goals(state_dir))
+    # Sweepd publishes a read-only digest. It may display fields understood by
+    # this package from a newer store, but it never uses this opt-in to write.
+    goals = _index_goals(list_goals(state_dir, allow_newer=True))
     transactions = _index_transactions(load_transactions(state_dir))
     registry = _index_registry(load_registry(state_dir))
     load_states = {state.host: state for state in load_load_states(state_dir)}
     load_levels = {host: state.load_level for host, state in sorted(load_states.items())}
     shed_lanes = tuple(session_ref for host in sorted(load_states) for session_ref in load_states[host].shed_lanes)
-    due_refs = {record.session_ref for record in due_goals(state_dir, now=current)}
+    due_refs = {record.session_ref for record in due_goals(state_dir, now=current, allow_newer=True)}
     lanes: dict[str, LaneState] = {}
     for session_ref in sorted(set(goals) | set(transactions)):
         lanes[session_ref] = _lane_state(
@@ -381,6 +394,11 @@ def build_snapshot(
             registry_entry=registry.get(session_name(session_ref)),
             due=session_ref in due_refs,
             load_level=load_levels.get(session_host(session_ref), 0),
+            lifecycle=(
+                record.state
+                if (record := get_lane_lifecycle(state_dir, session_ref)) is not None
+                else None
+            ),
         )
     return SweepSnapshot(
         lanes=lanes,

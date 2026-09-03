@@ -36,23 +36,25 @@ This example shows how to queue and deliver a message into a live tmux session.
 ### 1. Start a tmux session
 
 ```bash
-tmux new-session -d -s test-session
+tmux new-session -d -s test-session 'claude'
 ```
+
+This example requires a supported agent client that writes a transcript Chitra can bind to the tmux pane.
 
 ### 2. Create a queue directory and dispatch order
 
 Chitra expects a JSON queue in a configured directory (default `$CHITRA_STATE_DIR/queue`). Each order is one JSON file with a `.json` suffix.
 
 ```bash
-mkdir -p /tmp/chitra-demo/queue
-mkdir -p /tmp/chitra-demo/results
+mkdir -p /tmp/chitra-demo/queue/orders
+mkdir -p /tmp/chitra-demo/queue/results
 
 # Create a dispatch order
-cat > /tmp/chitra-demo/queue/order-001.json << 'EOF'
+cat > /tmp/chitra-demo/queue/orders/order-001.json << 'EOF'
 {
   "order_id": "order-001",
-  "lane_id": "test-session",
-  "text": "echo 'Hello from chitra!'"
+  "session_ref": "localhost:test-session:0.0",
+  "nudge": "Continue the queued task."
 }
 EOF
 ```
@@ -84,7 +86,7 @@ Each successful delivery is HMAC-signed and recorded here. The ledger is append-
 
 ## What's next
 
-- Read [Concepts](../concepts/) to understand chitra's two layers: the deterministic core and the LLM-judgment layer.
+- Read [Concepts](../concepts/) to understand Chitra's delivery core and persistent supervision layer.
 - Check the [Daemons reference](../daemons/) to learn what each tool does.
 - See [Configuration](../configuration/) to set up routing and policy for your deployment.
 - For systemd integration and running daemons continuously, refer to the main [README](../README.md).

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -171,3 +172,27 @@ def test_enqueue_is_the_only_delivery_writer_and_stays_idempotent(tmp_path: Path
     first = enqueue_dispatch_order(tmp_path, order)
     second = enqueue_dispatch_order(tmp_path, order)
     assert first == second
+
+
+def test_enqueue_never_overwrites_a_conflicting_same_id_order(tmp_path: Path) -> None:
+    original = DispatchOrder(order_id="peer-fixed-id", session_ref="localhost:monitor-b:main", nudge="first")
+    conflicting = original.model_copy(update={"nudge": "second"})
+    path = enqueue_dispatch_order(tmp_path, original)
+    original_bytes = path.read_bytes()
+
+    with pytest.raises(FileExistsError):
+        enqueue_dispatch_order(tmp_path, conflicting)
+
+    assert path.read_bytes() == original_bytes
+    assert DispatchOrder.model_validate_json(original_bytes) == original
+
+
+def test_concurrent_enqueue_of_same_order_converges_on_one_payload(tmp_path: Path) -> None:
+    order = DispatchOrder(order_id="peer-raced-id", session_ref="localhost:monitor-b:main", nudge="same")
+
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        paths = tuple(workers.map(lambda _index: enqueue_dispatch_order(tmp_path, order), range(32)))
+
+    assert len(set(paths)) == 1
+    assert DispatchOrder.model_validate_json(paths[0].read_bytes()) == order
+    assert not tuple((tmp_path / "orders").glob("*.tmp"))
