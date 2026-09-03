@@ -3,9 +3,10 @@
 Live fleet dashboard over one or more discovered Chitra state directories.
 One page: cockpit (Since-you-looked, Needs feedback, lane grid), a
 lane-detail drawer, a History tab, and an Activity tab (agenttrail's
-activity-card view, embedded). boardd never writes fleet state or spawns
-sessions directly; its two write endpoints shell out to the existing
-`chitra-goals` CLI. boardd is the one board — the old Artifact-published
+activity-card view, proxied through boardd's own origin). boardd never
+writes fleet state directly and never spawns sessions; its two write
+endpoints (ack, answer) shell out to the existing `chitra-goals` CLI, which
+is the only thing that ever touches goals.json. boardd is the one board — the old Artifact-published
 board (`board_publish.py` in the fleet `chitra-launcher` package) is
 deprecated in favour of this page; see "Deploy" below.
 
@@ -91,9 +92,9 @@ scan — it is not a production configuration path.
 | `BOARDD_STALE_AFTER_SECONDS` | `900` | Age after which the state file itself is called stale in the UI. |
 | `BOARDD_HEARTBEAT_SECONDS` | `15` | SSE heartbeat interval. |
 | `BOARDD_MONITORS_TICK_SECONDS` | `30` | How often `/events` re-runs discovery and pushes a `monitors` event. |
-| `BOARDD_AGENTTRAIL_URL` | `http://127.0.0.1:5330/` | Co-located agenttrail process, iframed by the Activity tab. |
+| `BOARDD_AGENTTRAIL_URL` | `http://127.0.0.1:5330/` | Where boardd's own supervisor spawns and reaches the vendored agenttrail process (loopback only). The Activity tab is served `/activity/` on boardd's own origin, which proxies here — the raw port is never given to the browser. |
 | `BOARDD_AGENTTRAIL_HOOK_URL` | `http://127.0.0.1:5330/hook` | Where boardd posts synthesized hook events. |
-| `BOARDD_AGENTTRAIL_CWD` | `/var/lib/polyphony-chitra` | The `cwd` value stamped on synthesized hook events; must match the vendored agenttrail process's own repo root. |
+| `BOARDD_AGENTTRAIL_CWD` | `/var/lib/polyphony-chitra` | The `cwd` value stamped on synthesized hook events, and the repo root boardd passes to the spawned agenttrail process; must match. |
 
 ## Reading the v3 schema
 
@@ -126,9 +127,19 @@ when they are in this set.
 ## Rendering: agenttrail's activity-card UI, proxied
 
 boardd vendors agenttrail (`sodiumsun/agenttrail` v0.2.0, pinned commit and
-license in `src/boardd/vendor/agenttrail/NOTICE.md`) unmodified. The
-Activity tab is an iframe onto a co-located, vendored agenttrail Node
-process; boardd drives it by posting synthesized Claude-Code-shaped hook
+license in `src/boardd/vendor/agenttrail/NOTICE.md`) unmodified. boardd
+spawns it itself at startup (`node <vendored>/bin/agenttrail.mjs`, bound to
+loopback) and supervises it — restart on exit with backoff, stopped on
+boardd's own shutdown, stdout/stderr logged. It is never exposed on the
+tailnet directly: the Activity tab's iframe points at `/activity/` on
+boardd's own origin, which boardd proxies to the loopback process — GET
+only, through a small allowlist of the paths agenttrail's UI actually
+fetches (`/`, `/world`, `/tree-of`, `/escalations`, `/events`). `/spawn`,
+`/setup-board`, `/answer`, and every other mutating route are refused: the
+vendored server's `/spawn` handler takes an arbitrary filesystem path from
+an unauthenticated POST and launches a detached Node process, so it must
+never reach the tailnet even by accident. boardd separately drives
+agenttrail's own live feed by posting synthesized Claude-Code-shaped hook
 events (`SessionStart`, `PreToolUse`/`PostToolUse` carrying the lane's `now`
 text, `Stop`) to its `/hook` endpoint on every lane status change — the same
 event shape and posting pattern this repository's own Orchestra board
@@ -265,16 +276,24 @@ check.
 ## Deploy
 
 Target: host twinridge, reading each discovered `/var/lib/polyphony-chitra*`
-read-only, reachable only over the tailnet.
+and, through `chitra-goals resolve-ask` only, writing ack/answer
+resolutions back into them; reachable only over the tailnet.
 
 1. Release boardd (and the vendored agenttrail Node process) as a pinned
    artifact through a Runline unit on twinridge — no checkouts, no
    hand-copied files on the host.
-2. Reach it over Tailscale Serve, tailnet only; no public listener.
+2. Reach it over Tailscale Serve, tailnet only; no public listener. boardd
+   spawns and supervises the vendored agenttrail Node process itself
+   (loopback-only, restarted on exit) and proxies its UI at `/activity/*`
+   under boardd's own origin — the raw Node port is never exposed on the
+   tailnet.
 3. Land `packaging/systemd/boardd.service.example` (draft in this repo) via
-   the governed host repo, running a dedicated `boardd` user with the state
-   dirs mounted read-only via `ReadOnlyPaths`, plus a paired unit for the
-   co-located agenttrail process.
+   the governed host repo, running a dedicated `boardd` user with
+   `ReadWritePaths=/var/lib` (the state roots' ids are discovered at
+   runtime, so systemd's glob-free path directives cannot name them in
+   advance) and `SupplementaryGroups=chitra` so it can write into
+   chitra-group-owned state directories. No paired unit is needed for
+   agenttrail — boardd owns that process directly.
 4. Add a tool-registry entry for boardd in the same PR that lands the unit.
 5. Wire the real translation model call behind
    `TranslationCache._model_translate`, with a persisted cache path.
