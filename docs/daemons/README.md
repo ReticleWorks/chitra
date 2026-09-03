@@ -1,13 +1,13 @@
 # Daemons and Tools
 
-Chitra provides a set of command-line tools and daemons organized by
-function. Four shared daemons run continuously when the host role is armed:
-dispatchd, watchd, triaged, and sweepd. The rest are periodic, ad-hoc, or
-observation-only services.
+Chitra provides command-line tools and daemons organized by function. New
+deployments run `monitord` for persistent supervision and `dispatchd` as the
+sole terminal writer. `watchd`, `triaged`, and `sweepd` remain for existing
+deployments. The rest are periodic, ad-hoc, or observation-only services.
 
 ## The Composed Monitor
 
-- **[monitord](monitord.md)** — The single observation-plane daemon: journal ingestion, deterministic detectors and response ladder, enrollment receipts, and presence in one entrypoint. `watchd`, `triaged`, and `sweepd` are deprecated by it.
+- **[monitord](monitord.md)** — Persistent, exact goal-bound supervision: transcript ingestion, deterministic detectors, crash-safe corrective orders, completion receipts, foreground investigation, and presence. `watchd`, `triaged`, and `sweepd` are deprecated by it.
 
 ## Delivery Systems
 
@@ -38,23 +38,25 @@ Auxiliary tools for testing, debugging, and drift detection.
 **Start chitra for the first time:**
 
 ```bash
-# Continuous shared daemons
+# Current supervision pair
 systemctl start chitra-dispatchd
-systemctl start chitra-watchd
-systemctl start chitra-triaged
-systemctl start chitra-sweepd
+systemctl start chitra-monitord@<instance>
 
 # Periodic rate-limit check
 systemctl start --timer chitra-rate-limit-guard.timer
 
 # Queue a message
-cat > /var/lib/chitra/queue/msg-001.json << 'EOF'
-{"order_id": "msg-001", "lane_id": "session-1", "text": "echo 'hello'"}
+mkdir -p /var/lib/chitra/lane-<instance>/queue/orders
+cat > /var/lib/chitra/lane-<instance>/queue/orders/msg-001.json << 'EOF'
+{"order_id": "msg-001", "session_ref": "localhost:session-1:0.0", "nudge": "Continue the queued task."}
 EOF
 
 # View the fleet board
 chitra-goals roster --format box
 ```
+
+The matching entry in `/etc/chitra/lanes.yaml` must set `state_dir` to
+`/var/lib/chitra/lane-<instance>` so shared `dispatchd` drains this queue.
 
 **Explain a supervised session's status:**
 

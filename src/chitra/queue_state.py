@@ -28,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import tempfile
 import uuid
 from collections.abc import Callable, Mapping
@@ -42,6 +43,39 @@ from ._fsio import write_json_atomic
 from .dispatch import _pid_alive
 
 logger = structlog.get_logger(__name__)
+
+_ORDER_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,191}\Z")
+
+
+def _require_real_directory(path: Path, *, label: str) -> Path:
+    """Return a queue directory only when it is real or safely absent."""
+    if path.is_symlink():
+        raise ValueError(f"{label} must not be a symlink: {path}")
+    if path.exists() and not path.is_dir():
+        raise ValueError(f"{label} must be a directory: {path}")
+    return path
+
+
+def _require_safe_order_id(order_id: str) -> str:
+    if _ORDER_ID_RE.fullmatch(order_id) is None:
+        raise ValueError(f"unsafe order id: {order_id!r}")
+    return order_id
+
+
+def _require_real_file(path: Path, *, label: str) -> Path:
+    if path.is_symlink():
+        raise ValueError(f"{label} must not be a symlink: {path}")
+    return path
+
+
+def _validate_pending_order_path(orders_dir: Path, pending_path: Path) -> None:
+    """Require one real, direct child of the queue's orders directory."""
+    _require_real_directory(orders_dir, label="orders directory")
+    expected = orders_dir / pending_path.name
+    if pending_path != expected:
+        raise ValueError(f"order path must be an exact child of {orders_dir}: {pending_path}")
+    if pending_path.is_symlink():
+        raise ValueError(f"order path must not be a symlink: {pending_path}")
 
 
 class QueueSubdir(StrEnum):
@@ -67,35 +101,44 @@ class QueueLayout:
 
     root: Path
 
+    def __post_init__(self) -> None:
+        _require_real_directory(self.root, label="queue root")
+        for subdir in QueueSubdir:
+            _require_real_directory(self.root / subdir, label=f"queue {subdir.value} directory")
+
+    def _subdir(self, subdir: QueueSubdir) -> Path:
+        _require_real_directory(self.root, label="queue root")
+        return _require_real_directory(self.root / subdir, label=f"queue {subdir.value} directory")
+
     @property
     def orders(self) -> Path:
         """Pending order files awaiting a claim."""
-        return self.root / QueueSubdir.ORDERS
+        return self._subdir(QueueSubdir.ORDERS)
 
     @property
     def in_flight(self) -> Path:
         """Claimed order files plus their owner markers and send nonces."""
-        return self.root / QueueSubdir.IN_FLIGHT
+        return self._subdir(QueueSubdir.IN_FLIGHT)
 
     @property
     def deferred(self) -> Path:
         """Parked orders (guard-held or lane-lock-retryable) plus retry sidecars."""
-        return self.root / QueueSubdir.DEFERRED
+        return self._subdir(QueueSubdir.DEFERRED)
 
     @property
     def results(self) -> Path:
         """One DispatchResult JSON per delivered order id."""
-        return self.root / QueueSubdir.RESULTS
+        return self._subdir(QueueSubdir.RESULTS)
 
     @property
     def processed(self) -> Path:
         """Order files whose terminal result exists (SENT only after ledger proof)."""
-        return self.root / QueueSubdir.PROCESSED
+        return self._subdir(QueueSubdir.PROCESSED)
 
     @property
     def invalid(self) -> Path:
         """Quarantine for order files that fail to parse."""
-        return self.root / QueueSubdir.INVALID
+        return self._subdir(QueueSubdir.INVALID)
 
     def create(self) -> tuple[Path, Path, Path]:
         """Create every standard subdirectory; return ``(orders, results, processed)``."""
@@ -105,19 +148,59 @@ class QueueLayout:
 
     def result_path(self, order_id: str) -> Path:
         """Path of the result JSON for ``order_id``."""
-        return self.results / f"{order_id}.json"
+        path = self.results / f"{_require_safe_order_id(order_id)}.json"
+        return _require_real_file(path, label="result path")
 
     def owner_marker_path(self, order_id: str) -> Path:
         """Path of the claim-reservation marker for ``order_id``."""
-        return self.in_flight / f".{order_id}.owner"
+        path = self.in_flight / f".{_require_safe_order_id(order_id)}.owner"
+        return _require_real_file(path, label="owner marker path")
 
     def send_nonce_path(self, order_id: str) -> Path:
         """Path of the send-nonce crash marker for ``order_id``."""
-        return self.in_flight / f".{order_id}.nonce"
+        path = self.in_flight / f".{_require_safe_order_id(order_id)}.nonce"
+        return _require_real_file(path, label="send nonce path")
 
     def send_nonce(self, order_id: str) -> SendNonce:
         """The send-nonce crash marker handle for ``order_id``."""
         return SendNonce(order_id=order_id, path=self.send_nonce_path(order_id))
+
+
+@dataclass(frozen=True)
+class QueueOrderArtifacts:
+    """Read-only locations that already own one dispatch order identity."""
+
+    order_id: str
+    order_paths: tuple[Path, ...]
+    result_path: Path | None
+
+    @property
+    def exists(self) -> bool:
+        """Whether the queue or its result store already knows this order."""
+        return bool(self.order_paths) or self.result_path is not None
+
+
+def locate_order(layout: QueueLayout, order_id: str) -> QueueOrderArtifacts:
+    """Locate one order across every durable queue state without mutating it."""
+    if _ORDER_ID_RE.fullmatch(order_id) is None:
+        raise ValueError(f"unsafe order id: {order_id!r}")
+    paths = tuple(
+        path
+        for directory in (
+            layout.orders,
+            layout.in_flight,
+            layout.deferred,
+            layout.processed,
+            layout.invalid,
+        )
+        if (path := directory / f"{order_id}.json").is_file()
+    )
+    result_path = layout.result_path(order_id)
+    return QueueOrderArtifacts(
+        order_id=order_id,
+        order_paths=paths,
+        result_path=result_path if result_path.is_file() else None,
+    )
 
 
 @dataclass(frozen=True)
@@ -148,7 +231,11 @@ class ClaimReservation:
         "claimed elsewhere", not as a failure of this worker's own claim,
         which is still valid until released.
         """
+        _require_real_directory(self.in_flight_dir, label="in_flight directory")
+        _validate_pending_order_path(self.in_flight_dir.parent / QueueSubdir.ORDERS, pending_path)
         claimed_path = self.in_flight_dir / pending_path.name
+        if claimed_path.is_symlink():
+            raise ValueError(f"claimed order path must not be a symlink: {claimed_path}")
         pending_path.rename(claimed_path)
         return claimed_path
 
@@ -168,8 +255,10 @@ def reserve_claim(in_flight_dir: Path, order_id: str) -> ClaimReservation | None
     marker already exists -- the caller lost the race and must skip the
     order entirely.
     """
+    _require_safe_order_id(order_id)
+    _require_real_directory(in_flight_dir, label="in_flight directory")
     in_flight_dir.mkdir(parents=True, exist_ok=True)
-    marker_path = in_flight_dir / f".{order_id}.owner"
+    marker_path = _require_real_file(in_flight_dir / f".{order_id}.owner", label="owner marker path")
     temporary_path: str | None = None
     try:
         # Publish the PID-bearing marker with an exclusive hard-link. A plain
@@ -241,7 +330,7 @@ def reclaim_stale_claims(layout: QueueLayout) -> None:
             continue
         logger.warning("dispatchd_reclaiming_stale_in_flight_order", path=str(claimed), owner_pid=pid)
         with contextlib.suppress(OSError):
-            claimed.replace(layout.orders / claimed.name)
+            _move_without_replace(claimed, layout.orders / claimed.name)
         with contextlib.suppress(OSError):
             owner_path.unlink()
 
@@ -271,27 +360,30 @@ class SendNonce:
     order_id: str
     path: Path
 
+    def _validate_path(self) -> None:
+        _require_real_directory(self.path.parent, label="in_flight directory")
+        if self.path.is_symlink():
+            raise ValueError(f"send nonce path must not be a symlink: {self.path}")
+
     def exists(self) -> bool:
         """Whether a prior attempt left a nonce for this order."""
+        self._validate_path()
         return self.path.exists()
 
     def mint(self) -> None:
         """Write this attempt's fresh random nonce."""
+        self._validate_path()
         self.path.write_text(uuid.uuid4().hex, encoding="utf-8")
 
     def clear(self) -> None:
         """Remove the nonce once the order reaches a terminal state; missing is fine."""
+        self._validate_path()
         with contextlib.suppress(OSError):
             self.path.unlink()
 
 
 class LaneLockRetryTracker:
-    """Durable per-order attempt counter parked beside a deferred order.
-
-    One sidecar per order id under ``deferred/`` counts transient failures
-    (lane-lock timeouts, unconfirmed deliveries) across daemon restarts, so
-    a retry budget survives crashes and bounds a permanently-busy lane.
-    """
+    """Durable per-order attempt counter parked beside a deferred order."""
 
     def __init__(self, deferred_dir: Path) -> None:
         self.deferred_dir = deferred_dir
@@ -303,10 +395,12 @@ class LaneLockRetryTracker:
         order scans only consider JSON order files, so this control record
         can never be mistaken for a dispatch order.
         """
+        _require_safe_order_id(order_id)
+        _require_real_directory(self.deferred_dir, label="deferred directory")
         return self.deferred_dir / f".{order_id}.lane-lock-attempts"
 
-    def attempts(self, order_id: str, *, retry_limit: int) -> int:
-        """Read a retry count, failing closed if a manually-corrupt sidecar appears."""
+    def attempts(self, order_id: str) -> int:
+        """Read a retry count; repair a corrupt diagnostic sidecar on the next attempt."""
         path = self.state_path(order_id)
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -317,15 +411,15 @@ class LaneLockRetryTracker:
             return 0
         except (OSError, ValueError, TypeError, KeyError) as exc:
             # Atomic writes prevent a process crash from producing this state.
-            # Treat an externally corrupted record as exhausted rather than
-            # resetting it and allowing an unbounded retry loop.
-            logger.error("dispatchd_lane_lock_retry_state_invalid", path=str(path), error=str(exc))
-            return retry_limit
+            # The count is diagnostic, not an authority or terminal-delivery
+            # gate, so corruption must not strand an unfinished order.
+            logger.warning("dispatchd_lane_lock_retry_state_invalid", path=str(path), error=str(exc))
+            return 0
         return attempts
 
-    def record_attempt(self, order_id: str, *, retry_limit: int) -> int:
+    def record_attempt(self, order_id: str) -> int:
         """Atomically increment and persist one failure count."""
-        attempts = self.attempts(order_id, retry_limit=retry_limit) + 1
+        attempts = self.attempts(order_id) + 1
         write_json_atomic(self.state_path(order_id), {"attempts": attempts})
         return attempts
 
@@ -348,6 +442,8 @@ def _move_without_replace(source: Path, target: Path) -> bool:
     Return ``False`` when ``target`` already exists. Let the caller decide
     whether that means "skip" or "already finalized".
     """
+    if source.is_symlink() or target.is_symlink():
+        raise ValueError(f"queue move paths must not be symlinks: {source}, {target}")
     try:
         os.link(source, target)
     except FileExistsError:
@@ -376,12 +472,20 @@ class StoredResult:
     order_id: str
     path: Path
 
+    def _validate_path(self) -> None:
+        _require_safe_order_id(self.order_id)
+        _require_real_directory(self.path.parent, label="results directory")
+        if self.path.is_symlink():
+            raise ValueError(f"result path must not be a symlink: {self.path}")
+
     def exists(self) -> bool:
         """Whether a terminal result has been published for this order id."""
+        self._validate_path()
         return self.path.exists()
 
     def read_payload(self) -> dict[str, Any] | None:
         """The stored result payload, or ``None`` when absent or unreadable."""
+        self._validate_path()
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -398,6 +502,7 @@ class StoredResult:
         created the file; on ``FileExistsError`` the existing result stands
         and this call's payload is discarded.
         """
+        self._validate_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path: str | None = None
         try:
@@ -430,6 +535,7 @@ class StoredResult:
         ``delivery_ledger_verified`` after retrying the ledger write. Byte-
         for-byte identical serialization to the historical result writer.
         """
+        self._validate_path()
         write_json_atomic(
             self.path,
             dict(payload),
@@ -477,6 +583,10 @@ class TerminalFinalization:
 
     def apply(self) -> bool:
         """Execute the transition; returns True iff this call wrote the result."""
+        _require_real_directory(self.results_dir, label="results directory")
+        _require_real_directory(self.destination_dir, label="queue destination directory")
+        if self.retry_state_dir is not None:
+            _require_real_directory(self.retry_state_dir, label="deferred directory")
         wrote_result = False
         if self.result_payload is not None:
             wrote_result = self.stored_result().create_once(self.result_payload)

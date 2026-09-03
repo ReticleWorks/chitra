@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from chitra.orders import DispatchOrder, DispatchResult, DispatchStatus
 from chitra.queue_state import (
     LaneLockRetryTracker,
     QueueLayout,
@@ -30,6 +31,32 @@ from chitra.queue_state import (
 # A pid essentially guaranteed not to be alive on any real system (the same
 # convention tests/test_dispatchd.py uses).
 _DEAD_PID = "999999999"
+
+
+@pytest.mark.parametrize("order_id", ["../escape", "foo/bar", "/absolute", ".", "..", "C:\\absolute"])
+def test_dispatch_order_and_result_reject_path_unsafe_ids(order_id: str) -> None:
+    with pytest.raises(ValueError):
+        DispatchOrder(order_id=order_id, session_ref="localhost:s:0.0", nudge="work")
+    with pytest.raises(ValueError):
+        DispatchResult(order_id=order_id, session_ref="localhost:s:0.0", status=DispatchStatus.FAILED)
+
+
+def test_deferred_move_does_not_clobber_a_colliding_target(tmp_path: Path) -> None:
+    deferred = tmp_path / "deferred"
+    orders = tmp_path / "orders"
+    deferred.mkdir()
+    orders.mkdir()
+    source = deferred / "ord-collision.json"
+    target = orders / source.name
+    source.write_text("deferred", encoding="utf-8")
+    target.write_text("already-pending", encoding="utf-8")
+
+    outcome = requeue_deferred_to_orders(deferred, orders)
+
+    assert outcome.requeued == []
+    assert outcome.skipped_existing_target == [source]
+    assert source.read_text(encoding="utf-8") == "deferred"
+    assert target.read_text(encoding="utf-8") == "already-pending"
 
 
 def _write_pending(orders_dir: Path, name: str, content: str = "{}") -> Path:
@@ -59,6 +86,22 @@ def test_layout_create_makes_every_standard_directory_and_returns_dispatchds_tup
     assert created == (tmp_path / "orders", tmp_path / "results", tmp_path / "processed")
     for subdir in (layout.orders, layout.results, layout.processed, layout.in_flight, layout.deferred):
         assert subdir.is_dir()
+
+
+@pytest.mark.parametrize("subdir", [None, "orders", "results", "in_flight", "deferred", "processed", "invalid"])
+def test_layout_rejects_a_symlinked_root_or_queue_subdirectory(tmp_path: Path, subdir: str | None) -> None:
+    target = tmp_path / "external"
+    target.mkdir()
+    root = tmp_path / "queue"
+    if subdir is None:
+        root.symlink_to(target, target_is_directory=True)
+    else:
+        root.mkdir()
+        (root / subdir).symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        layout = QueueLayout(root)
+        getattr(layout, subdir or "orders")
 
 
 def test_layout_control_file_paths_match_the_on_disk_names_dispatchd_has_always_used(tmp_path: Path) -> None:
@@ -122,6 +165,26 @@ def test_claim_renames_the_pending_order_into_in_flight_under_the_reservation(tm
     assert claimed == in_flight_dir / "ord-1.json"
     assert claimed.exists()
     assert not pending.exists()
+
+
+def test_claim_rejects_an_external_or_symlinked_order_without_touching_external_file(tmp_path: Path) -> None:
+    layout = QueueLayout(tmp_path)
+    layout.create()
+    reservation = reserve_claim(layout.in_flight, "ord-1")
+    assert reservation is not None
+    external = tmp_path / "external.json"
+    external.write_text("external", encoding="utf-8")
+    linked = layout.orders / "linked.json"
+    linked.symlink_to(external)
+
+    with pytest.raises(ValueError):
+        reservation.claim(tmp_path / "outside.json")
+    with pytest.raises(ValueError, match="symlink"):
+        reservation.claim(linked)
+
+    assert external.read_text(encoding="utf-8") == "external"
+    assert linked.is_symlink()
+    reservation.release()
 
 
 def test_release_removes_the_marker_and_is_safe_to_repeat(tmp_path: Path) -> None:
@@ -233,7 +296,7 @@ def test_retry_tracker_reads_zero_when_no_sidecar_exists(tmp_path: Path) -> None
     tracker = LaneLockRetryTracker(tmp_path)
 
     assert tracker.state_path("ord-1") == tmp_path / ".ord-1.lane-lock-attempts"
-    assert tracker.attempts("ord-1", retry_limit=20) == 0
+    assert tracker.attempts("ord-1") == 0
 
 
 def test_retry_tracker_increments_and_persists_across_instances(tmp_path: Path) -> None:
@@ -242,33 +305,32 @@ def test_retry_tracker_increments_and_persists_across_instances(tmp_path: Path) 
     writer = LaneLockRetryTracker(tmp_path)
     reader = LaneLockRetryTracker(tmp_path)
 
-    first = writer.record_attempt("ord-1", retry_limit=20)
-    second = writer.record_attempt("ord-1", retry_limit=20)
+    first = writer.record_attempt("ord-1")
+    second = writer.record_attempt("ord-1")
 
     assert first == 1
     assert second == 2
-    assert reader.attempts("ord-1", retry_limit=20) == 2
+    assert reader.attempts("ord-1") == 2
     assert json.loads(writer.state_path("ord-1").read_text(encoding="utf-8")) == {"attempts": 2}
 
 
 @pytest.mark.parametrize("corrupt_payload", ['{"attempts": true}', '{"attempts": -3}', '{"attempts": "many"}', "not json"])
-def test_retry_tracker_fails_closed_on_a_corrupt_sidecar(tmp_path: Path, corrupt_payload: str) -> None:
-    """An externally corrupted record is treated as exhausted (retry_limit),
-    never reset to zero -- resetting would allow an unbounded retry loop."""
+def test_retry_tracker_repairs_a_corrupt_diagnostic_sidecar(tmp_path: Path, corrupt_payload: str) -> None:
     tracker = LaneLockRetryTracker(tmp_path)
     tracker.state_path("ord-1").write_text(corrupt_payload, encoding="utf-8")
 
-    assert tracker.attempts("ord-1", retry_limit=7) == 7
+    assert tracker.attempts("ord-1") == 0
+    assert tracker.record_attempt("ord-1") == 1
 
 
 def test_retry_tracker_clear_removes_the_sidecar_and_is_safe_to_repeat(tmp_path: Path) -> None:
     tracker = LaneLockRetryTracker(tmp_path)
-    tracker.record_attempt("ord-1", retry_limit=20)
+    tracker.record_attempt("ord-1")
 
     tracker.clear("ord-1")
 
     assert not tracker.state_path("ord-1").exists()
-    assert tracker.attempts("ord-1", retry_limit=20) == 0
+    assert tracker.attempts("ord-1") == 0
     tracker.clear("ord-1")  # idempotent
 
 
@@ -280,6 +342,23 @@ def test_stored_result_create_once_preserves_the_first_writer(tmp_path: Path) ->
     assert stored.read_payload() == {"order_id": "ord-1", "status": "failed", "reason": "first"}
 
 
+def test_stored_result_rejects_a_symlink_without_touching_its_target(tmp_path: Path) -> None:
+    results = tmp_path / "results"
+    results.mkdir()
+    external = tmp_path / "external-result.json"
+    external.write_text('{"keep": true}', encoding="utf-8")
+    result_path = results / "ord-1.json"
+    result_path.symlink_to(external)
+    stored = StoredResult("ord-1", result_path)
+
+    with pytest.raises(ValueError, match="symlink"):
+        stored.exists()
+    with pytest.raises(ValueError, match="symlink"):
+        stored.overwrite({"keep": False})
+
+    assert external.read_text(encoding="utf-8") == '{"keep": true}'
+
+
 def test_terminal_finalization_is_idempotent_and_clears_control_markers(tmp_path: Path) -> None:
     layout = QueueLayout(tmp_path)
     layout.create()
@@ -288,7 +367,7 @@ def test_terminal_finalization_is_idempotent_and_clears_control_markers(tmp_path
     nonce = layout.send_nonce("ord-1")
     nonce.mint()
     tracker = LaneLockRetryTracker(layout.deferred)
-    tracker.record_attempt("ord-1", retry_limit=20)
+    tracker.record_attempt("ord-1")
 
     finalization = TerminalFinalization(
         claimed_path=claimed,
@@ -346,16 +425,16 @@ def test_requeue_deferred_to_orders_is_fifo_and_does_not_reset_retry_sidecars(tm
     os.utime(older, ns=(10, 10))
     os.utime(newer, ns=(20, 20))
     tracker = LaneLockRetryTracker(deferred)
-    tracker.record_attempt("older", retry_limit=20)
-    tracker.record_attempt("newer", retry_limit=20)
+    tracker.record_attempt("older")
+    tracker.record_attempt("newer")
 
     outcome = requeue_deferred_to_orders(deferred, orders)
 
     assert [path.name for path in outcome.requeued] == ["older.json", "newer.json"]
     assert outcome.skipped_existing_target == []
     assert outcome.failed == []
-    assert tracker.attempts("older", retry_limit=20) == 1
-    assert tracker.attempts("newer", retry_limit=20) == 1
+    assert tracker.attempts("older") == 1
+    assert tracker.attempts("newer") == 1
 
 
 def test_requeue_deferred_skips_a_target_created_after_scan_without_clobbering_it(tmp_path: Path) -> None:

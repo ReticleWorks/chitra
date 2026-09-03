@@ -29,7 +29,7 @@ from chitra.goals import (
     mark_completion_gate_passed,
     upsert_goal,
 )
-from chitra.validation_receipts import ReceiptError, ingest_receipt, list_receipts
+from chitra.validation_receipts import ReceiptError, ingest_receipt, list_receipts, receipt_path
 
 RECEIPT_NAME = "pytest-failing-target"
 SESSION_REF = "host:w2i-target-execution:0.0"
@@ -102,7 +102,7 @@ def _write_hash_bound_failing_target_receipt(root: Path, command: list[str]) -> 
 
 
 def _place_stored_receipt(root: Path, source: Path) -> Path:
-    stored = root / "validation-receipts" / f"{RECEIPT_NAME}.json"
+    stored = receipt_path(root, SESSION_REF, RECEIPT_NAME)
     stored.parent.mkdir(parents=True, exist_ok=True)
     payload = json.loads(source.read_text(encoding="utf-8"))
     stored.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")

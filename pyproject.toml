@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "chitra-monitor"
-version = "0.16.0"
-description = "Deterministic tmux relay/dedup daemons for AI-agent fleet monitoring"
+version = "0.19.2"
+description = "Persistent goal-bound supervision and deterministic tmux delivery for AI-agent fleets"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
@@ -49,6 +49,7 @@ test = [
 [project.scripts]
 dispatchd = "chitra.dispatchd:main"
 monitord = "chitra.monitord:main"
+chitra-monitord = "chitra.monitord:main"
 triaged = "chitra.triaged:main"
 draft-scanner = "chitra.draft_scanner:main"
 chitra-goals = "chitra.goals_cli:main"

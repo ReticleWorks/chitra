@@ -13,6 +13,7 @@ import pytest
 from _goal_fixtures import enrollment_fields, ingest_passing_receipt, passing_completion_evidence
 
 from chitra.artifacts import ARTIFACT_URL_PREFIX, ArtifactRecord, upsert_artifact
+from chitra.autonomy import AutonomyPolicy, CapabilityGrant, autonomy_policy_json
 from chitra.goals import (
     EnrolledScopeImmutableError,
     GoalNotFoundError,
@@ -22,6 +23,7 @@ from chitra.goals import (
     GoalStatus,
     GoalValidationError,
     add_ask,
+    add_foreground_task,
     check_specification,
     close_goal,
     descope_delta,
@@ -35,6 +37,7 @@ from chitra.goals import (
     mark_completion_gate_passed,
     redirect_goal,
     resolve_ask,
+    resolve_foreground_task,
     resume_goal,
     schema_is_newer_than_installed,
     session_host,
@@ -122,9 +125,7 @@ def _cli_enroll(
                     "out_of_scope": {"answer": "Unrelated board changes are excluded.", "provenance": "operator:test"},
                     "constraints": {"answer": "Keep the change small and tested.", "provenance": "operator:test"},
                 },
-                "enrolled_done_when_items": [
-                    {"id": "done-1", "text": done_when, "validator": "pytest", "required_receipt": "tests-green"}
-                ],
+                "enrolled_done_when_items": [{"id": "done-1", "text": done_when, "validator": "pytest", "required_receipt": "tests-green"}],
             }
         ),
         encoding="utf-8",
@@ -176,6 +177,31 @@ def test_open_asks_round_trip_and_set_preserves_them_until_explicitly_cleared(tm
 
     cleared = upsert_goal(tmp_path, _record(status="working"), clear_open_asks=True)
     assert cleared.open_asks == ()
+
+
+def test_foreground_tasks_are_durable_deduplicated_and_separate_from_operator_asks(tmp_path: Path) -> None:
+    stored = upsert_goal(tmp_path, _record())
+    first = add_foreground_task(
+        tmp_path,
+        stored.session_ref,
+        kind="question",
+        text="Inspect the repository and settle the unresolved schema choice.",
+        source="monitord",
+    )
+    repeated = add_foreground_task(
+        tmp_path,
+        stored.session_ref,
+        kind="question",
+        text="Inspect the repository and settle the unresolved schema choice.",
+        source="monitord",
+    )
+
+    assert repeated.foreground_tasks == first.foreground_tasks
+    assert repeated.open_asks == ()
+    tactical = upsert_goal(tmp_path, replace(repeated, now="foreground investigating", foreground_tasks=()))
+    assert tactical.foreground_tasks == repeated.foreground_tasks
+    resolved = resolve_foreground_task(tmp_path, stored.session_ref, task_id=first.foreground_tasks[0].task_id)
+    assert resolved.foreground_tasks == ()
 
 
 def test_add_ask_deduplicates_and_resolve_supports_text_index_and_all(tmp_path: Path) -> None:
@@ -272,17 +298,21 @@ def test_load_old_record_without_optional_fields_is_backward_compatible(tmp_path
     assert record.scope == ""
     assert record.goal_version == 1
     assert record.goal_history == ()
+    assert record.autonomy_policy.initiative == "aggressive"
     assert record.lane_id == "lane"
     assert record.enrolled_done_when == record.done_when
     assert record.enrolled_at == payload["updated_at"]
     with pytest.raises(GoalValidationError, match="legacy goals are display-only"):
         upsert_goal(tmp_path, record)
-    assert close_goal(
-        tmp_path,
-        record.session_ref,
-        administrative=True,
-        administrative_reason="retire the pre-interview record without claiming completion",
-    ) == record
+    assert (
+        close_goal(
+            tmp_path,
+            record.session_ref,
+            administrative=True,
+            administrative_reason="retire the pre-interview record without claiming completion",
+        )
+        == record
+    )
 
 
 @pytest.mark.parametrize(
@@ -317,6 +347,17 @@ def test_new_optional_goal_fields_are_strictly_validated(tmp_path: Path, field: 
         load_goals(tmp_path)
 
 
+@pytest.mark.parametrize("invalid_status", ["finished", "", None, 1])
+def test_persisted_goal_status_fails_closed(tmp_path: Path, invalid_status: object) -> None:
+    record_payload = _record().to_dict()
+    record_payload["status"] = invalid_status
+    payload = {"schema": "chitra.goals.v3", "goals": [record_payload]}
+    (tmp_path / "goals.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="goal record status"):
+        load_goals(tmp_path)
+
+
 def test_plain_upsert_preserves_strategic_version_and_history(tmp_path: Path) -> None:
     first = upsert_goal(tmp_path, _record())
     redirected = redirect_goal(tmp_path, first.session_ref, reason="operator narrowed delivery", scope="Goal storage and tests only.")
@@ -329,6 +370,23 @@ def test_plain_upsert_preserves_strategic_version_and_history(tmp_path: Path) ->
     assert revised.now == "running checks"
     assert revised.goal_version == 2
     assert revised.goal_history == redirected.goal_history
+
+
+def test_enrolled_autonomy_policy_changes_only_through_redirect(tmp_path: Path) -> None:
+    stored = upsert_goal(tmp_path, _record())
+    restricted = AutonomyPolicy(grants=(CapabilityGrant(grant_id="replan-only", capability="replan"),))
+
+    with pytest.raises(GoalRedirectRequiredError, match="redirect"):
+        upsert_goal(tmp_path, replace(stored, autonomy_policy=restricted))
+    redirected = redirect_goal(
+        tmp_path,
+        stored.session_ref,
+        reason="revise the frozen authority contract",
+        autonomy_policy=restricted,
+    )
+    assert redirected.autonomy_policy == restricted
+    assert redirected.goal_version == stored.goal_version + 1
+    assert json.loads(redirected.goal_history[-1]["autonomy_policy"]) == stored.autonomy_policy.model_dump(mode="json")
 
 
 def test_enrolled_scope_is_write_once_and_carried_through_later_writes(tmp_path: Path) -> None:
@@ -415,6 +473,7 @@ def test_redirect_records_prior_strategic_values_and_preserves_tactical_state(tm
             "scope": asked.scope,
             "revised_at": redirected.updated_at,
             "reason": "operator expanded the stated scope",
+            "autonomy_policy": autonomy_policy_json(asked.autonomy_policy),
         },
     )
     assert redirected.now == asked.now
@@ -675,6 +734,64 @@ def test_goal_cli_set_preserves_needs_when_omitted(tmp_path: Path, capsys: pytes
     assert stored.needs == "you: run the interview"
 
 
+@pytest.mark.parametrize("delivery", ["file", "inline"])
+def test_goal_cli_freezes_strict_autonomy_policy_at_enrollment(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    delivery: str,
+) -> None:
+    record = _record()
+    policy = AutonomyPolicy(
+        initiative="steady",
+        grants=(CapabilityGrant(grant_id="spend-usd", capability="spend", max_amount="20", currency="USD"),),
+    )
+    raw_policy = policy.model_dump_json()
+    if delivery == "file":
+        policy_path = tmp_path / "autonomy.json"
+        policy_path.write_text(raw_policy, encoding="utf-8")
+        policy_args = ["--autonomy-policy", str(policy_path)]
+    else:
+        policy_args = ["--autonomy-policy-json", raw_policy]
+    set_args = [
+        "set",
+        "--root",
+        str(tmp_path),
+        "--session-ref",
+        record.session_ref,
+        "--goal",
+        record.goal,
+        "--source",
+        record.source,
+        *_done_item_args(record),
+        *policy_args,
+    ]
+
+    enrolled = _cli_enroll(tmp_path, capsys, set_args, done_when=record.done_when)
+    assert enrolled.autonomy_policy == policy
+
+
+def test_goal_cli_rejects_unknown_autonomy_policy_fields(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    record = _record()
+    result = main(
+        [
+            "set",
+            "--root",
+            str(tmp_path),
+            "--session-ref",
+            record.session_ref,
+            "--goal",
+            record.goal,
+            "--source",
+            record.source,
+            "--autonomy-policy-json",
+            '{"schema":"chitra.autonomy.v1","initiative":"aggressive","grants":[],"model_grant":true}',
+        ]
+    )
+
+    assert result == 1
+    assert "Extra inputs are not permitted" in capsys.readouterr().err
+
+
 def test_goal_cli_set_redirect_now_and_check_paths(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     record = _record()
     set_args = [
@@ -832,9 +949,7 @@ def test_done_transition_and_close_require_the_exact_named_receipt(tmp_path: Pat
     assert get_goal(tmp_path, completed.session_ref) == completed
 
 
-def test_one_interviewed_item_with_named_receipt_succeeds_end_to_end(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_one_interviewed_item_with_named_receipt_succeeds_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     record = _record()
     set_args = [
         "set",
@@ -930,9 +1045,7 @@ def test_administrative_discard_requires_reason_and_is_not_completion(tmp_path: 
     assert get_goal(tmp_path, stored.session_ref) is None
 
 
-def test_goal_cli_first_set_requires_typed_interview_without_writing_goal(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_goal_cli_first_set_requires_typed_interview_without_writing_goal(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     record = _record()
     command = [
         "set",
@@ -1106,20 +1219,14 @@ def _write_schema_document(root: Path, schema: str, *, extra_document_field: boo
     (root / "goals.json").write_text(json.dumps(document), encoding="utf-8")
 
 
-def test_load_accepts_any_chitra_goals_version_and_ignores_unknown_fields(tmp_path: Path) -> None:
-    """A file written by a newer package (chitra.goals.v4+) loads here: any
-    chitra.goals.v<N> label is accepted and unknown top-level or per-record
-    fields are dropped in memory instead of crashing the reader -- the
-    outage class where an installed daemon died at load on a newer store."""
+def test_load_rejects_newer_chitra_goals_versions(tmp_path: Path) -> None:
+    """A newer writer's contract is not readable by this package."""
     _write_schema_document(tmp_path, "chitra.goals.v4", extra_document_field=True, extra_record_field=True)
 
-    records, file_schema = load_goals_document(tmp_path)
-
-    assert file_schema == "chitra.goals.v4"
-    assert [record.session_ref for record in records] == [_record().session_ref]
-    assert records[0].goal == _record().goal
-    assert not hasattr(records[0], "future_v4_field")
-    assert load_goals(tmp_path) == records
+    with pytest.raises(GoalsSchemaNewerError, match="newer than installed package schema"):
+        load_goals_document(tmp_path)
+    with pytest.raises(GoalsSchemaNewerError, match="newer than installed package schema"):
+        load_goals(tmp_path)
 
 
 def test_load_still_refuses_a_label_outside_the_chitra_goals_family(tmp_path: Path) -> None:
@@ -1172,12 +1279,8 @@ def test_schema_version_comparisons(schema: str) -> None:
     assert schema_is_newer_than_installed(schema) == (version > 3)
 
 
-def test_goal_cli_set_against_a_newer_store_exits_3_with_the_migrate_hint(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """The v4-outage CLI contract: a write against a store labeled newer than
-    this package exits 3 with the --migrate hint, and the store's schema
-    label is untouched so a newer package can still read its own file."""
+def test_goal_cli_set_against_a_newer_store_exits_3_with_the_migrate_hint(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """The CLI refuses to inspect a store written by a newer package."""
     document = {"schema": "chitra.goals.v4", "updated_at": "2026-08-22T00:00:00+00:00", "goals": []}
     (tmp_path / "goals.json").write_text(json.dumps(document), encoding="utf-8")
     record = _record()
@@ -1194,41 +1297,7 @@ def test_goal_cli_set_against_a_newer_store_exits_3_with_the_migrate_hint(
         "--source",
         record.source,
     ]
-    assert main(set_args) == 2
-    required = json.loads(capsys.readouterr().out)
-    assert required["type"] == "INTERVIEW_REQUIRED"
-    result_path = tmp_path / "interview-result.json"
-    result_path.write_text(
-        json.dumps(
-            {
-                "type": "INTERVIEW_RESULT",
-                "nonce": required["nonce"],
-                "receipt_name": required["receipt_name"],
-                "answers": {
-                    "intent": {
-                        "answer": "Deliver the requested deterministic goal behavior safely for operators.",
-                        "provenance": "operator:test",
-                    },
-                    "done_when": {"answer": record.done_when, "provenance": "operator:test"},
-                    "out_of_scope": {"answer": "Unrelated board changes are excluded.", "provenance": "operator:test"},
-                    "constraints": {"answer": "Keep the change small and tested.", "provenance": "operator:test"},
-                },
-                "enrolled_done_when_items": [
-                    {
-                        "id": "done-1",
-                        "text": record.done_when,
-                        "validator": "pytest",
-                        "required_receipt": "tests-green",
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    exit_code = main([*set_args, "--interview-result", str(result_path)])
-
-    assert exit_code == 3
+    assert main(set_args) == 3
     captured = capsys.readouterr()
     assert "newer than installed package schema" in captured.err
     assert "--migrate" in captured.err

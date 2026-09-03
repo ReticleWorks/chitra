@@ -557,10 +557,14 @@ class Watchd:
         except OSError as exc:
             logger.warning("watchd_raw_capture_write_failed", pane_id=pane_id, path=str(raw_path), error=str(exc))
 
-    def _session_ref(self, pane: Pane) -> str | None:
+    def _session_ref(self, pane: Pane, *, allow_newer: bool = False) -> str | None:
         root = self.config.goals_root or self.config.state_dir
         suffix = f":{pane.target}"
-        matches = [record.session_ref for record in list_goals(root) if record.session_ref.endswith(suffix)]
+        matches = [
+            record.session_ref
+            for record in list_goals(root, allow_newer=allow_newer)
+            if record.session_ref.endswith(suffix)
+        ]
         if len(matches) == 1:
             return matches[0]
         if len(matches) > 1:
@@ -1008,7 +1012,10 @@ class Watchd:
             if content is None:
                 continue
             self._save_raw_capture(pane.pane_id, content)
-            session_ref = self._session_ref(pane)
+            # This branch is deliberately sensing-only. It may map a pane from
+            # fields this package understands, but all goal mutation and
+            # completion decisions remain disabled for the newer store.
+            session_ref = self._session_ref(pane, allow_newer=True)
             try:
                 self.status_broker.observe(
                     pane_id=pane.pane_id,

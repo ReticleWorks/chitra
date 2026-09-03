@@ -11,23 +11,32 @@ import hashlib
 import json
 import re
 from collections.abc import Callable
+from decimal import Decimal
 from importlib.resources import files
 from pathlib import Path
-from typing import Literal, Self
+from typing import Literal, Self, cast
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from chitra.autonomy import (
+    DEFAULT_AUTONOMY_POLICY,
+    AuthorizationDecision,
+    Capability,
+    CapabilityUse,
+    authorize_action,
+    autonomy_policy_sha256,
+    capability_target_from_text,
+)
 from chitra.goal_enforcement import SessionReviewSignal, freeze_goal
 from chitra.goals import GoalRecord, check_specification
-from chitra.lexicon import OPERATOR_GATE_PATTERNS
 
 logger = structlog.get_logger(__name__)
 
 RiskClass = Literal["a0", "a1", "a2", "a3"]
-DecisionSource = Literal["goal", "principle", "oracle-escalated", "abstained"]
+AuthorityClass = Literal["routine", "diagnostic", "small_delta", "corrective", "operator_required"]
+DecisionSource = Literal["goal", "principle", "oracle-escalated", "foreground-residual", "kai-delegate"]
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
-
 
 class ReasoningContractError(ValueError):
     """Raised when a required reasoning contract is invalid or stale."""
@@ -40,7 +49,7 @@ class GoalJudgment(BaseModel):
 
     determines_answer: bool
     answer: str | None = None
-    goal_fields: list[Literal["intent", "goal", "done_when", "scope", "source"]] = Field(default_factory=list)
+    goal_fields: list[Literal["intent", "goal", "done_when", "scope", "source", "autonomy_policy"]] = Field(default_factory=list)
     inference: str = Field(min_length=1)
 
 
@@ -51,6 +60,7 @@ class DecisionQuestion(BaseModel):
 
     text: str = Field(min_length=1)
     answer_category: Literal["answer", "nudge", "action"] = "answer"
+    authority_class: AuthorityClass = "routine"
     risk_class: RiskClass = "a1"
     genuinely_ambiguous: bool = False
     expensive_to_reverse: bool = False
@@ -58,6 +68,17 @@ class DecisionQuestion(BaseModel):
     credentials: bool = False
     irreversible: bool = False
     strategy_redirect: bool = False
+    new_dependency: bool = False
+    new_schema: bool = False
+    new_hook: bool = False
+    new_authorization_boundary: bool = False
+    authentication: bool = False
+    security_change: bool = False
+    out_of_scope_path: bool = False
+    changes_frozen_outcome: bool = False
+    authority_evidence_complete: bool = True
+    capability_uses: list[CapabilityUse] = Field(default_factory=list)
+    verification_refs: list[str] = Field(default_factory=list)
     evidence_refs: list[str] = Field(default_factory=list)
     session_review: SessionReviewSignal | None = None
 
@@ -97,6 +118,18 @@ class OracleVerdict(BaseModel):
     confidence_basis: str = Field(min_length=1)
 
 
+class DelegatedAuthority(BaseModel):
+    """Provenance from the bridge's verification of Kai's authority."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    principal: Literal["kai"] = "kai"
+    grant_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    grant_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    satisfaction_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    request_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
 class DecisionAttestation(BaseModel):
     """Immutable pre-dispatch decision record bound to exact approved text."""
 
@@ -108,6 +141,8 @@ class DecisionAttestation(BaseModel):
     approved_text: str = Field(min_length=1)
     approved_text_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source: DecisionSource
+    delegated_authority: DelegatedAuthority | None = None
+    authority_class: AuthorityClass = "routine"
     goal_contract_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     goal_version: int = Field(ge=1)
     goal_fields: tuple[str, ...]
@@ -121,7 +156,10 @@ class DecisionAttestation(BaseModel):
     review_signal_id: str | None = None
     review_verdict: Literal["accept", "reject"] | None = None
     reviewer_count: int = Field(default=0, ge=0)
-    autonomy: Literal["autonomous", "operator_required"]
+    autonomy_policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    capability_grant_ids: tuple[str, ...] = ()
+    capability_requirements: tuple[Capability, ...] = ()
+    autonomy: Literal["autonomous", "foreground_residual", "operator_required"]
     operator_gate_reasons: tuple[str, ...] = ()
     operator_confirmation_required: bool
     operator_confirmed: bool = False
@@ -130,11 +168,25 @@ class DecisionAttestation(BaseModel):
     def validate_bindings(self) -> Self:
         if self.approved_text_sha256 != hashlib.sha256(self.approved_text.encode("utf-8")).hexdigest():
             raise ValueError("approved_text_sha256 does not match approved_text")
+        if self.source == "kai-delegate" and self.delegated_authority is None:
+            raise ValueError("Kai-delegated decisions require delegated_authority")
+        if self.source != "kai-delegate" and self.delegated_authority is not None:
+            raise ValueError("delegated_authority is valid only for Kai-delegated decisions")
         if self.operator_confirmed and not self.operator_confirmation_required:
             raise ValueError("operator confirmation cannot be attached to an autonomous decision")
-        if self.autonomy == "autonomous" and (self.operator_confirmation_required or self.review_verdict != "accept"):
-            raise ValueError("autonomous release requires unanimous watched-session acceptance and no operator gate")
+        if self.autonomy == "operator_required" and not self.operator_confirmation_required:
+            raise ValueError("operator-required decisions must request operator confirmation")
+        if self.autonomy != "operator_required" and self.operator_confirmation_required:
+            raise ValueError("only operator-required decisions can request operator confirmation")
+        if self.autonomy == "foreground_residual" and (
+            self.outcome != "abstain" or self.operator_confirmation_required or self.operator_confirmed
+        ):
+            raise ValueError("foreground residuals must remain with Chitra and cannot request operator confirmation")
+        if self.autonomy == "autonomous" and (self.outcome != "answer" or self.operator_confirmation_required):
+            raise ValueError("autonomous decisions must be answer outcomes without an operator gate")
         payload = self.model_dump(mode="json", exclude={"attestation_id"})
+        if self.delegated_authority is None:
+            payload.pop("delegated_authority")
         expected = f"sha256:{hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}"
         if self.attestation_id != expected:
             raise ValueError("attestation_id does not match the attestation record")
@@ -157,10 +209,17 @@ class DecisionAttestation(BaseModel):
             "reviewer_count": 0,
             "operator_gate_reasons": (),
             "operator_confirmed": False,
+            "authority_class": "routine",
+            "autonomy_policy_sha256": autonomy_policy_sha256(DEFAULT_AUTONOMY_POLICY),
+            "capability_grant_ids": (),
+            "capability_requirements": (),
             **values,
             "approved_text": approved_text,
             "approved_text_sha256": hashlib.sha256(approved_text.encode("utf-8")).hexdigest(),
         }
+        delegated_authority = payload.get("delegated_authority")
+        if delegated_authority is not None:
+            payload["delegated_authority"] = DelegatedAuthority.model_validate(delegated_authority).model_dump(mode="json")
         attestation_id = f"sha256:{hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}"
         return cls.model_validate({**payload, "attestation_id": attestation_id})
 
@@ -211,6 +270,63 @@ class PrinciplesIndex:
 
 
 Oracle = Callable[[OracleRequest], OracleVerdict]
+
+_TEXT_CAPABILITY_PATTERNS: tuple[tuple[Capability, re.Pattern[str]], ...] = (
+    ("credential_use", re.compile(r"\b(credentials?|password|secret|api[- ]?key|oauth token|access token)\b", re.I)),
+    ("spend", re.compile(r"\b(spend|purchase|buy|billing|payment|paid plan|budget)\b|\$\s*\d", re.I)),
+    ("authentication", re.compile(r"\b(authenticate|authentication|oauth|login|sign[ -]?in)\b", re.I)),
+    (
+        "security_change",
+        re.compile(r"\b(security boundary|authorization boundary|access control|permissions?|firewall|privilege)\b", re.I),
+    ),
+    ("irreversible_action", re.compile(r"\b(irreversible|delete|destroy|drop database|force[- ]push|terminate|revoke)\b", re.I)),
+    ("dependency_change", re.compile(r"\b(new dependency|install (?:a )?(?:package|library)|add (?:a )?(?:package|library))\b", re.I)),
+    ("schema_change", re.compile(r"\b(schema (?:change|migration)|new schema|database migration)\b", re.I)),
+    ("hook_change", re.compile(r"\b(new hook|add (?:a )?hook|plugin|integration endpoint)\b", re.I)),
+)
+_USD_AMOUNT_RE = re.compile(r"\$\s*(?P<amount>\d+(?:\.\d{1,2})?)")
+
+
+def _question_capability_uses(question: DecisionQuestion) -> tuple[CapabilityUse, ...]:
+    """Combine explicit action facts with mechanical consequence cues.
+
+    Explicit uses win for their capability, so a target-specific request can
+    never gain the broader inferred ``goal`` target as a second route.
+    """
+    uses: list[CapabilityUse] = list(question.capability_uses)
+    explicit = {use.capability for use in uses}
+    target = capability_target_from_text(question.text)
+    inferred: set[Capability] = {capability for capability, pattern in _TEXT_CAPABILITY_PATTERNS if pattern.search(question.text)}
+    for flag, capability in (
+        (question.spend, "spend"),
+        (question.credentials, "credential_use"),
+        (question.irreversible or question.expensive_to_reverse, "irreversible_action"),
+        (question.authentication, "authentication"),
+        (question.security_change or question.new_authorization_boundary, "security_change"),
+        (question.strategy_redirect or question.out_of_scope_path, "replan"),
+        (question.new_dependency, "dependency_change"),
+        (question.new_schema, "schema_change"),
+        (question.new_hook, "hook_change"),
+        (question.authority_class == "small_delta", "small_redesign"),
+    ):
+        if flag:
+            inferred.add(cast(Capability, capability))
+    for capability in sorted(inferred):
+        if capability in explicit:
+            continue
+        if capability == "spend":
+            amount_match = _USD_AMOUNT_RE.search(question.text)
+            uses.append(
+                CapabilityUse(
+                    capability="spend",
+                    target=target,
+                    amount=None if amount_match is None else Decimal(amount_match.group("amount")),
+                    currency=None if amount_match is None else "USD",
+                )
+            )
+        else:
+            uses.append(CapabilityUse(capability=capability, target=target))
+    return tuple(uses)
 
 
 class DecisionReasoner:
@@ -276,10 +392,7 @@ class DecisionReasoner:
             insufficiency.append("the compiled index contains no matching binding principle")
         else:
             insufficiency.append(f"no principle meets the {self.principle_threshold:.2f} confidence threshold")
-        oracle_warranted = question.genuinely_ambiguous or question.expensive_to_reverse or question.risk_class in ("a2", "a3")
-        if oracle_warranted:
-            if oracle is None:
-                raise ReasoningContractError("insufficiency gate requires an oracle callback for this consequential residual")
+        if oracle is not None:
             verdict = oracle(
                 OracleRequest(
                     goal=goal.to_dict(),
@@ -288,7 +401,7 @@ class DecisionReasoner:
                     principle_matches=matches,
                 )
             )
-            logger.info("reasoning_oracle_escalated", session_ref=goal.session_ref, risk_class=question.risk_class)
+            logger.info("reasoning_foreground_oracle_used", session_ref=goal.session_ref, risk_class=question.risk_class)
             return self._decision(
                 answer=verdict.verdict,
                 source="oracle-escalated",
@@ -302,17 +415,18 @@ class DecisionReasoner:
 
         return self._decision(
             answer=(
-                "The goal and binding principles do not settle this routine question; "
-                "provide the missing fact or a more specific goal clause."
+                "The frozen goal and current evidence do not settle this question. "
+                "Foreground Chitra must investigate the missing fact, replan within the frozen outcome, and continue pursuit."
             ),
-            source="abstained",
+            source="foreground-residual",
             goal=goal,
             question=question,
             goal_fields=list(goal_judgment.goal_fields),
             evidence_refs=question.evidence_refs,
-            confidence_basis="routine residuals do not justify oracle escalation",
+            confidence_basis="the foreground reasoning path must resolve this residual before dispatch",
             insufficiency=insufficiency,
             outcome="abstain",
+            force_foreground_residual=True,
         )
 
     def _decision(
@@ -328,41 +442,40 @@ class DecisionReasoner:
         confidence_basis: str,
         insufficiency: list[str] | None = None,
         outcome: Literal["answer", "abstain"] = "answer",
+        force_foreground_residual: bool = False,
     ) -> DecisionAttestation:
         selected = principles or []
         review = question.session_review
         gate_reasons: list[str] = []
-        if review is None:
-            gate_reasons.append("missing unanimous watched-session review")
-        elif review.verdict != "accept":
-            gate_reasons.append("watched-session review rejected the lane behavior")
-        if question.spend:
-            gate_reasons.append("spend")
-        if question.credentials:
-            gate_reasons.append("credentials")
-        if question.irreversible or question.expensive_to_reverse:
-            gate_reasons.append("irreversible action")
-        if question.strategy_redirect:
-            gate_reasons.append("strategy redirect")
-        if question.risk_class == "a3":
-            gate_reasons.append("a3 consequence")
-        combined_text = f"{question.text}\n{answer}"
-        for reason, pattern in OPERATOR_GATE_PATTERNS:
-            if pattern.search(combined_text):
-                gate_reasons.append(reason)
-        if outcome == "abstain":
-            gate_reasons.append("abstained decision")
+        capability_uses = _question_capability_uses(question)
+        authority: AuthorizationDecision = authorize_action(
+            goal.autonomy_policy,
+            capability_uses,
+            evidence_complete=(
+                question.authority_evidence_complete
+                and all(ref.strip() for ref in question.verification_refs)
+                and all(ref.strip() for ref in question.evidence_refs)
+            ),
+            changes_frozen_outcome=question.changes_frozen_outcome,
+        )
+        if authority.disposition == "operator_required":
+            gate_reasons.extend(authority.reasons)
+        foreground_residual = force_foreground_residual or authority.disposition == "foreground_residual"
         operator_required = bool(gate_reasons)
+        attested_outcome: Literal["answer", "abstain"] = "abstain" if foreground_residual else outcome
+        if attested_outcome == "abstain" and not foreground_residual:
+            foreground_residual = True
         message_kind = {
             "answer": "reasoned_answer",
             "nudge": "reasoned_nudge",
             "action": "reasoned_action",
         }[question.answer_category]
         return DecisionAttestation.create(
-            outcome=outcome,
+            outcome=attested_outcome,
             message_kind=message_kind,
             approved_text=answer,
             source=source,
+            authority_class=question.authority_class,
             goal_contract_id=freeze_goal(goal).contract_id,
             goal_version=goal.goal_version,
             goal_fields=tuple(goal_fields),
@@ -376,7 +489,10 @@ class DecisionReasoner:
             review_signal_id=review.signal_id if review is not None else None,
             review_verdict=review.verdict if review is not None else None,
             reviewer_count=len(review.reviewer_ids) if review is not None else 0,
-            autonomy="operator_required" if operator_required else "autonomous",
+            autonomy_policy_sha256=authority.policy_sha256,
+            capability_grant_ids=authority.grant_ids,
+            capability_requirements=tuple(use.capability for use in capability_uses),
+            autonomy=("operator_required" if operator_required else "foreground_residual" if foreground_residual else "autonomous"),
             operator_gate_reasons=tuple(dict.fromkeys(gate_reasons)),
             operator_confirmation_required=operator_required,
             operator_confirmed=False,

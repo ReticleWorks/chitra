@@ -30,9 +30,6 @@ from chitra.review_rubric import PERSISTENCE_FINDING_CODES
 _COMPLETION_FINDINGS: frozenset[FindingCode] = frozenset({"hedged_completion", "unsupported_completion"})
 _DRIFT_FINDINGS: frozenset[FindingCode] = frozenset({"goal_drift", "smuggled_redirect"})
 _PERSISTENCE_FINDINGS = PERSISTENCE_FINDING_CODES
-_REVIEW_REJECTION_GATE = "watched-session review rejected the lane behavior"
-
-
 def abstaining_oracle(request: OracleRequest) -> OracleVerdict:
     """Escalate a consequential residual without inventing an autonomous answer."""
     evidence_refs = request.question.evidence_refs
@@ -57,10 +54,10 @@ def _question_and_judgment(
     if finding_codes & _PERSISTENCE_FINDINGS:
         answer = (
             "The completed turn did not pass review because it stalled: "
-            "it declared a false blocker, deferred agent-doable work to the operator, took no action, "
-            "or asserted a state without proof. Take the in-authority next action now. "
-            "An item goes to the operator only for an access right you lack, consent for a step you cannot undo, "
-            "or a decision only the operator can make; otherwise act, and record what you tried with its observed result. "
+            "it declared a false blocker, deferred agent-doable work, took no action, "
+            "or asserted a state without proof. Take the next in-authority action allowed by the frozen goal now. "
+            "Escalate only when an access right is missing, a step cannot be undone without consent, "
+            "or a decision lies outside the frozen goal and scope; otherwise act, and record what you tried with its observed result. "
             "Cite the artifact check for any state you assert. "
             f"Continue against the frozen goal: {goal.goal}. Stay within scope: {goal.scope}."
         )
@@ -68,6 +65,7 @@ def _question_and_judgment(
             DecisionQuestion(
                 text="Should the stalled lane be directed to take its in-authority next action against the frozen goal?",
                 answer_category="nudge",
+                authority_class="corrective",
                 evidence_refs=evidence_refs,
                 session_review=review_signal,
             ),
@@ -87,6 +85,7 @@ def _question_and_judgment(
             DecisionQuestion(
                 text="Should the rejected lane direction be corrected back to the frozen goal?",
                 answer_category="nudge",
+                authority_class="corrective",
                 evidence_refs=evidence_refs,
                 session_review=review_signal,
             ),
@@ -108,6 +107,7 @@ def _question_and_judgment(
             DecisionQuestion(
                 text="Should the rejected completion claim continue against the frozen goal and completion condition?",
                 answer_category="action",
+                authority_class="corrective",
                 evidence_refs=evidence_refs,
                 session_review=review_signal,
             ),
@@ -122,6 +122,7 @@ def _question_and_judgment(
         DecisionQuestion(
             text="How should an unclassified adverse review finding be handled?",
             answer_category="action",
+            authority_class="corrective",
             evidence_refs=evidence_refs,
             session_review=review_signal,
         ),
@@ -142,7 +143,13 @@ def build_reasoned_dispatch(
     now: datetime | None = None,
     review_rejection_confirmed: bool = True,
 ) -> DispatchOrder | None:
-    """Build one attested corrective order, or fail closed with no dispatch."""
+    """Build one attested corrective order, or fail closed with no dispatch.
+
+    ``review_rejection_confirmed`` remains accepted for caller compatibility;
+    the rejected, current, grounded review signal is the authority for a
+    corrective dispatch. It is not converted into a simulated operator ruling.
+    """
+    del review_rejection_confirmed
     if review_signal.verdict == "accept":
         return None
 
@@ -157,9 +164,7 @@ def build_reasoned_dispatch(
     if attestation.outcome == "abstain":
         return None
     if attestation.operator_confirmation_required:
-        if not review_rejection_confirmed or attestation.operator_gate_reasons != (_REVIEW_REJECTION_GATE,):
-            return None
-        attestation = attestation.with_operator_confirmation()
+        return None
 
     created_at = (now or datetime.now(UTC)).isoformat()
     signal_digest = review_signal.signal_id.removeprefix("sha256:")

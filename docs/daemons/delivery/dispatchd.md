@@ -16,11 +16,11 @@ Dispatchd is chitra's always-on delivery engine. It drains a JSON order queue, d
    - Acquire an exclusive file lock (LaneLock) for that session.
    - Check the rate-limit freeze status. If the session is paused, defer the order.
    - Paste the message text into the tmux session via `tmux load-buffer` and `tmux paste-buffer`.
-   - Verify delivery by grepping the session's transcript for the exact text.
-   - Write a result file, sign a matching ledger entry, and move the order to
-     `processed/` only after the signed proof verifies.
+   - Verify delivery in the exact transcript bound to an autonomous order.
+   - Sign and verify the matching ledger entry.
+   - Write the result and move the order to `processed/`.
 
-Dispatchd is **single-threaded per session.** The LaneLock prevents two writers from racing. It is **idempotent:** once a result file exists, the order is never redelivered, even across a restart. A `SENT` result may temporarily have `delivery_ledger_verified=false`; that record lets a restart retry only the ledger write. The order is not acknowledged in `processed/` until the signed proof exists. If a crash happens before the result is written, the send-nonce marker plus transcript-grep check reconcile the state on the next run.
+Dispatchd is **single-threaded per session.** The LaneLock prevents two writers from racing. A new `SENT` result is published only after its signed delivery proof verifies. An older or externally planted `SENT` result cannot create its own proof during recovery. It remains claimed unless an already-existing signed row proves the exact order, message, session, and bound native session identity. If a crash happens before the result is written, the send-nonce marker and exact bound-transcript check reconcile the state without a second paste.
 
 ## CLI usage
 
@@ -28,7 +28,8 @@ Dispatchd is **single-threaded per session.** The LaneLock prevents two writers 
 dispatchd \
   --queue-dir /var/lib/chitra/queue \
   --ledger-path /var/lib/chitra/ledger.jsonl \
-  --state-dir /var/lib/chitra \
+  --goals-root /var/lib/chitra \
+  --transcript-bindings-path /etc/chitra/transcript-bindings.json \
   --poll-seconds 5 \
   --once
 ```
@@ -45,6 +46,9 @@ Run with `--once` for a single pass (used in cron/systemd timer). Omit it to run
 | `--lock-dir` | `$CHITRA_STATE_DIR/locks` | Directory for LaneLock files. |
 | `--routing-config-path` | Unset | Optional routing config (YAML). |
 | `--policy-config-path` | Unset | Optional policy config (YAML). |
+| `--goals-root` | `$CHITRA_STATE_DIR` | Goal store used to verify goal-bound orders. |
+| `--transcript-root` | Manifest directory | Root for relative transcript paths. |
+| `--transcript-bindings-path` | State root manifest | Exact session-to-transcript bindings for autonomous deliveries. |
 | `--allow-session-prefix` | All allowed | Allowlist of session name prefixes to deliver to. |
 | `--deny-session-prefix` | None | Denylist of session name prefixes. |
 | `--post-paste-wait-seconds` | 0.5 | Time to wait after paste before transcript grep. |
@@ -70,8 +74,8 @@ Run with `--once` for a single pass (used in cron/systemd timer). Omit it to run
 ```json
 {
   "order_id": "task-123",
-  "lane_id": "session-name",
-  "text": "command to send",
+  "session_ref": "localhost:session-name:0.0",
+  "nudge": "Continue the queued task.",
   "task_type": "optional routing key",
   "routing_hint": "optional explicit hint"
 }
@@ -82,11 +86,11 @@ Run with `--once` for a single pass (used in cron/systemd timer). Omit it to run
 ```json
 {
   "order_id": "task-123",
-  "lane_id": "session-name",
+  "session_ref": "localhost:session-name:0.0",
   "status": "sent",
   "delivery_ledger_verified": true,
-  "delivery_timestamp": "2025-01-15T12:34:56Z",
-  "nonce": "send-nonce-value"
+  "native_session_id": "adapter-native-session-id",
+  "at": "2025-01-15T12:34:56Z"
 }
 ```
 
@@ -95,11 +99,12 @@ Run with `--once` for a single pass (used in cron/systemd timer). Omit it to run
 **Deliver a single message:**
 
 ```bash
-cat > /var/lib/chitra/queue/msg-001.json << 'EOF'
+mkdir -p /var/lib/chitra/queue/orders
+cat > /var/lib/chitra/queue/orders/msg-001.json << 'EOF'
 {
   "order_id": "msg-001",
-  "lane_id": "my-session",
-  "text": "echo 'Hello'"
+  "session_ref": "localhost:my-session:0.0",
+  "nudge": "Continue the queued task."
 }
 EOF
 
@@ -129,6 +134,9 @@ python -c "from chitra.ledger import verify_delivery; verify_delivery(ledger_pat
 - **Idempotency:** Once a result file exists, the order is never redelivered.
 - **Ledger-gated acknowledgment:** A `SENT` order is not moved to
   `processed/` until its order-specific HMAC proof is present and valid in the
-  delivery ledger. A `SENT` result with a false proof flag is pending recovery,
-  not a completed queue acknowledgment.
+  delivery ledger. A pre-existing `SENT` result without that proof remains
+  claimed. Recovery does not sign it.
+- **Exact autonomous target:** Persistent-oversight and goal-answer orders fail
+  closed unless one validated manifest binds the goal session to one exact
+  transcript. Delivery proof must carry that transcript's native session ID.
 - **Single-writer:** LaneLock prevents concurrent writes to the same session.

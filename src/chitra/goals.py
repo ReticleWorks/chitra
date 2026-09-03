@@ -6,9 +6,11 @@ stated goal, completion condition, and current state.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +21,7 @@ from pydantic import ConfigDict, SkipValidation, TypeAdapter, ValidationInfo, mo
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 from chitra._fsio import locked_json_store, parse_iso8601, write_json_atomic
+from chitra.autonomy import DEFAULT_AUTONOMY_POLICY, AutonomyPolicy, autonomy_policy_json
 from chitra.close_gate import RequiredItem, _recorded_descopes, require_structured_close_inventory
 from chitra.completion_gate import CompletionEvidence, require_completion_receipts
 from chitra.plain_english import require_plain_english
@@ -55,11 +58,11 @@ SCHEMA = "chitra.goals.v3"
 # disposal, but their missing v3 enrollment contract can never pass launch,
 # enter a done state, or use completion close.
 SUPPORTED_SCHEMAS = (SCHEMA, "chitra.goals.v2", "chitra.goals.v1")
-# Reads tolerate every chitra.goals.v<N> document (unknown fields are ignored
-# on load), so a file written by a newer package can never crash a daemon at
-# load time; GOALS_SCHEMA_RE is the read gate, not SUPPORTED_SCHEMAS. Writes
-# keep the file's own schema label and refuse a file newer than SCHEMA unless
-# the caller explicitly migrates (see GoalsSchemaNewerError).
+# Reads accept this package's schema and older versions only. A newer package
+# may have changed the meaning of fields this package cannot verify, so every
+# load/read fails closed with GoalsSchemaNewerError. Writes keep the file's own
+# older schema label and refuse a newer file unless the caller explicitly
+# migrates (see GoalsSchemaNewerError).
 GOALS_SCHEMA_RE = re.compile(r"^chitra\.goals\.v([0-9]+)$")
 GOALS_SCHEMA_NEWER_MESSAGE = "goals schema newer than installed package"
 
@@ -83,6 +86,7 @@ RATE_LIMIT_HOLD_REASON_PREFIX = "rate-limit:"
 LOAD_SHED_HOLD_REASON_PREFIX = "load-shed:"
 DONE_STATUSES = frozenset(("done-pending-verification", "done-pending-close"))
 LEGACY_ENROLLED_AT = "1970-01-01T00:00:00+00:00"
+ForegroundTaskKind = Literal["question", "investigate", "replan"]
 
 
 class GoalValidationError(ValueError):
@@ -105,6 +109,35 @@ class GoalsSchemaNewerError(ValueError):
     """Raised when a write would rewrite a goals.json newer than this package."""
 
 
+@contextmanager
+def goal_lane_lock(
+    root: Path | None,
+    session_ref: str,
+    *,
+    lock_dir: Path | None = None,
+) -> Iterator[None]:
+    """Hold the dispatch lane lock before touching this lane's goal state.
+
+    Dispatch takes the lane lock before its final goal recheck and keeps it
+    through the terminal paste. Goal writers use the same order, then take
+    the goals-file lock. When a root is supplied, both sides default to its
+    ``locks`` directory; callers with an explicit dispatch ``--lock-dir``
+    pass that directory here as well.
+    """
+    from chitra.dispatch import LaneLock
+
+    resolved_lock_dir = lock_dir if lock_dir is not None else (root / "locks" if root is not None else None)
+    lane_lock = LaneLock(session_ref, lock_dir=resolved_lock_dir)
+    # A delivery keeps this lock while it waits for the target transcript to
+    # flush. Goal mutations wait out that bounded verification window rather
+    # than failing after LaneLock's shorter transport-oriented default.
+    lane_lock.acquire(blocking=True, timeout_seconds=60.0)
+    try:
+        yield
+    finally:
+        lane_lock.release()
+
+
 @pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True))
 class InterviewReceipt:
     """Immutable proof that all four enrollment questions were answered."""
@@ -125,13 +158,25 @@ class EnrolledDoneWhenItem:
     required_receipt: str
 
 
+@pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True))
+class ForegroundTask:
+    """One durable, goal-version-bound item for Chitra's foreground agent."""
+
+    task_id: str
+    kind: ForegroundTaskKind
+    text: str
+    source: str
+    goal_version: int
+    created_at: str
+
+
 @pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True, extra="ignore"))
 class GoalRecord:
     """The five canonical fields plus monitor-maintained tactical metadata.
 
-    ``extra="ignore"`` is the persisted-read contract: fields this package
-    does not know (written by a newer schema) are dropped in memory instead
-    of failing the load.
+    ``extra="ignore"`` preserves compatibility with older records and
+    harmless extension fields in records at this schema. The document schema
+    gate in ``load_goals_document`` rejects newer writers before records load.
     """
 
     session_ref: str
@@ -163,6 +208,8 @@ class GoalRecord:
     interview_receipt: InterviewReceipt | None = None
     enrolled_done_when_items: tuple[EnrolledDoneWhenItem, ...] = ()
     completion_proofs: tuple[CompletionEvidence, ...] = ()
+    autonomy_policy: AutonomyPolicy = DEFAULT_AUTONOMY_POLICY
+    foreground_tasks: tuple[ForegroundTask, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return cast(dict[str, object], _GOAL_RECORD_ADAPTER.dump_python(self, mode="json"))
@@ -200,6 +247,8 @@ class GoalRecord:
             if not isinstance(value, str):
                 raise ValueError(f"goal record {field} must be a string")
             normalized[field] = value
+        if normalized["status"] not in GOAL_STATUSES:
+            raise ValueError(f"goal record status must be one of {', '.join(GOAL_STATUSES)}")
         for field in (
             "lane_id",
             "enrolled_done_when",
@@ -249,6 +298,7 @@ class GoalRecord:
         if not isinstance(raw_history, list):
             raise ValueError("goal record goal_history must be a list of objects")
         strategic_fields = {"goal", "done_when", "intent", "scope", "revised_at", "reason"}
+        strategic_fields_with_autonomy = {*strategic_fields, "autonomy_policy"}
         review_restart_fields = {
             "event",
             "previous_contract_id",
@@ -258,7 +308,11 @@ class GoalRecord:
             "reason",
         }
         for entry in raw_history:
-            if not isinstance(entry, dict) or set(entry) not in (strategic_fields, review_restart_fields):
+            if not isinstance(entry, dict) or set(entry) not in (
+                strategic_fields,
+                strategic_fields_with_autonomy,
+                review_restart_fields,
+            ):
                 raise ValueError("goal record goal_history entries must contain strategic prior values or a review restart event")
             if not all(isinstance(value, str) for value in entry.values()):
                 raise ValueError("goal record goal_history entries must contain strings")
@@ -269,6 +323,38 @@ class GoalRecord:
             if not isinstance(raw_items, list):
                 raise ValueError(f"goal record {field} must be a list")
             normalized[field] = raw_items
+        raw_foreground_tasks = payload.get("foreground_tasks", [])
+        foreground_fields = {"task_id", "kind", "text", "source", "goal_version", "created_at"}
+        if not isinstance(raw_foreground_tasks, list):
+            raise ValueError("goal record foreground_tasks must be a list")
+        for task in raw_foreground_tasks:
+            if not isinstance(task, dict) or set(task) != foreground_fields:
+                raise ValueError("goal record foreground_tasks entries must contain the complete foreground task")
+            if task["kind"] not in ("question", "investigate", "replan"):
+                raise ValueError("goal record foreground task kind is invalid")
+            if not all(isinstance(task[field], str) for field in ("task_id", "text", "source", "created_at")):
+                raise ValueError("goal record foreground task text fields must be strings")
+            if not isinstance(task["goal_version"], int) or isinstance(task["goal_version"], bool) or task["goal_version"] < 1:
+                raise ValueError("goal record foreground task goal_version must be a positive integer")
+            if not task["text"].strip() or not task["source"].strip():
+                raise ValueError("goal record foreground task text and source must be non-empty")
+            expected_task_id = _foreground_task_id(
+                session_ref,
+                task["goal_version"],
+                cast(ForegroundTaskKind, task["kind"]),
+                task["text"],
+                task["source"],
+            )
+            if task["task_id"] != expected_task_id:
+                raise ValueError("goal record foreground task_id does not match its contents")
+            parse_iso8601(
+                task["created_at"],
+                invalid_message="goal record foreground task created_at must be an ISO8601 datetime",
+                timezone_message="goal record foreground task created_at must include a timezone",
+                require_timezone=True,
+            )
+        normalized["foreground_tasks"] = raw_foreground_tasks
+        normalized["autonomy_policy"] = payload.get("autonomy_policy", DEFAULT_AUTONOMY_POLICY.model_dump(mode="json"))
         return normalized
 
 
@@ -455,14 +541,56 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def load_goals_document(root: Path | None = None) -> tuple[list[GoalRecord], str]:
+def _foreground_task_id(
+    session_ref: str,
+    goal_version: int,
+    kind: ForegroundTaskKind,
+    text: str,
+    source: str,
+) -> str:
+    payload = json.dumps(
+        [session_ref, goal_version, kind, text.strip(), source.strip()],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+def make_foreground_task(
+    session_ref: str,
+    goal_version: int,
+    *,
+    kind: ForegroundTaskKind,
+    text: str,
+    source: str,
+    created_at: str | None = None,
+) -> ForegroundTask:
+    """Build one stable foreground work item without granting it authority."""
+    if not text.strip() or not source.strip():
+        raise ValueError("foreground task text and source must be non-empty")
+    if goal_version < 1:
+        raise ValueError("foreground task goal_version must be positive")
+    return ForegroundTask(
+        task_id=_foreground_task_id(session_ref, goal_version, kind, text, source),
+        kind=kind,
+        text=text.strip(),
+        source=source.strip(),
+        goal_version=goal_version,
+        created_at=created_at or _utc_now(),
+    )
+
+
+def load_goals_document(root: Path | None = None, *, allow_newer: bool = False) -> tuple[list[GoalRecord], str]:
     """Load records plus the file's own ``file_schema``, backfilling legacy anchors.
 
-    Any ``chitra.goals.v<N>`` document loads; unknown top-level and per-record
-    fields are ignored in memory so a newer writer's file stays readable here
-    instead of crashing the reader. The returned second element is the file's
-    own schema label, which writers must keep unless an explicit migration
-    upgrades it (see ``GoalsSchemaNewerError``).
+    Installed and older ``chitra.goals.v<N>`` documents load. A newer schema
+    fails closed because unknown fields may change the meaning of the goal or
+    its authority gates. The returned second element is the file's own schema
+    label, which writers keep unless an explicit migration upgrades it.
+
+    ``allow_newer`` is reserved for explicit read-only observation and
+    operator-approved migration. Ordinary and authoritative reads fail closed
+    on a newer schema.
 
     Records written before enrollment anchors existed use their current
     ``done_when`` once, and persist that normalized anchor on their next write.
@@ -477,6 +605,8 @@ def load_goals_document(root: Path | None = None) -> tuple[list[GoalRecord], str
     schema = payload.get("schema")
     if not isinstance(schema, str) or _schema_version(schema) is None:
         raise ValueError(f"goals.json schema must match {GOALS_SCHEMA_RE.pattern}, got {schema!r}")
+    if schema_is_newer_than_installed(schema) and not allow_newer:
+        raise GoalsSchemaNewerError(f"goals.json file schema {schema} is newer than installed package schema {SCHEMA}; refusing to read it")
     raw_goals = payload.get("goals")
     if not isinstance(raw_goals, list):
         raise ValueError("goals.json goals must be a list")
@@ -487,13 +617,13 @@ def load_goals_document(root: Path | None = None) -> tuple[list[GoalRecord], str
     return records, schema
 
 
-def load_goals(root: Path | None = None) -> list[GoalRecord]:
+def load_goals(root: Path | None = None, *, allow_newer: bool = False) -> list[GoalRecord]:
     """Load records, backfilling legacy enrollment anchors in memory.
 
     Records written before enrollment anchors existed use their current
     ``done_when`` once, and persist that normalized anchor on their next write.
     """
-    records, _ = load_goals_document(root)
+    records, _ = load_goals_document(root, allow_newer=allow_newer)
     return records
 
 
@@ -527,6 +657,7 @@ def upsert_goal(
     *,
     clear_open_asks: bool = False,
     migrate: bool = False,
+    lock_dir: Path | None = None,
 ) -> GoalRecord:
     """Validate and atomically insert or update one record by ``session_ref``.
 
@@ -539,7 +670,7 @@ def upsert_goal(
     issues = validate_goal(rec, require_enrollment=False)
     if issues:
         raise GoalValidationError("; ".join(issues))
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, rec.session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         stored = _upsert_goal_locked(root, rec, clear_open_asks=clear_open_asks, migrate=migrate)
     logger.info("goal_mutated", session_ref=stored.session_ref, action="upsert")
     return stored
@@ -555,6 +686,7 @@ def _upsert_goal_locked(
     allow_done_transition: bool = False,
     allow_completion_proofs: bool = False,
     allow_legacy_administrative: bool = False,
+    clear_foreground_tasks: bool = False,
     mutation_time: str | None = None,
     migrate: bool = False,
 ) -> GoalRecord:
@@ -569,7 +701,7 @@ def _upsert_goal_locked(
     leave a real window between the caller's own read and the write. See
     docs/SOL-ADVERSARIAL-REVIEW finding #9.
     """
-    records = load_goals(root)
+    records = load_goals(root, allow_newer=migrate)
     existing = next((record for record in records if record.session_ref == rec.session_ref), None)
     if existing is not None and validate_enrollment_contract(existing) and not allow_legacy_administrative:
         raise GoalValidationError("legacy goals are display-only; use a reasoned administrative redirect or discard")
@@ -619,6 +751,9 @@ def _upsert_goal_locked(
     open_asks = rec.open_asks
     if existing is not None and not open_asks and existing.open_asks and not clear_open_asks:
         open_asks = existing.open_asks
+    foreground_tasks = rec.foreground_tasks
+    if existing is not None and not foreground_tasks and existing.foreground_tasks and not clear_foreground_tasks:
+        foreground_tasks = existing.foreground_tasks
     hold_reason = rec.hold_reason
     resume_at = rec.resume_at
     if existing is not None and rec.status == existing.status and not hold_reason and not resume_at:
@@ -656,6 +791,8 @@ def _upsert_goal_locked(
         interview_receipt=rec.interview_receipt,
         enrolled_done_when_items=rec.enrolled_done_when_items,
         completion_proofs=rec.completion_proofs,
+        autonomy_policy=rec.autonomy_policy,
+        foreground_tasks=foreground_tasks,
     )
     records = [record for record in records if record.session_ref != rec.session_ref]
     records.append(stored)
@@ -665,7 +802,7 @@ def _upsert_goal_locked(
 
 def _strategic_fields_match(left: GoalRecord, right: GoalRecord) -> bool:
     """Compare strategic fields while treating whitespace-only revisions alike."""
-    return all(
+    return left.autonomy_policy == right.autonomy_policy and all(
         getattr(left, field).strip() == getattr(right, field).strip() for field in ("goal", "done_when", "intent", "scope", "source")
     )
 
@@ -680,11 +817,13 @@ def redirect_goal(
     intent: str | None = None,
     scope: str | None = None,
     source: str | None = None,
+    autonomy_policy: AutonomyPolicy | None = None,
+    lock_dir: Path | None = None,
 ) -> GoalRecord:
     """Replace strategic values after recording the prior operator direction."""
     if not reason.strip():
         raise ValueError("redirect reason must be non-empty")
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
@@ -697,8 +836,10 @@ def redirect_goal(
             intent=existing.intent if intent is None else intent,
             scope=existing.scope if scope is None else scope,
             source=existing.source if source is None else source,
+            autonomy_policy=existing.autonomy_policy if autonomy_policy is None else autonomy_policy,
             status="working" if existing.status in DONE_STATUSES else existing.status,
             last_verified="" if existing.status in DONE_STATUSES else existing.last_verified,
+            foreground_tasks=(),
         )
         if _strategic_fields_match(existing, redirected):
             raise ValueError("redirect must change at least one strategic field")
@@ -713,6 +854,7 @@ def redirect_goal(
             "scope": existing.scope,
             "revised_at": revised_at,
             "reason": reason,
+            "autonomy_policy": autonomy_policy_json(existing.autonomy_policy),
         }
         candidate = replace(
             redirected,
@@ -727,6 +869,7 @@ def redirect_goal(
             allow_strategic_change=True,
             allow_goal_metadata_change=True,
             allow_legacy_administrative=True,
+            clear_foreground_tasks=True,
             mutation_time=revised_at,
         )
     logger.info("goal_mutated", session_ref=session_ref, action="administrative-redirect-not-done", reason=reason)
@@ -740,6 +883,7 @@ def record_review_restart(
     previous_contract_id: str,
     restarted_contract_id: str,
     behavior_sha256: str,
+    lock_dir: Path | None = None,
 ) -> GoalRecord:
     """Append the required revert trail for an automatic redirect restart.
 
@@ -747,7 +891,7 @@ def record_review_restart(
     deliberately leaves every strategic field and the goal version unchanged;
     ``redirect_goal`` already recorded the strategic revision itself.
     """
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
@@ -778,12 +922,13 @@ def update_now(
     status: GoalStatus | None = None,
     last_verified: str | None = None,
     migrate: bool = False,
+    lock_dir: Path | None = None,
 ) -> GoalRecord:
     """Update only the current tactical state of an existing goal record."""
     if status in DONE_STATUSES:
         raise GoalValidationError("update_now cannot set a done-* status; use the completion-gate path")
-    with locked_json_store(goals_path(root)):
-        existing = get_goal(root, session_ref)
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
+        existing = get_goal(root, session_ref, allow_newer=migrate)
         if existing is None:
             raise GoalNotFoundError(session_ref)
         stored = _upsert_goal_locked(
@@ -800,6 +945,59 @@ def update_now(
     return stored
 
 
+def add_foreground_task(
+    root: Path | None,
+    session_ref: str,
+    *,
+    kind: ForegroundTaskKind,
+    text: str,
+    source: str,
+    lock_dir: Path | None = None,
+) -> GoalRecord:
+    """Persist one deduplicated residual for the foreground Chitra agent."""
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
+        existing = get_goal(root, session_ref)
+        if existing is None:
+            raise GoalNotFoundError(session_ref)
+        task = make_foreground_task(
+            session_ref,
+            existing.goal_version,
+            kind=kind,
+            text=text,
+            source=source,
+        )
+        tasks = existing.foreground_tasks
+        if all(item.task_id != task.task_id for item in tasks):
+            tasks = (*tasks, task)
+        stored = _upsert_goal_locked(root, replace(existing, foreground_tasks=tasks))
+    logger.info("goal_foreground_task_added", session_ref=session_ref, task_id=task.task_id, kind=kind)
+    return stored
+
+
+def resolve_foreground_task(
+    root: Path | None,
+    session_ref: str,
+    *,
+    task_id: str,
+    lock_dir: Path | None = None,
+) -> GoalRecord:
+    """Remove one completed foreground task without touching operator asks."""
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
+        existing = get_goal(root, session_ref)
+        if existing is None:
+            raise GoalNotFoundError(session_ref)
+        tasks = tuple(task for task in existing.foreground_tasks if task.task_id != task_id)
+        if len(tasks) == len(existing.foreground_tasks):
+            raise ValueError(f"foreground task not found: {task_id}")
+        stored = _upsert_goal_locked(
+            root,
+            replace(existing, foreground_tasks=tasks),
+            clear_foreground_tasks=True,
+        )
+    logger.info("goal_foreground_task_resolved", session_ref=session_ref, task_id=task_id)
+    return stored
+
+
 def mark_completion_gate_passed(
     root: Path | None,
     session_ref: str,
@@ -807,9 +1005,10 @@ def mark_completion_gate_passed(
     now: str,
     last_verified: str,
     completion_evidence: Sequence[CompletionEvidence],
+    lock_dir: Path | None = None,
 ) -> GoalRecord:
     """Record Watchd's already-passed completion audit and goal review."""
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
@@ -842,7 +1041,14 @@ def mark_completion_gate_passed(
     return stored
 
 
-def hold_goal(root: Path | None, session_ref: str, *, reason: str, resume_at: str = "") -> GoalRecord:
+def hold_goal(
+    root: Path | None,
+    session_ref: str,
+    *,
+    reason: str,
+    resume_at: str = "",
+    lock_dir: Path | None = None,
+) -> GoalRecord:
     """Mark an existing lane held while retaining its re-arm payload."""
     if not reason.strip():
         raise ValueError("hold reason must be non-empty")
@@ -853,7 +1059,7 @@ def hold_goal(root: Path | None, session_ref: str, *, reason: str, resume_at: st
             timezone_message="resume_at must be an ISO8601 datetime with timezone",
             require_timezone=True,
         )
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
@@ -885,6 +1091,7 @@ def transfer_goal(
     digest: str,
     reason: str,
     resume_at: str = "",
+    lock_dir: Path | None = None,
 ) -> tuple[GoalRecord, GoalRecord]:
     """Hold a lane and scaffold its successor on the other backend, atomically.
 
@@ -914,7 +1121,7 @@ def transfer_goal(
             timezone_message="resume_at must be an ISO8601 datetime with timezone",
             require_timezone=True,
         )
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
@@ -936,6 +1143,18 @@ def transfer_goal(
             scope=existing.scope,
             interview_receipt=existing.interview_receipt,
             enrolled_done_when_items=existing.enrolled_done_when_items,
+            autonomy_policy=existing.autonomy_policy,
+            foreground_tasks=tuple(
+                make_foreground_task(
+                    successor_ref,
+                    1,
+                    kind=task.kind,
+                    text=task.text,
+                    source=task.source,
+                    created_at=task.created_at,
+                )
+                for task in existing.foreground_tasks
+            ),
             successor_of=session_ref,
             now=f"scaffolded by transfer to {to_backend}: {reason}",
         )
@@ -963,9 +1182,9 @@ def transfer_goal(
     return held, stored_successor
 
 
-def resume_goal(root: Path | None, session_ref: str) -> GoalRecord:
+def resume_goal(root: Path | None, session_ref: str, *, lock_dir: Path | None = None) -> GoalRecord:
     """Return an explicitly held lane to working state and clear hold metadata."""
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
@@ -976,13 +1195,18 @@ def resume_goal(root: Path | None, session_ref: str) -> GoalRecord:
     return resumed
 
 
-def due_goals(root: Path | None = None, *, now: datetime | None = None) -> list[GoalRecord]:
+def due_goals(
+    root: Path | None = None,
+    *,
+    now: datetime | None = None,
+    allow_newer: bool = False,
+) -> list[GoalRecord]:
     """Return timed held lanes due at or before ``now`` in stable operator order."""
     current = datetime.now(UTC) if now is None else now
     if current.tzinfo is None:
         raise ValueError("now must be timezone-aware")
     due: list[tuple[datetime, GoalRecord]] = []
-    for record in load_goals(root):
+    for record in load_goals(root, allow_newer=allow_newer):
         if record.status != "held" or not record.resume_at:
             continue
         resume_at = parse_iso8601(
@@ -996,9 +1220,9 @@ def due_goals(root: Path | None = None, *, now: datetime | None = None) -> list[
     return [record for _, record in sorted(due, key=lambda item: (item[0], item[1].session_ref))]
 
 
-def add_ask(root: Path | None, session_ref: str, ask: str) -> GoalRecord:
+def add_ask(root: Path | None, session_ref: str, ask: str, *, lock_dir: Path | None = None) -> GoalRecord:
     """Persist one exact open operator ask for an existing lane, once only."""
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
@@ -1020,12 +1244,13 @@ def resolve_ask(
     basis: str = "Operator answered the ask.",
     citation: str = "operator-ruling",
     authority: str = "operator",
+    lock_dir: Path | None = None,
 ) -> GoalRecord:
     """Retire asks while preserving who decided and the cited basis."""
     selector_count = int(ask is not None) + int(index is not None) + int(all)
     if selector_count != 1:
         raise ValueError("select exactly one of ask, index, or all")
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
@@ -1063,14 +1288,14 @@ def resolve_ask(
     return stored
 
 
-def get_goal(root: Path | None, session_ref: str) -> GoalRecord | None:
+def get_goal(root: Path | None, session_ref: str, *, allow_newer: bool = False) -> GoalRecord | None:
     """Return the record for ``session_ref``, if the monitor has stored one."""
-    return next((record for record in load_goals(root) if record.session_ref == session_ref), None)
+    return next((record for record in load_goals(root, allow_newer=allow_newer) if record.session_ref == session_ref), None)
 
 
-def list_goals(root: Path | None = None) -> list[GoalRecord]:
+def list_goals(root: Path | None = None, *, allow_newer: bool = False) -> list[GoalRecord]:
     """Return all current goal records in their persisted order."""
-    return load_goals(root)
+    return load_goals(root, allow_newer=allow_newer)
 
 
 def descope_delta(record: GoalRecord) -> tuple[RequiredItem, ...]:
@@ -1100,6 +1325,7 @@ def close_goal(
     operator_acknowledged_items: Sequence[str] = (),
     administrative: bool = False,
     administrative_reason: str = "",
+    lock_dir: Path | None = None,
 ) -> GoalRecord:
     """Remove a record.
 
@@ -1108,7 +1334,7 @@ def close_goal(
     (e.g. a superseded hold being reconciled by the sweep janitor), NOT a
     completion claim, so the delivery-inventory gate does not apply to it.
     """
-    with locked_json_store(goals_path(root)):
+    with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         records = load_goals(root)
         closed = next((record for record in records if record.session_ref == session_ref), None)
         if closed is None:

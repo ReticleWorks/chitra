@@ -17,12 +17,40 @@ from chitra import board
 from chitra import goals as goal_store
 from chitra._fsio import locked_json_store, parse_iso8601, write_json_atomic
 from chitra.artifacts import list_unreviewed_artifacts
+from chitra.autonomy import DEFAULT_AUTONOMY_POLICY, AutonomyPolicy, load_autonomy_policy_json
 from chitra.completion_gate import CompletionEvidence
 from chitra.lane_read import extract_open_asks, read_last_assistant_message
 from chitra.policy_config import load_policy_config, resolve_guidance
 from chitra.state_paths import state_dir
 
 _DONE_ITEM_KEYS = ("id", "text", "validator", "receipt")
+
+
+def _autonomy_policy_from_args(
+    args: argparse.Namespace,
+    *,
+    default: AutonomyPolicy | None,
+) -> AutonomyPolicy | None:
+    policy_path = getattr(args, "autonomy_policy", None)
+    policy_json = getattr(args, "autonomy_policy_json", None)
+    if policy_path is not None:
+        return load_autonomy_policy_json(policy_path.read_text(encoding="utf-8"))
+    if policy_json is not None:
+        return load_autonomy_policy_json(policy_json)
+    return default
+
+
+def _add_autonomy_policy_args(command: argparse.ArgumentParser) -> None:
+    group = command.add_mutually_exclusive_group()
+    group.add_argument(
+        "--autonomy-policy",
+        type=Path,
+        help="Strict chitra.autonomy.v1 JSON file to freeze into this goal.",
+    )
+    group.add_argument(
+        "--autonomy-policy-json",
+        help="Strict inline chitra.autonomy.v1 JSON to freeze into this goal.",
+    )
 
 
 def _parse_done_item_specs(specs: Sequence[str]) -> tuple[goal_store.EnrolledDoneWhenItem, ...]:
@@ -62,6 +90,8 @@ def _interview_nonce_path(root: Path, session_ref: str) -> Path:
 
 
 def _set_request_sha256(args: argparse.Namespace) -> str:
+    autonomy_policy = _autonomy_policy_from_args(args, default=DEFAULT_AUTONOMY_POLICY)
+    assert autonomy_policy is not None
     payload = {
         "session_ref": args.session_ref,
         "goal": args.goal,
@@ -75,6 +105,7 @@ def _set_request_sha256(args: argparse.Namespace) -> str:
         "last_verified": args.last_verified,
         "needs": args.needs,
         "open_asks": args.open_ask,
+        "autonomy_policy": autonomy_policy.model_dump(mode="json"),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -109,8 +140,7 @@ def _interview_required(root: Path, args: argparse.Namespace) -> dict[str, objec
         "nonce": persisted["nonce"],
         "receipt_name": persisted["receipt_name"],
         "questions": [
-            {"id": question_id, "text": goal_store.INTERVIEW_QUESTIONS[question_id]}
-            for question_id in goal_store.INTERVIEW_QUESTION_IDS
+            {"id": question_id, "text": goal_store.INTERVIEW_QUESTIONS[question_id]} for question_id in goal_store.INTERVIEW_QUESTION_IDS
         ],
     }
 
@@ -124,7 +154,9 @@ def _read_nonce_record(nonce_path: Path) -> dict[str, Any] | None:
     return loaded if isinstance(loaded, dict) else None
 
 
-def _parse_interview_result(root: Path, args: argparse.Namespace) -> tuple[
+def _parse_interview_result(
+    root: Path, args: argparse.Namespace
+) -> tuple[
     goal_store.InterviewReceipt,
     tuple[goal_store.EnrolledDoneWhenItem, ...],
     dict[str, str],
@@ -199,9 +231,7 @@ def _parse_interview_result(root: Path, args: argparse.Namespace) -> tuple[
             raise ValueError("interview result done items must be objects")
         if not items:
             raise ValueError("interview result enrolled_done_when_items must contain at least one item")
-    answers_sha256 = hashlib.sha256(
-        json.dumps(ordered_answers, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    answers_sha256 = hashlib.sha256(json.dumps(ordered_answers, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
     receipt = goal_store.InterviewReceipt(
         name=str(nonce_record["receipt_name"]),
         completed_at=datetime.now(UTC).isoformat(),
@@ -254,6 +284,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     set_command.add_argument("--status", choices=goal_store.GOAL_STATUSES, default="working")
     set_command.add_argument("--now", default="")
     set_command.add_argument("--last-verified", default="")
+    _add_autonomy_policy_args(set_command)
     set_command.add_argument("--interview-result", type=Path)
     set_command.add_argument(
         "--migrate",
@@ -336,6 +367,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     redirect_command.add_argument("--intent")
     redirect_command.add_argument("--scope")
     redirect_command.add_argument("--source")
+    _add_autonomy_policy_args(redirect_command)
 
     now_command = commands.add_parser("now", help="Update only a lane's tactical current state.")
     add_root(now_command)
@@ -417,6 +449,8 @@ def _enroll_from_interview_result(root: Path, args: argparse.Namespace) -> goal_
         done_when = goal_store.render_done_when_items(done_items)
         intent = answers["intent"]
         scope = f"Out of scope: {answers['out_of_scope']} Constraints: {answers['constraints']}"
+        autonomy_policy = _autonomy_policy_from_args(args, default=DEFAULT_AUTONOMY_POLICY)
+        assert autonomy_policy is not None
         requested_record = goal_store.GoalRecord(
             session_ref=args.session_ref,
             goal=args.goal,
@@ -432,6 +466,7 @@ def _enroll_from_interview_result(root: Path, args: argparse.Namespace) -> goal_
             interview_receipt=receipt,
             enrolled_done_when_items=done_items,
             completion_proofs=(),
+            autonomy_policy=autonomy_policy,
         )
         pre_commit_payload: dict[str, Any] | None
         try:
@@ -443,10 +478,7 @@ def _enroll_from_interview_result(root: Path, args: argparse.Namespace) -> goal_
         try:
             with locked_json_store(nonce_path):
                 persisted_nonce_record = _read_nonce_record(nonce_path)
-                if (
-                    persisted_nonce_record is None
-                    or persisted_nonce_record.get("nonce") != nonce_record["nonce"]
-                ):
+                if persisted_nonce_record is None or persisted_nonce_record.get("nonce") != nonce_record["nonce"]:
                     raise ValueError("interview nonce was replaced before enrollment committed")
                 nonce_record["consumed_at"] = stored.enrolled_at
                 write_json_atomic(nonce_path, nonce_record)
@@ -474,13 +506,13 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(_interview_required(args.root, args), indent=2, sort_keys=True))
                 return 2
             if existing is not None and existing.interview_receipt is None:
-                raise goal_store.GoalValidationError(
-                    "legacy goals are display-only; use a reasoned administrative redirect or discard"
-                )
+                raise goal_store.GoalValidationError("legacy goals are display-only; use a reasoned administrative redirect or discard")
             if existing is not None and args.interview_result is not None:
                 raise goal_store.GoalValidationError("goal is already enrolled; its interview receipt and done items are frozen")
 
             if existing is not None:
+                requested_autonomy_policy = _autonomy_policy_from_args(args, default=existing.autonomy_policy)
+                assert requested_autonomy_policy is not None
                 stored = goal_store.upsert_goal(
                     args.root,
                     goal_store.GoalRecord(
@@ -498,6 +530,7 @@ def main(argv: list[str] | None = None) -> int:
                         interview_receipt=existing.interview_receipt,
                         enrolled_done_when_items=existing.enrolled_done_when_items,
                         completion_proofs=existing.completion_proofs,
+                        autonomy_policy=requested_autonomy_policy,
                     ),
                     clear_open_asks=args.clear_asks,
                     migrate=args.migrate,
@@ -548,6 +581,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "resume":
             _print_record(goal_store.resume_goal(args.root, args.session_ref))
         elif args.command == "redirect":
+            redirected_autonomy_policy = _autonomy_policy_from_args(args, default=None)
             _print_record(
                 goal_store.redirect_goal(
                     args.root,
@@ -558,6 +592,7 @@ def main(argv: list[str] | None = None) -> int:
                     intent=args.intent,
                     scope=args.scope,
                     source=args.source,
+                    autonomy_policy=redirected_autonomy_policy,
                 )
             )
         elif args.command == "now":

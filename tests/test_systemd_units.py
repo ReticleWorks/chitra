@@ -273,6 +273,25 @@ def test_shared_daemon_units_are_the_canonical_package_layout() -> None:
     assert "chitra-dispatchd.service" in configuration_docs
 
 
+def test_persistent_supervision_units_share_lane_queue_and_binding_topology() -> None:
+    """The monitor's per-lane queue must be the dispatcher's lane queue."""
+    monitor = (SYSTEMD_DIR / "chitra-monitord@.service.example").read_text(encoding="utf-8")
+    dispatch = (SYSTEMD_DIR / "chitra-dispatchd.service").read_text(encoding="utf-8")
+
+    assert "ConditionPathExists=/etc/chitra/transcript-bindings.json" in monitor
+    assert "--transcript-bindings-path /etc/chitra/transcript-bindings.json" in monitor
+    assert "StateDirectory=chitra" in monitor
+    assert "Environment=CHITRA_STATE_DIR=/var/lib/chitra/lane-%i" in monitor
+    assert "ExecStartPre=/usr/bin/install -d -o chitra -g chitra -m 0750 ${CHITRA_STATE_DIR}" in monitor
+    assert "--dispatch-queue-dir ${CHITRA_STATE_DIR}/queue" in monitor
+    assert "--transcript-bindings-path /etc/chitra/transcript-bindings.json" in dispatch
+    assert "/var/lib/chitra/lane-<id>" in dispatch
+
+    monitor_docs = (REPO_ROOT / "docs" / "daemons" / "monitord.md").read_text(encoding="utf-8")
+    assert "/var/lib/chitra/lane-<lane-id>" in monitor_docs
+    assert "/etc/chitra/transcript-bindings.json" in monitor_docs
+
+
 def test_the_merge_daemon_unit_fails_rather_than_starting_without_its_token() -> None:
     """A dash prefix would let systemd start the unit with no token at all.
 

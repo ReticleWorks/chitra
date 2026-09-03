@@ -1,5 +1,55 @@
 # Changelog
 
+All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
+
+## [0.19.2] - 2026-08-30
+
+### Added
+
+- Tell every governed Claude and Codex lane to maintain one
+  AgentTrail-compatible `PLAN.md` in its declared worktree. The setup note
+  defines stable task IDs, dependencies, file scopes, intermediate status,
+  and evidence-only completion updates while leaving frozen goals and verified
+  receipts authoritative.
+
+### Changed
+
+- Move monitord's per-lane state root from
+  `/var/lib/polyphony-chitra-<lane-id>` to `/var/lib/chitra/lane-<lane-id>`.
+  Existing goals, journals, and receipts are not migrated automatically;
+  see the deployment note in `docs/daemons/monitord.md` for where the old
+  data stays and what an operator must do by hand before upgrading a host
+  that already has lanes running.
+- Fail `dispatchd` fast, with a clear log line and non-zero exit, when an
+  explicit `--transcript-bindings-path` names a manifest that does not
+  exist. Previously the unit's `ConditionPathExists` skipped the service
+  silently, so `systemctl start` reported success while dispatchd never ran.
+
+### Documentation
+
+- Document the lane-plan path, update cadence, shared syntax, and authority
+  boundary in the governed-lane guide and project overview.
+
+## [0.19.1] - 2026-08-27
+
+### Fixed
+
+- Permit governed lanes on Twinridge and retain enough Codex transcript history
+  to reconcile signed Dispatchd delivery proofs.
+
+## [0.19.0] - 2026-08-27
+
+### Added
+
+- Bind delegated Kai decisions to validated authority, satisfaction, and request
+  digests in the immutable decision attestation.
+- Add request-bound, idempotent rearming of provider-native goal and recurring
+  loop controls for active lanes.
+
+### Changed
+
+- Publish dispatch orders without replacing a different producer's payload.
+
 ## 0.9.11
 
 - Normalize canonical remote pane targets at the governed grant boundary and
@@ -18,7 +68,83 @@
   SSH grant verbs, allowing the draft guard to recognize the Codex 0.147 empty
   composer without granting raw remote tmux execution.
 
-All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
+## [0.18.0] - 2026-08-27
+
+### Added
+
+- Add frozen, per-goal autonomy policies with typed capabilities, targets,
+  expiry and quantitative limits. Matching grants now authorize goal-scoped
+  action without a second topic-based operator gate.
+- Add exact `active`, `paused`, `shelved`, and independently verified `closed`
+  lane states, bound worktree and transcript checkpoints, idempotent lifecycle
+  transitions, and unfinished-work restoration on resume.
+- Add user-supplied canonical knowledge bundles and provider setup receipts.
+  Codex uses a profile beside its existing configuration; Claude receives a
+  native goal and a session-scoped recurring pursuit loop.
+
+### Changed
+
+- Pursue every actionable finding per monitor pass and retry true transport
+  failures without a fixed abandonment count. Deterministic goal, policy,
+  scope, and schema rejections now become foreground replanning work.
+- Pursue an idle lane after one clean monitor pass by default. Per-goal policy
+  can set a different threshold after evidence supports it.
+- Run Claude's recurring in-session enforcement hook every five minutes by
+  default, with a per-goal interval override.
+- Flag repeated identical tool outcomes and unchanged test runs on their second
+  occurrence, the first point where a loop exists.
+- Grant every goal-scoped capability by default, including spending. A goal
+  can still freeze narrower targets, amounts, units, expiry, or capabilities.
+- Gate Dispatchd on the authoritative lane lifecycle while keeping it the sole
+  terminal writer. A typed pause-prune control is the only paused-lane write.
+
+### Removed
+
+- Remove the persisted round-robin finding cursor, per-pass action cap,
+  terminal retry exhaustion, duplicate lifecycle constants, and the unused
+  standalone checkpoint writer.
+- Remove the legacy archive alias. Lane state is exactly active, paused,
+  shelved, or closed.
+
+## [0.17.0] - 2026-08-27
+
+### Added
+
+- Bind every monitored transcript to one exact session, lane, client version,
+  and frozen goal through a validated manifest.
+- Persist corrective intent, queue publication, signed delivery consumption,
+  retries, progress boundaries, and verified completion in a crash-safe
+  per-lane supervision ledger. A durable round-robin cursor prevents one
+  recurring incident from starving later findings.
+- Answer routine goal questions and explicit small reversible design questions
+  from the frozen contract. Question intent, retries, delivery, and consumption
+  survive restarts. Dispatchd recomputes each answer before delivery.
+- Run completion validators only after a structured completion claim and mark
+  completion only after the exact stored results independently verify.
+- Create one bounded pursuit incident after three clean monitor passes with no
+  scoped progress, while suppressing it for pending delivery or questions.
+
+### Fixed
+
+- Stop elapsed time and historical findings from advancing the correction
+  ladder without genuine post-consumption recurrence.
+- Isolate validation receipts by exact goal session so matching receipt names
+  from another goal cannot close the lane. Safely migrate unambiguous legacy
+  receipts while rejecting same-name cross-session ambiguity.
+- Reject stale, held, completed, or forged goal-bound orders before pane I/O,
+  including a second goal check under the lane lock. Bound terminal transport
+  retries across restarts and fail closed on a newer goal-store schema.
+- Reject unsafe queue identifiers and unconfined receipt validator targets.
+  Serialize goal writers with dispatch, and never turn a pre-existing SENT
+  result into delivery proof during crash recovery.
+- Require persistent-oversight deliveries to use the exact transcript manifest
+  binding and bind their signed ledger rows to that transcript's native session
+  identity.
+- Filter historical journal rows against the complete current transcript
+  binding after a lane or native-session rebind.
+- Reject symlinked or external queue paths and ignore validator registries from
+  receipt upload directories. Connect the shipped monitor and dispatch service
+  examples to the same per-lane state, queue, ledger, and binding manifest.
 
 ## [0.16.0] - 2026-08-23
 
