@@ -50,3 +50,34 @@ def test_discover_units_matches_deployed_names(monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake_run)
     found = discover_units()
     assert found == {"folio": "active", "boomtown": "active"}
+
+
+def test_discover_units_reads_the_active_column_not_the_line(monkeypatch):
+    """A failed unit must be reported failed, and a unit whose *name*
+    contains "failed" must not be.
+
+    systemd prefixes a status glyph to any row that is not plain
+    loaded+active, and `--plain` does not strip it. The old pattern anchored
+    the unit name at `^`, so the bulleted row below matched nothing and the
+    failed instance disappeared from the picker. A looser fix — searching the
+    line for "failed" — would then mis-report `@failed-lane`, which is an
+    ordinary running lane.
+    """
+    fake_stdout = (
+        "● polyphony-chitra-watchd@folio.service        loaded failed     failed      Chitra watchd (folio)\n"
+        "polyphony-chitra-watchd@failed-lane.service    loaded active     running     Chitra watchd (failed-lane)\n"
+        "polyphony-chitra-sweepd@boomtown.service       loaded activating auto-restart Chitra sweepd (boomtown)\n"
+        "polyphony-chitra-triaged@ghost.service         not-found inactive dead        Chitra triaged (ghost)\n"
+        "Loaded units listed. Pass --all to see loaded but inactive units, too.\n"
+    )
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout=fake_stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert discover_units() == {
+        "folio": "failed",
+        "failed-lane": "active",
+        "boomtown": "activating",
+        "ghost": "inactive",
+    }
