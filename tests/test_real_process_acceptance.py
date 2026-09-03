@@ -43,7 +43,14 @@ accepted = False
 fd = sys.stdin.fileno()
 old_attrs = termios.tcgetattr(fd)
 attrs = termios.tcgetattr(fd)
-attrs[3] &= ~(termios.ECHO | termios.ECHONL)
+# Non-canonical mode: a canonical-mode tty caps one line at MAX_INPUT
+# (1024 bytes on macOS/BSD, 4096 on Linux) and silently drops the rest,
+# which truncates a long single-line nudge before Python ever sees it.
+# Reading raw and buffering into lines ourselves removes that cap on
+# every platform.
+attrs[3] &= ~(termios.ECHO | termios.ECHONL | termios.ICANON)
+attrs[6][termios.VMIN] = 1
+attrs[6][termios.VTIME] = 0
 termios.tcsetattr(fd, termios.TCSANOW, attrs)
 print("$", flush=True)
 try:
