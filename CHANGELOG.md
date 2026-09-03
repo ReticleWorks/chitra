@@ -20,6 +20,10 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   see the deployment note in `docs/daemons/monitord.md` for where the old
   data stays and what an operator must do by hand before upgrading a host
   that already has lanes running.
+- Fail `dispatchd` fast, with a clear log line and non-zero exit, when an
+  explicit `--transcript-bindings-path` names a manifest that does not
+  exist. Previously the unit's `ConditionPathExists` skipped the service
+  silently, so `systemctl start` reported success while dispatchd never ran.
 
 ### Documentation
 

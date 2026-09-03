@@ -1461,6 +1461,24 @@ def test_no_goals_root_configured_leaves_dispatch_unaffected(tmp_path: Path, mon
     assert results[0].status == DispatchStatus.SENT
 
 
+def test_main_fails_fast_when_transcript_bindings_path_is_missing(tmp_path: Path) -> None:
+    """The shipped unit's ConditionPathExists skips the service silently, so
+    systemctl start reports success while dispatchd never runs. main() must
+    itself refuse and exit non-zero when an explicit
+    --transcript-bindings-path names a file that does not exist."""
+    exit_code = main(
+        [
+            "--once",
+            "--queue-dir",
+            str(tmp_path / "queue"),
+            "--transcript-bindings-path",
+            str(tmp_path / "transcript-bindings.json"),
+        ]
+    )
+
+    assert exit_code != 0
+
+
 def test_goals_root_is_wired_through_the_cli_entrypoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Regression for SOL finding #7: build_arg_parser() exposed --goals-root
     but main() never forwarded it to run_once/run_forever, so a deployment

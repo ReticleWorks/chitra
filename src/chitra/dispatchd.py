@@ -1877,6 +1877,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    if args.transcript_bindings_path is not None and not args.transcript_bindings_path.exists():
+        # load_transcript_bindings() treats a missing path as "legacy
+        # journals only" and silently returns no bindings -- correct for an
+        # unset default, but not when an explicit --transcript-bindings-path
+        # names a file that should exist. The shipped systemd unit's
+        # ConditionPathExists skips the service without an error, so
+        # `systemctl start` reports success while nothing runs. Fail fast
+        # here instead.
+        logger.error(
+            "dispatchd_transcript_bindings_missing",
+            path=str(args.transcript_bindings_path),
+            detail="dispatchd refuses to start with no autonomous-delivery bindings",
+        )
+        return 1
     queue_dir = args.queue_dir or default_queue_dir()
     allowed_session_prefixes = resolve_session_prefixes(args.allow_session_prefix, env_var=SESSION_ALLOW_PREFIXES_ENV_VAR)
     denied_session_prefixes = resolve_session_prefixes(args.deny_session_prefix, env_var=SESSION_DENY_PREFIXES_ENV_VAR)
