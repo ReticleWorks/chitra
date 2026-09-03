@@ -872,13 +872,27 @@ def start_lane(
         # its pipe stayed unrecorded until somebody looked.
         arm_transcript_pipe(lane, runner=runner)
         if pending_activation:
-            _transition_for_lane(
-                lane,
-                goal,
-                target="active",
-                resume_note="Resumed an already-live governed lane." if _resume else "Recorded an already-live governed lane.",
-                request_id=_request_id,
-            )
+            try:
+                _transition_for_lane(
+                    lane,
+                    goal,
+                    target="active",
+                    resume_note="Resumed an already-live governed lane." if _resume else "Recorded an already-live governed lane.",
+                    request_id=_request_id,
+                )
+            except ValueError as exc:
+                # The lane's workdir is not a usable git worktree (deleted,
+                # moved, or misdeclared in lanes.yaml). Restore the prior
+                # respawn behaviour: the pipe is still re-armed above, but the
+                # lifecycle transition and native-controls enqueue -- which
+                # both require a worktree binding or a tracked lifecycle --
+                # are skipped rather than crashing the respawn path.
+                print(
+                    f"lane {lane.identifier} respawn: skipping lifecycle transition, "
+                    f"workdir is not a git worktree: {exc}",
+                    file=sys.stderr,
+                )
+                return False
             native_controls = write_native_controls(lane, goal, backend=backend, setup_note=setup_note)
         enqueue_native_controls(lane, goal)
         return False
