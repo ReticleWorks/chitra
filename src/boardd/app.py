@@ -272,12 +272,31 @@ async def events(monitor: str | None = None) -> StreamingResponse:
 ACTIVITY_ALLOWED_PATHS = frozenset({"", "world", "tree-of", "escalations", "events"})
 
 
+# A blocking upstream read runs in the default executor's fixed-size thread
+# pool. A synchronous socket read can't be cancelled from an awaiting
+# coroutine, so a client that vanishes mid-stream (closes the tab) while a
+# read is in flight leaves that thread pinned until the read itself returns.
+# Bound every read so an abandoned connection is reclaimed within one
+# timeout instead of indefinitely.
+#
+# request.is_disconnected() was tried here and dropped: polling it from
+# inside a StreamingResponse generator raced the ASGI server's own use of
+# the same receive channel and, measured against the live process, could
+# leave the *entire* app unresponsive to new connections for the length of
+# the read timeout — a known Starlette footgun, not specific to this proxy.
+# Ending the stream on a read timeout is simpler and carries no such risk:
+# EventSource reconnects automatically, so an idle Activity tab just
+# reconnects roughly every UPSTREAM_READ_TIMEOUT seconds instead of holding
+# one connection open forever.
+UPSTREAM_READ_TIMEOUT = 30.0
+
+
 async def _proxy_get(url: str) -> StreamingResponse:
     loop = asyncio.get_event_loop()
 
     def _connect() -> tuple[int, str, Any]:
         try:
-            resp = urllib.request.urlopen(url)  # noqa: S310 — loopback-only, GET-only, allowlisted path
+            resp = urllib.request.urlopen(url, timeout=UPSTREAM_READ_TIMEOUT)  # noqa: S310 — loopback, GET-only, allowlisted
             return resp.status, resp.headers.get("content-type", "application/octet-stream"), resp
         except urllib.error.HTTPError as e:
             content_type = e.headers.get("content-type", "text/plain") if e.headers else "text/plain"
@@ -289,14 +308,34 @@ async def _proxy_get(url: str) -> StreamingResponse:
         raise HTTPException(status_code=502, detail=f"agenttrail unreachable: {e}") from e
 
     async def body() -> AsyncIterator[bytes]:
+        # .read1(), not .read(): for a chunked, still-open stream (agenttrail's
+        # SSE /events), .read(n) blocks until n bytes have accumulated or the
+        # connection closes — measured against the live process, it silently
+        # sat for 5+ seconds after the initial event that had already
+        # arrived. .read1() returns whatever is already available, the way a
+        # passthrough proxy needs.
+        read1 = getattr(upstream, "read1", None)
+        reader = read1 or upstream.read
         try:
             while True:
-                chunk = await loop.run_in_executor(None, upstream.read, 8192)
+                try:
+                    chunk = await loop.run_in_executor(None, reader, 8192)
+                except TimeoutError:
+                    break  # idle this long — end the stream; the client reconnects
                 if not chunk:
                     break
                 yield chunk
         finally:
-            upstream.close()
+            # Not a plain upstream.close(): io.BufferedReader (what
+            # http.client hands back) serializes read/close behind one
+            # internal lock. On client disconnect, cancellation can land
+            # here *while* a read from the loop above is still in flight
+            # in its executor thread, holding that lock — a same-thread
+            # close() then blocks the whole event loop (not just this
+            # request) until that read returns, measured against the live
+            # process as a 30-second stall of the entire app. Closing in
+            # the executor keeps the wait off the event loop.
+            await loop.run_in_executor(None, upstream.close)
 
     return StreamingResponse(body(), status_code=status, media_type=content_type)
 
