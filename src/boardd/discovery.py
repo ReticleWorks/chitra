@@ -123,6 +123,10 @@ class MonitorInfo:
     unit_active_state: str
     lane_count: int
     needs_feedback_count: int
+    # False for a unit discovered with no goals.json directory behind it yet
+    # (root_for_id's synthetic path doesn't exist on disk). The mobile
+    # monitor picker greys this row out rather than pretending it has data.
+    has_state_root: bool = True
 
 
 def is_dev_mode() -> bool:

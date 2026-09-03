@@ -88,6 +88,7 @@ def test_api_monitors():
     assert monitors[0]["id"] == "monitor"
     assert monitors[0]["lane_count"] == 10
     assert monitors[0]["needs_feedback_count"] == 6
+    assert monitors[0]["has_state_root"] is True
 
 
 def test_api_state_unknown_monitor_404():

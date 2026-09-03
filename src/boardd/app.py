@@ -51,6 +51,7 @@ def current_monitors() -> dict[str, discovery.MonitorInfo]:
             unit_active_state=units.get(monitor_id, "unknown"),
             lane_count=view["summary"]["lane_count"],
             needs_feedback_count=view["summary"]["needs_you_count"],
+            has_state_root=root.is_dir(),
         )
     return out
 
