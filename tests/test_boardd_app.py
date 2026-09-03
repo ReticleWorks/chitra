@@ -196,3 +196,58 @@ def test_answer_rejects_empty_text(tmp_path):
             os.environ.pop("BOARDD_STATE_ROOTS", None)
         else:
             os.environ["BOARDD_STATE_ROOTS"] = old
+
+
+def test_answer_rejects_oversized_body(tmp_path):
+    state_dir = _write_endpoint_env(tmp_path)
+    old = os.environ.get("BOARDD_STATE_ROOTS")
+    os.environ["BOARDD_STATE_ROOTS"] = f"monitor={state_dir}"
+    try:
+        big = json.dumps({"text": "y" * (70 * 1024)})
+        r = client.post(
+            "/api/lanes/wiki-backfill/answer",
+            content=big,
+            headers={"content-type": "application/json"},
+        )
+        assert r.status_code == 413
+    finally:
+        if old is None:
+            os.environ.pop("BOARDD_STATE_ROOTS", None)
+        else:
+            os.environ["BOARDD_STATE_ROOTS"] = old
+
+
+def test_answer_rejects_non_json_body(tmp_path):
+    state_dir = _write_endpoint_env(tmp_path)
+    old = os.environ.get("BOARDD_STATE_ROOTS")
+    os.environ["BOARDD_STATE_ROOTS"] = f"monitor={state_dir}"
+    try:
+        r = client.post(
+            "/api/lanes/wiki-backfill/answer",
+            content=b"not json",
+            headers={"content-type": "application/json"},
+        )
+        assert r.status_code == 400
+    finally:
+        if old is None:
+            os.environ.pop("BOARDD_STATE_ROOTS", None)
+        else:
+            os.environ["BOARDD_STATE_ROOTS"] = old
+
+
+def test_answer_rejects_empty_body(tmp_path):
+    state_dir = _write_endpoint_env(tmp_path)
+    old = os.environ.get("BOARDD_STATE_ROOTS")
+    os.environ["BOARDD_STATE_ROOTS"] = f"monitor={state_dir}"
+    try:
+        r = client.post(
+            "/api/lanes/wiki-backfill/answer",
+            content=b"",
+            headers={"content-type": "application/json"},
+        )
+        assert r.status_code == 400
+    finally:
+        if old is None:
+            os.environ.pop("BOARDD_STATE_ROOTS", None)
+        else:
+            os.environ["BOARDD_STATE_ROOTS"] = old

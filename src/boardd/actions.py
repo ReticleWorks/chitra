@@ -59,10 +59,12 @@ def _resolve_ask(state_dir: Path, lane_id: str, *, basis: str | None) -> None:
         argv += ["--basis", basis]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=CHITRA_GOALS_TIMEOUT)
-    except FileNotFoundError as e:
-        raise LaneActionError(f"could not run chitra-goals: {e}") from e
     except subprocess.TimeoutExpired as e:
         raise LaneActionError(f"chitra-goals timed out: {e}") from e
+    except OSError as e:
+        # Covers FileNotFoundError and, e.g., E2BIG if an oversized argv ever
+        # slips past the request-body cap in app.py.
+        raise LaneActionError(f"could not run chitra-goals: {e}") from e
     if proc.returncode != 0:
         raise LaneActionError(proc.stderr.strip() or f"chitra-goals exited {proc.returncode}")
 

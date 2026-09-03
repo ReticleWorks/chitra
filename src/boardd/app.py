@@ -23,6 +23,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, ValidationError
 from watchfiles import awatch
 
 from chitra.goals import load_goals
@@ -33,6 +34,41 @@ from .translate import TranslationCache
 
 app = FastAPI(title="boardd", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=config.PKG_DIR / "static"), name="static")
+
+MAX_REQUEST_BODY_BYTES = 64 * 1024
+
+
+class AnswerBody(BaseModel):
+    text: str = Field(default="", max_length=4096)
+
+
+async def _read_bounded_json(request: Request, model: type[BaseModel]) -> BaseModel:
+    """Read+validate a JSON body, bounded before it ever reaches a subprocess argv.
+
+    413 over the size cap, 400 for anything that isn't a valid JSON object
+    matching ``model`` (empty body included) — never an unhandled 500.
+    """
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            too_big = int(content_length) > MAX_REQUEST_BODY_BYTES
+        except ValueError:
+            too_big = False  # malformed header; the real read below still enforces the cap
+        if too_big:
+            raise HTTPException(status_code=413, detail="request body exceeds 64 KB")
+    body = await request.body()
+    if len(body) > MAX_REQUEST_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="request body exceeds 64 KB")
+    if not body.strip():
+        raise HTTPException(status_code=400, detail="request body must be valid JSON")
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"request body must be valid JSON: {e}") from e
+    try:
+        return model.model_validate(data)
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 _tcache = TranslationCache(config.TRANSLATION_SEED)
 _agenttrail_status: dict[str, str] = {}  # session_ref -> status, last posted to agenttrail
@@ -240,11 +276,11 @@ async def ack_lane(lane_id: str, monitor: str | None = None) -> JSONResponse:
 
 @app.post("/api/lanes/{lane_id}/answer")
 async def answer_lane(lane_id: str, request: Request, monitor: str | None = None) -> JSONResponse:
+    body = await _read_bounded_json(request, AnswerBody)
+    assert isinstance(body, AnswerBody)
     root = _root_for_write(monitor)
-    body = await request.json()
-    text = str(body.get("text", "")) if isinstance(body, dict) else ""
     try:
-        actions.answer_lane(root, lane_id, text)
+        actions.answer_lane(root, lane_id, body.text)
     except actions.LaneActionError as e:
         raise HTTPException(status_code=404 if e.not_found else 400, detail=str(e)) from e
     return JSONResponse({"ok": True})
