@@ -25,6 +25,20 @@ pytest
 - New behavior needs a test. This project has no untested modules; let's keep it that way.
 - Keep changes focused — this project explicitly favors staying small over accumulating features.
 
+## Hygiene hook
+
+This repo enforces a secrets-and-PII hygiene check (`scripts/hygiene_check.py`, deny-list in
+`.hygiene-denylist`) plus [gitleaks](https://github.com/gitleaks/gitleaks) via
+[pre-commit](https://pre-commit.com). A repo can't force a hooks path on your clone, so install it once:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+After that, both checks run automatically on `git commit`. Run `python3 scripts/hygiene_check.py --fix`
+to rewrite existing matches to neutral placeholders instead of fixing them by hand.
+
 ## Code of Conduct
 
 See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
