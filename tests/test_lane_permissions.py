@@ -118,12 +118,12 @@ def test_the_flag_check_passes_the_command_the_launcher_builds() -> None:
 
 
 def test_the_probes_cover_the_classes_the_blocked_lanes_needed(tmp_path: Path) -> None:
-    probes, unprobed = build_probes(tmp_path, ssh_target="tiptap@renegade")
+    probes, unprobed = build_probes(tmp_path, ssh_target="agent@renegade")
     assert [probe.name for probe in probes] == ["file_write", "gh_api_write", "fleet_ssh"]
     assert unprobed == ()
     assert str(probe_path(tmp_path)) in probes[0].instruction
     assert "gh api --method POST" in probes[1].instruction
-    assert "tiptap@renegade" in probes[2].instruction
+    assert "agent@renegade" in probes[2].instruction
 
 
 def test_the_write_probe_uses_the_file_tool_not_a_shell_redirect(tmp_path: Path) -> None:
@@ -341,7 +341,7 @@ def test_a_clean_probe_leaves_the_lane_running(tmp_path: Path, monkeypatch: pyte
 
 
 def test_the_ssh_target_can_come_from_the_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CHITRA_LANE_SELFTEST_SSH_TARGET", "tiptap@renegade")
+    monkeypatch.setenv("CHITRA_LANE_SELFTEST_SSH_TARGET", "agent@renegade")
     seen: list[Sequence[str]] = []
 
     def _record(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -357,7 +357,7 @@ def test_the_ssh_target_can_come_from_the_environment(tmp_path: Path, monkeypatc
         runner=lambda command: _completed(""),
         probe_runner=_record,
     )
-    assert any("tiptap@renegade" in argument for argument in seen[0])
+    assert any("agent@renegade" in argument for argument in seen[0])
 
 
 def test_the_receipt_records_what_the_self_test_proved() -> None:

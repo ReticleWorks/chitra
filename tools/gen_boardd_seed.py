@@ -32,8 +32,8 @@ TRANSLATIONS: dict[str, str] = {
         "A real flushed batch arrives as a dispatch order, and the monitor's decision shows up in the decision log.",
     "research route ships disabled until the dispatchd retry fix is applied on twinridge":
         "The research route ships switched off until the dispatch retry fix lands on twinridge.",
-    "Give Trey a conversational sorting surface that files governed intents instead of doing work":
-        "Give Trey a conversational sorting surface that files governed intents instead of doing the work itself.",
+    "Give the operator a conversational sorting surface that files governed intents instead of doing work":
+        "Give the operator a conversational sorting surface that files governed intents instead of doing the work itself.",
 
     # ---- twinridge:boardd-build
     "Build boardd: a tailnet web dashboard reading the chitra state dir, pushing per-change updates, translating agent updates to plain technical English at render time.":

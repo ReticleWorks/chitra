@@ -4,7 +4,7 @@ Measured on tophand over the 2026-08-16/17 shift: three governed lanes were
 refused their own core work by the Claude Code auto-mode classifier, with the
 message "Denied by auto mode classifier - Blocked by classifier". infra-followup
 lost its package publish, access-broker lost a pull-request write, and
-starchamber lost ``ssh tiptap@renegade``. One refusal landed on a read-only
+starchamber lost ``ssh agent@renegade``. One refusal landed on a read-only
 ``git status``. Each lane read the refusal as a policy decision and told the
 operator a person was needed, which cost hours across one shift.
 

@@ -12,7 +12,7 @@
       "lane_id": "",
       "enrolled_done_when": "",
       "enrolled_at": "",
-      "intent": "Give Trey a conversational sorting surface that files governed intents instead of doing work",
+      "intent": "Give the operator a conversational sorting surface that files governed intents instead of doing work",
       "scope": "skill + outbox + validator + monitor doctrine paragraphs; boardd is a separate lane",
       "goal_version": 2,
       "goal_history": [],
