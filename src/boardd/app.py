@@ -264,14 +264,22 @@ def _root_for_write(monitor: str | None) -> Path:
     return _resolve_root(monitor or _default_monitor_id(roots), roots)
 
 
+def _lane_action_status(e: actions.LaneActionError, *, default: int) -> int:
+    if e.not_found:
+        return 404
+    if e.no_op:
+        return 409  # nothing to resolve — never a false-success 200
+    return default
+
+
 @app.post("/api/lanes/{lane_id}/ack")
 async def ack_lane(lane_id: str, monitor: str | None = None) -> JSONResponse:
     root = _root_for_write(monitor)
     try:
-        actions.ack_lane(root, lane_id)
+        record = actions.ack_lane(root, lane_id)
     except actions.LaneActionError as e:
-        raise HTTPException(status_code=404 if e.not_found else 502, detail=str(e)) from e
-    return JSONResponse({"ok": True})
+        raise HTTPException(status_code=_lane_action_status(e, default=502), detail=str(e)) from e
+    return JSONResponse({"ok": True, "changed": True, "lane": record.to_dict()})
 
 
 @app.post("/api/lanes/{lane_id}/answer")
@@ -280,10 +288,10 @@ async def answer_lane(lane_id: str, request: Request, monitor: str | None = None
     assert isinstance(body, AnswerBody)
     root = _root_for_write(monitor)
     try:
-        actions.answer_lane(root, lane_id, body.text)
+        record = actions.answer_lane(root, lane_id, body.text)
     except actions.LaneActionError as e:
-        raise HTTPException(status_code=404 if e.not_found else 400, detail=str(e)) from e
-    return JSONResponse({"ok": True})
+        raise HTTPException(status_code=_lane_action_status(e, default=400), detail=str(e)) from e
+    return JSONResponse({"ok": True, "changed": True, "lane": record.to_dict()})
 
 
 # Re-exported so callers/tests reach the review-queue statuses via app, not a

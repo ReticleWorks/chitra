@@ -151,10 +151,33 @@ def test_ack_clears_open_asks(tmp_path):
     try:
         r = client.post("/api/lanes/wiki-backfill/ack")
         assert r.status_code == 200, r.text
-        assert r.json() == {"ok": True}
+        body = r.json()
+        assert body["ok"] is True
+        assert body["changed"] is True
+        assert body["lane"]["open_asks"] == []
         state = client.get("/api/state").json()
         lane = next(ln for ln in state["lanes"] if ln["lane_id"] == "wiki-backfill")
         assert lane["open_asks"] == []
+    finally:
+        if old is None:
+            os.environ.pop("BOARDD_STATE_ROOTS", None)
+        else:
+            os.environ["BOARDD_STATE_ROOTS"] = old
+
+
+def test_ack_on_lane_with_no_open_asks_is_409(tmp_path):
+    """Second ack on a lane with nothing left to resolve must not return a
+    false 200 — that is the exact honesty failure state.py's invariants
+    guard against everywhere else."""
+    state_dir = _write_endpoint_env(tmp_path)
+    old = os.environ.get("BOARDD_STATE_ROOTS")
+    os.environ["BOARDD_STATE_ROOTS"] = f"monitor={state_dir}"
+    try:
+        r1 = client.post("/api/lanes/wiki-backfill/ack")
+        assert r1.status_code == 200, r1.text
+        r2 = client.post("/api/lanes/wiki-backfill/ack")
+        assert r2.status_code == 409, r2.text
+        assert r2.json()["detail"]
     finally:
         if old is None:
             os.environ.pop("BOARDD_STATE_ROOTS", None)

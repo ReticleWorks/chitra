@@ -183,14 +183,20 @@ artboards: three views behind a bottom tab bar.
   one-line now/ask summary reusing the same server-computed, honesty-marked
   text the wide layout already shows. Done lanes render at 0.72 opacity.
 - **Review.** One card per needs-feedback item, oldest first, with the
-  action pair its lane actually supports: an open ask gets a text box plus
-  Send answer and Acknowledge; `completion-disputed` and
-  `done-pending-verification` get Send back and Accept done; everything
+  action pair its lane actually supports: an open ask, or a status-only
+  item for `completion-disputed`/`done-pending-verification`, both get a
+  text box plus Send answer and Acknowledge — chitra-goals has no verb
+  that closes or disputes a done-pending lane (only `resolve-ask`, which
+  needs a literal open ask), so there is no "Accept done" or "Send back"
+  to offer; a status-only item with nothing to resolve reports that
+  honestly (see below), it does not pretend to change the lane. Everything
   else (`turn-finished-unverified`, or `blocked` with no literal ask) gets
-  Nudge and Open lane (switches to Lanes and scrolls to the card). A
-  successful action removes the card immediately; a failed one shows a
-  toast and leaves the card in place. The Review tab carries an
-  unread-count badge.
+  Nudge and Open lane (switches to Lanes and scrolls to the card); Nudge is
+  the same no-op-safe answer call, so it only succeeds when the lane
+  actually has an open ask to attach the note to. The card is removed only
+  when the server reports the lane actually changed; a no-op or failed
+  action shows a toast and leaves the card in place. The Review tab
+  carries an unread-count badge.
 - **Activity.** The same agenttrail iframe as the wide layout's Activity
   tab, loaded lazily when the tab is first opened.
 - **Monitor picker.** A bottom sheet (tap the monitor pill in the header)

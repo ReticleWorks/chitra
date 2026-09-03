@@ -291,7 +291,9 @@ async function postLaneAction(laneId, action, body) {
     headers: body ? { "content-type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,
   });
-  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `${action} failed`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.detail || `${action} failed`);
+  return data;
 }
 
 function renderNeeds() {
@@ -762,12 +764,19 @@ function mobileReviewCard(item) {
     showToast(String(err.message || err));
   };
 
+  // A no-op resolve (no open ask on the lane) now comes back as an error
+  // response, not a false 200 — postLaneAction throws and `fail` runs
+  // instead of removeCard. `result.changed` is checked too: the API
+  // contract promises it, even though today every 200 already implies it.
   if (kind === "nudge") {
     const nudgeBtn = el("button", { class: "m-review-btn quiet" }, "Nudge");
     nudgeBtn.addEventListener("click", async () => {
       nudgeBtn.disabled = true; nudgeBtn.textContent = "Sending…";
-      try { await postLaneAction(item.lane_id, "answer", { text: DEFAULT_NUDGE_TEXT }); removeCard(); }
-      catch (err) { fail(nudgeBtn, "Nudge", err); }
+      try {
+        const result = await postLaneAction(item.lane_id, "answer", { text: DEFAULT_NUDGE_TEXT });
+        if (result.changed) removeCard();
+        else fail(nudgeBtn, "Nudge", new Error("Nothing to nudge — no open ask on this lane."));
+      } catch (err) { fail(nudgeBtn, "Nudge", err); }
     });
     const openBtn = el("button", { class: "m-review-btn primary" }, "Open lane");
     openBtn.addEventListener("click", () => openLaneInLanes(item.lane_ref));
@@ -775,25 +784,34 @@ function mobileReviewCard(item) {
     return card;
   }
 
-  const input = el("input", {
-    class: "m-review-input", type: "text",
-    placeholder: kind === "disputed" ? "Reason for sending back" : "Type an answer",
-  });
-  const primaryLabel = kind === "disputed" ? "Send back" : "Send answer";
-  const secondaryLabel = kind === "disputed" ? "Accept done" : "Acknowledge";
-  const secondaryBtn = el("button", { class: kind === "disputed" ? "m-review-btn success" : "m-review-btn quiet" }, secondaryLabel);
+  // "disputed" (completion-disputed / done-pending-verification) only
+  // changes what the badge shows above; chitra-goals has no verb that
+  // closes or disputes a done-pending lane (only resolve-ask, which needs
+  // a literal open ask), so it gets the same ack/answer pair as "ask" —
+  // never the "Accept done"/"Send back" labels this UI used to show for
+  // an action the backend never actually took.
+  const input = el("input", { class: "m-review-input", type: "text", placeholder: "Type an answer" });
+  const primaryLabel = "Send answer";
+  const secondaryLabel = "Acknowledge";
+  const secondaryBtn = el("button", { class: "m-review-btn quiet" }, secondaryLabel);
   secondaryBtn.addEventListener("click", async () => {
     secondaryBtn.disabled = true; secondaryBtn.textContent = "…";
-    try { await postLaneAction(item.lane_id, "ack"); removeCard(); }
-    catch (err) { fail(secondaryBtn, secondaryLabel, err); }
+    try {
+      const result = await postLaneAction(item.lane_id, "ack");
+      if (result.changed) removeCard();
+      else fail(secondaryBtn, secondaryLabel, new Error("Nothing to acknowledge — no open ask on this lane."));
+    } catch (err) { fail(secondaryBtn, secondaryLabel, err); }
   });
   const primaryBtn = el("button", { class: "m-review-btn primary" }, primaryLabel);
   primaryBtn.addEventListener("click", async () => {
     const text = input.value.trim();
     if (!text) { input.focus(); return; }
     primaryBtn.disabled = true; primaryBtn.textContent = "…";
-    try { await postLaneAction(item.lane_id, "answer", { text }); removeCard(); }
-    catch (err) { fail(primaryBtn, primaryLabel, err); }
+    try {
+      const result = await postLaneAction(item.lane_id, "answer", { text });
+      if (result.changed) removeCard();
+      else fail(primaryBtn, primaryLabel, new Error("Nothing to answer — no open ask on this lane."));
+    } catch (err) { fail(primaryBtn, primaryLabel, err); }
   });
   card.append(input, el("div", { class: "m-review-acts" }, secondaryBtn, primaryBtn));
   return card;
