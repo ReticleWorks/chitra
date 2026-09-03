@@ -67,6 +67,64 @@ try {
 <div class="scrim" id="scrim" hidden></div>
 <aside class="drawer" id="drawer" hidden aria-modal="true" role="dialog"></aside>
 
+<!-- Mobile shell: single column under 600px. Desktop markup above stays as
+     the wider layout; CSS swaps the two at the 600px breakpoint. -->
+<div class="mobile-app" id="mobile-app">
+  <header class="m-header">
+    <div class="m-heading">
+      <div class="m-title" id="m-title">Lanes</div>
+      <div class="m-subtitle" id="m-subtitle"></div>
+    </div>
+    <button class="m-monitor-btn" id="m-monitor-btn" aria-label="Choose monitor">
+      <span class="m-dot" id="m-monitor-dot"></span>
+      <span id="m-monitor-label">Chitra</span>
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6l4 4 4-4"></path></svg>
+    </button>
+  </header>
+
+  <main class="m-main">
+    <section id="m-view-lanes">
+      <div class="m-chips" id="m-chips"></div>
+      <button class="m-banner" id="m-banner" hidden></button>
+      <div class="m-lanelist" id="m-lanelist"></div>
+    </section>
+
+    <section id="m-view-review" hidden>
+      <div class="m-reviewlist" id="m-reviewlist"></div>
+    </section>
+
+    <section id="m-view-activity" hidden>
+      <iframe class="m-trail-frame" id="m-trail-frame" title="agenttrail activity cards"></iframe>
+    </section>
+  </main>
+
+  <nav class="m-tabbar" id="m-tabbar" role="tablist">
+    <button class="m-tab on" id="m-tab-lanes" role="tab" aria-selected="true" data-tab="lanes">
+      <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="14" height="4" rx="1"></rect><rect x="3" y="12" width="14" height="4" rx="1"></rect></svg>
+      <span>Lanes</span>
+    </button>
+    <button class="m-tab" id="m-tab-review" role="tab" aria-selected="false" data-tab="review">
+      <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h12v8H9l-4 3v-3H4z"></path></svg>
+      <span>Review</span>
+      <span class="m-badge" id="m-review-badge" hidden>0</span>
+    </button>
+    <button class="m-tab" id="m-tab-activity" role="tab" aria-selected="false" data-tab="activity">
+      <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="6"></circle><path d="M10 7v3l2 2"></path></svg>
+      <span>Activity</span>
+    </button>
+  </nav>
+
+  <div class="m-toast" id="m-toast" hidden></div>
+</div>
+
+<div class="m-sheet-scrim" id="m-sheet-scrim" hidden></div>
+<div class="m-sheet" id="m-sheet" hidden role="dialog" aria-modal="true" aria-label="Choose monitors">
+  <div class="m-sheet-grab"></div>
+  <div class="m-sheet-label">Show lanes from</div>
+  <div class="m-sheet-rows" id="m-sheet-rows"></div>
+  <button class="m-sheet-apply" id="m-sheet-apply">Show all selected</button>
+</div>
+
 <script src="/static/app.js"></script>
 </body>
 </html>
