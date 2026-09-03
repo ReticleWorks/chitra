@@ -17,7 +17,7 @@ from chitra.autonomy import autonomy_policy_sha256
 from chitra.detect import Finding, IncidentStore, LadderDecision
 from chitra.detect.ladder import discover_consumption_proof, discover_delivery_consumption_proof
 from chitra.dispatch import directive_voice_violation, enqueue_dispatch_order
-from chitra.goals import GoalRecord, add_foreground_task
+from chitra.goals import GoalRecord, add_foreground_task, hold_goal
 from chitra.journal import CanonicalEvent
 from chitra.ledger import verify_delivery
 from chitra.orders import DispatchOrder, DispatchResult, DispatchStatus
@@ -38,6 +38,14 @@ class CorrectiveActionResult:
 
 
 DeliveryFailureDisposition = Literal["foreground_replan", "lifecycle_wait", "transport_retry"]
+
+# Persistent doggedness is a Chitra goal, so the escalation is capped, never
+# the pursuit: a lane whose transport keeps rejecting the same corrective
+# nudge stops retrying every ``retry_delay_seconds`` after this many
+# attempts and is instead held for foreground/operator attention (mirrors
+# ``rate_limit_guard._escalate_or_retry``'s cap-then-escalate shape).
+MAX_CORRECTIVE_RETRY_ATTEMPTS = 8
+MAX_CORRECTIVE_RETRY_DELAY_SECONDS = 3600.0
 
 
 def _autonomy_grant_summary(goal: GoalRecord) -> str:
@@ -205,15 +213,19 @@ def reconcile_corrective_action(
     ledger_path: Path | None = None,
     ledger_key_path: Path | None = None,
     retry_delay_seconds: float = 60.0,
+    max_attempts: int = MAX_CORRECTIVE_RETRY_ATTEMPTS,
 ) -> CorrectiveActionResult:
     """Persist, publish, or recover one correction without duplicate delivery.
 
     A failed delivery records its attempt and returns to the durable pursuit
-    loop after the retry delay. Attempts are evidence, never a reason to
-    abandon an unfinished goal.
+    loop after a backed-off retry delay. Attempts are evidence, never a
+    reason to abandon an unfinished goal -- but past ``max_attempts`` the
+    lane is held for foreground attention instead of nudging forever.
     """
     if retry_delay_seconds < 0:
         raise ValueError("retry_delay_seconds cannot be negative")
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
     ledger = SupervisionLedger(state_root, lane)
     digest = goal_digest(goal)
     marker = decision.record.order_marker
@@ -436,7 +448,47 @@ def reconcile_corrective_action(
             suffix = "foreground replan required" if failure_disposition == "foreground_replan" else "lifecycle wait required"
             return CorrectiveActionResult("blocked", order.order_id, marker, False, f"{reason}; {suffix}")
         next_attempt = attempt + 1
-        next_retry_at = (datetime.now(UTC) + timedelta(seconds=retry_delay_seconds)).isoformat()
+        if next_attempt >= max_attempts:
+            hold_reason = (
+                f"corrective-retry-exhausted: {next_attempt} attempts of stage "
+                f"{stage!r} for finding {finding.fingerprint} all ended in "
+                f"transport failure ({reason})"
+            )
+            hold_goal(state_root, goal.session_ref, reason=hold_reason)
+            if not (
+                latest is not None
+                and _same_action(latest, order, finding, stage)
+                and latest.state == "blocked"
+                and latest.obstacle == "retry_cap_exceeded"
+            ):
+                ledger.transition(
+                    state="blocked",
+                    session_ref=goal.session_ref,
+                    goal_version=goal.goal_version,
+                    goal_digest_value=digest,
+                    reason=reason,
+                    finding_fingerprint=finding.fingerprint,
+                    stage=stage,
+                    order_id=order.order_id,
+                    order_marker=marker,
+                    observed_event_id="",
+                    turn_boundary_event_id="",
+                    obstacle="retry_cap_exceeded",
+                    attempt=next_attempt,
+                    next_retry_at="",
+                )
+            return CorrectiveActionResult(
+                "blocked",
+                order.order_id,
+                marker,
+                False,
+                f"{reason}; retry cap of {max_attempts} exceeded, lane held: {hold_reason}",
+            )
+        # Backoff doubles with each attempt, capped so a permanently broken
+        # transport still gets checked on a bounded schedule rather than
+        # spinning at the base interval forever.
+        backoff_seconds = min(retry_delay_seconds * (2 ** (next_attempt - 1)), MAX_CORRECTIVE_RETRY_DELAY_SECONDS)
+        next_retry_at = (datetime.now(UTC) + timedelta(seconds=backoff_seconds)).isoformat()
         if not (
             latest is not None
             and _same_action(latest, order, finding, stage)

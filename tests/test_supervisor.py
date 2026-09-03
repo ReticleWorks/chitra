@@ -12,6 +12,7 @@ from chitra.goals import GoalRecord, get_goal, upsert_goal
 from chitra.orders import DispatchResult, DispatchStatus
 from chitra.supervision import SupervisionLedger, goal_digest
 from chitra.supervisor import (
+    MAX_CORRECTIVE_RETRY_ATTEMPTS,
     build_corrective_order,
     classify_delivery_failure,
     order_marker,
@@ -301,3 +302,30 @@ def test_sibling_finding_cannot_reset_an_action_retry_cursor(tmp_path: Path) -> 
     retry = build_corrective_order(goal, first_finding, first_decision, retry_attempt=1)
     assert resumed.enqueued is True
     assert resumed.order_id == retry.order_id
+
+
+def test_transport_retry_cap_holds_the_lane_instead_of_nudging_forever(tmp_path: Path) -> None:
+    goal, finding = _goal(), _finding()
+    goal = replace(goal, goal="Ship the bounded persistent supervisor safely today.", **enrollment_fields(goal.done_when))
+    decision = _decision(finding, action="open")
+    upsert_goal(tmp_path / "state", goal)
+
+    current_id = reconcile_corrective_action(**_kwargs(tmp_path, goal, finding, decision)).order_id  # type: ignore[arg-type]
+    capped = None
+    for _attempt in range(MAX_CORRECTIVE_RETRY_ATTEMPTS):
+        _write_result(tmp_path, current_id)
+        failed = reconcile_corrective_action(**_kwargs(tmp_path, goal, finding, decision))  # type: ignore[arg-type]
+        assert failed.state == "blocked"
+        if "retry cap" in failed.reason:
+            capped = failed
+            break
+        resumed = reconcile_corrective_action(**_kwargs(tmp_path, goal, finding, decision))  # type: ignore[arg-type]
+        assert resumed.enqueued is True
+        current_id = resumed.order_id
+
+    assert capped is not None, "the retry cap was never reached"
+    assert "lane held" in capped.reason
+    held = get_goal(tmp_path / "state", goal.session_ref)
+    assert held is not None
+    assert held.status == "held"
+    assert held.hold_reason.startswith("corrective-retry-exhausted")
