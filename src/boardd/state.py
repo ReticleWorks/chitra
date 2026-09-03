@@ -1,16 +1,19 @@
 """State loading and view building.
 
-boardd is a pure reader. This module reads the two daemon-owned files
-(goals.json, sweep-digest.json), never writes them, and builds the single
-view dict served by /api/state and pushed over SSE.
+boardd is a pure reader. This module reads goals.json (chitra.goals.v3,
+loaded through chitra's own GoalRecord validator so a v3 record is never
+hand-parsed twice) and sweep-digest.json (still boardd's own since chitra
+has no loader for it), never writes either, and builds the single view dict
+served by /api/state and pushed over SSE.
 
 Honesty rules enforced here, not in the template:
 - Agent-reported results always carry verified=False and the UI mark
   "Boardd has not verified this." There is no code path that sets
   verified=True without an evidence record.
 - A done-when condition renders as machine-tracked ONLY if the goal carries
-  an evidence binding for it. The mock state carries none, so every
-  condition says so in plain words.
+  a matching, passing chitra.completion_gate.CompletionEvidence record for
+  it. A lane with no enrolled_done_when_items falls back to its plain-text
+  done_when clauses, all honestly unbound.
 - Stale data states its age; ages are computed from file timestamps, never
   invented.
 """
@@ -21,8 +24,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from chitra.goals import GoalsSchemaNewerError, load_goals_document, session_name
+
 from .config import DIGEST_FILE, GOALS_FILE, STALE_AFTER_SECONDS
 from .translate import TranslationCache
+
+SCHEMA = "boardd.state.v2"
 
 # ---------------------------------------------------------------- loading
 
@@ -31,14 +38,36 @@ def load_state_files(state_dir: Path) -> dict[str, Any]:
     """Read the two state files. Missing or bad files are reported, not hidden."""
     errors: list[str] = []
     out: dict[str, Any] = {"goals": None, "digest": None, "errors": errors}
-    for name, slot in ((GOALS_FILE, "goals"), (DIGEST_FILE, "digest")):
-        p = state_dir / name
+
+    goals_path = state_dir / GOALS_FILE
+    try:
+        raw_doc: Any = json.loads(goals_path.read_text())
+    except FileNotFoundError:
+        errors.append(f"{GOALS_FILE} not found in {state_dir}")
+        raw_doc = None
+    except (json.JSONDecodeError, OSError) as e:
+        errors.append(f"{GOALS_FILE} unreadable: {e}")
+        raw_doc = None
+    if raw_doc is not None:
         try:
-            out[slot] = json.loads(p.read_text())
-        except FileNotFoundError:
-            errors.append(f"{name} not found in {state_dir}")
-        except (json.JSONDecodeError, OSError) as e:
-            errors.append(f"{name} unreadable: {e}")
+            records, schema = load_goals_document(state_dir, allow_newer=True)
+        except (ValueError, GoalsSchemaNewerError) as e:
+            errors.append(f"{GOALS_FILE} unreadable: {e}")
+        else:
+            out["goals"] = {
+                "schema": schema,
+                "updated_at": raw_doc.get("updated_at", "") if isinstance(raw_doc, dict) else "",
+                "note": raw_doc.get("note") if isinstance(raw_doc, dict) else None,
+                "goals": [record.to_dict() for record in records],
+            }
+
+    digest_path = state_dir / DIGEST_FILE
+    try:
+        out["digest"] = json.loads(digest_path.read_text())
+    except FileNotFoundError:
+        errors.append(f"{DIGEST_FILE} not found in {state_dir}")
+    except (json.JSONDecodeError, OSError) as e:
+        errors.append(f"{DIGEST_FILE} unreadable: {e}")
     return out
 
 
@@ -66,38 +95,65 @@ def split_conditions(done_when: str) -> list[str]:
     return [c.strip() for c in (done_when or "").split(";") if c.strip()]
 
 
-def build_done_when(goal: dict[str, Any], tc: TranslationCache) -> dict[str, Any]:
-    """Build the condition list with per-condition evidence labels.
+def _structured_proof(item: dict[str, Any], proofs: list[dict[str, Any]]) -> dict[str, str]:
+    """One enrolled_done_when_item's proof state, from completion_proofs.
 
-    Evidence bindings, when the daemons provide them, are expected as
-    goal["evidence"]: a list of {condition, verified, method, at}. The mock
-    state has none, so every condition is honestly unbound.
+    Mirrors the exact-match chain chitra.completion_gate.completion_receipt_issues
+    enforces before a lane may close: the item id, then its named receipt,
+    then its validator, then a passing result. boardd only reads this chain;
+    it never runs a validator or grants a passing result itself.
+    """
+    item_proofs = [p for p in proofs if p.get("done_when_item_id") == item.get("id")]
+    named = [p for p in item_proofs if p.get("receipt_name") == item.get("required_receipt")]
+    validated = [p for p in named if p.get("validator") == item.get("validator")]
+    passing = [p for p in validated if p.get("validator_result") == "pass"]
+    validator = item.get("validator", "an automatic check")
+    if passing:
+        return {
+            "state": "verified",
+            "label": f"Proven by {validator}, receipt {item.get('required_receipt')}.",
+        }
+    if validated:
+        return {
+            "state": "pending",
+            "label": f"Checked by {validator}; no passing result yet.",
+        }
+    return {
+        "state": "unbound",
+        "label": "Not checked automatically — no evidence source is linked. Needs review to call done.",
+    }
+
+
+def build_done_when(goal: dict[str, Any], tc: TranslationCache) -> dict[str, Any]:
+    """Build the condition list with per-condition proof labels.
+
+    A lane enrolled under chitra.goals.v3 with structured done items
+    (goal["enrolled_done_when_items"]) is checked against its
+    completion_proofs. A lane without structured items (legacy, or not yet
+    enrolled) falls back to its plain-text done_when clauses, which have no
+    machine binding and render honestly as unbound.
     """
     conditions: list[dict[str, Any]] = []
-    evidence = {e.get("condition"): e for e in goal.get("evidence", [])}
     proven = 0
     tracked = 0
-    for text in split_conditions(goal.get("done_when", "")):
-        ev = evidence.get(text)
-        if ev is None:
+    items = goal.get("enrolled_done_when_items") or []
+    proofs = goal.get("completion_proofs") or []
+    if items:
+        for item in items:
+            proof = _structured_proof(item, proofs)
+            if proof["state"] == "verified":
+                proven += 1
+                tracked += 1
+            elif proof["state"] == "pending":
+                tracked += 1
+            conditions.append({**tc.get(item.get("text", "")), "proof": proof})
+    else:
+        for text in split_conditions(goal.get("done_when", "")):
             proof = {
                 "state": "unbound",
                 "label": "Not checked automatically — no evidence source is linked. Needs review to call done.",
             }
-        elif ev.get("verified"):
-            proven += 1
-            tracked += 1
-            proof = {
-                "state": "verified",
-                "label": f"Proven by {ev.get('method', 'an automatic check')} at {ev.get('at', 'an unrecorded time')}.",
-            }
-        else:
-            tracked += 1
-            proof = {
-                "state": "pending",
-                "label": f"Checked automatically by {ev.get('method', 'an automatic check')}; no passing evidence yet.",
-            }
-        conditions.append({**tc.get(text), "proof": proof})
+            conditions.append({**tc.get(text), "proof": proof})
 
     total = len(conditions)
     unproven = total - proven
@@ -141,8 +197,14 @@ STATUS_PILLS = {
     "blocked": ("bad", "Blocked"),
     "idle": ("warn", "Quiet"),
     "turn-finished-unverified": ("warn", "Awaiting audit"),
+    "completion-disputed": ("bad", "Completion disputed"),
     "done-pending-verification": ("ok", "Done, pending proof"),
+    "done-pending-close": ("ok", "Done, pending close"),
 }
+
+# The four statuses that always belong in the needs-feedback review queue,
+# whether or not the lane also carries an open ask.
+REVIEW_STATUSES = {"completion-disputed", "done-pending-verification", "turn-finished-unverified", "blocked"}
 
 
 def build_movement(goal: dict[str, Any], tc: TranslationCache) -> dict[str, Any]:
@@ -156,8 +218,12 @@ def build_movement(goal: dict[str, Any], tc: TranslationCache) -> dict[str, Any]
         sentence = hold["text"]
     elif status == "turn-finished-unverified":
         sentence = "The agent reports its turn finished. The completion audit has not confirmed it."
+    elif status == "completion-disputed":
+        sentence = "The agent claims this is done. The registered validator did not confirm a passing receipt."
     elif status == "done-pending-verification":
         sentence = "The work is reported done; the proof window is still running."
+    elif status == "done-pending-close":
+        sentence = "The work is proven done and is waiting on your close."
     elif status == "idle":
         sentence = "No session is active on this lane."
     else:
@@ -222,14 +288,18 @@ def build_view(state_dir: Path, tc: TranslationCache, now: datetime | None = Non
     needs_you = []
     for g in goals_doc.get("goals", []):
         ref = g.get("session_ref", "")
+        lane_id = g.get("lane_id") or session_name(ref)
         movement = build_movement(g, tc)
         done_when = build_done_when(g, tc)
         scope = build_scope(g, tc)
         latest = latest_by_lane.get(ref)
         asks = [tc.get(a) for a in g.get("open_asks", [])]
+        status = g.get("status", "unknown")
+        needs_review = status in REVIEW_STATUSES or bool(asks)
         lane = {
             "session_ref": ref,
-            "title": g.get("title", ref),
+            "lane_id": lane_id,
+            "title": session_name(ref) if ref else lane_id,
             "goal": tc.get(g.get("goal", "")),
             "intent": tc.get(g.get("intent", "")) if g.get("intent") else None,
             "movement": movement,
@@ -238,18 +308,47 @@ def build_view(state_dir: Path, tc: TranslationCache, now: datetime | None = Non
             "scope": scope,
             "open_asks": asks,
             "goal_version": g.get("goal_version"),
-            "updated_ts": (latest or {}).get("ts") or (goals_at.isoformat() if goals_at else None),
+            "needs_review": needs_review,
+            "updated_ts": (latest or {}).get("ts") or g.get("updated_at") or (goals_at.isoformat() if goals_at else None),
         }
         lanes.append(lane)
-        for ask in asks:
+        if not needs_review:
+            continue
+        since = g.get("updated_at") or lane["updated_ts"]
+        if asks:
+            for ask in asks:
+                needs_you.append(
+                    {
+                        "lane_ref": ref,
+                        "lane_id": lane_id,
+                        "lane_title": lane["title"],
+                        "goal": lane["goal"],
+                        "question": ask,
+                        "context": movement["sentence"],
+                        "since": since,
+                    }
+                )
+        else:
+            # A status-triggered review item carries no literal ask text;
+            # boardd's own plain-words reason stands in for one, marked as
+            # already-translated so it never shows the "not yet translated"
+            # mark that belongs to raw session lines.
+            reason = f"Status is {STATUS_PILLS.get(status, ('', status))[1].lower()} — needs review."
             needs_you.append(
                 {
                     "lane_ref": ref,
+                    "lane_id": lane_id,
                     "lane_title": lane["title"],
-                    "question": ask,
+                    "goal": lane["goal"],
+                    "question": {"text": reason, "raw": reason, "translated": True},
                     "context": movement["sentence"],
+                    "since": since,
                 }
             )
+    # Oldest ask first. "since" is the record's own last-write time — v3
+    # carries no per-ask timestamp, so this is the closest honest proxy for
+    # how long a lane has been waiting on the operator.
+    needs_you.sort(key=lambda item: item["since"] or "")
 
     counts: dict[str, int] = {}
     for lane in lanes:
@@ -259,7 +358,7 @@ def build_view(state_dir: Path, tc: TranslationCache, now: datetime | None = Non
     data_stale = goals_age is not None and goals_age > STALE_AFTER_SECONDS
 
     return {
-        "schema": "boardd.state.v1",
+        "schema": SCHEMA,
         "generated_at": now.isoformat(),
         "source": {
             "state_dir": str(state_dir),
@@ -314,7 +413,9 @@ def summary_sentence(counts: dict[str, int], total: int) -> str:
         ("blocked", "blocked"),
         ("idle", "quiet"),
         ("turn-finished-unverified", "awaiting a completion audit"),
+        ("completion-disputed", "disputed"),
         ("done-pending-verification", "done pending proof"),
+        ("done-pending-close", "done pending close"),
     ):
         n = counts.get(status, 0)
         if n:

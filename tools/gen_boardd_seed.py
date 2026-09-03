@@ -94,6 +94,8 @@ TRANSLATIONS: dict[str, str] = {
         "Four injects are drafted. Inject 4 names a real vendor; at review you decide whether to keep the name with a disclaimer or make it fictional.",
     "waiting on operator time for inject review":
         "Waiting for your time to review the injects.",
+    "agent claims the pack is delivered; the registered validator did not confirm a passing receipt":
+        "The agent claims the pack is delivered. The registered validator did not confirm a passing result.",
     "all injects drafted in template voice": "Every inject is drafted in the template voice.",
     "legal review notes resolved": "Every legal-review note is resolved.",
     "pack delivered to the competition folder": "The pack is delivered to the competition folder.",
@@ -146,6 +148,8 @@ TRANSLATIONS: dict[str, str] = {
     "all three models run on the same sample": "All three models have run on the same sample.",
     "retrieval quality table produced": "The retrieval-quality comparison table is produced.",
     "recommendation memo written": "The recommendation memo is written.",
+    "all three models ran; the recommendation memo is written and awaiting the operator's close":
+        "All three models ran. The recommendation memo is written and is waiting for your close.",
     "Pick the rebuild embedder on evidence, not vibes":
         "Pick the rebuild's embedding model on evidence, not vibes.",
 

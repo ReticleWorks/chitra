@@ -1,7 +1,9 @@
 # boardd — live fleet dashboard (DRAFT unit, NOT deployed).
 #
-# Target host: twinridge. boardd is a pure reader over the chitra state dir;
-# it must never gain write access to /var/lib/polyphony-chitra.
+# Target host: twinridge. boardd reads every chitra state root and, through
+# the chitra-goals CLI only, writes ack/answer resolutions back into each
+# lane's goals.json — it never writes any other fleet state and never spawns
+# sessions.
 #
 # Deploy checklist (see docs/boardd.md):
 #   - install the app + venv at /opt/boardd (released artifact, not a checkout)
@@ -15,21 +17,33 @@ Wants=network-online.target
 
 [Service]
 Type=exec
-# Dedicated non-privileged user; must NOT be the chitra daemon user.
+# Dedicated non-privileged user; must NOT be the chitra daemon user. It
+# joins the chitra group only for state-directory write access — it holds
+# no other chitra-group privilege.
 User=boardd
 Group=boardd
+SupplementaryGroups=chitra
 Environment=BOARDD_STATE_DIR=/var/lib/polyphony-chitra
 ExecStart=/opt/boardd/venv/bin/uvicorn boardd.app:app --host 100.0.0.0 --port 8480
 # ^ replace 100.0.0.0 with twinridge's tailnet address at deploy time; never 0.0.0.0.
 Restart=on-failure
 RestartSec=3
 
-# Hardening: reader-only posture, enforced by the kernel not by promise.
+# Hardening: kernel-enforced, not a promise. ProtectSystem=strict makes the
+# whole filesystem read-only except what is listed below.
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 NoNewPrivileges=true
-ReadOnlyPaths=/var/lib/polyphony-chitra
+# boardd's write endpoints shell out to `chitra-goals resolve-ask`, which
+# rewrites goals.json in whichever monitor root a lane lives on. Monitor
+# roots are discovered at runtime (/var/lib/polyphony-chitra, then a sibling
+# /var/lib/polyphony-chitra-<id> per monitor instance) — systemd's path
+# directives take no glob, so the ids cannot be listed here in advance.
+# /var/lib is the narrowest directive systemd offers that still covers every
+# present and future sibling; ProtectSystem=strict already keeps everything
+# outside /var/lib (and the other paths below) read-only or inaccessible.
+ReadWritePaths=/var/lib
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 MemoryDenyWriteExecute=true

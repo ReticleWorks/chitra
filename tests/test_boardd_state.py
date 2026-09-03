@@ -19,19 +19,46 @@ def view():
 
 
 def test_all_lanes_load(view):
-    assert view["schema"] == "boardd.state.v1"
-    assert view["source"]["goals_schema"] == "chitra.goals.v1"
+    assert view["schema"] == "boardd.state.v2"
+    assert view["source"]["goals_schema"] == "chitra.goals.v3"
     assert view["source"]["errors"] == []
     assert len(view["lanes"]) == 10
     assert view["summary"]["lane_count"] == 10
 
 
-def test_needs_you_comes_from_open_asks(view):
-    # Fixture state: boardd-build has 2 asks, wiki-backfill has 1.
+def test_needs_you_comes_from_open_asks_and_review_statuses(view):
+    # Fixture state: boardd-build has 2 asks, wiki-backfill has 1. The three
+    # review-queue statuses without asks (completion-disputed, turn-finished-
+    # unverified, done-pending-verification) each contribute one status-only item.
     refs = [n["lane_ref"] for n in view["needs_you"]]
     assert refs.count("twinridge:boardd-build") == 2
     assert refs.count("tophand:wiki-backfill") == 1
-    assert len(view["needs_you"]) == 3
+    assert refs.count("twinridge:c912-scenarios") == 1
+    assert refs.count("trailhead:feeds-service") == 1
+    assert refs.count("twinridge:ws-paper") == 1
+    assert len(view["needs_you"]) == 6
+
+
+def test_needs_you_sorted_oldest_first(view):
+    since = [n["since"] for n in view["needs_you"]]
+    assert since == sorted(since)
+
+
+def test_needs_you_status_only_items_have_plain_reason(view):
+    item = next(n for n in view["needs_you"] if n["lane_ref"] == "twinridge:c912-scenarios")
+    assert item["question"]["translated"] is True
+    assert "needs review" in item["question"]["text"].lower()
+
+
+def test_needs_review_badge_on_lanes(view):
+    flagged = {ln["session_ref"] for ln in view["lanes"] if ln["needs_review"]}
+    assert flagged == {
+        "twinridge:boardd-build",
+        "tophand:wiki-backfill",
+        "twinridge:c912-scenarios",
+        "trailhead:feeds-service",
+        "twinridge:ws-paper",
+    }
 
 
 def test_scope_delta_detected_on_ws_paper(view):
@@ -48,13 +75,27 @@ def test_no_scope_delta_when_same(view):
 
 
 def test_nothing_masquerades_as_tracked(view):
-    """Fixture state has no evidence bindings, so no condition may render as
-    machine-tracked and none may be counted proven."""
+    """Every lane except ws-paper (structured items, exercised below) has no
+    enrolled_done_when_items, so its plain-text clauses stay honestly unbound."""
     for lane in view["lanes"]:
+        if lane["session_ref"] == "twinridge:ws-paper":
+            continue
         assert lane["done_when"]["proven"] == 0
         for cond in lane["done_when"]["conditions"]:
             assert cond["proof"]["state"] == "unbound"
             assert "no evidence source is linked" in cond["proof"]["label"].lower()
+
+
+def test_structured_done_when_items_read_completion_proofs(view):
+    """ws-paper carries two enrolled_done_when_items: one has a passing
+    completion_proof (verified), the other has none (unbound)."""
+    lane = next(ln for ln in view["lanes"] if ln["session_ref"] == "twinridge:ws-paper")
+    done_when = lane["done_when"]
+    assert done_when["total"] == 2
+    assert done_when["proven"] == 1
+    states = {c["raw"]: c["proof"]["state"] for c in done_when["conditions"]}
+    assert states["all reviewer 2 comments dispositioned"] == "verified"
+    assert states["sections 3 and 5 rewritten"] == "unbound"
 
 
 def test_banned_phrasing_absent(view):

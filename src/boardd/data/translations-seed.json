@@ -63,10 +63,6 @@
     "raw": "capped Needs-you zone and change rail",
     "text": "The needs-you zone and the change list both have size caps."
   },
-  "fe4784a612fbf38cbf8e643c511b612654cc4c1619e83109aec7b37a9d1ca34f": {
-    "raw": "phone filter",
-    "text": "The phone view has a lane filter."
-  },
   "c0c900c73edfc6704e8289afb8ca99cd79324ca62bd7637ee3dc993a04b9309e": {
     "raw": "translation cache with raw fallback",
     "text": "Translations are cached by line, and the raw line shows when no translation exists."
@@ -139,13 +135,9 @@
     "raw": "Produce the v2 scenario pack through the scenario pipeline with reviewer notes resolved.",
     "text": "Produce the version 2 scenario pack through the scenario pipeline, with every reviewer note resolved."
   },
-  "5121de879be18475d80b706226a46ac9fd7bf82488dc6a523c1dbf8d1a4bc85a": {
-    "raw": "four injects drafted; inject 4 names a real vendor and needs a keep-with-disclaimer or fictionalize call at review",
-    "text": "Four injects are drafted. Inject 4 names a real vendor; at review you decide whether to keep the name with a disclaimer or make it fictional."
-  },
-  "2663b8d0336073518f5508541f0fbc4b91c42bad0dbd56e750277b1dc2a77098": {
-    "raw": "waiting on operator time for inject review",
-    "text": "Waiting for your time to review the injects."
+  "9c4dc72a2efca570311e6007035041d5158ea9ca18803cc265a4eb1945677658": {
+    "raw": "agent claims the pack is delivered; the registered validator did not confirm a passing receipt",
+    "text": "The agent claims the pack is delivered. The registered validator did not confirm a passing result."
   },
   "4d81e8d5053dffa029f6cfbad324d68039766f0c736447786be70424db29490d": {
     "raw": "Competition-ready scenario pack",
@@ -243,13 +235,9 @@
     "raw": "Compare three embedding models on the corpus sample before the Atlas corpus rebuild.",
     "text": "Compare three embedding models on the corpus sample before the Atlas corpus is rebuilt."
   },
-  "129660539a230b430149cc955af602b90053c8809837cda6033bcd3b2b336421": {
-    "raw": "first model finished its sample run; results file verified",
-    "text": "The first model finished its sample run, and the results file is present and checked."
-  },
-  "112ae3640d18c740ed89ad32b52f7677af6ff45e76ac3bb3c30847146220e710": {
-    "raw": "rate-limit window until 18:00; second model queued",
-    "text": "Inside a rate-limit window until 18:00, with the second model queued. This is scheduled, not stuck."
+  "d9b2eaf011f01bf65f692afefb5be8a86994c2446545310c770910bd5ce749c0": {
+    "raw": "all three models ran; the recommendation memo is written and awaiting the operator's close",
+    "text": "All three models ran. The recommendation memo is written and is waiting for your close."
   },
   "fad99882b646b1b56cbb3a44b4a53c152692db19d7a3337d14b20a09763ca8a9": {
     "raw": "Pick the rebuild embedder on evidence, not vibes",

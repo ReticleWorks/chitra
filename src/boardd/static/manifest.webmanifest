@@ -1,0 +1,10 @@
+{
+  "name": "boardd — Chitra fleet dashboard",
+  "short_name": "boardd",
+  "description": "Live Chitra fleet dashboard",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "icons": []
+}

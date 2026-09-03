@@ -1,140 +1,1505 @@
 {
-  "schema": "chitra.goals.v1",
+  "schema": "chitra.goals.v3",
   "updated_at": "2026-08-08T16:40:00-04:00",
   "note": "SIMULATION roster. Lanes mirror real open Polyphony work; states are frozen mock snapshots, not live.",
   "goals": [
     {
       "session_ref": "roundtop:ramble-build",
-      "title": "Ramble skill and intent path",
       "goal": "Build the ramble skill (conversation contract, five routes, RCP v1 outbox format) and the sync step that turns flushed batches into dispatchd orders for the monitor.",
       "done_when": "skill merged; RCP validator merged in the chitra repo; a live flushed batch lands as a dispatchd order and the monitor's decision appears in the decision log; research route ships disabled until the dispatchd retry fix is applied on twinridge",
-      "enrolled_done_when": "same as done_when",
+      "source": "task-file:PLAN.md",
+      "status": "working",
+      "lane_id": "",
+      "enrolled_done_when": "",
+      "enrolled_at": "",
       "intent": "Give the operator a conversational sorting surface that files governed intents instead of doing work",
       "scope": "skill + outbox + validator + monitor doctrine paragraphs; boardd is a separate lane",
-      "status": "working",
+      "goal_version": 2,
+      "goal_history": [],
       "now": "conversation-contract simulation running with the operator; findings feed the skill draft",
+      "last_verified": "",
+      "created_at": "2026-08-08T16:40:00-04:00",
+      "updated_at": "2026-08-08T14:20:00-04:00",
       "open_asks": [],
-      "goal_version": 2
+      "retired_asks": [],
+      "needs": "",
+      "hold_reason": "",
+      "resume_at": "",
+      "successor_of": "",
+      "transferred_to": "",
+      "interview_receipt": null,
+      "enrolled_done_when_items": [],
+      "completion_proofs": [],
+      "autonomy_policy": {
+        "schema": "chitra.autonomy.v1",
+        "initiative": "aggressive",
+        "idle_pursuit_passes": 1,
+        "loop_interval_minutes": 5,
+        "grants": [
+          {
+            "grant_id": "default-replan",
+            "capability": "replan",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-small-redesign",
+            "capability": "small_redesign",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-dependency-change",
+            "capability": "dependency_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-schema-change",
+            "capability": "schema_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-hook-change",
+            "capability": "hook_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-credential-use",
+            "capability": "credential_use",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-authentication",
+            "capability": "authentication",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-security-change",
+            "capability": "security_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-irreversible-action",
+            "capability": "irreversible_action",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-spend",
+            "capability": "spend",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          }
+        ]
+      },
+      "foreground_tasks": []
     },
     {
       "session_ref": "twinridge:boardd-build",
-      "title": "boardd live fleet dashboard",
       "goal": "Build boardd: a tailnet web dashboard reading the chitra state dir, pushing per-change updates, translating agent updates to plain technical English at render time.",
-      "done_when": "SSE server deployed on twinridge with a tool-registry entry; identical-wording rulings; three degraded states; 15-lane condensed mode; capped Needs-you zone and change rail; phone filter; translation cache with raw fallback; JSON state endpoint; artifact board retired after N clean days",
-      "enrolled_done_when": "same as done_when",
+      "done_when": "SSE server deployed on twinridge with a tool-registry entry; identical-wording rulings; three degraded states; 15-lane condensed mode; capped Needs-you zone and change rail; translation cache with raw fallback; JSON state endpoint; artifact board retired after N clean days",
+      "source": "task-file:PLAN.md",
+      "status": "held",
+      "lane_id": "",
+      "enrolled_done_when": "",
+      "enrolled_at": "",
       "intent": "Move fleet visibility out of chat onto a glanceable board built for the operator",
       "scope": "pure reader; never writes fleet state; never spawns sessions",
-      "status": "held",
-      "hold_reason": "awaiting operator acceptance of the v3 visual mockups and go on the build plan",
+      "goal_version": 1,
+      "goal_history": [],
       "now": "v3 mockups published with Linear and Vercel derived visual language",
-      "open_asks": ["Accept the dashboard direction?", "Go on the five-step build?"],
-      "goal_version": 1
+      "last_verified": "",
+      "created_at": "2026-08-08T16:40:00-04:00",
+      "updated_at": "2026-08-08T15:30:00-04:00",
+      "open_asks": [
+        "Accept the dashboard direction?",
+        "Go on the five-step build?"
+      ],
+      "retired_asks": [],
+      "needs": "",
+      "hold_reason": "awaiting operator acceptance of the v3 visual mockups and go on the build plan",
+      "resume_at": "",
+      "successor_of": "",
+      "transferred_to": "",
+      "interview_receipt": null,
+      "enrolled_done_when_items": [],
+      "completion_proofs": [],
+      "autonomy_policy": {
+        "schema": "chitra.autonomy.v1",
+        "initiative": "aggressive",
+        "idle_pursuit_passes": 1,
+        "loop_interval_minutes": 5,
+        "grants": [
+          {
+            "grant_id": "default-replan",
+            "capability": "replan",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-small-redesign",
+            "capability": "small_redesign",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-dependency-change",
+            "capability": "dependency_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-schema-change",
+            "capability": "schema_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-hook-change",
+            "capability": "hook_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-credential-use",
+            "capability": "credential_use",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-authentication",
+            "capability": "authentication",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-security-change",
+            "capability": "security_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-irreversible-action",
+            "capability": "irreversible_action",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-spend",
+            "capability": "spend",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          }
+        ]
+      },
+      "foreground_tasks": []
     },
     {
       "session_ref": "tophand:chitra-deploy",
-      "title": "Chitra daemon fixes to production",
       "goal": "Land chitra PR 27 (blocked-order retry, config-crash survival, unit env drift guard, README fixes) and deploy the fixed daemons to twinridge.",
       "done_when": "PR 27 merged green; new version deployed to twinridge; a lock-blocked order observed retrying from deferred/ on the live host",
-      "enrolled_done_when": "same as done_when",
+      "source": "task-file:PLAN.md",
+      "status": "working",
+      "lane_id": "",
+      "enrolled_done_when": "",
+      "enrolled_at": "",
       "intent": "Close the silent-loss hole before Ramble's research route ships",
       "scope": "the four PR-27 defects only",
-      "status": "working",
+      "goal_version": 1,
+      "goal_history": [],
       "now": "merge watcher on CI; checks were queued at last look; deploy step prepared behind the merge",
+      "last_verified": "",
+      "created_at": "2026-08-08T16:40:00-04:00",
+      "updated_at": "2026-08-08T16:10:00-04:00",
       "open_asks": [],
-      "goal_version": 1
+      "retired_asks": [],
+      "needs": "",
+      "hold_reason": "",
+      "resume_at": "",
+      "successor_of": "",
+      "transferred_to": "",
+      "interview_receipt": null,
+      "enrolled_done_when_items": [],
+      "completion_proofs": [],
+      "autonomy_policy": {
+        "schema": "chitra.autonomy.v1",
+        "initiative": "aggressive",
+        "idle_pursuit_passes": 1,
+        "loop_interval_minutes": 5,
+        "grants": [
+          {
+            "grant_id": "default-replan",
+            "capability": "replan",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-small-redesign",
+            "capability": "small_redesign",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-dependency-change",
+            "capability": "dependency_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-schema-change",
+            "capability": "schema_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-hook-change",
+            "capability": "hook_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-credential-use",
+            "capability": "credential_use",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-authentication",
+            "capability": "authentication",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-security-change",
+            "capability": "security_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-irreversible-action",
+            "capability": "irreversible_action",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-spend",
+            "capability": "spend",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          }
+        ]
+      },
+      "foreground_tasks": []
     },
     {
       "session_ref": "tophand:atlas-ingest",
-      "title": "Atlas incremental ingestion",
       "goal": "Give Atlas an incremental ingestion trigger so harvested records load without a manual full-pipeline run.",
       "done_when": "a harvest completion triggers ingestion automatically; record_id dedup holds; post-load counts match the harvest manifest",
-      "enrolled_done_when": "same as done_when",
-      "intent": "Stop harvests from piling up unloaded; harvest currently retrieves but nothing calls the loader",
-      "scope": "trigger + dedup only; no changes to harvest scoring",
+      "source": "task-file:PLAN.md",
       "status": "idle",
+      "lane_id": "",
+      "enrolled_done_when": "",
+      "enrolled_at": "",
+      "intent": "Stop harvests from piling up unloaded; harvest currently retrieves but nothing calls the loader",
+      "scope": "ingestion trigger only; harvest pipeline itself is out of scope",
+      "goal_version": 1,
+      "goal_history": [],
       "now": "no active session since the compute-graph root cause closed; the known gap is that nothing invokes ingestion after harvest",
+      "last_verified": "",
+      "created_at": "2026-08-08T16:40:00-04:00",
+      "updated_at": "2026-08-08T11:05:00-04:00",
       "open_asks": [],
-      "goal_version": 1
+      "retired_asks": [],
+      "needs": "",
+      "hold_reason": "",
+      "resume_at": "",
+      "successor_of": "",
+      "transferred_to": "",
+      "interview_receipt": null,
+      "enrolled_done_when_items": [],
+      "completion_proofs": [],
+      "autonomy_policy": {
+        "schema": "chitra.autonomy.v1",
+        "initiative": "aggressive",
+        "idle_pursuit_passes": 1,
+        "loop_interval_minutes": 5,
+        "grants": [
+          {
+            "grant_id": "default-replan",
+            "capability": "replan",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-small-redesign",
+            "capability": "small_redesign",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-dependency-change",
+            "capability": "dependency_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-schema-change",
+            "capability": "schema_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-hook-change",
+            "capability": "hook_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-credential-use",
+            "capability": "credential_use",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-authentication",
+            "capability": "authentication",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-security-change",
+            "capability": "security_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-irreversible-action",
+            "capability": "irreversible_action",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-spend",
+            "capability": "spend",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          }
+        ]
+      },
+      "foreground_tasks": []
     },
     {
       "session_ref": "twinridge:c912-scenarios",
-      "title": "Cyber 9/12 scenario pipeline v2",
       "goal": "Produce the v2 scenario pack through the scenario pipeline with reviewer notes resolved.",
       "done_when": "all injects drafted in template voice; legal review notes resolved; pack delivered to the competition folder",
-      "enrolled_done_when": "same as done_when",
+      "source": "task-file:PLAN.md",
+      "status": "completion-disputed",
+      "lane_id": "",
+      "enrolled_done_when": "",
+      "enrolled_at": "",
       "intent": "Competition-ready scenario pack",
-      "scope": "writing and review only; no pipeline code changes in this lane",
-      "status": "held",
-      "hold_reason": "waiting on operator time for inject review",
-      "now": "four injects drafted; inject 4 names a real vendor and needs a keep-with-disclaimer or fictionalize call at review",
+      "scope": "the v2 pack only; the pipeline itself is out of scope",
+      "goal_version": 1,
+      "goal_history": [],
+      "now": "agent claims the pack is delivered; the registered validator did not confirm a passing receipt",
+      "last_verified": "",
+      "created_at": "2026-08-08T16:40:00-04:00",
+      "updated_at": "2026-08-08T12:40:00-04:00",
       "open_asks": [],
-      "goal_version": 1
+      "retired_asks": [],
+      "needs": "",
+      "hold_reason": "",
+      "resume_at": "",
+      "successor_of": "",
+      "transferred_to": "",
+      "interview_receipt": null,
+      "enrolled_done_when_items": [],
+      "completion_proofs": [],
+      "autonomy_policy": {
+        "schema": "chitra.autonomy.v1",
+        "initiative": "aggressive",
+        "idle_pursuit_passes": 1,
+        "loop_interval_minutes": 5,
+        "grants": [
+          {
+            "grant_id": "default-replan",
+            "capability": "replan",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-small-redesign",
+            "capability": "small_redesign",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-dependency-change",
+            "capability": "dependency_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-schema-change",
+            "capability": "schema_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-hook-change",
+            "capability": "hook_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-credential-use",
+            "capability": "credential_use",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-authentication",
+            "capability": "authentication",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-security-change",
+            "capability": "security_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-irreversible-action",
+            "capability": "irreversible_action",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-spend",
+            "capability": "spend",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          }
+        ]
+      },
+      "foreground_tasks": []
     },
     {
       "session_ref": "tophand:harvest-elec",
-      "title": "Election infrastructure source corpus",
       "goal": "Build a scored corpus of 120 full-text sources on election infrastructure security via the source-harvest pipeline.",
       "done_when": "120 sources at quality 4 or better indexed; audit pass complete; validation pass over the whole kept set; final report written",
-      "enrolled_done_when": "same as done_when",
-      "intent": "Primary-source base for the fall research push",
-      "scope": "harvest and score only; no synthesis writing in this lane",
+      "source": "task-file:PLAN.md",
       "status": "working",
+      "lane_id": "",
+      "enrolled_done_when": "",
+      "enrolled_at": "",
+      "intent": "Primary-source base for the fall research push",
+      "scope": "the 120-source target and its audit and validation passes",
+      "goal_version": 1,
+      "goal_history": [],
       "now": "collectors fetched 87 of 120 candidates; 14 paywalled DOIs queued for the escape ladder; HTML extraction quality flagged low on 9 records",
+      "last_verified": "",
+      "created_at": "2026-08-08T16:40:00-04:00",
+      "updated_at": "2026-08-08T16:31:00-04:00",
       "open_asks": [],
-      "goal_version": 3
+      "retired_asks": [],
+      "needs": "",
+      "hold_reason": "",
+      "resume_at": "",
+      "successor_of": "",
+      "transferred_to": "",
+      "interview_receipt": null,
+      "enrolled_done_when_items": [],
+      "completion_proofs": [],
+      "autonomy_policy": {
+        "schema": "chitra.autonomy.v1",
+        "initiative": "aggressive",
+        "idle_pursuit_passes": 1,
+        "loop_interval_minutes": 5,
+        "grants": [
+          {
+            "grant_id": "default-replan",
+            "capability": "replan",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-small-redesign",
+            "capability": "small_redesign",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-dependency-change",
+            "capability": "dependency_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-schema-change",
+            "capability": "schema_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-hook-change",
+            "capability": "hook_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-credential-use",
+            "capability": "credential_use",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-authentication",
+            "capability": "authentication",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-security-change",
+            "capability": "security_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-irreversible-action",
+            "capability": "irreversible_action",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-spend",
+            "capability": "spend",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          }
+        ]
+      },
+      "foreground_tasks": []
     },
     {
       "session_ref": "twinridge:ws-paper",
-      "title": "Workshop paper revision",
       "goal": "Revise the workshop paper until every reviewer 2 comment has a written disposition.",
       "done_when": "all reviewer 2 comments dispositioned; sections 3 and 5 rewritten; gaps pass rerun clean; voice-fix pass done",
-      "enrolled_done_when": "all reviewer 2 comments dispositioned; all reviewer 3 optional comments dispositioned; sections 3 and 5 rewritten; gaps pass rerun clean; voice-fix pass done",
-      "intent": "Resubmission-ready draft",
-      "scope": "reviewer 2 mandatory comments; reviewer 3 optionals were descoped by operator ruling 08-05",
+      "source": "task-file:PLAN.md",
       "status": "turn-finished-unverified",
+      "lane_id": "",
+      "enrolled_done_when": "all reviewer 2 comments dispositioned; all reviewer 3 optional comments dispositioned; sections 3 and 5 rewritten; gaps pass rerun clean; voice-fix pass done",
+      "enrolled_at": "",
+      "intent": "Resubmission-ready draft",
+      "scope": "reviewer 2's comments; reviewer 3's are optional and were dropped",
+      "goal_version": 2,
+      "goal_history": [],
       "now": "agent reports section 5 rewrite complete; completion audit queued",
+      "last_verified": "",
+      "created_at": "2026-08-08T16:40:00-04:00",
+      "updated_at": "2026-08-08T16:22:00-04:00",
       "open_asks": [],
-      "goal_version": 3
+      "retired_asks": [],
+      "needs": "",
+      "hold_reason": "",
+      "resume_at": "",
+      "successor_of": "",
+      "transferred_to": "",
+      "interview_receipt": null,
+      "enrolled_done_when_items": [
+        {
+          "id": "ws-paper-r2-dispositioned",
+          "text": "all reviewer 2 comments dispositioned",
+          "validator": "suite",
+          "required_receipt": "r2-dispositioned.json"
+        },
+        {
+          "id": "ws-paper-sections-rewritten",
+          "text": "sections 3 and 5 rewritten",
+          "validator": "suite",
+          "required_receipt": "sections-rewritten.json"
+        }
+      ],
+      "completion_proofs": [
+        {
+          "kind": "artifact",
+          "citation": "tests/fixtures/boardd_state/ws-paper/r2-dispositioned.json",
+          "todo_item": null,
+          "done_when_item_id": "ws-paper-r2-dispositioned",
+          "receipt_name": "r2-dispositioned.json",
+          "validator": "suite",
+          "validator_result": "pass"
+        }
+      ],
+      "autonomy_policy": {
+        "schema": "chitra.autonomy.v1",
+        "initiative": "aggressive",
+        "idle_pursuit_passes": 1,
+        "loop_interval_minutes": 5,
+        "grants": [
+          {
+            "grant_id": "default-replan",
+            "capability": "replan",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-small-redesign",
+            "capability": "small_redesign",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-dependency-change",
+            "capability": "dependency_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-schema-change",
+            "capability": "schema_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-hook-change",
+            "capability": "hook_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-credential-use",
+            "capability": "credential_use",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-authentication",
+            "capability": "authentication",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-security-change",
+            "capability": "security_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-irreversible-action",
+            "capability": "irreversible_action",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-spend",
+            "capability": "spend",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          }
+        ]
+      },
+      "foreground_tasks": []
     },
     {
       "session_ref": "trailhead:feeds-service",
-      "title": "Feeds service daily digest",
       "goal": "Keep the Feeds daily digest generating and delivered on schedule.",
       "done_when": "seven consecutive on-schedule digests after the repair",
-      "enrolled_done_when": "same as done_when",
-      "intent": "Reliable morning digest",
-      "scope": "the one small program that is Feeds; no new features",
+      "source": "task-file:PLAN.md",
       "status": "done-pending-verification",
+      "lane_id": "",
+      "enrolled_done_when": "",
+      "enrolled_at": "",
+      "intent": "Reliable morning digest",
+      "scope": "the seven-clean-day proof window only",
+      "goal_version": 1,
+      "goal_history": [],
       "now": "repair landed; three of seven clean days elapsed",
+      "last_verified": "",
+      "created_at": "2026-08-08T16:40:00-04:00",
+      "updated_at": "2026-08-08T14:55:00-04:00",
       "open_asks": [],
-      "goal_version": 1
+      "retired_asks": [],
+      "needs": "",
+      "hold_reason": "",
+      "resume_at": "",
+      "successor_of": "",
+      "transferred_to": "",
+      "interview_receipt": null,
+      "enrolled_done_when_items": [],
+      "completion_proofs": [],
+      "autonomy_policy": {
+        "schema": "chitra.autonomy.v1",
+        "initiative": "aggressive",
+        "idle_pursuit_passes": 1,
+        "loop_interval_minutes": 5,
+        "grants": [
+          {
+            "grant_id": "default-replan",
+            "capability": "replan",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-small-redesign",
+            "capability": "small_redesign",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-dependency-change",
+            "capability": "dependency_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-schema-change",
+            "capability": "schema_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-hook-change",
+            "capability": "hook_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-credential-use",
+            "capability": "credential_use",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-authentication",
+            "capability": "authentication",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-security-change",
+            "capability": "security_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-irreversible-action",
+            "capability": "irreversible_action",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-spend",
+            "capability": "spend",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          }
+        ]
+      },
+      "foreground_tasks": []
     },
     {
       "session_ref": "renegade:embed-bench",
-      "title": "Embedding model benchmark",
       "goal": "Compare three embedding models on the corpus sample before the Atlas corpus rebuild.",
       "done_when": "all three models run on the same sample; retrieval quality table produced; recommendation memo written",
-      "enrolled_done_when": "same as done_when",
+      "source": "task-file:PLAN.md",
+      "status": "done-pending-close",
+      "lane_id": "",
+      "enrolled_done_when": "",
+      "enrolled_at": "",
       "intent": "Pick the rebuild embedder on evidence, not vibes",
-      "scope": "benchmark only; the rebuild itself is a future lane",
-      "status": "held",
-      "hold_reason": "rate-limit window until 18:00; second model queued",
-      "now": "first model finished its sample run; results file verified",
+      "scope": "the three-model comparison only",
+      "goal_version": 1,
+      "goal_history": [],
+      "now": "all three models ran; the recommendation memo is written and awaiting the operator's close",
+      "last_verified": "",
+      "created_at": "2026-08-08T16:40:00-04:00",
+      "updated_at": "2026-08-08T15:47:00-04:00",
       "open_asks": [],
-      "goal_version": 1
+      "retired_asks": [],
+      "needs": "",
+      "hold_reason": "",
+      "resume_at": "",
+      "successor_of": "",
+      "transferred_to": "",
+      "interview_receipt": null,
+      "enrolled_done_when_items": [],
+      "completion_proofs": [],
+      "autonomy_policy": {
+        "schema": "chitra.autonomy.v1",
+        "initiative": "aggressive",
+        "idle_pursuit_passes": 1,
+        "loop_interval_minutes": 5,
+        "grants": [
+          {
+            "grant_id": "default-replan",
+            "capability": "replan",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-small-redesign",
+            "capability": "small_redesign",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-dependency-change",
+            "capability": "dependency_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-schema-change",
+            "capability": "schema_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-hook-change",
+            "capability": "hook_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-credential-use",
+            "capability": "credential_use",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-authentication",
+            "capability": "authentication",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-security-change",
+            "capability": "security_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-irreversible-action",
+            "capability": "irreversible_action",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-spend",
+            "capability": "spend",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          }
+        ]
+      },
+      "foreground_tasks": []
     },
     {
       "session_ref": "tophand:wiki-backfill",
-      "title": "Crossroads wiki backfill",
       "goal": "Backfill the wiki's project pages for the six projects that shipped since July with durable facts and decision records.",
       "done_when": "six project pages updated; each cites its digest entries; lint clean",
-      "enrolled_done_when": "same as done_when",
-      "intent": "Stop re-deriving project state from scratch in new sessions",
-      "scope": "extraction from existing digests only; no new research",
+      "source": "task-file:PLAN.md",
       "status": "blocked",
+      "lane_id": "",
+      "enrolled_done_when": "",
+      "enrolled_at": "",
+      "intent": "Stop re-deriving project state from scratch in new sessions",
+      "scope": "the six named projects only",
+      "goal_version": 1,
+      "goal_history": [],
       "now": "two pages done; blocked because the wiki write path rejects one page over a taxonomy naming collision",
-      "open_asks": ["Rename the colliding page 'atlas-compute' to 'atlas-compute-graph', or merge into the existing page?"],
-      "goal_version": 1
+      "last_verified": "",
+      "created_at": "2026-08-08T16:40:00-04:00",
+      "updated_at": "2026-08-08T15:58:00-04:00",
+      "open_asks": [
+        "Rename the colliding page 'atlas-compute' to 'atlas-compute-graph', or merge into the existing page?"
+      ],
+      "retired_asks": [],
+      "needs": "",
+      "hold_reason": "",
+      "resume_at": "",
+      "successor_of": "",
+      "transferred_to": "",
+      "interview_receipt": null,
+      "enrolled_done_when_items": [],
+      "completion_proofs": [],
+      "autonomy_policy": {
+        "schema": "chitra.autonomy.v1",
+        "initiative": "aggressive",
+        "idle_pursuit_passes": 1,
+        "loop_interval_minutes": 5,
+        "grants": [
+          {
+            "grant_id": "default-replan",
+            "capability": "replan",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-small-redesign",
+            "capability": "small_redesign",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-dependency-change",
+            "capability": "dependency_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-schema-change",
+            "capability": "schema_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-hook-change",
+            "capability": "hook_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-credential-use",
+            "capability": "credential_use",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-authentication",
+            "capability": "authentication",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-security-change",
+            "capability": "security_change",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-irreversible-action",
+            "capability": "irreversible_action",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          },
+          {
+            "grant_id": "default-spend",
+            "capability": "spend",
+            "targets": [
+              "goal"
+            ],
+            "max_amount": null,
+            "currency": null,
+            "max_units": null,
+            "expires_at": null
+          }
+        ]
+      },
+      "foreground_tasks": []
     }
   ]
 }
