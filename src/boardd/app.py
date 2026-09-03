@@ -16,6 +16,7 @@ write endpoints shell out to the existing chitra-goals CLI (see actions.py).
 
 import asyncio
 import json
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator
@@ -91,7 +92,19 @@ async def _read_bounded_json(request: Request, model: type[BaseModel]) -> BaseMo
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 _tcache = TranslationCache(config.TRANSLATION_SEED)
-_agenttrail_status: dict[str, str] = {}  # session_ref -> status, last posted to agenttrail
+
+# {state root: {session_ref: status}} — the last status boardd posted to
+# agenttrail, per monitor. It was one flat process-wide dict, and
+# `sync_lanes` returns only the lanes of the root it was handed, so two
+# clients watching different monitors overwrote each other's snapshot and
+# each switch re-emitted SessionStart for lanes agenttrail already tracked.
+# Keying by root keeps the snapshots apart.
+#
+# A threading.Lock, not an asyncio.Lock: `_sync_agenttrail` runs in a worker
+# thread (asyncio.to_thread), so the two sides are not both on the event
+# loop.
+_agenttrail_status: dict[Path, dict[str, str]] = {}
+_agenttrail_lock = threading.Lock()
 
 
 def current_monitors() -> dict[str, discovery.MonitorInfo]:
@@ -204,12 +217,13 @@ def _sse(event: str, data: Any) -> str:
 
 
 def _sync_agenttrail(root: Path) -> None:
-    global _agenttrail_status
     try:
         lanes = [record.to_dict() for record in load_goals(root, allow_newer=True)]
     except (ValueError, OSError):
         return
-    _agenttrail_status = agenttrail_bridge.sync_lanes(config.AGENTTRAIL_HOOK_URL, config.AGENTTRAIL_CWD, lanes, _agenttrail_status)
+    with _agenttrail_lock:
+        prev = _agenttrail_status.get(root, {})
+        _agenttrail_status[root] = agenttrail_bridge.sync_lanes(config.AGENTTRAIL_HOOK_URL, config.AGENTTRAIL_CWD, lanes, prev)
 
 
 @app.get("/events")

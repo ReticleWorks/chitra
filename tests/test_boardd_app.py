@@ -322,3 +322,31 @@ def test_activity_proxy_allows_listed_path_and_blocks_others(monkeypatch):
     finally:
         server.shutdown()
         thread.join(timeout=2)
+
+
+def test_agenttrail_status_snapshot_is_per_monitor(tmp_path, monkeypatch):
+    """Two monitors must not overwrite each other's last-posted snapshot.
+
+    The snapshot was one flat process-wide dict while sync_lanes only ever
+    returns the lanes of the root it was handed, so switching monitors
+    wiped the first one's history and re-emitted SessionStart for lanes
+    agenttrail already tracked.
+    """
+    seen_prev = []
+
+    def fake_sync(hook_url, cwd, lanes, prev):
+        seen_prev.append(dict(prev))
+        return {"lane-a": "working"}
+
+    monkeypatch.setattr(app_module, "_agenttrail_status", {})
+    monkeypatch.setattr(app_module, "load_goals", lambda root, allow_newer=True: [])
+    monkeypatch.setattr(app_module.agenttrail_bridge, "sync_lanes", fake_sync)
+
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    app_module._sync_agenttrail(root_a)
+    app_module._sync_agenttrail(root_b)
+    app_module._sync_agenttrail(root_a)
+
+    # Third call sees root_a's own snapshot; root_b started from empty and
+    # never clobbered it.
+    assert seen_prev == [{}, {}, {"lane-a": "working"}]
