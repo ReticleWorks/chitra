@@ -7,6 +7,7 @@ Endpoints:
   GET  /events?monitor=        Server-Sent Events: initial state, per-change state, heartbeats
   POST /api/lanes/{id}/ack     clear a lane's open asks (chitra-goals resolve-ask --all)
   POST /api/lanes/{id}/answer  clear a lane's open asks with the answer as basis
+  GET  /activity/*             proxy onto the co-located, boardd-supervised agenttrail process
   GET  /static/*               css/js assets, manifest, service worker
 
 boardd never writes fleet state directly and never spawns sessions; its two
@@ -15,7 +16,10 @@ write endpoints shell out to the existing chitra-goals CLI (see actions.py).
 
 import asyncio
 import json
+import urllib.error
+import urllib.request
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -28,11 +32,27 @@ from watchfiles import awatch
 
 from chitra.goals import load_goals
 
-from . import actions, agenttrail_bridge, config, discovery
+from . import actions, agenttrail_bridge, agenttrail_supervisor, config, discovery
 from .state import REVIEW_STATUSES, build_view
 from .translate import TranslationCache
 
-app = FastAPI(title="boardd", docs_url=None, redoc_url=None)
+_supervisor = agenttrail_supervisor.AgenttrailSupervisor()
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
+    # BOARDD_DEV=1 (tests, local non-systemd smoke) never spawns a real
+    # Node process — same escape hatch discovery.py already uses.
+    if not discovery.is_dev_mode():
+        _supervisor.start()
+    try:
+        yield
+    finally:
+        if not discovery.is_dev_mode():
+            _supervisor.stop()
+
+
+app = FastAPI(title="boardd", docs_url=None, redoc_url=None, lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=config.PKG_DIR / "static"), name="static")
 
 MAX_REQUEST_BODY_BYTES = 64 * 1024
@@ -113,7 +133,6 @@ def _view_for(monitor_id: str | None) -> dict[str, Any]:
     root = _resolve_root(resolved, roots)
     view = build_view(root, _tcache)
     view["monitor"] = resolved
-    view["agenttrail_url"] = config.AGENTTRAIL_PUBLIC_URL
     return view
 
 
@@ -150,7 +169,6 @@ def _combined_view(roots: dict[str, Path]) -> dict[str, Any]:
         "sentence": f"{len(roots)} monitor{'s' if len(roots) != 1 else ''}, {len(lanes)} lanes total.",
         "needs_you_count": len(needs_you),
     }
-    merged["agenttrail_url"] = config.AGENTTRAIL_PUBLIC_URL
     return merged
 
 
@@ -243,6 +261,55 @@ async def events(monitor: str | None = None) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# Paths agenttrail's own public/index.html actually fetches from its UI —
+# the only ones proxied. Everything else, including every mutating route
+# (`/spawn` takes an arbitrary filesystem path from an unauthenticated POST
+# and launches a detached Node process — see NOTICE.md), is refused: this
+# route only ever registers GET, and an unlisted path 404s before an
+# upstream request is even made.
+ACTIVITY_ALLOWED_PATHS = frozenset({"", "world", "tree-of", "escalations", "events"})
+
+
+async def _proxy_get(url: str) -> StreamingResponse:
+    loop = asyncio.get_event_loop()
+
+    def _connect() -> tuple[int, str, Any]:
+        try:
+            resp = urllib.request.urlopen(url)  # noqa: S310 — loopback-only, GET-only, allowlisted path
+            return resp.status, resp.headers.get("content-type", "application/octet-stream"), resp
+        except urllib.error.HTTPError as e:
+            content_type = e.headers.get("content-type", "text/plain") if e.headers else "text/plain"
+            return e.code, content_type, e
+
+    try:
+        status, content_type, upstream = await loop.run_in_executor(None, _connect)
+    except OSError as e:
+        raise HTTPException(status_code=502, detail=f"agenttrail unreachable: {e}") from e
+
+    async def body() -> AsyncIterator[bytes]:
+        try:
+            while True:
+                chunk = await loop.run_in_executor(None, upstream.read, 8192)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            upstream.close()
+
+    return StreamingResponse(body(), status_code=status, media_type=content_type)
+
+
+@app.get("/activity/{path:path}")
+async def activity_proxy(path: str, request: Request) -> StreamingResponse:
+    if path not in ACTIVITY_ALLOWED_PATHS:
+        raise HTTPException(status_code=404, detail="not proxied")
+    port = agenttrail_supervisor.agenttrail_port()
+    url = f"http://127.0.0.1:{port}/{path}"
+    if request.url.query:
+        url += f"?{request.url.query}"
+    return await _proxy_get(url)
 
 
 @app.get("/healthz")

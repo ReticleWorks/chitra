@@ -39,5 +39,11 @@ AGENTTRAIL_PUBLIC_URL = os.environ.get("BOARDD_AGENTTRAIL_URL", "http://127.0.0.
 # agenttrail keys its live "runs" to events whose cwd matches its own repo
 # root; boardd's synthesized events carry this fixed value regardless of
 # which monitor a lane actually lives on, since agenttrail has no concept of
-# multiple chitra monitors.
+# multiple chitra monitors. It is also the repo path boardd spawns the
+# vendored agenttrail process against — the two must keep matching.
 AGENTTRAIL_CWD = os.environ.get("BOARDD_AGENTTRAIL_CWD", "/var/lib/polyphony-chitra")
+
+# `node` binary boardd spawns the vendored agenttrail process with. A bare
+# name relies on PATH; override with an absolute path if the deploy unit's
+# PATH doesn't carry it.
+AGENTTRAIL_NODE_BIN = os.environ.get("BOARDD_AGENTTRAIL_NODE_BIN", "node")

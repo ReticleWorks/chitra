@@ -3,6 +3,8 @@
 import importlib
 import json
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -274,3 +276,49 @@ def test_answer_rejects_empty_body(tmp_path):
             os.environ.pop("BOARDD_STATE_ROOTS", None)
         else:
             os.environ["BOARDD_STATE_ROOTS"] = old
+
+
+class _FakeAgenttrailHandler(BaseHTTPRequestHandler):
+    """Stand-in for the real vendored agenttrail process — enough to prove
+    the proxy allows a listed GET path through and blocks everything else,
+    without spawning Node."""
+
+    def do_GET(self):  # noqa: N802 — BaseHTTPRequestHandler's naming convention
+        if self.path == "/world":
+            body = b'{"ok": true, "from": "fake-agenttrail"}'
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *args):
+        pass  # keep test output quiet
+
+
+def test_activity_proxy_allows_listed_path_and_blocks_others(monkeypatch):
+    server = HTTPServer(("127.0.0.1", 0), _FakeAgenttrailHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setattr(config, "AGENTTRAIL_PUBLIC_URL", f"http://127.0.0.1:{port}/")
+
+        r = client.get("/activity/world")
+        assert r.status_code == 200, r.text
+        assert r.json()["from"] == "fake-agenttrail"
+
+        # Not on agenttrail's own UI-fetch allowlist — never even reaches
+        # the fake upstream, which would 404 it anyway if it did.
+        r_spawn = client.get("/activity/spawn")
+        assert r_spawn.status_code == 404
+
+        # The proxy route registers GET only — a mutating verb against an
+        # otherwise-allowed path has no matching route at all.
+        r_post = client.post("/activity/world")
+        assert r_post.status_code in (404, 405)
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)

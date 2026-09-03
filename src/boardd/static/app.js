@@ -13,6 +13,12 @@
 
 const $ = (id) => document.getElementById(id);
 
+// The Activity tab iframe always points here, on boardd's own origin —
+// never a raw loopback URL, which would resolve in the *viewer's* browser
+// instead of the server's. boardd proxies this to the co-located,
+// boardd-supervised agenttrail process (see app.py's /activity/* route).
+const ACTIVITY_URL = "/activity/";
+
 let state = null;          // last state payload from the server
 let lastMessageAt = null;  // last SSE message (state or heartbeat)
 let liveness = "connecting"; // connecting | live | delayed | disconnected
@@ -596,8 +602,7 @@ function showTab(name) {
   }
   if (name === "trail") {
     const frame = $("trail-frame");
-    const url = state && state.agenttrail_url;
-    if (url && frame.src !== url) frame.src = url;
+    if (frame.getAttribute("src") !== ACTIVITY_URL) frame.src = ACTIVITY_URL;
   }
 }
 $("tab-cockpit").addEventListener("click", () => showTab("cockpit"));
@@ -846,8 +851,7 @@ function showMobileTab(name) {
   }
   if (name === "activity") {
     const frame = $("m-trail-frame");
-    const url = state && state.agenttrail_url;
-    if (url && frame.src !== url) frame.src = url;
+    if (frame.getAttribute("src") !== ACTIVITY_URL) frame.src = ACTIVITY_URL;
   }
   if (state) renderMobileHeader();
 }
