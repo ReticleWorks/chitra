@@ -1,0 +1,16 @@
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.3
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: hygiene-check
+        name: hygiene check (names, emails, hostnames, org terms)
+        description: >-
+          Flags personal names, emails, internal hostnames, and project/org
+          terms against .hygiene-denylist. See scripts/hygiene_check.py.
+        entry: python3 scripts/hygiene_check.py
+        language: system
+        types: [text]
