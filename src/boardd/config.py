@@ -28,3 +28,16 @@ STALE_AFTER_SECONDS = int(os.environ.get("BOARDD_STALE_AFTER_SECONDS", "900"))
 
 # SSE heartbeat interval, seconds.
 HEARTBEAT_SECONDS = float(os.environ.get("BOARDD_HEARTBEAT_SECONDS", "15"))
+
+# How often /events re-runs monitor discovery and pushes a "monitors" event.
+MONITORS_TICK_SECONDS = float(os.environ.get("BOARDD_MONITORS_TICK_SECONDS", "30"))
+
+# The co-located, vendored agenttrail process (src/boardd/vendor/agenttrail).
+# boardd posts synthesized hook events to it and iframes its UI from here.
+AGENTTRAIL_HOOK_URL = os.environ.get("BOARDD_AGENTTRAIL_HOOK_URL", "http://127.0.0.1:5330/hook")
+AGENTTRAIL_PUBLIC_URL = os.environ.get("BOARDD_AGENTTRAIL_URL", "http://127.0.0.1:5330/")
+# agenttrail keys its live "runs" to events whose cwd matches its own repo
+# root; boardd's synthesized events carry this fixed value regardless of
+# which monitor a lane actually lives on, since agenttrail has no concept of
+# multiple chitra monitors.
+AGENTTRAIL_CWD = os.environ.get("BOARDD_AGENTTRAIL_CWD", "/var/lib/polyphony-chitra")
