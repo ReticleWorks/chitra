@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [Unreleased]
+
+### Fixed
+
+- boardd: run the blocking work off the event loop. Monitor discovery, the
+  state-root re-read, the agenttrail hook posts and the two `chitra-goals`
+  subprocess calls all ran inside `async def` handlers or the SSE
+  generator, so one slow `systemctl` or one unreachable agenttrail stalled
+  every connected client.
+- boardd: keep the last-posted agenttrail snapshot per monitor, behind a
+  lock. One flat process-wide dict meant two clients on different monitors
+  overwrote each other and every switch re-emitted `SessionStart`.
+- boardd: match systemd's own unit vocabulary when reading `systemctl
+  list-units`. A failed instance carries a status glyph that the old
+  pattern's `^` anchor rejected, so the unit an operator most needs to see
+  disappeared from the monitor picker.
+- boardd: catch `ValueError` as well as `OSError` when posting an
+  agenttrail hook event. A malformed hook URL killed the Server-Sent Events
+  stream for every client, over a side channel documented as best-effort.
+- boardd: ship PWA icons (192 and 512), without which Android never offers
+  the install prompt, and sandbox both Activity iframes so the framed page
+  can no longer navigate boardd's top-level window.
+
 ## [0.20.0] - 2026-09-03
 
 ### Added
