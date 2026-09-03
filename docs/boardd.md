@@ -159,6 +159,60 @@ page, its CSS and JS, and the manifest — never `/api/state` or `/events`.
 Board data is always live or explicitly marked stale; it is never served
 from a cache pretending to be current.
 
+### Mobile UI
+
+Under 600px, boardd shows a separate mobile shell (a sibling to the wider
+layout above, which stays unchanged) built from the approved design
+artboards: three views behind a bottom tab bar.
+
+- **Lanes.** Header (monitor name, last-updated time), status filter chips
+  (All / Working / Blocked / Done, each with a live count), a "N lanes need
+  you" banner that links to Review when the queue is non-empty, and one
+  card per lane — monospaced lane id, a status badge, the goal, and a
+  one-line now/ask summary reusing the same server-computed, honesty-marked
+  text the wide layout already shows. Done lanes render at 0.72 opacity.
+- **Review.** One card per needs-feedback item, oldest first, with the
+  action pair its lane actually supports: an open ask gets a text box plus
+  Send answer and Acknowledge; `completion-disputed` and
+  `done-pending-verification` get Send back and Accept done; everything
+  else (`turn-finished-unverified`, or `blocked` with no literal ask) gets
+  Nudge and Open lane (switches to Lanes and scrolls to the card). A
+  successful action removes the card immediately; a failed one shows a
+  toast and leaves the card in place. The Review tab carries an
+  unread-count badge.
+- **Activity.** The same agenttrail iframe as the wide layout's Activity
+  tab, loaded lazily when the tab is first opened.
+- **Monitor picker.** A bottom sheet (tap the monitor pill in the header)
+  listing every monitor from `/api/monitors` — a state dot colored by unit
+  state, lane count, and needs-you count. A monitor with no state root on
+  disk yet shows a disabled row. Selection is multi-select, persisted to
+  `localStorage`, and drives the same `?monitor=` query the wide layout
+  uses: selecting everything (or nothing) maps to `all`, selecting exactly
+  one maps to that id. A genuine partial subset (two of three or more) has
+  no server-side union endpoint yet, so it degrades to `all` until boardd
+  grows a comma-separated filter.
+
+### Dark mode (mobile)
+
+The mobile shell uses agenttrail's own light/dark token set — background,
+card, line, dim/soft text, and the accent, success, danger, and purple
+status colors — as CSS custom properties, following the same
+`prefers-color-scheme` and manual `data-theme` toggle already wired up for
+the wide layout, so both layouts and the embedded Activity iframe read as
+one system.
+
+### A cascade bug this build fixed
+
+Driving the new shell through a real browser (not just the structural CSS
+tests below) surfaced a pre-existing cascade bug: an element toggled by the
+`hidden` attribute stays hidden only if nothing else declares `display` at
+equal or higher specificity. The desktop drawer, and initially the new
+mobile banner/sheet/view sections, all paired `hidden` with an unconditional
+class-level `display: flex`, so the attribute silently lost the cascade tie
+— the drawer, in particular, is `position: fixed` and full-width under
+528px, so it intercepted every click on any narrow viewport regardless of
+its `hidden` state. All are now guarded with `:not([hidden])`.
+
 ## Dark mode
 
 `prefers-color-scheme: dark` is honoured automatically. A manual toggle in

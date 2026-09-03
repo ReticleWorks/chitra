@@ -25,6 +25,20 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 - Add a service worker and web app manifest (shell-only cache, no offline
   data) and a manual light/dark theme toggle matching agenttrail's own dark
   palette, on top of the existing mobile single-column layout.
+- Add a mobile shell (Lanes, Review, Activity behind a bottom tab bar,
+  single column under 600px) matching the approved design artboards:
+  status filter chips, a needs-you banner, per-lane cards, review cards
+  wired to the ack/answer endpoints with the status-appropriate action
+  pair, and a monitor-picker bottom sheet. Ships alongside the existing
+  wider layout, which is unchanged above that breakpoint.
+
+### Fixed
+
+- Fix a `hidden`-attribute cascade bug: several elements (the drawer,
+  and the new mobile banner/sheet/view sections) paired `hidden` with
+  an author `display` rule of equal-or-higher specificity, so the
+  attribute silently lost the tie and the element stayed visible and
+  click-intercepting. Guarded with `:not([hidden])`.
 
 ### Changed
 
