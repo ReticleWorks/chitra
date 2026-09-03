@@ -181,14 +181,22 @@ async def index() -> FileResponse:
     return FileResponse(config.PKG_DIR / "static" / "index.html")
 
 
+# current_monitors(), _view_for() and _sync_agenttrail() all block: a
+# `systemctl` subprocess (3 s), a full re-read of every discovered state
+# root, and up to three 2 s urllib POSTs per changed lane. Every one of them
+# is reached from an `async def` handler or the SSE generator, so one
+# unreachable agenttrail or one slow systemctl stalled every connected
+# client. They run in a worker thread now; the functions themselves stay
+# synchronous, which keeps their sync callers and tests unchanged.
 @app.get("/api/monitors")
 async def api_monitors() -> JSONResponse:
-    return JSONResponse([vars(m) for m in current_monitors().values()])
+    monitors = await asyncio.to_thread(current_monitors)
+    return JSONResponse([vars(m) for m in monitors.values()])
 
 
 @app.get("/api/state")
 async def api_state(monitor: str | None = None) -> JSONResponse:
-    return JSONResponse(_view_for(monitor))
+    return JSONResponse(await asyncio.to_thread(_view_for, monitor))
 
 
 def _sse(event: str, data: Any) -> str:
@@ -233,9 +241,9 @@ async def events(monitor: str | None = None) -> StreamingResponse:
         loop = asyncio.get_event_loop()
         last_monitors_push = loop.time()
         try:
-            yield _sse("state", _view_for(monitor))
+            yield _sse("state", await asyncio.to_thread(_view_for, monitor))
             if watch_root is not None:
-                _sync_agenttrail(watch_root)
+                await asyncio.to_thread(_sync_agenttrail, watch_root)
             while True:
                 try:
                     msg = await asyncio.wait_for(queue.get(), timeout=config.HEARTBEAT_SECONDS)
@@ -244,14 +252,15 @@ async def events(monitor: str | None = None) -> StreamingResponse:
                     if isinstance(msg, str) and msg.startswith("watch-error"):
                         yield _sse("error", {"detail": msg})
                     else:
-                        yield _sse("state", _view_for(monitor))
+                        yield _sse("state", await asyncio.to_thread(_view_for, monitor))
                         if watch_root is not None:
-                            _sync_agenttrail(watch_root)
+                            await asyncio.to_thread(_sync_agenttrail, watch_root)
                 except TimeoutError:
                     now = loop.time()
                     if now - last_monitors_push >= config.MONITORS_TICK_SECONDS:
                         last_monitors_push = now
-                        yield _sse("monitors", [vars(m) for m in current_monitors().values()])
+                        monitors = await asyncio.to_thread(current_monitors)
+                        yield _sse("monitors", [vars(m) for m in monitors.values()])
                     yield _sse("heartbeat", {"ts": datetime.now(UTC).isoformat()})
         finally:
             task.cancel()
@@ -353,7 +362,7 @@ async def activity_proxy(path: str, request: Request) -> StreamingResponse:
 
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
-    view = current_view()
+    view = await asyncio.to_thread(current_view)
     return JSONResponse(
         {
             "ok": not view["source"]["errors"],
@@ -382,7 +391,7 @@ def _lane_action_status(e: actions.LaneActionError, *, default: int) -> int:
 async def ack_lane(lane_id: str, monitor: str | None = None) -> JSONResponse:
     root = _root_for_write(monitor)
     try:
-        record = actions.ack_lane(root, lane_id)
+        record = await asyncio.to_thread(actions.ack_lane, root, lane_id)
     except actions.LaneActionError as e:
         raise HTTPException(status_code=_lane_action_status(e, default=502), detail=str(e)) from e
     return JSONResponse({"ok": True, "changed": True, "lane": record.to_dict()})
@@ -394,7 +403,7 @@ async def answer_lane(lane_id: str, request: Request, monitor: str | None = None
     assert isinstance(body, AnswerBody)
     root = _root_for_write(monitor)
     try:
-        record = actions.answer_lane(root, lane_id, body.text)
+        record = await asyncio.to_thread(actions.answer_lane, root, lane_id, body.text)
     except actions.LaneActionError as e:
         raise HTTPException(status_code=_lane_action_status(e, default=400), detail=str(e)) from e
     return JSONResponse({"ok": True, "changed": True, "lane": record.to_dict()})
