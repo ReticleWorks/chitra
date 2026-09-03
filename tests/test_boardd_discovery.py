@@ -1,6 +1,8 @@
-"""Root-glob half of monitor discovery: no systemd needed, just a temp dir tree."""
+"""Monitor discovery: root-glob half (temp dir tree) and unit half (fake systemctl)."""
 
-from boardd.discovery import ROOT_PREFIX, discover_state_roots
+import subprocess
+
+from boardd.discovery import ROOT_PREFIX, discover_state_roots, discover_units
 
 
 def test_discover_state_roots_from_temp_dir_tree(tmp_path):
@@ -29,3 +31,22 @@ def test_discover_state_roots_from_temp_dir_tree(tmp_path):
 
 def test_discover_state_roots_missing_base_is_empty(tmp_path):
     assert discover_state_roots(tmp_path / "does-not-exist") == {}
+
+
+def test_discover_units_matches_deployed_names(monkeypatch):
+    """UNIT_TEMPLATES must match the real fleet unit names in
+    packaging/systemd/ownership.json (polyphony-chitra-<role>@), not a bare
+    <role>@ pattern that never appears on a deployed host."""
+    fake_stdout = (
+        "polyphony-chitra-watchd@folio.service     loaded active   running Chitra watchd (folio)\n"
+        "polyphony-chitra-triaged@folio.service    loaded active   running Chitra triaged (folio)\n"
+        "polyphony-chitra-dispatchd@folio.service  loaded inactive dead    Chitra dispatchd (folio)\n"
+        "polyphony-chitra-sweepd@boomtown.service  loaded active   running Chitra sweepd (boomtown)\n"
+    )
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout=fake_stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    found = discover_units()
+    assert found == {"folio": "active", "boomtown": "active"}

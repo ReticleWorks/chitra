@@ -6,8 +6,9 @@ require an operator to remember to update boardd when a monitor instance is
 added or removed. Instead boardd finds them itself, every time it is asked:
 
 - unit discovery: which chitra systemd template instances are installed
-  (`polyphony-chitra-watchd@<id>`, `triaged@<id>`, `dispatchd@<id>`,
-  `sweepd@<id>`) via `systemctl list-units`;
+  (`polyphony-chitra-watchd@<id>`, `polyphony-chitra-triaged@<id>`,
+  `polyphony-chitra-dispatchd@<id>`, `polyphony-chitra-sweepd@<id>`) via
+  `systemctl list-units`;
 - root discovery: which `/var/lib/polyphony-chitra*` directories actually
   hold a goals.json.
 
@@ -32,9 +33,9 @@ from . import config
 
 UNIT_TEMPLATES = (
     "polyphony-chitra-watchd@*",
-    "triaged@*",
-    "dispatchd@*",
-    "sweepd@*",
+    "polyphony-chitra-triaged@*",
+    "polyphony-chitra-dispatchd@*",
+    "polyphony-chitra-sweepd@*",
 )
 ROOT_GLOB_BASE = Path("/var/lib")
 ROOT_PREFIX = "polyphony-chitra"
