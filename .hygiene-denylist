@@ -1,0 +1,51 @@
+# .hygiene-denylist
+#
+# One pattern per line. Blank lines and lines starting with # are ignored.
+#
+# A line starting with ! is an ALLOW pattern: a deny match whose span is
+# fully covered by an allow match on the same line is not flagged, and is
+# not rewritten by --fix.
+#
+# A deny line may carry a --fix replacement after a tab character:
+#     <regex><TAB><placeholder>
+# The default placeholder (no tab) is <redacted>.
+
+# --- email addresses ---
+[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}	<redacted-email>
+
+# --- personal names / person-as-host handles ---
+\bTrey\b	<redacted-name>
+\bHerr\b	<redacted-name>
+\btiptap\b	<redacted-name>
+\broundtop\b	<redacted-name>
+
+# --- internal hostnames / tailnet ---
+\btwinridge\b	<host>
+\btophand\b	<host>
+\brenegade\b	<host>
+\btrailhead\b	<host>
+\bsatchmo\b	<host>
+\btwister\b	<host>
+\brawhide\b	<host>
+\.ts\.net	<host>
+\b100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b	<host>
+
+# --- project / org references ---
+\bpolyphony\b	<org>
+\bPolyphony\b	<org>
+\bReticleWorks\b	<org>
+\breticle\b	<org>
+\bBoomtown\b	<org>
+\bAtlas\b	<org>
+\bGCT\b	<org>
+\bKai\b	<org>
+\bCrossroads\b	<org>
+\bDocsHome\b	<org>
+\bOpsHome\b	<org>
+
+# --- allow-list ---
+# chitra is this product's own name. polyphony-chitra is the shipped
+# systemd unit prefix (packaging/systemd/*.service*). Renaming that prefix
+# is a fleet-wide packaging change, out of scope here -- see the PR body.
+!\bchitra\b
+!polyphony-chitra[a-z-]*
