@@ -18,8 +18,29 @@ let lastMessageAt = null;  // last SSE message (state or heartbeat)
 let liveness = "connecting"; // connecting | live | delayed | disconnected
 let es = null;
 let openLaneRef = null;
+let currentMonitor = new URLSearchParams(location.search).get("monitor") || "";
 
 const DELAYED_AFTER_MS = 40_000; // > 2 missed 15 s heartbeats
+
+// ------------------------------------------------------------ theme
+
+function applyTheme(pref) {
+  if (pref === "light" || pref === "dark") document.documentElement.dataset.theme = pref;
+  else delete document.documentElement.dataset.theme;
+}
+try { applyTheme(localStorage.getItem("boardd-theme")); } catch { /* private mode etc. */ }
+
+$("theme-toggle").addEventListener("click", () => {
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  const current = document.documentElement.dataset.theme || (dark ? "dark" : "light");
+  const next = current === "dark" ? "light" : "dark";
+  applyTheme(next);
+  try { localStorage.setItem("boardd-theme", next); } catch { /* private mode etc. */ }
+});
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/static/sw.js").catch(() => {});
+}
 
 // ------------------------------------------------------------ helpers
 
@@ -126,7 +147,8 @@ function renderTopbar() {
 
 function connect() {
   if (es) es.close();
-  es = new EventSource("/events");
+  const q = currentMonitor ? `?monitor=${encodeURIComponent(currentMonitor)}` : "";
+  es = new EventSource(`/events${q}`);
   setLiveness("connecting");
   es.addEventListener("state", (e) => {
     lastMessageAt = new Date().toISOString();
@@ -134,6 +156,7 @@ function connect() {
     setLiveness("live");
     renderAll();
   });
+  es.addEventListener("monitors", (e) => renderMonitorPicker(JSON.parse(e.data)));
   es.addEventListener("heartbeat", () => {
     lastMessageAt = new Date().toISOString();
     if (liveness !== "live") setLiveness("live");
@@ -146,6 +169,30 @@ function connect() {
 }
 
 $("retry").addEventListener("click", () => connect());
+
+// ------------------------------------------------------------ monitor picker
+
+function renderMonitorPicker(monitors) {
+  const pick = $("monitor-pick");
+  if (!monitors || monitors.length <= 1) { pick.hidden = true; return; }
+  const selected = currentMonitor || monitors[0].id;
+  const opts = monitors.map((m) =>
+    el("option", { value: m.id },
+      `${m.id} (${m.lane_count} lanes${m.needs_feedback_count ? `, ${m.needs_feedback_count} need feedback` : ""})`));
+  opts.push(el("option", { value: "all" }, "all monitors"));
+  pick.replaceChildren(...opts);
+  pick.value = selected;
+  pick.hidden = false;
+}
+$("monitor-pick").addEventListener("change", (e) => {
+  currentMonitor = e.target.value;
+  const url = new URL(location.href);
+  url.searchParams.set("monitor", currentMonitor);
+  history.replaceState(null, "", url);
+  connect();
+});
+
+fetch("/api/monitors").then((r) => r.json()).then(renderMonitorPicker).catch(() => {});
 
 setInterval(() => {
   if (liveness === "live" && lastMessageAt &&
@@ -222,25 +269,36 @@ function renderSince() {
   }
 }
 
+async function postLaneAction(laneId, action, body) {
+  const q = currentMonitor && currentMonitor !== "all" ? `?monitor=${encodeURIComponent(currentMonitor)}` : "";
+  const r = await fetch(`/api/lanes/${encodeURIComponent(laneId)}/${action}${q}`, {
+    method: "POST",
+    headers: body ? { "content-type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `${action} failed`);
+}
+
 function renderNeeds() {
   const zone = $("zone-needs");
   const card = $("needs-card");
   card.replaceChildren();
   card.classList.remove("quiet");
+  // Oldest-ask-first: the server already sorts state.needs_you this way.
   const items = state.needs_you;
   if (!items.length) {
     // Healthy state: one quiet line, no standing red zone.
     zone.hidden = false;
     card.classList.add("quiet");
     card.append(el("span", { class: "ok" }, "✓"),
-      el("span", { class: "msg" }, "Nothing is waiting on you."));
+      el("span", { class: "msg" }, "Nothing needs feedback."));
     return;
   }
   zone.hidden = false;
   card.append(el("div", { class: "ny-head" },
-    el("h3", {}, "Needs you"),
+    el("h3", {}, "Needs feedback"),
     el("span", { class: "ny-count" },
-      `${items.length === 1 ? "one decision" : items.length + " decisions"} waiting`)));
+      `${items.length === 1 ? "one lane" : items.length + " lanes"} waiting, oldest first`)));
   for (const item of items) {
     const copyBtn = el("button", { class: "btn quiet" }, "Copy question for Ramble");
     copyBtn.addEventListener("click", async (e) => {
@@ -259,10 +317,32 @@ function renderNeeds() {
       const lane = state.lanes.find((l) => l.session_ref === item.lane_ref);
       if (lane) openDrawer(lane);
     });
+    const ackBtn = el("button", { class: "btn quiet" }, "Ack");
+    ackBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      ackBtn.textContent = "Acking…";
+      try { await postLaneAction(item.lane_id, "ack"); connect(); }
+      catch (err) { ackBtn.textContent = String(err.message || err); return; }
+      ackBtn.textContent = "Acked";
+    });
+    const answerBox = el("textarea", { placeholder: "Answer, then Send", rows: "2" });
+    const answerBtn = el("button", { class: "btn quiet" }, "Send answer");
+    answerBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const text = answerBox.value.trim();
+      if (!text) return;
+      answerBtn.textContent = "Sending…";
+      try { await postLaneAction(item.lane_id, "answer", { text }); connect(); }
+      catch (err) { answerBtn.textContent = String(err.message || err); return; }
+      answerBtn.textContent = "Sent";
+    });
     card.append(el("div", { class: "ruling" },
       el("div", { class: "what" }, el("b", {}, item.lane_title), " asks: ", tline(item.question)),
+      el("div", { class: "why" }, el("b", {}, "Goal: "), tline(item.goal)),
       el("div", { class: "why" }, item.context),
-      el("div", { class: "acts" }, copyBtn, openBtn)));
+      el("div", { class: "acts" }, copyBtn, openBtn, ackBtn),
+      answerBox,
+      el("div", { class: "acts" }, answerBtn)));
   }
 }
 
@@ -287,6 +367,7 @@ function laneCard(lane) {
 
   card.append(el("div", { class: "head" },
     el("span", { class: "title" }, lane.title),
+    lane.needs_review ? el("span", { class: "badge review" }, "Needs feedback") : null,
     el("span", { class: "age" }, `Updated ${ageWords(lane.updated_ts)}`)));
 
   card.append(el("div", { class: "goalline" }, el("b", {}, "Goal: "), tline(lane.goal)));
@@ -484,20 +565,28 @@ function renderOpsFooter() {
 // ------------------------------------------------------------ tabs
 
 function showTab(name) {
-  const cockpit = name === "cockpit";
-  $("view-cockpit").hidden = !cockpit;
-  $("view-history").hidden = cockpit;
-  $("tab-cockpit").classList.toggle("on", cockpit);
-  $("tab-history").classList.toggle("on", !cockpit);
-  $("tab-cockpit").setAttribute("aria-selected", String(cockpit));
-  $("tab-history").setAttribute("aria-selected", String(!cockpit));
+  for (const [tab, view] of [["cockpit", "view-cockpit"], ["history", "view-history"], ["trail", "view-trail"]]) {
+    const on = tab === name;
+    $(view).hidden = !on;
+    $(`tab-${tab}`).classList.toggle("on", on);
+    $(`tab-${tab}`).setAttribute("aria-selected", String(on));
+  }
+  if (name === "trail") {
+    const frame = $("trail-frame");
+    const url = state && state.agenttrail_url;
+    if (url && frame.src !== url) frame.src = url;
+  }
 }
 $("tab-cockpit").addEventListener("click", () => showTab("cockpit"));
 $("tab-history").addEventListener("click", () => showTab("history"));
+$("tab-trail").addEventListener("click", () => showTab("trail"));
 
 // ------------------------------------------------------------ boot
 
-fetch("/api/state").then((r) => r.json()).then((s) => {
-  if (!state) { state = s; renderAll(); }
-}).catch(() => { /* SSE will state the truth in the top bar */ });
+{
+  const q = currentMonitor ? `?monitor=${encodeURIComponent(currentMonitor)}` : "";
+  fetch(`/api/state${q}`).then((r) => r.json()).then((s) => {
+    if (!state) { state = s; renderAll(); }
+  }).catch(() => { /* SSE will state the truth in the top bar */ });
+}
 connect();

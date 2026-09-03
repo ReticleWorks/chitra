@@ -3,8 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#000000">
 <title>boardd</title>
 <link rel="stylesheet" href="/static/style.css">
+<link rel="manifest" href="/static/manifest.webmanifest">
+<script>
+try {
+  var saved = localStorage.getItem("boardd-theme");
+  if (saved === "light" || saved === "dark") document.documentElement.dataset.theme = saved;
+} catch {}
+</script>
 </head>
 <body>
 
@@ -15,10 +23,13 @@
   <span class="tb-state" id="live-state">Connecting&hellip;</span>
   <span class="tb-move" id="move-sentence"></span>
   <span class="spacer"></span>
+  <select class="monitor-pick" id="monitor-pick" hidden></select>
+  <button class="theme-toggle" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme">&#9680;</button>
   <button class="btn quiet" id="retry" hidden>Retry</button>
   <nav class="tabs" role="tablist">
     <button class="tab on" id="tab-cockpit" role="tab" aria-selected="true">Cockpit</button>
     <button class="tab" id="tab-history" role="tab" aria-selected="false">History</button>
+    <button class="tab" id="tab-trail" role="tab" aria-selected="false">Activity</button>
   </nav>
 </header>
 
@@ -43,6 +54,11 @@
   <section id="view-history" hidden>
     <p class="hist-legend" id="hist-legend"></p>
     <div id="hist-groups"></div>
+  </section>
+
+  <section id="view-trail" hidden>
+    <p class="trail-note">Live activity cards from agenttrail, driven by boardd's own lane changes.</p>
+    <iframe class="trail-frame" id="trail-frame" title="agenttrail activity cards"></iframe>
   </section>
 
   <footer class="opsfoot" id="opsfoot"></footer>

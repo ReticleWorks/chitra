@@ -38,58 +38,61 @@
   --r-card: 8px;
   --r-chip: 6px;
 }
+/* Dark tokens match the vendored agenttrail UI's own dark palette
+   (src/boardd/vendor/agenttrail) so boardd's cockpit and the embedded
+   activity-card view read as one system, not two apps stitched together. */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --page: #101114;
-    --panel: #17181c;
-    --raised: #1b1d21;
-    --inset: #141519;
-    --line: #26282e;
-    --line-soft: #202227;
-    --line-strong: #33363d;
-    --ink: #e7e9ec;
-    --ink-soft: #9aa1ac;
-    --ink-faint: #676e7a;
+    --page: #000000;
+    --panel: #181818;
+    --raised: #1f1f1f;
+    --inset: #141414;
+    --line: #313131;
+    --line-soft: #262626;
+    --line-strong: #3d3d3d;
+    --ink: #ffffff;
+    --ink-soft: #d1d1d1;
+    --ink-faint: #9b9b9b;
     --dim: rgba(5, 6, 8, 0.55);
-    --good: #58b786;
-    --good-bg: #17271e;
+    --good: #70a784;
+    --good-bg: rgba(63, 127, 87, 0.18);
     --warn: #d2a04f;
     --warn-bg: #2b2314;
     --bad: #e07f76;
     --bad-bg: #33201d;
-    --ramble: #a893e2;
-    --ramble-bg: #241f33;
+    --ramble: #e9a23b;
+    --ramble-bg: #2e220f;
     --primary-bg: #e7e9ec;
     --primary-fg: #101114;
-    --focus: rgba(168, 147, 226, 0.5);
+    --focus: rgba(233, 162, 59, 0.5);
     --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3);
     --shadow-frame: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px -16px rgba(0, 0, 0, 0.6);
     --shadow-drawer: -24px 0 48px -24px rgba(0, 0, 0, 0.7);
   }
 }
 :root[data-theme="dark"] {
-  --page: #101114;
-  --panel: #17181c;
-  --raised: #1b1d21;
-  --inset: #141519;
-  --line: #26282e;
-  --line-soft: #202227;
-  --line-strong: #33363d;
-  --ink: #e7e9ec;
-  --ink-soft: #9aa1ac;
-  --ink-faint: #676e7a;
+  --page: #000000;
+  --panel: #181818;
+  --raised: #1f1f1f;
+  --inset: #141414;
+  --line: #313131;
+  --line-soft: #262626;
+  --line-strong: #3d3d3d;
+  --ink: #ffffff;
+  --ink-soft: #d1d1d1;
+  --ink-faint: #9b9b9b;
   --dim: rgba(5, 6, 8, 0.55);
-  --good: #58b786;
-  --good-bg: #17271e;
+  --good: #70a784;
+  --good-bg: rgba(63, 127, 87, 0.18);
   --warn: #d2a04f;
   --warn-bg: #2b2314;
   --bad: #e07f76;
   --bad-bg: #33201d;
-  --ramble: #a893e2;
-  --ramble-bg: #241f33;
+  --ramble: #e9a23b;
+  --ramble-bg: #2e220f;
   --primary-bg: #e7e9ec;
   --primary-fg: #101114;
-  --focus: rgba(168, 147, 226, 0.5);
+  --focus: rgba(233, 162, 59, 0.5);
   --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3);
   --shadow-frame: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px -16px rgba(0, 0, 0, 0.6);
   --shadow-drawer: -24px 0 48px -24px rgba(0, 0, 0, 0.7);
@@ -173,6 +176,21 @@ button { font: inherit; color: inherit; background: none; border: none; padding:
 .qlink:hover { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
 .qlink:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 
+.theme-toggle {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; border-radius: 6px;
+  color: var(--ink-soft); cursor: pointer; font-size: 0.85rem;
+  border: 1px solid var(--line);
+}
+.theme-toggle:hover { color: var(--ink); border-color: var(--line-strong); }
+.theme-toggle:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+
+.monitor-pick {
+  font: inherit; font-size: 0.78rem; color: var(--ink); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 6px; padding: 0.2rem 0.5rem; min-height: 28px;
+}
+.monitor-pick:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+
 /* ---- shared bits ---- */
 .pill {
   display: inline-flex; align-items: center; gap: 0.32rem;
@@ -243,6 +261,30 @@ button { font: inherit; color: inherit; background: none; border: none; padding:
 .needsyou.quiet { display: flex; align-items: center; gap: 0.6rem; padding: 0.75rem 1rem; }
 .needsyou.quiet .ok { color: var(--good); font-weight: 700; font-size: 0.9rem; }
 .needsyou.quiet .msg { font-size: 0.88rem; }
+.ruling textarea {
+  width: 100%; box-sizing: border-box; margin-top: 0.5rem; padding: 0.5rem 0.6rem;
+  font: inherit; font-size: 0.82rem; color: var(--ink);
+  background: var(--inset); border: 1px solid var(--line); border-radius: var(--r-chip);
+  resize: vertical; min-height: 2.4rem;
+}
+.ruling textarea:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+
+/* ---- needs-review badge, shown on lane cards elsewhere ---- */
+.badge.review {
+  display: inline-flex; align-items: center; gap: 0.28rem;
+  font-size: 10.5px; font-weight: 600; letter-spacing: 0.01em;
+  padding: 0.2rem 0.45rem; border-radius: 999px;
+  background: var(--bad-bg); color: var(--bad);
+}
+.badge.review::before { content: "\25CF"; font-size: 8px; }
+
+/* ---- activity-card view (co-located agenttrail, embedded) ---- */
+.trail-frame {
+  width: 100%; height: calc(100vh - 90px); min-height: 420px;
+  border: 1px solid var(--line); border-radius: var(--r-card);
+  margin-top: 0.6rem; background: var(--panel);
+}
+.trail-note { font-size: 0.78rem; color: var(--ink-faint); margin: 0.5rem 0 0; }
 
 /* ---- movement summary line ---- */
 .movesum { font-size: 0.85rem; color: var(--ink-soft); margin: 1.1rem 0 0; }
