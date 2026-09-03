@@ -13,13 +13,46 @@
 
 const $ = (id) => document.getElementById(id);
 
+// The Activity tab iframe always points here, on boardd's own origin —
+// never a raw loopback URL, which would resolve in the *viewer's* browser
+// instead of the server's. boardd proxies this to the co-located,
+// boardd-supervised agenttrail process (see app.py's /activity/* route).
+const ACTIVITY_URL = "/activity/";
+
 let state = null;          // last state payload from the server
 let lastMessageAt = null;  // last SSE message (state or heartbeat)
 let liveness = "connecting"; // connecting | live | delayed | disconnected
 let es = null;
 let openLaneRef = null;
+let currentMonitor = new URLSearchParams(location.search).get("monitor") || "";
+
+// mobile shell state
+let mobileTab = "lanes";       // lanes | review | activity
+let mobileFilter = "all";      // all | working | blocked | done
+let lastMonitors = [];         // last /api/monitors payload
+let selectedMonitorIds = null; // Set, or null until monitors are known
 
 const DELAYED_AFTER_MS = 40_000; // > 2 missed 15 s heartbeats
+
+// ------------------------------------------------------------ theme
+
+function applyTheme(pref) {
+  if (pref === "light" || pref === "dark") document.documentElement.dataset.theme = pref;
+  else delete document.documentElement.dataset.theme;
+}
+try { applyTheme(localStorage.getItem("boardd-theme")); } catch { /* private mode etc. */ }
+
+$("theme-toggle").addEventListener("click", () => {
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  const current = document.documentElement.dataset.theme || (dark ? "dark" : "light");
+  const next = current === "dark" ? "light" : "dark";
+  applyTheme(next);
+  try { localStorage.setItem("boardd-theme", next); } catch { /* private mode etc. */ }
+});
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/static/sw.js").catch(() => {});
+}
 
 // ------------------------------------------------------------ helpers
 
@@ -126,13 +159,19 @@ function renderTopbar() {
 
 function connect() {
   if (es) es.close();
-  es = new EventSource("/events");
+  const q = currentMonitor ? `?monitor=${encodeURIComponent(currentMonitor)}` : "";
+  es = new EventSource(`/events${q}`);
   setLiveness("connecting");
   es.addEventListener("state", (e) => {
     lastMessageAt = new Date().toISOString();
     state = JSON.parse(e.data);
     setLiveness("live");
     renderAll();
+  });
+  es.addEventListener("monitors", (e) => {
+    const monitors = JSON.parse(e.data);
+    renderMonitorPicker(monitors);
+    cacheMonitors(monitors);
   });
   es.addEventListener("heartbeat", () => {
     lastMessageAt = new Date().toISOString();
@@ -146,6 +185,33 @@ function connect() {
 }
 
 $("retry").addEventListener("click", () => connect());
+
+// ------------------------------------------------------------ monitor picker
+
+function renderMonitorPicker(monitors) {
+  const pick = $("monitor-pick");
+  if (!monitors || monitors.length <= 1) { pick.hidden = true; return; }
+  const selected = currentMonitor || monitors[0].id;
+  const opts = monitors.map((m) =>
+    el("option", { value: m.id },
+      `${m.id} (${m.lane_count} lanes${m.needs_feedback_count ? `, ${m.needs_feedback_count} need feedback` : ""})`));
+  opts.push(el("option", { value: "all" }, "all monitors"));
+  pick.replaceChildren(...opts);
+  pick.value = selected;
+  pick.hidden = false;
+}
+$("monitor-pick").addEventListener("change", (e) => {
+  currentMonitor = e.target.value;
+  const url = new URL(location.href);
+  url.searchParams.set("monitor", currentMonitor);
+  history.replaceState(null, "", url);
+  connect();
+});
+
+fetch("/api/monitors").then((r) => r.json()).then((monitors) => {
+  renderMonitorPicker(monitors);
+  cacheMonitors(monitors);
+}).catch(() => {});
 
 setInterval(() => {
   if (liveness === "live" && lastMessageAt &&
@@ -168,6 +234,7 @@ function renderAll() {
   renderLanes();
   renderHistory();
   renderOpsFooter();
+  renderMobile();
   if (openLaneRef) {
     const lane = state.lanes.find((l) => l.session_ref === openLaneRef);
     if (lane) renderDrawer(lane); else closeDrawer();
@@ -179,6 +246,7 @@ function renderAges() {
   if (state && liveness !== "connecting") {
     renderSince();
     renderLanes();
+    renderMobile();
   }
 }
 
@@ -222,25 +290,44 @@ function renderSince() {
   }
 }
 
+async function postLaneAction(laneId, action, body, monitorId) {
+  // In the "all" combined view, every lane/needs-you item is tagged with
+  // its own monitor id (app.py's _combined_view) — a write must target
+  // that, not whatever monitor happens to be the discovery default, or it
+  // silently hits the wrong monitor's lane. Fall back to currentMonitor
+  // for the single-monitor view, where every item already belongs to it.
+  const target = monitorId || (currentMonitor && currentMonitor !== "all" ? currentMonitor : "");
+  const q = target ? `?monitor=${encodeURIComponent(target)}` : "";
+  const r = await fetch(`/api/lanes/${encodeURIComponent(laneId)}/${action}${q}`, {
+    method: "POST",
+    headers: body ? { "content-type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.detail || `${action} failed`);
+  return data;
+}
+
 function renderNeeds() {
   const zone = $("zone-needs");
   const card = $("needs-card");
   card.replaceChildren();
   card.classList.remove("quiet");
+  // Oldest-ask-first: the server already sorts state.needs_you this way.
   const items = state.needs_you;
   if (!items.length) {
     // Healthy state: one quiet line, no standing red zone.
     zone.hidden = false;
     card.classList.add("quiet");
     card.append(el("span", { class: "ok" }, "✓"),
-      el("span", { class: "msg" }, "Nothing is waiting on you."));
+      el("span", { class: "msg" }, "Nothing needs feedback."));
     return;
   }
   zone.hidden = false;
   card.append(el("div", { class: "ny-head" },
-    el("h3", {}, "Needs you"),
+    el("h3", {}, "Needs feedback"),
     el("span", { class: "ny-count" },
-      `${items.length === 1 ? "one decision" : items.length + " decisions"} waiting`)));
+      `${items.length === 1 ? "one lane" : items.length + " lanes"} waiting, oldest first`)));
   for (const item of items) {
     const copyBtn = el("button", { class: "btn quiet" }, "Copy question for Ramble");
     copyBtn.addEventListener("click", async (e) => {
@@ -259,10 +346,32 @@ function renderNeeds() {
       const lane = state.lanes.find((l) => l.session_ref === item.lane_ref);
       if (lane) openDrawer(lane);
     });
+    const ackBtn = el("button", { class: "btn quiet" }, "Ack");
+    ackBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      ackBtn.textContent = "Acking…";
+      try { await postLaneAction(item.lane_id, "ack", undefined, item.monitor); connect(); }
+      catch (err) { ackBtn.textContent = String(err.message || err); return; }
+      ackBtn.textContent = "Acked";
+    });
+    const answerBox = el("textarea", { placeholder: "Answer, then Send", rows: "2" });
+    const answerBtn = el("button", { class: "btn quiet" }, "Send answer");
+    answerBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const text = answerBox.value.trim();
+      if (!text) return;
+      answerBtn.textContent = "Sending…";
+      try { await postLaneAction(item.lane_id, "answer", { text }, item.monitor); connect(); }
+      catch (err) { answerBtn.textContent = String(err.message || err); return; }
+      answerBtn.textContent = "Sent";
+    });
     card.append(el("div", { class: "ruling" },
       el("div", { class: "what" }, el("b", {}, item.lane_title), " asks: ", tline(item.question)),
+      el("div", { class: "why" }, el("b", {}, "Goal: "), tline(item.goal)),
       el("div", { class: "why" }, item.context),
-      el("div", { class: "acts" }, copyBtn, openBtn)));
+      el("div", { class: "acts" }, copyBtn, openBtn, ackBtn),
+      answerBox,
+      el("div", { class: "acts" }, answerBtn)));
   }
 }
 
@@ -287,6 +396,7 @@ function laneCard(lane) {
 
   card.append(el("div", { class: "head" },
     el("span", { class: "title" }, lane.title),
+    lane.needs_review ? el("span", { class: "badge review" }, "Needs feedback") : null,
     el("span", { class: "age" }, `Updated ${ageWords(lane.updated_ts)}`)));
 
   card.append(el("div", { class: "goalline" }, el("b", {}, "Goal: "), tline(lane.goal)));
@@ -484,20 +594,355 @@ function renderOpsFooter() {
 // ------------------------------------------------------------ tabs
 
 function showTab(name) {
-  const cockpit = name === "cockpit";
-  $("view-cockpit").hidden = !cockpit;
-  $("view-history").hidden = cockpit;
-  $("tab-cockpit").classList.toggle("on", cockpit);
-  $("tab-history").classList.toggle("on", !cockpit);
-  $("tab-cockpit").setAttribute("aria-selected", String(cockpit));
-  $("tab-history").setAttribute("aria-selected", String(!cockpit));
+  for (const [tab, view] of [["cockpit", "view-cockpit"], ["history", "view-history"], ["trail", "view-trail"]]) {
+    const on = tab === name;
+    $(view).hidden = !on;
+    $(`tab-${tab}`).classList.toggle("on", on);
+    $(`tab-${tab}`).setAttribute("aria-selected", String(on));
+  }
+  if (name === "trail") {
+    const frame = $("trail-frame");
+    if (frame.getAttribute("src") !== ACTIVITY_URL) frame.src = ACTIVITY_URL;
+  }
 }
 $("tab-cockpit").addEventListener("click", () => showTab("cockpit"));
 $("tab-history").addEventListener("click", () => showTab("history"));
+$("tab-trail").addEventListener("click", () => showTab("trail"));
+
+// ------------------------------------------------------------ mobile shell
+//
+// Single column under 600px: Lanes / Review / Activity behind a bottom tab
+// bar (Main.dc.html / Review.dc.html / Monitors.dc.html). Reuses the same
+// `state` and SSE connection as the wide layout above; only the rendering
+// and the monitor-picker UI differ.
+
+const STATUS_META = {
+  working: { label: "Working", tone: "success", group: "working" },
+  held: { label: "Held", tone: "neutral", group: "working" },
+  idle: { label: "Idle", tone: "neutral", group: "working" },
+  "turn-finished-unverified": { label: "Unverified", tone: "purple", group: "working" },
+  "completion-disputed": { label: "Disputed", tone: "danger", group: "working" },
+  "done-pending-verification": { label: "Verifying", tone: "success", group: "working" },
+  blocked: { label: "Blocked", tone: "accent", group: "blocked" },
+  "done-pending-close": { label: "Done", tone: "success", group: "done" },
+};
+function statusMeta(status) {
+  return STATUS_META[status] || { label: status || "Unknown", tone: "neutral", group: "working" };
+}
+
+const DEFAULT_NUDGE_TEXT = "Nudge: please post a status update on this lane.";
+
+function laneNowLine(lane) {
+  if (lane.open_asks.length) return el("span", {}, "Asks: ", tline(lane.open_asks[0]));
+  if (lane.movement.status === "working" && lane.movement.now && lane.movement.now.text) {
+    return el("span", {}, "Now: ", tline(lane.movement.now));
+  }
+  return el("span", {}, lane.movement.sentence); // already a plain server-authored sentence
+}
+
+function showToast(message) {
+  const toast = $("m-toast");
+  toast.textContent = message;
+  toast.hidden = false;
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => { toast.hidden = true; }, 4000);
+}
+
+function renderMobile() {
+  if (!state) return;
+  renderMobileHeader();
+  renderMobileChips();
+  renderMobileBanner();
+  renderMobileLanes();
+  renderMobileReview();
+  renderMobileBadge();
+}
+
+function renderMobileHeader() {
+  if (mobileTab === "review") {
+    $("m-title").textContent = "Needs you";
+    const n = state.needs_you.length;
+    $("m-subtitle").textContent = n ? `${n} open · oldest first` : "Nothing open";
+  } else {
+    $("m-title").textContent = "Lanes";
+    const when = state.source.goals_updated_at ? clockTime(state.source.goals_updated_at) : "--:--";
+    const monitorLabel = state.monitor && state.monitor !== "all" ? state.monitor : "all monitors";
+    $("m-subtitle").textContent = `Updated ${when} · ${monitorLabel}`;
+  }
+  $("m-monitor-label").textContent = currentMonitor === "all" || !currentMonitor ? "All" : currentMonitor;
+  const anyActive = lastMonitors.some((m) => m.unit_active_state === "active");
+  $("m-monitor-dot").style.background = anyActive || !lastMonitors.length ? "var(--mb-success)" : "var(--mb-dim)";
+}
+
+const CHIP_DEFS = [["all", "All"], ["working", "Working"], ["blocked", "Blocked"], ["done", "Done"]];
+
+function renderMobileChips() {
+  const box = $("m-chips");
+  box.replaceChildren();
+  const counts = { all: state.lanes.length, working: 0, blocked: 0, done: 0 };
+  for (const lane of state.lanes) counts[statusMeta(lane.movement.status).group]++;
+  for (const [key, label] of CHIP_DEFS) {
+    const chip = el("button", { class: `m-chip${mobileFilter === key ? " on" : ""}` }, `${label} · ${counts[key]}`);
+    chip.addEventListener("click", () => { mobileFilter = key; renderMobile(); });
+    box.append(chip);
+  }
+}
+
+function renderMobileBanner() {
+  const banner = $("m-banner");
+  const items = state.needs_you;
+  if (!items.length) { banner.hidden = true; return; }
+  banner.hidden = false;
+  banner.replaceChildren(
+    el("div", {},
+      el("div", { class: "m-banner-title" }, `${items.length} lane${items.length === 1 ? "" : "s"} need you`),
+      el("div", { class: "m-banner-sub" }, `Oldest ask waiting ${ageWords(items[0].since).replace(/ ago$/, "")}`)),
+    el("span", { class: "m-banner-cta" }, "Review"));
+}
+$("m-banner").addEventListener("click", () => showMobileTab("review"));
+
+function renderMobileLanes() {
+  const list = $("m-lanelist");
+  list.replaceChildren();
+  const lanes = state.lanes.filter(
+    (lane) => mobileFilter === "all" || statusMeta(lane.movement.status).group === mobileFilter);
+  if (!lanes.length) {
+    list.append(el("div", { class: "m-review-empty" }, "No lanes match this filter."));
+    return;
+  }
+  for (const lane of lanes) list.append(mobileLaneCard(lane));
+}
+
+function mobileLaneCard(lane) {
+  const meta = statusMeta(lane.movement.status);
+  const classes = ["m-lane"];
+  if (lane.movement.status === "working") classes.push("m-lane-tint");
+  if (meta.group === "done") classes.push("m-lane-done");
+  const card = el("article", { class: classes.join(" "), "data-lane-ref": lane.session_ref });
+  card.append(
+    el("div", { class: "m-lane-head" },
+      el("span", { class: "m-lane-id" }, lane.lane_id),
+      el("span", { class: `m-badge-pill ${meta.tone}` }, meta.label)),
+    el("div", { class: "m-lane-goal" }, tline(lane.goal)),
+    el("div", { class: "m-lane-now" }, laneNowLine(lane)));
+  return card;
+}
+
+function renderMobileBadge() {
+  const badge = $("m-review-badge");
+  const n = state.needs_you.length;
+  badge.hidden = !n;
+  badge.textContent = String(n);
+}
+
+function reviewActionKind(item) {
+  const lane = state.lanes.find((l) => l.session_ref === item.lane_ref);
+  if (lane && lane.open_asks.length) return "ask";
+  const status = lane ? lane.movement.status : null;
+  if (status === "completion-disputed" || status === "done-pending-verification") return "disputed";
+  return "nudge"; // turn-finished-unverified, blocked with no literal ask, or unknown
+}
+
+function renderMobileReview() {
+  const list = $("m-reviewlist");
+  list.replaceChildren();
+  if (!state.needs_you.length) {
+    list.append(el("div", { class: "m-review-empty" }, "Nothing needs feedback."));
+    return;
+  }
+  for (const item of state.needs_you) list.append(mobileReviewCard(item));
+}
+
+function mobileReviewCard(item) {
+  const lane = state.lanes.find((l) => l.session_ref === item.lane_ref);
+  const kind = reviewActionKind(item);
+  const meta = kind === "ask" ? { label: "Asks", tone: "accent" } : statusMeta(lane ? lane.movement.status : "");
+  const card = el("div", { class: "m-review-card" });
+  card.append(
+    el("div", { class: "m-review-head" },
+      el("span", { class: "m-lane-id" }, `${item.lane_id} · ${ageWords(item.since).replace(/ ago$/, "")}`),
+      el("span", { class: `m-badge-pill ${meta.tone}` }, meta.label)),
+    el("div", { class: "m-review-ask" }, tline(item.question)),
+    el("div", { class: "m-review-goal" }, "Goal: ", tline(item.goal)));
+
+  const removeCard = () => {
+    state.needs_you = state.needs_you.filter((i) => i !== item);
+    renderMobile();
+  };
+  const fail = (btn, label, err) => {
+    btn.disabled = false;
+    btn.textContent = label;
+    showToast(String(err.message || err));
+  };
+
+  // A no-op resolve (no open ask on the lane) now comes back as an error
+  // response, not a false 200 — postLaneAction throws and `fail` runs
+  // instead of removeCard. `result.changed` is checked too: the API
+  // contract promises it, even though today every 200 already implies it.
+  if (kind === "nudge") {
+    const nudgeBtn = el("button", { class: "m-review-btn quiet" }, "Nudge");
+    nudgeBtn.addEventListener("click", async () => {
+      nudgeBtn.disabled = true; nudgeBtn.textContent = "Sending…";
+      try {
+        const result = await postLaneAction(item.lane_id, "answer", { text: DEFAULT_NUDGE_TEXT }, item.monitor);
+        if (result.changed) removeCard();
+        else fail(nudgeBtn, "Nudge", new Error("Nothing to nudge — no open ask on this lane."));
+      } catch (err) { fail(nudgeBtn, "Nudge", err); }
+    });
+    const openBtn = el("button", { class: "m-review-btn primary" }, "Open lane");
+    openBtn.addEventListener("click", () => openLaneInLanes(item.lane_ref));
+    card.append(el("div", { class: "m-review-acts" }, nudgeBtn, openBtn));
+    return card;
+  }
+
+  // "disputed" (completion-disputed / done-pending-verification) only
+  // changes what the badge shows above; chitra-goals has no verb that
+  // closes or disputes a done-pending lane (only resolve-ask, which needs
+  // a literal open ask), so it gets the same ack/answer pair as "ask" —
+  // never the "Accept done"/"Send back" labels this UI used to show for
+  // an action the backend never actually took.
+  const input = el("input", { class: "m-review-input", type: "text", placeholder: "Type an answer" });
+  const primaryLabel = "Send answer";
+  const secondaryLabel = "Acknowledge";
+  const secondaryBtn = el("button", { class: "m-review-btn quiet" }, secondaryLabel);
+  secondaryBtn.addEventListener("click", async () => {
+    secondaryBtn.disabled = true; secondaryBtn.textContent = "…";
+    try {
+      const result = await postLaneAction(item.lane_id, "ack", undefined, item.monitor);
+      if (result.changed) removeCard();
+      else fail(secondaryBtn, secondaryLabel, new Error("Nothing to acknowledge — no open ask on this lane."));
+    } catch (err) { fail(secondaryBtn, secondaryLabel, err); }
+  });
+  const primaryBtn = el("button", { class: "m-review-btn primary" }, primaryLabel);
+  primaryBtn.addEventListener("click", async () => {
+    const text = input.value.trim();
+    if (!text) { input.focus(); return; }
+    primaryBtn.disabled = true; primaryBtn.textContent = "…";
+    try {
+      const result = await postLaneAction(item.lane_id, "answer", { text }, item.monitor);
+      if (result.changed) removeCard();
+      else fail(primaryBtn, primaryLabel, new Error("Nothing to answer — no open ask on this lane."));
+    } catch (err) { fail(primaryBtn, primaryLabel, err); }
+  });
+  card.append(input, el("div", { class: "m-review-acts" }, secondaryBtn, primaryBtn));
+  return card;
+}
+
+function openLaneInLanes(laneRef) {
+  mobileFilter = "all";
+  showMobileTab("lanes");
+  renderMobile();
+  requestAnimationFrame(() => {
+    const target = document.querySelector(`.m-lane[data-lane-ref="${CSS.escape(laneRef)}"]`);
+    if (!target) return;
+    target.scrollIntoView({ block: "center", behavior: "smooth" });
+    target.style.outline = "2px solid var(--mb-accent)";
+    setTimeout(() => { target.style.outline = ""; }, 1600);
+  });
+}
+
+function showMobileTab(name) {
+  mobileTab = name;
+  for (const tab of ["lanes", "review", "activity"]) {
+    const on = tab === name;
+    $(`m-view-${tab}`).hidden = !on;
+    $(`m-tab-${tab}`).classList.toggle("on", on);
+    $(`m-tab-${tab}`).setAttribute("aria-selected", String(on));
+  }
+  if (name === "activity") {
+    const frame = $("m-trail-frame");
+    if (frame.getAttribute("src") !== ACTIVITY_URL) frame.src = ACTIVITY_URL;
+  }
+  if (state) renderMobileHeader();
+}
+$("m-tab-lanes").addEventListener("click", () => showMobileTab("lanes"));
+$("m-tab-review").addEventListener("click", () => showMobileTab("review"));
+$("m-tab-activity").addEventListener("click", () => showMobileTab("activity"));
+
+// ---- monitor picker sheet (Monitors.dc.html) ----
+
+function cacheMonitors(monitors) {
+  lastMonitors = monitors || [];
+  const availableIds = lastMonitors.filter((m) => m.has_state_root).map((m) => m.id);
+  if (selectedMonitorIds === null) {
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem("boardd-monitors-selected") || "null"); } catch { /* private mode */ }
+    selectedMonitorIds = Array.isArray(saved) && saved.length && saved.every((id) => availableIds.includes(id))
+      ? new Set(saved) : new Set(availableIds);
+  } else {
+    // Drop selections for monitors that vanished between discovery ticks.
+    for (const id of [...selectedMonitorIds]) if (!availableIds.includes(id)) selectedMonitorIds.delete(id);
+  }
+  renderMonitorSheet();
+  renderMobile();
+}
+
+function renderMonitorSheet() {
+  const rows = $("m-sheet-rows");
+  rows.replaceChildren();
+  for (const m of lastMonitors) {
+    const selectable = m.has_state_root;
+    const selected = selectable && selectedMonitorIds.has(m.id);
+    const dotColor = !selectable ? "var(--mb-dim)" : m.unit_active_state === "active" ? "var(--mb-success)" : "var(--mb-accent)";
+    const sub = selectable
+      ? `${m.lane_count} lane${m.lane_count === 1 ? "" : "s"}${m.needs_feedback_count ? ` · ${m.needs_feedback_count} need you` : ""}`
+      : "No state root yet";
+    const row = el("div", { class: `m-sheet-row${selected ? " selected" : ""}${selectable ? "" : " disabled"}` },
+      el("span", { class: "m-sheet-row-dot", style: `background:${dotColor}` }),
+      el("div", { class: "m-sheet-row-body" },
+        el("div", { class: "m-sheet-row-name" }, m.id),
+        el("div", { class: "m-sheet-row-sub" }, sub)),
+      el("span", { class: `m-sheet-row-check${selected ? " checked" : ""}` }, selected ? "✓" : ""));
+    if (selectable) {
+      row.addEventListener("click", () => {
+        if (selectedMonitorIds.has(m.id)) selectedMonitorIds.delete(m.id); else selectedMonitorIds.add(m.id);
+        renderMonitorSheet();
+      });
+    }
+    rows.append(row);
+  }
+  const availableIds = lastMonitors.filter((m) => m.has_state_root).map((m) => m.id);
+  const allSelected = availableIds.length > 0 && availableIds.every((id) => selectedMonitorIds.has(id));
+  $("m-sheet-apply").textContent = allSelected || selectedMonitorIds.size === 0
+    ? "Show all selected" : `Show ${selectedMonitorIds.size} selected`;
+}
+
+function openMonitorSheet() {
+  renderMonitorSheet();
+  $("m-sheet-scrim").hidden = false;
+  $("m-sheet").hidden = false;
+}
+function closeMonitorSheet() {
+  $("m-sheet-scrim").hidden = true;
+  $("m-sheet").hidden = true;
+}
+$("m-monitor-btn").addEventListener("click", openMonitorSheet);
+$("m-sheet-scrim").addEventListener("click", closeMonitorSheet);
+$("m-sheet-apply").addEventListener("click", () => {
+  try { localStorage.setItem("boardd-monitors-selected", JSON.stringify([...selectedMonitorIds])); } catch { /* private mode */ }
+  const availableIds = lastMonitors.filter((m) => m.has_state_root).map((m) => m.id);
+  const allSelected = availableIds.length > 0 && availableIds.every((id) => selectedMonitorIds.has(id));
+  let next;
+  if (allSelected || selectedMonitorIds.size === 0) next = "all";
+  else if (selectedMonitorIds.size === 1) next = [...selectedMonitorIds][0];
+  // ponytail: the server only understands one monitor id or "all"; a
+  // genuine partial subset (2 of 3+) has no union endpoint yet, so it
+  // degrades to "all" until boardd grows a comma-separated filter.
+  else next = "all";
+  currentMonitor = next;
+  const url = new URL(location.href);
+  url.searchParams.set("monitor", currentMonitor);
+  history.replaceState(null, "", url);
+  closeMonitorSheet();
+  connect();
+});
 
 // ------------------------------------------------------------ boot
 
-fetch("/api/state").then((r) => r.json()).then((s) => {
-  if (!state) { state = s; renderAll(); }
-}).catch(() => { /* SSE will state the truth in the top bar */ });
+{
+  const q = currentMonitor ? `?monitor=${encodeURIComponent(currentMonitor)}` : "";
+  fetch(`/api/state${q}`).then((r) => r.json()).then((s) => {
+    if (!state) { state = s; renderAll(); }
+  }).catch(() => { /* SSE will state the truth in the top bar */ });
+}
 connect();

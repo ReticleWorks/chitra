@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "chitra-monitor"
-version = "0.19.2"
+version = "0.20.0"
 description = "Persistent goal-bound supervision and deterministic tmux delivery for AI-agent fleets"
 readme = "README.md"
 license = "MIT"
@@ -101,3 +101,6 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 # The boardd seed generator embeds full-sentence translation pairs; keeping
 # each raw/translated line intact beats wrapping them at 140 columns.
 "tools/gen_boardd_seed.py" = ["E501"]
+# Same reasoning: the v3 fixture generator embeds full-sentence done_when
+# clauses lifted from the same fixture content.
+"tools/gen_boardd_v3_fixture.py" = ["E501"]

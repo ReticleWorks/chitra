@@ -2,6 +2,52 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [0.20.0] - 2026-09-03
+
+### Added
+
+- Make boardd the single Chitra board: read the live `chitra.goals.v3`
+  schema (through chitra's own `GoalRecord` loader, matching completion
+  proofs against `enrolled_done_when_items`), auto-discover every Chitra
+  monitor instance on the host (systemd units plus state-root glob, no
+  hand-edited map) with an `/api/monitors` endpoint and a `?monitor=`
+  selector, and add a needs-feedback review queue covering
+  completion-disputed, done-pending-verification, turn-finished-unverified,
+  and blocked lanes alongside open asks, sorted oldest first, with a badge
+  on affected lane cards.
+- Add two write endpoints, `POST /api/lanes/{id}/ack` and
+  `.../answer`, that shell out to the existing `chitra-goals` CLI
+  (`resolve-ask --all`) — no new store.
+- Vendor agenttrail v0.2.0 (pinned commit, MIT license recorded) and drive
+  its activity-card UI from a co-located process via synthesized hook
+  events, embedded in boardd's own Activity tab, so operators reach it
+  through boardd's one page.
+- Add a service worker and web app manifest (shell-only cache, no offline
+  data) and a manual light/dark theme toggle matching agenttrail's own dark
+  palette, on top of the existing mobile single-column layout.
+- Add a mobile shell (Lanes, Review, Activity behind a bottom tab bar,
+  single column under 600px) matching the approved design artboards:
+  status filter chips, a needs-you banner, per-lane cards, review cards
+  wired to the ack/answer endpoints with the status-appropriate action
+  pair, and a monitor-picker bottom sheet. Ships alongside the existing
+  wider layout, which is unchanged above that breakpoint.
+
+### Fixed
+
+- Fix a `hidden`-attribute cascade bug: several elements (the drawer,
+  and the new mobile banner/sheet/view sections) paired `hidden` with
+  an author `display` rule of equal-or-higher specificity, so the
+  attribute silently lost the tie and the element stayed visible and
+  click-intercepting. Guarded with `:not([hidden])`.
+
+### Changed
+
+- Replace the stale 2026-08-08 v1 fixture with one generated directly from
+  `GoalRecord` instances (`tools/gen_boardd_v3_fixture.py`), covering every
+  v3 status.
+- Deprecate the Artifact-published board (`board_publish.py` in the fleet
+  `chitra-launcher` package) in favour of boardd.
+
 ## [0.19.2] - 2026-08-30
 
 ### Added
