@@ -136,3 +136,5 @@ security reports go through [SECURITY.md](SECURITY.md).
 ## License
 
 MIT © 2026 Reticle Works. See [LICENSE](LICENSE) for the full text.
+
+<!-- zuul hygiene gate probe, safe to ignore -->
