@@ -350,3 +350,18 @@ def test_agenttrail_status_snapshot_is_per_monitor(tmp_path, monkeypatch):
     # Third call sees root_a's own snapshot; root_b started from empty and
     # never clobbered it.
     assert seen_prev == [{}, {}, {"lane-a": "working"}]
+
+
+def test_hook_post_survives_a_malformed_hook_url(caplog):
+    """A bad BOARDD_AGENTTRAIL_HOOK_URL must not kill the SSE stream.
+
+    urllib raises ValueError, not OSError, for a URL with no scheme, and the
+    old contextlib.suppress(OSError) let it escape `_sync_agenttrail` and
+    end the stream for every connected client — over a side channel this
+    module documents as never blocking boardd.
+    """
+    from boardd import agenttrail_bridge
+
+    with caplog.at_level("WARNING"):
+        agenttrail_bridge.post_hook_event("not-a-url", {"hook_event_name": "SessionStart"})
+    assert "agenttrail hook post to not-a-url failed" in caplog.text
