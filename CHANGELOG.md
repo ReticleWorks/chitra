@@ -12,6 +12,15 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   and evidence-only completion updates while leaving frozen goals and verified
   receipts authoritative.
 
+### Changed
+
+- Move monitord's per-lane state root from
+  `/var/lib/polyphony-chitra-<lane-id>` to `/var/lib/chitra/lane-<lane-id>`.
+  Existing goals, journals, and receipts are not migrated automatically;
+  see the deployment note in `docs/daemons/monitord.md` for where the old
+  data stays and what an operator must do by hand before upgrading a host
+  that already has lanes running.
+
 ### Documentation
 
 - Document the lane-plan path, update cadence, shared syntax, and authority

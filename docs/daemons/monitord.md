@@ -85,6 +85,14 @@ lane's `queue/` directory. The shared `chitra-dispatchd.service` reads the
 same lane roots from `lanes.yaml` and uses the same
 `/etc/chitra/transcript-bindings.json` manifest.
 
+Migration note: this state root moved in `0.19.2` from
+`/var/lib/polyphony-chitra-<lane-id>` (systemd `StateDirectory=polyphony-chitra-%i`)
+to `/var/lib/chitra/lane-<lane-id>` (`StateDirectory=chitra`). Upgrading a
+host that already has lanes running does not move anything: `monitord`
+starts against an empty state root at the new path, and the old goals,
+journals, and receipts stay in place at the old path until an operator
+copies or archives them by hand.
+
 Flags include `--state-dir`, `--transcript-root`,
 `--transcript-bindings-path`, `--dispatch-queue-dir`, `--ledger-path`,
 `--ledger-key-path`, `--retry-delay-seconds`, `--findings-path`,
