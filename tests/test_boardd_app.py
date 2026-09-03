@@ -365,3 +365,26 @@ def test_hook_post_survives_a_malformed_hook_url(caplog):
     with caplog.at_level("WARNING"):
         agenttrail_bridge.post_hook_event("not-a-url", {"hook_event_name": "SessionStart"})
     assert "agenttrail hook post to not-a-url failed" in caplog.text
+
+
+def test_manifest_icons_exist_and_are_served():
+    """An empty "icons" array means Android never offers the install
+    prompt, so the PWA the mobile UI was built for cannot be installed."""
+    manifest = client.get("/static/manifest.webmanifest").json()
+    sizes = {icon["sizes"] for icon in manifest["icons"]}
+    assert sizes == {"192x192", "512x512"}
+    for icon in manifest["icons"]:
+        assert icon["type"] == "image/png"
+        r = client.get(icon["src"])
+        assert r.status_code == 200, icon["src"]
+        assert r.content.startswith(b"\x89PNG")
+
+
+def test_activity_iframes_are_sandboxed():
+    """Without a sandbox attribute the framed agenttrail page can navigate
+    boardd's own top-level window. allow-top-navigation is not granted."""
+    html = client.get("/").text
+    frames = [line for line in html.splitlines() if "<iframe" in line]
+    assert len(frames) == 2, frames
+    for frame in frames:
+        assert 'sandbox="allow-scripts allow-same-origin"' in frame
