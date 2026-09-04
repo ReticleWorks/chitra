@@ -28,6 +28,10 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   revalidation, so an installed viewer kept the old board across a boardd
   release until the cache name was hand-bumped. The manifest and icons stay
   cache-first.
+- boardd: `POST /hook` bounds the request body before buffering it, through
+  the same reader `/answer` uses — a declared content-length over 64 KB is
+  refused before a byte is read, and the stream is cut at the cap for a
+  request that declares nothing. It used to read the whole body first.
 
 ## [0.21.0] - 2026-09-03
 

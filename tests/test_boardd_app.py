@@ -381,6 +381,17 @@ def test_board_answer_logs_upstream_and_resolves_the_ask(tmp_path, monkeypatch):
         thread.join(timeout=2)
 
 
+def test_hook_refuses_an_oversized_body(monkeypatch):
+    """/hook used to buffer the whole body and only then measure it. It
+    reads through the same bounded reader as /answer now."""
+    r = client.post(
+        "/hook",
+        content=b"x" * (70 * 1024),
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 413
+
+
 def test_answers_log_records_what_reached_chitra(tmp_path, monkeypatch):
     """The log used to be written first and unconditionally, so it recorded
     what the operator typed, not what landed. A refused answer is logged as

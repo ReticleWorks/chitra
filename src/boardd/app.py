@@ -89,23 +89,40 @@ class BoardAnswerBody(BaseModel):
     at: str = Field(default="", max_length=64)
 
 
-async def _read_bounded_json(request: Request, model: type[BaseModel]) -> BaseModel:
-    """Read+validate a JSON body, bounded before it ever reaches a subprocess argv.
+async def _bounded_body(request: Request) -> bytes:
+    """Read a request body, refusing anything over the cap.
 
-    413 over the size cap, 400 for anything that isn't a valid JSON object
-    matching ``model`` (empty body included) — never an unhandled 500.
+    Two checks, because either alone is escapable: a declared content-length
+    over the cap is refused before a byte is read, and the stream itself is
+    cut off at the cap for a request that declares nothing or lies. Every
+    write endpoint reads through here, so nothing buffers a whole unbounded
+    body first.
     """
     content_length = request.headers.get("content-length")
     if content_length is not None:
         try:
             too_big = int(content_length) > MAX_REQUEST_BODY_BYTES
         except ValueError:
-            too_big = False  # malformed header; the real read below still enforces the cap
+            too_big = False  # malformed header; the stream read below still enforces the cap
         if too_big:
             raise HTTPException(status_code=413, detail="request body exceeds 64 KB")
-    body = await request.body()
-    if len(body) > MAX_REQUEST_BODY_BYTES:
-        raise HTTPException(status_code=413, detail="request body exceeds 64 KB")
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > MAX_REQUEST_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="request body exceeds 64 KB")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _read_bounded_json(request: Request, model: type[BaseModel]) -> BaseModel:
+    """Read+validate a JSON body, bounded before it ever reaches a subprocess argv.
+
+    413 over the size cap, 400 for anything that isn't a valid JSON object
+    matching ``model`` (empty body included) — never an unhandled 500.
+    """
+    body = await _bounded_body(request)
     if not body.strip():
         raise HTTPException(status_code=400, detail="request body must be valid JSON")
     try:
@@ -503,10 +520,8 @@ async def board_answer(request: Request) -> JSONResponse:
 @app.post("/hook")
 async def board_hook(request: Request) -> StreamingResponse:
     """agenttrail's event intake, passed straight through."""
+    body = await _bounded_body(request)
     port = agenttrail_supervisor.agenttrail_port()
-    body = await request.body()
-    if len(body) > MAX_REQUEST_BODY_BYTES:
-        raise HTTPException(status_code=413, detail="request body exceeds 64 KB")
     ok = await asyncio.to_thread(_post_upstream, f"http://127.0.0.1:{port}/hook", None, body)
     return StreamingResponse(iter([b'{"ok":%s}' % (b"true" if ok else b"false")]), media_type="application/json")
 
