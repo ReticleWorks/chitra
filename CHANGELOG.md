@@ -23,6 +23,11 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   typed. The log line was appended before the write ran and whatever the
   write returned, so refused answers read as sent ones. It is written after
   the write now, and a refused answer is logged as `failed: <reason>`.
+- boardd: the service worker serves the board page network-first with the
+  cached copy as its offline fallback. It was cache-first with no
+  revalidation, so an installed viewer kept the old board across a boardd
+  release until the cache name was hand-bumped. The manifest and icons stay
+  cache-first.
 
 ## [0.21.0] - 2026-09-03
 
