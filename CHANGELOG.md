@@ -19,6 +19,10 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   board-raised review ask, which lands in the lane's `retired_asks` — the
   field the lane's own agent reads. `POST /api/lanes/{id}/ack` still returns
   409 when there is nothing to clear: it carries no operator text.
+- boardd: `answers.log` records what reached chitra, not what the operator
+  typed. The log line was appended before the write ran and whatever the
+  write returned, so refused answers read as sent ones. It is written after
+  the write now, and a refused answer is logged as `failed: <reason>`.
 
 ## [0.21.0] - 2026-09-03
 

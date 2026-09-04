@@ -454,17 +454,33 @@ __all__ = ["app", "REVIEW_STATUSES"]
 # /healthz and the /static mount all win over this catch-all.
 
 
+def _log_answer(body: BoardAnswerBody, marker: str) -> bool:
+    """Append one line to agenttrail's answers.log.
+
+    agenttrail records `{key, answer, at}` and nothing else, so a failure is
+    marked in the answer itself. Best-effort, like every other call into that
+    process: a down agenttrail must never fail an answer chitra already took.
+    """
+    payload = body.model_dump()
+    if marker:
+        payload["answer"] = f"{marker} — {payload['answer']}"
+    port = agenttrail_supervisor.agenttrail_port()
+    return _post_upstream(f"http://127.0.0.1:{port}/answer", payload)
+
+
 @app.post("/answer")
 async def board_answer(request: Request) -> JSONResponse:
     """The escalation panel's "Send to session".
 
     Two destinations, in that order:
 
-    1. agenttrail's own `/answer`, which appends one line to
+    1. `chitra-goals` for that lane, which is what actually records the
+       answer in chitra state.
+    2. agenttrail's own `/answer`, which appends one line to
        `.agenttrail/answers.log` — parity with the approved board, and the
-       operator's own record of what they said.
-    2. `chitra-goals resolve-ask` for that lane, which is what actually
-       retires the ask in chitra state.
+       operator's own record. It runs second so the log says what reached
+       chitra: a failed write is logged as `failed: <reason>`, not as an
+       answer that never landed.
 
     The escalation key board_bridge writes is ``<monitor>:<lane>``, so the
     answer is written to the state root the operator was actually looking
@@ -474,16 +490,13 @@ async def board_answer(request: Request) -> JSONResponse:
     body = await _read_bounded_json(request, BoardAnswerBody)
     assert isinstance(body, BoardAnswerBody)
 
-    port = agenttrail_supervisor.agenttrail_port()
-    logged = await asyncio.to_thread(
-        _post_upstream, f"http://127.0.0.1:{port}/answer", body.model_dump()
-    )
-
     root, lane = await asyncio.to_thread(_root_for_answer, body.key)
     try:
         record = await asyncio.to_thread(actions.answer_lane, root, lane, body.answer)
     except actions.LaneActionError as e:
+        await asyncio.to_thread(_log_answer, body, f"failed: {e}")
         raise HTTPException(status_code=_lane_action_status(e, default=400), detail=str(e)) from e
+    logged = await asyncio.to_thread(_log_answer, body, "")
     return JSONResponse({"ok": True, "logged": logged, "lane": record.to_dict()})
 
 

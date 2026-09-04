@@ -281,6 +281,7 @@ def test_answer_rejects_empty_body(tmp_path):
 
 
 ANSWERS_LOG: list[str] = []  # what the fake upstream was actually POSTed
+ANSWER_BODIES: list[dict] = []  # and the /answer payloads it recorded
 
 
 class _FakeAgenttrailHandler(BaseHTTPRequestHandler):
@@ -305,9 +306,11 @@ class _FakeAgenttrailHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):  # noqa: N802 — BaseHTTPRequestHandler's naming convention
-        self.rfile.read(int(self.headers.get("content-length", 0)))
+        raw = self.rfile.read(int(self.headers.get("content-length", 0)))
         if self.path in ("/answer", "/hook"):
             ANSWERS_LOG.append(self.path)
+            if self.path == "/answer":
+                ANSWER_BODIES.append(json.loads(raw))
             self._ok(b'{"ok":true}')
         else:
             self.send_response(404)
@@ -373,6 +376,32 @@ def test_board_answer_logs_upstream_and_resolves_the_ask(tmp_path, monkeypatch):
         assert r.json()["lane"]["open_asks"] == []
 
         assert client.post("/answer", json={"key": "monitor:no-such-lane", "answer": "x"}).status_code == 404
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+
+
+def test_answers_log_records_what_reached_chitra(tmp_path, monkeypatch):
+    """The log used to be written first and unconditionally, so it recorded
+    what the operator typed, not what landed. A refused answer is logged as
+    a failure."""
+    root = _write_endpoint_env(tmp_path)
+    monkeypatch.setenv("BOARDD_STATE_ROOTS", f"monitor={root}")
+
+    server = HTTPServer(("127.0.0.1", 0), _FakeAgenttrailHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    ANSWER_BODIES.clear()
+    try:
+        monkeypatch.setattr(config, "AGENTTRAIL_PUBLIC_URL", f"http://127.0.0.1:{port}/")
+
+        assert client.post("/answer", json={"key": "monitor:nope", "answer": "x", "at": ""}).status_code == 404
+        assert ANSWER_BODIES[-1]["answer"].startswith("failed: ")
+        assert "nope" in ANSWER_BODIES[-1]["answer"]
+
+        assert client.post("/answer", json={"key": "monitor:wiki-backfill", "answer": "Do it.", "at": ""}).status_code == 200
+        assert ANSWER_BODIES[-1]["answer"] == "Do it."
     finally:
         server.shutdown()
         thread.join(timeout=2)
