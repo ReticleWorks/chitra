@@ -11,6 +11,14 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   the escalation key is `<monitor>:<lane>` and `/answer` splits it back
   apart. Before this every answer resolved against the default monitor's
   state root, which made every card outside that monitor unanswerable.
+- boardd: a status-only review card's "Send to session" now succeeds. A lane
+  that is blocked, completion-disputed, turn-finished-unverified or
+  done-pending-verification with no literal open ask has nothing for
+  `chitra-goals resolve-ask` to retire, so every Send returned 409. The
+  answer is now recorded through the same CLI as the basis of one
+  board-raised review ask, which lands in the lane's `retired_asks` — the
+  field the lane's own agent reads. `POST /api/lanes/{id}/ack` still returns
+  409 when there is nothing to clear: it carries no operator text.
 
 ## [0.21.0] - 2026-09-03
 

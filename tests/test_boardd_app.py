@@ -378,6 +378,31 @@ def test_board_answer_logs_upstream_and_resolves_the_ask(tmp_path, monkeypatch):
         thread.join(timeout=2)
 
 
+def test_a_status_only_lane_accepts_an_answer(tmp_path, monkeypatch):
+    """A blocked lane with no literal ask is on the stack and offers a Send.
+    That Send used to 409 every time, because resolve-ask had nothing to
+    retire. The answer is recorded as the basis of the board's review ask."""
+    root = _write_endpoint_env(tmp_path, lane="status-only", open_asks=())
+    monkeypatch.setenv("BOARDD_STATE_ROOTS", f"monitor={root}")
+
+    server = HTTPServer(("127.0.0.1", 0), _FakeAgenttrailHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setattr(config, "AGENTTRAIL_PUBLIC_URL", f"http://127.0.0.1:{port}/")
+
+        r = client.post("/answer", json={"key": "monitor:status-only", "answer": "Unblock it.", "at": "now"})
+        assert r.status_code == 200, r.text
+        assert r.json()["lane"]["open_asks"] == []
+        retired = json.loads((root / "goals.json").read_text())["goals"][0]["retired_asks"]
+        assert retired[-1]["basis"] == "Unblock it."
+        assert retired[-1]["authority"] == "operator"
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+
+
 def test_an_answer_lands_on_the_monitor_its_card_came_from(tmp_path, monkeypatch):
     """Two monitors, one lane each. The escalation key carries the monitor,
     so monitor B's card resolves B's ask and never touches A's."""
