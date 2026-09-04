@@ -33,11 +33,13 @@ importlib.reload(app_module)
 client = TestClient(app_module.app)
 
 
-def test_index_serves_page():
+def test_root_with_no_agenttrail_is_a_502_not_a_500():
+    """Nothing is vendored-served from Python any more: / is the board,
+    proxied from the agenttrail process. With no process up that is a
+    plain 502, never an unhandled error."""
     r = client.get("/")
-    assert r.status_code == 200
-    assert "boardd" in r.text
-    assert 'name="viewport"' in r.text
+    assert r.status_code == 502
+    assert "agenttrail unreachable" in r.text
 
 
 def test_api_state():
@@ -278,18 +280,35 @@ def test_answer_rejects_empty_body(tmp_path):
             os.environ["BOARDD_STATE_ROOTS"] = old
 
 
+ANSWERS_LOG: list[str] = []  # what the fake upstream was actually POSTed
+
+
 class _FakeAgenttrailHandler(BaseHTTPRequestHandler):
     """Stand-in for the real vendored agenttrail process — enough to prove
     the proxy allows a listed GET path through and blocks everything else,
     without spawning Node."""
 
+    def _ok(self, body: bytes, content_type: str = "application/json"):
+        self.send_response(200)
+        self.send_header("content-type", content_type)
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):  # noqa: N802 — BaseHTTPRequestHandler's naming convention
-        if self.path == "/world":
-            body = b'{"ok": true, "from": "fake-agenttrail"}'
-            self.send_response(200)
-            self.send_header("content-type", "application/json")
+        path = self.path.split("?")[0]
+        if path == "/":
+            self._ok(b"<!doctype html><title>agenttrail</title>", "text/html")
+        elif path in ("/world", "/escalations", "/tree-of", "/events"):
+            self._ok(b'{"ok": true, "from": "fake-agenttrail"}')
+        else:
+            self.send_response(404)
             self.end_headers()
-            self.wfile.write(body)
+
+    def do_POST(self):  # noqa: N802 — BaseHTTPRequestHandler's naming convention
+        self.rfile.read(int(self.headers.get("content-length", 0)))
+        if self.path in ("/answer", "/hook"):
+            ANSWERS_LOG.append(self.path)
+            self._ok(b'{"ok":true}')
         else:
             self.send_response(404)
             self.end_headers()
@@ -298,27 +317,66 @@ class _FakeAgenttrailHandler(BaseHTTPRequestHandler):
         pass  # keep test output quiet
 
 
-def test_activity_proxy_allows_listed_path_and_blocks_others(monkeypatch):
+def test_root_proxy_serves_the_board_and_blocks_the_rest(monkeypatch):
+    """The board is mounted at `/`, so its own root-absolute fetches
+    resolve — that was the defect behind the old `/activity/` mount, where
+    the page asked for `/world` and got boardd's 404. Every mutating route
+    but the board's own two stays refused."""
     server = HTTPServer(("127.0.0.1", 0), _FakeAgenttrailHandler)
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    ANSWERS_LOG.clear()
     try:
         monkeypatch.setattr(config, "AGENTTRAIL_PUBLIC_URL", f"http://127.0.0.1:{port}/")
 
-        r = client.get("/activity/world")
+        assert "agenttrail" in client.get("/").text
+
+        # Root-absolute, exactly as the page requests them.
+        for path in ("/world", "/escalations", "/tree-of?port=5330", "/events"):
+            r = client.get(path)
+            assert r.status_code == 200, (path, r.text)
+            assert r.json()["from"] == "fake-agenttrail", path
+
+        # Never reaches the upstream: /spawn launches a detached Node
+        # process from an unauthenticated POST body.
+        for path in ("/spawn", "/setup-board", "/suggest", "/nudge"):
+            assert client.get(path).status_code == 404, path
+            assert client.post(path).status_code in (404, 405), path
+
+        # POST /hook is the board's own event intake and passes through.
+        assert client.post("/hook", json={"hook_event_name": "SessionStart"}).status_code == 200
+        assert ANSWERS_LOG == ["/hook"]
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+
+
+def test_board_answer_logs_upstream_and_resolves_the_ask(tmp_path, monkeypatch):
+    """"Send to session" has two destinations: agenttrail's answers.log,
+    for parity with the approved board, and chitra-goals resolve-ask, which
+    is what actually retires the ask."""
+    monkeypatch.setenv("BOARDD_STATE_ROOTS", f"monitor={_write_endpoint_env(tmp_path)}")
+
+    server = HTTPServer(("127.0.0.1", 0), _FakeAgenttrailHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    ANSWERS_LOG.clear()
+    try:
+        monkeypatch.setattr(config, "AGENTTRAIL_PUBLIC_URL", f"http://127.0.0.1:{port}/")
+
+        r = client.post("/answer", json={"key": "wiki-backfill", "answer": "Merge it.", "at": "now"})
         assert r.status_code == 200, r.text
-        assert r.json()["from"] == "fake-agenttrail"
+        assert r.json()["logged"] is True
+        assert ANSWERS_LOG == ["/answer"]
+        assert r.json()["lane"]["open_asks"] == []
 
-        # Not on agenttrail's own UI-fetch allowlist — never even reaches
-        # the fake upstream, which would 404 it anyway if it did.
-        r_spawn = client.get("/activity/spawn")
-        assert r_spawn.status_code == 404
+        # Nothing left to resolve on that lane, and never a false success.
+        again = client.post("/answer", json={"key": "wiki-backfill", "answer": "Merge it.", "at": "now"})
+        assert again.status_code == 409
 
-        # The proxy route registers GET only — a mutating verb against an
-        # otherwise-allowed path has no matching route at all.
-        r_post = client.post("/activity/world")
-        assert r_post.status_code in (404, 405)
+        assert client.post("/answer", json={"key": "no-such-lane", "answer": "x"}).status_code == 404
     finally:
         server.shutdown()
         thread.join(timeout=2)
@@ -338,14 +396,14 @@ def test_agenttrail_status_snapshot_is_per_monitor(tmp_path, monkeypatch):
         seen_prev.append(dict(prev))
         return {"lane-a": "working"}
 
-    monkeypatch.setattr(app_module, "_agenttrail_status", {})
-    monkeypatch.setattr(app_module, "load_goals", lambda root, allow_newer=True: [])
-    monkeypatch.setattr(app_module.agenttrail_bridge, "sync_lanes", fake_sync)
+    from boardd import board_bridge
 
-    root_a, root_b = tmp_path / "a", tmp_path / "b"
-    app_module._sync_agenttrail(root_a)
-    app_module._sync_agenttrail(root_b)
-    app_module._sync_agenttrail(root_a)
+    monkeypatch.setattr(board_bridge.agenttrail_bridge, "sync_lanes", fake_sync)
+    bridge = board_bridge.BoardBridge(tmp_path / "workspace")
+
+    bridge.post_hooks([("a", [])])
+    bridge.post_hooks([("b", [])])
+    bridge.post_hooks([("a", [])])
 
     # Third call sees root_a's own snapshot; root_b started from empty and
     # never clobbered it.
@@ -380,11 +438,9 @@ def test_manifest_icons_exist_and_are_served():
         assert r.content.startswith(b"\x89PNG")
 
 
-def test_activity_iframes_are_sandboxed():
-    """Without a sandbox attribute the framed agenttrail page can navigate
-    boardd's own top-level window. allow-top-navigation is not granted."""
-    html = client.get("/").text
-    frames = [line for line in html.splitlines() if "<iframe" in line]
-    assert len(frames) == 2, frames
-    for frame in frames:
-        assert 'sandbox="allow-scripts allow-same-origin"' in frame
+def test_no_iframe_survives_the_cockpit():
+    """The sandbox that #134 added guarded an iframe onto agenttrail. The
+    board is the top-level document now, so there is no frame to guard —
+    and no second surface that could reintroduce one."""
+    assert not (config.PKG_DIR / "static" / "index.html").exists()
+    assert "<iframe" not in (config.PKG_DIR / "vendor" / "agenttrail" / "public" / "index.html").read_text()
