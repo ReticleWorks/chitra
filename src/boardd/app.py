@@ -21,9 +21,10 @@ Endpoints:
   GET  /healthz                readiness plus the state-file errors, as JSON
   GET  /static/*               manifest, icons, service worker
 
-Every other upstream route is refused before a request is made — `/spawn`
-takes an arbitrary filesystem path from an unauthenticated POST and
-launches a detached Node process (see vendor/agenttrail/NOTICE.md).
+Every other upstream route is refused before a request is made: 404 for a
+GET, 405 for a POST. `/spawn` is why — it takes an arbitrary filesystem path
+from an unauthenticated POST and launches a detached Node process (see
+vendor/agenttrail/NOTICE.md).
 
 boardd never writes fleet state directly and never spawns sessions; its
 write endpoints shell out to the existing chitra-goals CLI (see actions.py).
@@ -299,10 +300,12 @@ async def events(monitor: str | None = None) -> StreamingResponse:
 
 # Paths agenttrail's own public/index.html actually fetches, and the only
 # ones proxied. The board is mounted at `/`, so these resolve exactly as
-# the page asks for them — root-absolute. Anything unlisted 404s before an
-# upstream request is made, `/spawn` and `/setup-board` among them: /spawn
-# takes an arbitrary filesystem path from an unauthenticated POST and
-# launches a detached Node process (see NOTICE.md).
+# the page asks for them — root-absolute. Anything unlisted is refused
+# before an upstream request is made, `/spawn` and `/setup-board` among
+# them: /spawn takes an arbitrary filesystem path from an unauthenticated
+# POST and launches a detached Node process (see NOTICE.md). An unlisted GET
+# is a 404 from the catch-all below; an unlisted POST is a 405, because the
+# catch-all is GET-only and no POST route matches it.
 BOARD_GET_PATHS = frozenset({"", "world", "tree-of", "escalations", "events"})
 
 # The two the board POSTs. `/answer` is the escalation panel's "Send to
@@ -323,9 +326,9 @@ BOARD_POST_PATHS = frozenset({"answer", "hook"})
 # leave the *entire* app unresponsive to new connections for the length of
 # the read timeout — a known Starlette footgun, not specific to this proxy.
 # Ending the stream on a read timeout is simpler and carries no such risk:
-# EventSource reconnects automatically, so an idle Activity tab just
-# reconnects roughly every UPSTREAM_READ_TIMEOUT seconds instead of holding
-# one connection open forever.
+# EventSource reconnects automatically, so an idle board just reconnects
+# roughly every UPSTREAM_READ_TIMEOUT seconds instead of holding one
+# connection open forever.
 UPSTREAM_READ_TIMEOUT = 30.0
 
 

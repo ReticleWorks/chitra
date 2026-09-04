@@ -110,9 +110,9 @@ scan — it is not a production configuration path.
 | `BOARDD_STALE_AFTER_SECONDS` | `900` | Age after which the state file itself is called stale in the UI. |
 | `BOARDD_HEARTBEAT_SECONDS` | `15` | SSE heartbeat interval. |
 | `BOARDD_MONITORS_TICK_SECONDS` | `30` | How often `/events` re-runs discovery and pushes a `monitors` event. |
-| `BOARDD_AGENTTRAIL_URL` | `http://127.0.0.1:5330/` | Where boardd's own supervisor spawns and reaches the vendored agenttrail process (loopback only). The Activity tab is served `/activity/` on boardd's own origin, which proxies here — the raw port is never given to the browser. |
+| `BOARDD_AGENTTRAIL_URL` | `http://127.0.0.1:5330/` | Where boardd's own supervisor spawns and reaches the vendored agenttrail process (loopback only). The board is served at `/` on boardd's own origin, which proxies here — the raw port is never given to the browser. |
 | `BOARDD_AGENTTRAIL_HOOK_URL` | `http://127.0.0.1:5330/hook` | Where boardd posts synthesized hook events. |
-| `BOARDD_AGENTTRAIL_CWD` | `/var/lib/polyphony-chitra` | The `cwd` value stamped on synthesized hook events, and the repo root boardd passes to the spawned agenttrail process; must match. |
+| `BOARDD_AGENTTRAIL_CWD` | `/var/lib/boardd/workspace` | boardd's own workspace: the `cwd` stamped on synthesized hook events, the repo root boardd passes to the spawned agenttrail process, and where the bridge writes `PLAN.md` and `roster.json`. The two must match, and it must never be a chitra state root. |
 
 ## Reading the v3 schema
 

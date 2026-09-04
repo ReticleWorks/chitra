@@ -32,6 +32,12 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   the same reader `/answer` uses — a declared content-length over 64 KB is
   refused before a byte is read, and the stream is cut at the cap for a
   request that declares nothing. It used to read the whole body first.
+- boardd docs: `docs/boardd.md`'s configuration table described the deleted
+  Activity tab and gave the old `BOARDD_AGENTTRAIL_CWD` default, which is
+  the exact value this release changed for a stated safety reason. The
+  supervisor's operator-facing warnings said "Activity tab will not work"
+  where a missing `node` now means the board at `/` returns 502. The
+  vendored `NOTICE.md` still called the files unmodified in two places.
 
 ## [0.21.0] - 2026-09-03
 
@@ -51,7 +57,8 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   page's root-absolute fetches resolve. Under the old `/activity/` mount
   they did not: the page asked for `/world` and got boardd's 404. `/spawn`,
   `/setup-board` and everything else stay refused before an upstream
-  request is made.
+  request is made — 404 for an unlisted GET, 405 for an unlisted POST,
+  since the catch-all route is GET-only.
 - boardd: `POST /answer` appends to agenttrail's `answers.log`, keeping
   parity with the approved board, **and** routes the same answer to
   `chitra-goals resolve-ask` for that lane. 409 when nothing resolves, 404

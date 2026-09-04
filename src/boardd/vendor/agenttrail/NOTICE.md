@@ -3,7 +3,7 @@
 - Upstream: https://github.com/sodiumsun/agenttrail
 - Version: v0.2.0
 - Commit: 0d5d151
-- Vendored: 2026-09-01 (copied unmodified into this repository 2026-09-03 for boardd)
+- Vendored: 2026-09-01 (re-vendored into this repository 2026-09-03 for boardd, with the local patches below)
 - License: MIT (see `LICENSE` in this directory; copyright Kelly Sun)
 
 ## Local patches
@@ -60,8 +60,8 @@ The one clean seam is `/hook`: agenttrail already turns a stream of
 Claude-Code-shaped hook events (SessionStart, PreToolUse, PostToolUse, Stop,
 ...) into its live "run" view without needing PLAN.md at all. boardd drives
 that seam instead — see `src/boardd/agenttrail_bridge.py` — running this
-vendored, unmodified agenttrail as a co-located Node process and posting
-synthesized hook events to it on every lane change.
+vendored agenttrail, patched as listed above, as a co-located Node process
+and posting synthesized hook events to it on every lane change.
 
 Since 0.21.0 this page is not one view inside boardd — it IS boardd's board,
 mounted at `/` through an allowlisted proxy, with its `PLAN.md` and

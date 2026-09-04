@@ -4,8 +4,9 @@ boardd owns this process end to end: started once at app startup from the
 vendored bundle, restarted on exit with backoff, stopped on boardd's own
 shutdown, stdout/stderr logged. Best-effort by design, same as
 agenttrail_bridge.py's hook posts — a missing `node` binary or a crashing
-agenttrail must never take boardd down with it; the Activity tab just stops
-working and the rest of the board is unaffected.
+agenttrail must never take boardd down with it. boardd itself stays up and
+its JSON API keeps answering; the board page at `/` returns 502 until the
+process is back.
 """
 
 import logging
@@ -25,8 +26,8 @@ RESTART_BACKOFF_SECONDS = (1, 2, 5, 10, 30)
 
 
 def agenttrail_port() -> int:
-    """The port both the supervisor and the /activity/* proxy target —
-    always read fresh from config so tests can override it per-call."""
+    """The port both the supervisor and the board proxy target — always read
+    fresh from config so tests can override it per-call."""
     return urlparse(config.AGENTTRAIL_PUBLIC_URL).port or 5330
 
 
@@ -40,7 +41,7 @@ class AgenttrailSupervisor:
 
     def start(self) -> None:
         if not VENDORED_BIN.exists():
-            logger.warning("agenttrail vendored bundle not found at %s; Activity tab will not work", VENDORED_BIN)
+            logger.warning("agenttrail vendored bundle not found at %s; the board at / will return 502", VENDORED_BIN)
             return
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="agenttrail-supervisor", daemon=True)
@@ -80,7 +81,7 @@ class AgenttrailSupervisor:
                     bufsize=1,
                 )
             except OSError as e:
-                logger.warning("could not start agenttrail (%s); Activity tab will not work: %s", self._node_bin, e)
+                logger.warning("could not start agenttrail (%s); the board at / will return 502: %s", self._node_bin, e)
                 return
             self._proc = proc
             self._drain_output(proc)

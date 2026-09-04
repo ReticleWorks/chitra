@@ -343,9 +343,11 @@ def test_root_proxy_serves_the_board_and_blocks_the_rest(monkeypatch):
 
         # Never reaches the upstream: /spawn launches a detached Node
         # process from an unauthenticated POST body.
+        # An unlisted GET is the catch-all's 404; an unlisted POST is 405,
+        # because that catch-all is GET-only and no POST route matches.
         for path in ("/spawn", "/setup-board", "/suggest", "/nudge"):
             assert client.get(path).status_code == 404, path
-            assert client.post(path).status_code in (404, 405), path
+            assert client.post(path).status_code == 405, path
 
         # POST /hook is the board's own event intake and passes through.
         assert client.post("/hook", json={"hook_event_name": "SessionStart"}).status_code == 200
