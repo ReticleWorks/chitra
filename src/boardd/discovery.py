@@ -41,7 +41,36 @@ ROOT_GLOB_BASE = Path("/var/lib")
 ROOT_PREFIX = "polyphony-chitra"
 DEFAULT_MONITOR_ID = "monitor"
 
-_UNIT_RE = re.compile(r"^\S*@([^.\s]+)\.\S+\s+\S+\s+(\S+)\s")
+# systemd's ActiveState vocabulary, verbatim (systemd.dbus(5) / `systemctl
+# --state=help`). Matching the ACTIVE column against this closed set is what
+# separates a genuinely failed unit from an instance whose *name* happens to
+# contain the word — `polyphony-chitra-watchd@failed-lane.service` is a
+# perfectly ordinary lane.
+ACTIVE_STATES = frozenset(
+    {"active", "reloading", "inactive", "failed", "activating", "deactivating", "maintenance", "refreshing"}
+)
+
+# One `systemctl list-units --plain --no-legend` row:
+#
+#   [●] UNIT  LOAD  ACTIVE  SUB  DESCRIPTION
+#
+# systemd prefixes a status glyph (●, *, x, and the arrows) to a unit that
+# is not simply loaded+active, and `--plain` does not suppress it. The old
+# pattern anchored the unit name at `^`, so a failed instance —
+# `● polyphony-chitra-watchd@folio.service loaded failed failed …` — matched
+# nothing and vanished from the picker: exactly the unit an operator most
+# needs to see. The glyph is optional here, the unit name must carry the
+# real deployed prefix and a `.service` suffix, and ACTIVE is captured
+# separately from SUB so `activating` + `auto-restart` never reads as
+# `failed`.
+_UNIT_RE = re.compile(
+    r"^\s*[^\w\s]?\s*"                                # optional status glyph
+    rf"{re.escape(ROOT_PREFIX)}-\w+@([^.\s]+)\.service"  # unit, capturing the instance id
+    r"\s+\S+"                                            # LOAD
+    r"\s+(\S+)"                                          # ACTIVE
+    r"\s+(\S+)"                                          # SUB
+    r"(?:\s|$)"
+)
 
 
 def root_for_id(monitor_id: str, base: Path = ROOT_GLOB_BASE) -> Path:
@@ -95,6 +124,8 @@ def discover_units(timeout: float = 3.0) -> dict[str, str]:
         if not m:
             continue
         monitor_id, active_state = m.group(1), m.group(2)
+        if active_state not in ACTIVE_STATES:
+            continue  # not a unit row systemd wrote; don't invent a state for it
         # A unit signal only wins over another unit signal by being active;
         # never let one dead template hide another's live instance.
         if monitor_id not in found or active_state == "active":

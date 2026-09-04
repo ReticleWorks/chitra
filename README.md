@@ -50,25 +50,29 @@ agent's say-so. See [Design notes](docs/DESIGN.md).
 
 ## boardd — the fleet board
 
-`boardd` (0.20.0) is the one Chitra board; an older board published as a
+`boardd` (0.21.0) is the one Chitra board; an older board published as a
 claude.ai Artifact is deprecated. It auto-discovers every monitor instance
 on a host — by reading the four daemons' systemd units and by globbing
 `/var/lib/polyphony-chitra*` for a `goals.json` — so there is no map to keep
 in sync as monitors come and go.
 
-The cockpit's **needs-feedback review queue** lists every lane an operator
-should look at: any open question, plus lanes in a disputed-completion,
-done-pending-verification, unverified-turn, or blocked state, sorted
-oldest first. From there an operator can **ack** or **answer** a lane; both
-actions write back through the existing `chitra-goals` command-line tool, so
-boardd never becomes a second writer of goal state.
+The board is a pan/zoom canvas of session cards — one per lane, showing the
+goal, the marker, and what the lane is doing right now — with a stack of
+red-bordered **escalation cards** down the right edge. Every lane that needs
+an operator decision appears there: any open question, plus lanes in a
+disputed-completion, done-pending-verification, unverified-turn, or blocked
+state, oldest first. Clicking one opens a panel with the context, the
+question, a recommendation, and a box to answer it. Sending an answer writes
+back through the existing `chitra-goals` command-line tool, so boardd never
+becomes a second writer of goal state.
 
-The **Activity** tab renders live session activity using `agenttrail`, a
-vendored open-source UI component, run as its own supervised process and
-reached only through a same-origin proxy inside boardd — the underlying
-process is never exposed directly. boardd also ships as an installable
-mobile web app (add to home screen, works offline for the shell only) with
-light and dark themes.
+The page itself is `agenttrail`, a vendored open-source UI, run as its own
+supervised process and reached only through a same-origin allowlisted proxy
+inside boardd — the underlying process is never exposed directly, and its
+`/spawn` route is refused. boardd feeds it from chitra goal state rather
+than describing that state in a second dashboard of its own. It also
+installs as a mobile web app (add to home screen, offline for the shell
+only), where the same escalation stack becomes the full-width review queue.
 
 **Deploy:** boardd runs as a systemd service bound to `127.0.0.1:8480` and is
 reached over the tailnet through Tailscale Serve — never a public listener.

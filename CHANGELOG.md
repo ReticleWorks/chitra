@@ -2,6 +2,137 @@
 
 All notable changes to this project are documented here, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project uses [Semantic Versioning](https://semver.org/), currently in the 0.x range (see `docs/DESIGN.md` for why 1.0.0 is reserved for later).
 
+## [Unreleased]
+
+### Fixed
+
+- boardd: an answer sent from the escalation stack now lands on the monitor
+  whose card it came from. The board page POSTs only `{key, answer, at}`, so
+  the escalation key is `<monitor>:<lane>` and `/answer` splits it back
+  apart. Before this every answer resolved against the default monitor's
+  state root, which made every card outside that monitor unanswerable.
+- boardd: a status-only review card's "Send to session" now succeeds. A lane
+  that is blocked, completion-disputed, turn-finished-unverified or
+  done-pending-verification with no literal open ask has nothing for
+  `chitra-goals resolve-ask` to retire, so every Send returned 409. The
+  answer is now recorded through the same CLI as the basis of one
+  board-raised review ask, which lands in the lane's `retired_asks` — the
+  field the lane's own agent reads. `POST /api/lanes/{id}/ack` still returns
+  409 when there is nothing to clear: it carries no operator text.
+- boardd: `answers.log` records what reached chitra, not what the operator
+  typed. The log line was appended before the write ran and whatever the
+  write returned, so refused answers read as sent ones. It is written after
+  the write now, and a refused answer is logged as `failed: <reason>`.
+- boardd: the service worker serves the board page network-first with the
+  cached copy as its offline fallback. It was cache-first with no
+  revalidation, so an installed viewer kept the old board across a boardd
+  release until the cache name was hand-bumped. The manifest and icons stay
+  cache-first.
+- boardd: `POST /hook` bounds the request body before buffering it, through
+  the same reader `/answer` uses — a declared content-length over 64 KB is
+  refused before a byte is read, and the stream is cut at the cap for a
+  request that declares nothing. It used to read the whole body first.
+- boardd docs: `docs/boardd.md`'s configuration table described the deleted
+  Activity tab and gave the old `BOARDD_AGENTTRAIL_CWD` default, which is
+  the exact value this release changed for a stated safety reason. The
+  supervisor's operator-facing warnings said "Activity tab will not work"
+  where a missing `node` now means the board at `/` returns 502. The
+  vendored `NOTICE.md` still called the files unmodified in two places.
+- boardd: the vendored page's local patches are itemised as eight, not six.
+  One entry called "mobile reflow" covered three separate changes, two of
+  which are not the reflow: the installable-shell head block (now patch 7)
+  and the "Find the session" rewrite (now patch 8), which renders every
+  `find:` key the feed sends and replaces the upstream `cmux` hint — a
+  change to the desktop panel, not only the narrow layout.
+
+## [0.21.0] - 2026-09-03
+
+### Changed
+
+- **boardd: the approved board is the board.** The Orchestra board built
+  and approved on 2026-09-01 was already vendored here byte-for-byte, then
+  demoted to a third tab behind a second dashboard that re-solved the same
+  problem differently. That dashboard is gone. agenttrail's page now mounts
+  at `/` and is fed from chitra goal state: `src/boardd/board_bridge.py`
+  renders every discovered monitor's `GoalRecord`s into the `PLAN.md` the
+  canvas draws its session cards from and the `roster.json` the red
+  escalation stack reads, and posts the hook events that move a card live.
+  It re-renders on any state-file change and at least every 30 s.
+- boardd: the root proxy passes the board's own routes — GET `/`, `/world`,
+  `/tree-of`, `/escalations`, `/events` and POST `/answer`, `/hook` — so the
+  page's root-absolute fetches resolve. Under the old `/activity/` mount
+  they did not: the page asked for `/world` and got boardd's 404. `/spawn`,
+  `/setup-board` and everything else stay refused before an upstream
+  request is made — 404 for an unlisted GET, 405 for an unlisted POST,
+  since the catch-all route is GET-only.
+- boardd: `POST /answer` appends to agenttrail's `answers.log`, keeping
+  parity with the approved board, **and** routes the same answer to
+  `chitra-goals resolve-ask` for that lane. 409 when nothing resolves, 404
+  when no lane matches — never a false success.
+- boardd: `BOARDD_AGENTTRAIL_CWD` now defaults to `/var/lib/boardd/workspace`,
+  boardd's own directory, not the chitra state root. The bridge writes into
+  it every tick and the SSE watcher watches the state roots, so the old
+  default would have fed its own watcher forever.
+- boardd: the vendored `NOTICE.md` lists all six local patches on
+  `public/index.html` and both on `bin/agenttrail.mjs`. It previously
+  claimed both files were byte-for-byte upstream, and neither was.
+
+### Added
+
+- boardd: a mobile reflow of the approved board (patch 6 on the vendored
+  page). agenttrail's canvas does not reflow, so below 600 px — or with
+  `?m=1` at any width — the file tree and the canvas step aside, the
+  escalation stack becomes the full-width review queue with the same card
+  anatomy and the same four-section answer panel, and the session cards
+  follow as one column with the same header, title and task lines. The
+  manifest, icons and shell-only service worker ride on the board page
+  itself, with `start_url` `/`.
+- boardd: the escalation panel's "Find the session" shows every reveal
+  field the feed sends — host, monitor id, lane id and tmux pane target —
+  rather than four fixed rows.
+- boardd: `?monitor=<id>` on the board filters the canvas and the stack to
+  one monitor. Several monitors render as contiguous, id-prefixed runs of
+  cards; agenttrail's plan convention has no node above a component.
+
+### Removed
+
+- boardd's separate cockpit: `static/index.html`, `app.js`, `style.css`, the
+  three tabs, the lane-detail drawer and the mobile bottom tab bar.
+  `/api/state`, `/api/monitors`, `/healthz` and the write endpoints are
+  unchanged; boardd's own SSE stream moves to `/api/events`, because the
+  board owns `/events`.
+
+### Fixed
+
+- boardd: run the blocking work off the event loop. Monitor discovery, the
+  state-root re-read, the agenttrail hook posts and the two `chitra-goals`
+  subprocess calls all ran inside `async def` handlers or the SSE
+  generator, so one slow `systemctl` or one unreachable agenttrail stalled
+  every connected client. This release also covers the two sites the review
+  of #134 found still on the loop: `discover_monitors()` in the SSE handler
+  and `_root_for_write()` behind both write endpoints.
+- boardd: keep the last-posted agenttrail snapshot per monitor. One flat
+  process-wide dict meant two clients on different monitors overwrote each
+  other and every switch re-emitted `SessionStart`. The snapshot now lives
+  in the bridge, which is the only thing that posts hook events.
+- boardd: match systemd's own unit vocabulary when reading `systemctl
+  list-units`. A failed instance carries a status glyph that the old
+  pattern's `^` anchor rejected, so the unit an operator most needs to see
+  disappeared from the monitor picker.
+- boardd: catch `ValueError` as well as `OSError` when posting an
+  agenttrail hook event. A malformed hook URL killed the Server-Sent Events
+  stream for every client, over a side channel documented as best-effort.
+- boardd: ship PWA icons (192 and 512), without which Android never offers
+  the install prompt. The iframe sandbox from the same change is moot —
+  there is no iframe now, and a test holds that.
+- boardd: three layout defects found by screenshotting the running board at
+  390 px. The reflow's media query sat before the `.esc-*` rules and lost on
+  cascade order; `.app`'s auto-sized grid column let one nowrap escalation
+  title widen the page to 983 px inside a 390 px viewport; and the answer
+  panel's `.esc-btn.primary` was stretched to fill the panel by upstream's
+  narrow-screen `.primary` rule for the canvas section, which shares the
+  class.
+
 ## [0.20.0] - 2026-09-03
 
 ### Added

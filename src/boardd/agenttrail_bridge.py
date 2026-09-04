@@ -14,10 +14,12 @@ change that fails to reach agenttrail is not lost — it is still in
 goals.json and still shows on boardd's own page.
 """
 
-import contextlib
 import json
+import logging
 import urllib.request
 from typing import Any
+
+logger = logging.getLogger("boardd.agenttrail_bridge")
 
 AGENTTRAIL_TOOL_NAME = "chitra-lane"
 
@@ -47,11 +49,23 @@ def hook_events_for_lane(prev_status: str | None, lane: dict[str, Any], *, sessi
 
 
 def post_hook_event(hook_url: str, event: dict[str, Any], *, timeout: float = 2.0) -> None:
+    """Post one hook event. Best-effort: returns None on any failure, logged.
+
+    OSError alone was not enough. A malformed BOARDD_AGENTTRAIL_HOOK_URL —
+    no scheme, or a scheme urllib has no opener for — raises ValueError out
+    of Request() or urlopen(), not OSError. That escaped `_sync_agenttrail`
+    and killed the whole SSE stream for every connected client, over a side
+    channel this module documents as never blocking boardd. Both are caught
+    here and logged once; nothing is lost, since the lane change is still in
+    goals.json and still on boardd's own page.
+    """
     body = json.dumps(event, default=str).encode()
-    req = urllib.request.Request(hook_url, data=body, headers={"content-type": "application/json"})
-    # ponytail: best-effort side channel — agenttrail being down never blocks boardd
-    with contextlib.suppress(OSError):
-        urllib.request.urlopen(req, timeout=timeout).read()
+    try:
+        # ponytail: best-effort side channel — agenttrail being down never blocks boardd
+        req = urllib.request.Request(hook_url, data=body, headers={"content-type": "application/json"})
+        urllib.request.urlopen(req, timeout=timeout).read()  # noqa: S310 — loopback hook URL from config
+    except (OSError, ValueError) as e:
+        logger.warning("agenttrail hook post to %s failed: %s", hook_url, e)
 
 
 def sync_lanes(hook_url: str, cwd: str, lanes: list[dict[str, Any]], prev_statuses: dict[str, str]) -> dict[str, str]:
