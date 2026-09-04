@@ -36,12 +36,16 @@ MONITORS_TICK_SECONDS = float(os.environ.get("BOARDD_MONITORS_TICK_SECONDS", "30
 # boardd posts synthesized hook events to it and iframes its UI from here.
 AGENTTRAIL_HOOK_URL = os.environ.get("BOARDD_AGENTTRAIL_HOOK_URL", "http://127.0.0.1:5330/hook")
 AGENTTRAIL_PUBLIC_URL = os.environ.get("BOARDD_AGENTTRAIL_URL", "http://127.0.0.1:5330/")
-# agenttrail keys its live "runs" to events whose cwd matches its own repo
-# root; boardd's synthesized events carry this fixed value regardless of
-# which monitor a lane actually lives on, since agenttrail has no concept of
-# multiple chitra monitors. It is also the repo path boardd spawns the
-# vendored agenttrail process against — the two must keep matching.
-AGENTTRAIL_CWD = os.environ.get("BOARDD_AGENTTRAIL_CWD", "/var/lib/polyphony-chitra")
+# The workspace directory boardd spawns the vendored agenttrail process
+# against, and the cwd its synthesized hook events carry — agenttrail keys
+# its live "runs" to events whose cwd matches its own repo root, so the two
+# must keep matching.
+#
+# It is boardd's own directory, and must NEVER be a chitra state root.
+# board_bridge writes PLAN.md and roster.json into it every tick, and
+# app.py's SSE watcher watches the state roots: rendering into one would
+# feed its own watcher forever.
+AGENTTRAIL_CWD = os.environ.get("BOARDD_AGENTTRAIL_CWD", "/var/lib/boardd/workspace")
 
 # `node` binary boardd spawns the vendored agenttrail process with. A bare
 # name relies on PATH; override with an absolute path if the deploy unit's

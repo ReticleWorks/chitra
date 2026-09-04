@@ -1,11 +1,11 @@
 {
-  "name": "boardd — Chitra fleet dashboard",
+  "name": "boardd — the Chitra board",
   "short_name": "boardd",
-  "description": "Live Chitra fleet dashboard",
+  "description": "The Chitra fleet board: session cards and the escalation queue",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#ffffff",
-  "theme_color": "#ffffff",
+  "background_color": "#0d0d0d",
+  "theme_color": "#0d0d0d",
   "icons": [
     {
       "src": "/static/icon-192.png",

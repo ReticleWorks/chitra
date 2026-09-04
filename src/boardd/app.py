@@ -1,22 +1,36 @@
 """boardd — live fleet dashboard. Pure reader over discovered chitra state roots.
 
+The board itself is the vendored agenttrail page, mounted at ``/`` and fed
+from chitra goal state by board_bridge. boardd has no second dashboard of
+its own: the canvas of session cards and the red escalation stack ARE the
+board, and everything below is either that page's own traffic or the JSON
+API underneath it.
+
 Endpoints:
-  GET  /                       the one-page UI (cockpit, drawer, history)
+  GET  /                       the board (proxied from the agenttrail process)
+  GET  /world /tree-of /escalations /events   the board's own data routes
+  POST /hook                   the board's event intake
+  POST /answer                 the escalation panel's "Send to session" — appended
+                               to agenttrail's answers.log AND routed to
+                               chitra-goals resolve-ask for that lane
   GET  /api/monitors           discovered Chitra monitor instances on this host
   GET  /api/state?monitor=     full view JSON for one monitor id, or "all"
-  GET  /events?monitor=        Server-Sent Events: initial state, per-change state, heartbeats
+  GET  /api/events?monitor=    Server-Sent Events: initial state, per-change state, heartbeats
   POST /api/lanes/{id}/ack     clear a lane's open asks (chitra-goals resolve-ask --all)
   POST /api/lanes/{id}/answer  clear a lane's open asks with the answer as basis
-  GET  /activity/*             proxy onto the co-located, boardd-supervised agenttrail process
-  GET  /static/*               css/js assets, manifest, service worker
+  GET  /healthz                readiness plus the state-file errors, as JSON
+  GET  /static/*               manifest, icons, service worker
 
-boardd never writes fleet state directly and never spawns sessions; its two
+Every other upstream route is refused before a request is made — `/spawn`
+takes an arbitrary filesystem path from an unauthenticated POST and
+launches a detached Node process (see vendor/agenttrail/NOTICE.md).
+
+boardd never writes fleet state directly and never spawns sessions; its
 write endpoints shell out to the existing chitra-goals CLI (see actions.py).
 """
 
 import asyncio
 import json
-import threading
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator
@@ -26,29 +40,33 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 from watchfiles import awatch
 
-from chitra.goals import load_goals
-
-from . import actions, agenttrail_bridge, agenttrail_supervisor, config, discovery
+from . import actions, agenttrail_supervisor, board_bridge, config, discovery
 from .state import REVIEW_STATUSES, build_view
 from .translate import TranslationCache
 
 _supervisor = agenttrail_supervisor.AgenttrailSupervisor()
+_bridge = board_bridge.BoardBridge()
 
 
 @asynccontextmanager
 async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
     # BOARDD_DEV=1 (tests, local non-systemd smoke) never spawns a real
-    # Node process — same escape hatch discovery.py already uses.
+    # Node process — same escape hatch discovery.py already uses. The
+    # bridge still runs under it, so a dev smoke against a fixture state
+    # dir renders a real PLAN.md and roster.json for a hand-started
+    # agenttrail to read.
     if not discovery.is_dev_mode():
         _supervisor.start()
+    _bridge.start()
     try:
         yield
     finally:
+        await _bridge.stop()
         if not discovery.is_dev_mode():
             _supervisor.stop()
 
@@ -61,6 +79,14 @@ MAX_REQUEST_BODY_BYTES = 64 * 1024
 
 class AnswerBody(BaseModel):
     text: str = Field(default="", max_length=4096)
+
+
+class BoardAnswerBody(BaseModel):
+    """What the board's escalation panel POSTs to /answer."""
+
+    key: str = Field(min_length=1, max_length=256)
+    answer: str = Field(min_length=1, max_length=4096)
+    at: str = Field(default="", max_length=64)
 
 
 async def _read_bounded_json(request: Request, model: type[BaseModel]) -> BaseModel:
@@ -92,19 +118,6 @@ async def _read_bounded_json(request: Request, model: type[BaseModel]) -> BaseMo
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 _tcache = TranslationCache(config.TRANSLATION_SEED)
-
-# {state root: {session_ref: status}} — the last status boardd posted to
-# agenttrail, per monitor. It was one flat process-wide dict, and
-# `sync_lanes` returns only the lanes of the root it was handed, so two
-# clients watching different monitors overwrote each other's snapshot and
-# each switch re-emitted SessionStart for lanes agenttrail already tracked.
-# Keying by root keeps the snapshots apart.
-#
-# A threading.Lock, not an asyncio.Lock: `_sync_agenttrail` runs in a worker
-# thread (asyncio.to_thread), so the two sides are not both on the event
-# loop.
-_agenttrail_status: dict[Path, dict[str, str]] = {}
-_agenttrail_lock = threading.Lock()
 
 
 def current_monitors() -> dict[str, discovery.MonitorInfo]:
@@ -189,18 +202,13 @@ def current_view() -> dict[str, Any]:
     return _view_for(None)
 
 
-@app.get("/")
-async def index() -> FileResponse:
-    return FileResponse(config.PKG_DIR / "static" / "index.html")
-
-
-# current_monitors(), _view_for() and _sync_agenttrail() all block: a
-# `systemctl` subprocess (3 s), a full re-read of every discovered state
-# root, and up to three 2 s urllib POSTs per changed lane. Every one of them
-# is reached from an `async def` handler or the SSE generator, so one
-# unreachable agenttrail or one slow systemctl stalled every connected
-# client. They run in a worker thread now; the functions themselves stay
-# synchronous, which keeps their sync callers and tests unchanged.
+# current_monitors(), _view_for(), discover_monitors() and _root_for_write()
+# all block: a `systemctl` subprocess (3 s) and a full re-read of every
+# discovered state root. Every one of them is reached from an `async def`
+# handler or the SSE generator, so one slow systemctl stalled every
+# connected client. They run in a worker thread now; the functions
+# themselves stay synchronous, which keeps their sync callers and tests
+# unchanged.
 @app.get("/api/monitors")
 async def api_monitors() -> JSONResponse:
     monitors = await asyncio.to_thread(current_monitors)
@@ -216,21 +224,11 @@ def _sse(event: str, data: Any) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-def _sync_agenttrail(root: Path) -> None:
-    try:
-        lanes = [record.to_dict() for record in load_goals(root, allow_newer=True)]
-    except (ValueError, OSError):
-        return
-    with _agenttrail_lock:
-        prev = _agenttrail_status.get(root, {})
-        _agenttrail_status[root] = agenttrail_bridge.sync_lanes(config.AGENTTRAIL_HOOK_URL, config.AGENTTRAIL_CWD, lanes, prev)
-
-
-@app.get("/events")
+@app.get("/api/events")
 async def events(monitor: str | None = None) -> StreamingResponse:
     # Resolved before the stream starts: an unknown monitor id must come back
     # as a normal 404, not fail silently mid-stream.
-    roots = discovery.discover_monitors()
+    roots = await asyncio.to_thread(discovery.discover_monitors)
     watch_root: Path | None
     if monitor == "all":
         watch_root = None  # no single dir to watch; the client still gets fresh state on the heartbeat/monitors tick
@@ -256,8 +254,6 @@ async def events(monitor: str | None = None) -> StreamingResponse:
         last_monitors_push = loop.time()
         try:
             yield _sse("state", await asyncio.to_thread(_view_for, monitor))
-            if watch_root is not None:
-                await asyncio.to_thread(_sync_agenttrail, watch_root)
             while True:
                 try:
                     msg = await asyncio.wait_for(queue.get(), timeout=config.HEARTBEAT_SECONDS)
@@ -267,8 +263,6 @@ async def events(monitor: str | None = None) -> StreamingResponse:
                         yield _sse("error", {"detail": msg})
                     else:
                         yield _sse("state", await asyncio.to_thread(_view_for, monitor))
-                        if watch_root is not None:
-                            await asyncio.to_thread(_sync_agenttrail, watch_root)
                 except TimeoutError:
                     now = loop.time()
                     if now - last_monitors_push >= config.MONITORS_TICK_SECONDS:
@@ -286,13 +280,17 @@ async def events(monitor: str | None = None) -> StreamingResponse:
     )
 
 
-# Paths agenttrail's own public/index.html actually fetches from its UI —
-# the only ones proxied. Everything else, including every mutating route
-# (`/spawn` takes an arbitrary filesystem path from an unauthenticated POST
-# and launches a detached Node process — see NOTICE.md), is refused: this
-# route only ever registers GET, and an unlisted path 404s before an
-# upstream request is even made.
-ACTIVITY_ALLOWED_PATHS = frozenset({"", "world", "tree-of", "escalations", "events"})
+# Paths agenttrail's own public/index.html actually fetches, and the only
+# ones proxied. The board is mounted at `/`, so these resolve exactly as
+# the page asks for them — root-absolute. Anything unlisted 404s before an
+# upstream request is made, `/spawn` and `/setup-board` among them: /spawn
+# takes an arbitrary filesystem path from an unauthenticated POST and
+# launches a detached Node process (see NOTICE.md).
+BOARD_GET_PATHS = frozenset({"", "world", "tree-of", "escalations", "events"})
+
+# The two the board POSTs. `/answer` is the escalation panel's "Send to
+# session"; `/hook` is the event intake board_bridge itself posts to.
+BOARD_POST_PATHS = frozenset({"answer", "hook"})
 
 
 # A blocking upstream read runs in the default executor's fixed-size thread
@@ -312,6 +310,19 @@ ACTIVITY_ALLOWED_PATHS = frozenset({"", "world", "tree-of", "escalations", "even
 # reconnects roughly every UPSTREAM_READ_TIMEOUT seconds instead of holding
 # one connection open forever.
 UPSTREAM_READ_TIMEOUT = 30.0
+
+
+def _post_upstream(url: str, payload: Any, raw: bytes | None = None) -> bool:
+    """POST to the loopback agenttrail process. Best-effort, like every
+    other call into it: a down agenttrail must never fail an operator's
+    answer, which is written to chitra state either way."""
+    body = raw if raw is not None else json.dumps(payload, default=str).encode()
+    req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=UPSTREAM_READ_TIMEOUT).read()  # noqa: S310 — loopback, allowlisted path
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 async def _proxy_get(url: str) -> StreamingResponse:
@@ -363,15 +374,7 @@ async def _proxy_get(url: str) -> StreamingResponse:
     return StreamingResponse(body(), status_code=status, media_type=content_type)
 
 
-@app.get("/activity/{path:path}")
-async def activity_proxy(path: str, request: Request) -> StreamingResponse:
-    if path not in ACTIVITY_ALLOWED_PATHS:
-        raise HTTPException(status_code=404, detail="not proxied")
-    port = agenttrail_supervisor.agenttrail_port()
-    url = f"http://127.0.0.1:{port}/{path}"
-    if request.url.query:
-        url += f"?{request.url.query}"
-    return await _proxy_get(url)
+
 
 
 @app.get("/healthz")
@@ -403,7 +406,7 @@ def _lane_action_status(e: actions.LaneActionError, *, default: int) -> int:
 
 @app.post("/api/lanes/{lane_id}/ack")
 async def ack_lane(lane_id: str, monitor: str | None = None) -> JSONResponse:
-    root = _root_for_write(monitor)
+    root = await asyncio.to_thread(_root_for_write, monitor)
     try:
         record = await asyncio.to_thread(actions.ack_lane, root, lane_id)
     except actions.LaneActionError as e:
@@ -415,7 +418,7 @@ async def ack_lane(lane_id: str, monitor: str | None = None) -> JSONResponse:
 async def answer_lane(lane_id: str, request: Request, monitor: str | None = None) -> JSONResponse:
     body = await _read_bounded_json(request, AnswerBody)
     assert isinstance(body, AnswerBody)
-    root = _root_for_write(monitor)
+    root = await asyncio.to_thread(_root_for_write, monitor)
     try:
         record = await asyncio.to_thread(actions.answer_lane, root, lane_id, body.text)
     except actions.LaneActionError as e:
@@ -426,3 +429,67 @@ async def answer_lane(lane_id: str, request: Request, monitor: str | None = None
 # Re-exported so callers/tests reach the review-queue statuses via app, not a
 # separate import of boardd.state.
 __all__ = ["app", "REVIEW_STATUSES"]
+
+
+# ---------------------------------------------------------------- the board
+#
+# Registered last: FastAPI matches in registration order, so /api/*,
+# /healthz and the /static mount all win over this catch-all.
+
+
+@app.post("/answer")
+async def board_answer(request: Request) -> JSONResponse:
+    """The escalation panel's "Send to session".
+
+    Two destinations, in that order:
+
+    1. agenttrail's own `/answer`, which appends one line to
+       `.agenttrail/answers.log` — parity with the approved board, and the
+       operator's own record of what they said.
+    2. `chitra-goals resolve-ask` for that lane, which is what actually
+       retires the ask in chitra state.
+
+    The escalation key board_bridge writes is the lane id, which
+    actions._find_record accepts directly. A key that resolves nothing is a
+    409, exactly as /api/lanes/{id}/answer returns — never a false success.
+    """
+    body = await _read_bounded_json(request, BoardAnswerBody)
+    assert isinstance(body, BoardAnswerBody)
+
+    port = agenttrail_supervisor.agenttrail_port()
+    logged = await asyncio.to_thread(
+        _post_upstream, f"http://127.0.0.1:{port}/answer", body.model_dump()
+    )
+
+    root = await asyncio.to_thread(_root_for_write, None)
+    try:
+        record = await asyncio.to_thread(actions.answer_lane, root, body.key, body.answer)
+    except actions.LaneActionError as e:
+        raise HTTPException(status_code=_lane_action_status(e, default=400), detail=str(e)) from e
+    return JSONResponse({"ok": True, "logged": logged, "lane": record.to_dict()})
+
+
+@app.post("/hook")
+async def board_hook(request: Request) -> StreamingResponse:
+    """agenttrail's event intake, passed straight through."""
+    port = agenttrail_supervisor.agenttrail_port()
+    body = await request.body()
+    if len(body) > MAX_REQUEST_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="request body exceeds 64 KB")
+    ok = await asyncio.to_thread(_post_upstream, f"http://127.0.0.1:{port}/hook", None, body)
+    return StreamingResponse(iter([b'{"ok":%s}' % (b"true" if ok else b"false")]), media_type="application/json")
+
+
+@app.get("/{path:path}")
+async def board(path: str, request: Request) -> StreamingResponse:
+    if path not in BOARD_GET_PATHS:
+        raise HTTPException(status_code=404, detail="not proxied")
+    port = agenttrail_supervisor.agenttrail_port()
+    url = f"http://127.0.0.1:{port}/{path}"
+    if request.url.query:
+        url += f"?{request.url.query}"
+    # ?monitor= on the page itself re-points the bridge, so the canvas and
+    # the escalation stack show that monitor's lanes and nothing else.
+    if path == "":
+        await asyncio.to_thread(_bridge.set_monitor, request.query_params.get("monitor"))
+    return await _proxy_get(url)
