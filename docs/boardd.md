@@ -1,12 +1,12 @@
 # boardd — the single Chitra board
 
-Live fleet dashboard over one or more discovered Chitra state directories.
-One page: cockpit (Since-you-looked, Needs feedback, lane grid), a
-lane-detail drawer, a History tab, and an Activity tab (agenttrail's
-activity-card view, proxied through boardd's own origin). boardd never
-writes fleet state directly and never spawns sessions; its two write
-endpoints (ack, answer) shell out to the existing `chitra-goals` CLI, which
-is the only thing that ever touches goals.json. boardd is the one board — the old Artifact-published
+The board over one or more discovered Chitra state directories: a pan/zoom
+canvas of session cards with a red escalation stack down the right edge,
+fed from chitra goal state. It is the board built and approved on
+2026-09-01, not a description of one — see "The board" below. boardd never
+writes fleet state directly and never spawns sessions; its write endpoints
+shell out to the existing `chitra-goals` CLI, which is the only thing that
+ever touches goals.json. boardd is the one board — the old Artifact-published
 board (`board_publish.py` in the fleet `chitra-launcher` package) is
 deprecated in favour of this page; see "Deploy" below.
 
@@ -19,7 +19,8 @@ pip install 'chitra-monitor[boardd]'
 ```
 
 Python 3.12 + FastAPI. Extra dependencies: `fastapi`, `uvicorn`, `watchfiles`
-only. No build step, no CDN; one HTML page with vanilla JS.
+only. No build step, no CDN. The page itself is the vendored agenttrail
+bundle, served by a co-located Node process boardd owns.
 
 ## Run against the bundled fixture state dir
 
@@ -33,16 +34,31 @@ BOARDD_DEV=1 BOARDD_STATE_ROOTS=monitor=tests/fixtures/boardd_state \
   uvicorn boardd.app:app --port 8480
 ```
 
-Then open http://127.0.0.1:8480/.
+Then open http://127.0.0.1:8480/. For a run that actually paints, start the
+vendored agenttrail process against a workspace directory of your own first
+and point boardd at it:
 
-- `GET /` — the dashboard.
+```sh
+mkdir -p /tmp/boardd-workspace
+node src/boardd/vendor/agenttrail/bin/agenttrail.mjs /tmp/boardd-workspace --port 5331 --no-open &
+BOARDD_DEV=1 BOARDD_STATE_ROOTS=monitor=tests/fixtures/boardd_state \
+  BOARDD_AGENTTRAIL_CWD=/tmp/boardd-workspace \
+  BOARDD_AGENTTRAIL_URL=http://127.0.0.1:5331/ \
+  BOARDD_AGENTTRAIL_HOOK_URL=http://127.0.0.1:5331/hook \
+  uvicorn boardd.app:app --port 8480
+```
+
+Under `BOARDD_DEV=1` boardd does not spawn agenttrail itself, which is why
+the command above starts it by hand. The bridge runs either way.
+
+- `GET /` — the board. `?monitor=<id>` filters it to one monitor.
 - `GET /api/monitors` — every discovered monitor: id, state root, unit
   active state, lane count, needs-feedback count. Re-scanned on every call.
 - `GET /api/state?monitor=<id|all>` — full board state as JSON for one
   monitor, or the union of all of them. This is also Ramble's roster read
   path. Omit `monitor` for the default single-instance id (`monitor`) or the
   first discovered monitor.
-- `GET /events?monitor=<id|all>` — Server-Sent Events: an initial `state`
+- `GET /api/events?monitor=<id|all>` — Server-Sent Events: an initial `state`
   event, a new `state` event whenever a file in that monitor's state dir
   changes, a `monitors` event every 30 s (`BOARDD_MONITORS_TICK_SECONDS`)
   with a fresh `/api/monitors` result, and a `heartbeat` every 15 s.
@@ -52,6 +68,8 @@ Then open http://127.0.0.1:8480/.
 - `POST /api/lanes/{lane_id}/answer` — body `{"text": "..."}`; clears a
   lane's open asks with the given text recorded as the retirement basis
   (`chitra-goals resolve-ask --all --basis <text>`).
+- `POST /answer` — what the board's own answer panel calls; body
+  `{"key": "<lane>", "answer": "...", "at": "..."}`. See "The answer path".
 
 Edit `goals.json` in a state dir while the page is open and the board
 updates without a reload. Kill the server and the top bar turns honest:
@@ -114,129 +132,157 @@ to refresh the translation seed for any new lines.
 
 ## Needs-feedback review queue
 
-The cockpit's top zone lists every lane that needs an operator decision:
+The escalation stack carries every lane that needs an operator decision:
 status `completion-disputed`, `done-pending-verification`,
 `turn-finished-unverified`, or `blocked`, or a non-empty `open_asks` list.
 Each card shows the ask text (or, for a status-only trigger with no literal
 ask, boardd's own plain-words reason) and the lane's goal, sorted
 oldest-lane-update first — v3 carries no per-ask timestamp, so the lane's
 own last-write time is the closest honest proxy for how long it has been
-waiting. Lane cards elsewhere in the grid carry a "Needs feedback" badge
-when they are in this set.
+waiting. `/api/state` reports the same set as `needs_you`, so the board and
+the JSON API never disagree about who needs attention.
 
-## Rendering: agenttrail's activity-card UI, proxied
+## The board
 
-boardd vendors agenttrail (`sodiumsun/agenttrail` v0.2.0, pinned commit and
-license in `src/boardd/vendor/agenttrail/NOTICE.md`) unmodified. boardd
-spawns it itself at startup (`node <vendored>/bin/agenttrail.mjs`, bound to
-loopback) and supervises it — restart on exit with backoff, stopped on
-boardd's own shutdown, stdout/stderr logged. It is never exposed on the
-tailnet directly: the Activity tab's iframe points at `/activity/` on
-boardd's own origin, which boardd proxies to the loopback process — GET
-only, through a small allowlist of the paths agenttrail's UI actually
-fetches (`/`, `/world`, `/tree-of`, `/escalations`, `/events`). `/spawn`,
-`/setup-board`, `/answer`, and every other mutating route are refused: the
-vendored server's `/spawn` handler takes an arbitrary filesystem path from
-an unauthenticated POST and launches a detached Node process, so it must
-never reach the tailnet even by accident. boardd separately drives
-agenttrail's own live feed by posting synthesized Claude-Code-shaped hook
-events (`SessionStart`, `PreToolUse`/`PostToolUse` carrying the lane's `now`
-text, `Stop`) to its `/hook` endpoint on every lane status change — the same
-event shape and posting pattern this repository's own Orchestra board
-bridge (`bridge.py`) already uses successfully.
+The board is agenttrail's page, mounted at `/`. There is no second boardd
+dashboard: the canvas of session cards and the red escalation stack down the
+right edge ARE the board, fed from chitra goal state.
 
-**Why proxy instead of driving agenttrail's UI directly from boardd's own
-endpoint**, which was the first plan: agenttrail's `public/index.html` is
-not a stateless renderer of an external feed. It is the client half of a
-single self-contained Node service that owns its own world model — a
-repo-rooted `PLAN.md` component tree, a multi-board registry served from
-`/world`, graph and minimap layout, and several bespoke endpoints
-(`/spawn`, `/setup-board`, `/tree-of`, `/suggest`, `/escalations`,
-`/answer`) with no analog in chitra's `GoalRecord` schema. Reproducing that
-model in Python would mean re-implementing most of agenttrail's server, not
-translating one shape into another — clearly more code, and a second,
-divergent copy of logic upstream already maintains. The one clean seam is
-`/hook`: agenttrail already turns a stream of hook events into its live
-"run" view with no `PLAN.md` at all, and this repository already has a
-proven implementation of posting to it. Driving that seam is the smaller
-diff, so that is what boardd does.
+That page was built and approved on 2026-09-01 as the Orchestra board, and
+vendored here (`sodiumsun/agenttrail` v0.2.0, pinned commit and license in
+`src/boardd/vendor/agenttrail/NOTICE.md`, which lists every local patch).
+Until 0.21.0 boardd shipped its own separate cockpit and demoted the
+approved board to a third tab behind it. That cockpit is gone.
+
+boardd spawns the vendored process itself at startup
+(`node <vendored>/bin/agenttrail.mjs`, bound to loopback) and supervises it —
+restart on exit with backoff, stopped on boardd's own shutdown,
+stdout/stderr logged. The Node port is never exposed on the tailnet.
+
+### What the board shows
+
+- **Session cards** on a pan/zoom canvas, one per lane: a monospace header
+  line (`chitra · <session_ref> · monitor <id>`), the lane name and goal,
+  `n of m tasks · <status>`, and the lane's current movement on a `tech:`
+  line.
+- **Markers**, the same four the approved board used: `[~]` working, `[!]`
+  waiting on you, `[x]` done pending close, `[ ]` idle or held.
+- **The escalation stack**, red-bordered cards down the right edge ending
+  about a third of the way up from the bottom. Every `[!]` lane appears
+  once. Clicking one opens the answer panel: Context, Question,
+  Recommendation, Your answer, then **Send to session** and **Find the
+  session**.
+- **A Runs toggle** in the canvas toolbar hides and shows the floating run
+  cards. They start hidden.
+
+### How chitra state reaches it
+
+`src/boardd/board_bridge.py` writes the two files agenttrail reads out of
+its workspace directory (`BOARDD_AGENTTRAIL_CWD`), then posts the events
+that move a card live. It re-renders whenever a state file changes and at
+least every 30 s.
+
+| chitra | board |
+| --- | --- |
+| a `GoalRecord` | one `##` component in `PLAN.md` — one session card |
+| `status: working` | `[~]` |
+| `blocked`, `turn-finished-unverified`, `completion-disputed`, `done-pending-verification`, or any `open_asks` | `[!]`, and one entry in `roster.json`'s `escalations` |
+| `done-pending-close` | `[x]` |
+| `idle`, `held` | `[ ]` |
+| `now`, else `hold_reason` | the card's `tech:` line |
+| an open ask | `tech: NEEDS-INPUT HH:MM — <the ask>` |
+| `goal` | the escalation's title |
+| `goal` + `now` + `last_verified` | the panel's Context |
+| a `foreground_task`, else `hold_reason`, else the proof still owed | the panel's Recommendation |
+| host, monitor id, lane id, tmux pane target | the panel's "Find the session" |
+
+An open ask outranks the status: it is a live, unanswered request to the
+operator whatever the lane is otherwise doing.
+
+The workspace directory is boardd's own and must never be a chitra state
+root. board_bridge writes into it every tick and the SSE watcher watches the
+state roots, so rendering into one would feed its own watcher forever.
+
+### The answer path
+
+`POST /answer` — what **Send to session** calls — has two destinations, in
+order:
+
+1. agenttrail's own `/answer`, which appends one JSON line to
+   `.agenttrail/answers.log`. Parity with the approved board, and the
+   operator's own record of what they said.
+2. `chitra-goals resolve-ask` for that lane, which is what actually retires
+   the ask in chitra state.
+
+The escalation key is the lane id, which `actions._find_record` accepts
+directly. A key that resolves nothing returns 409 and a key that matches no
+lane returns 404 — never a false success. agenttrail being down does not
+fail the write; the answer still reaches chitra state.
+
+### The proxy
+
+Only the paths agenttrail's page actually fetches are proxied, and they
+resolve root-absolute because the board is mounted at the root:
+
+- GET `/`, `/world`, `/tree-of`, `/escalations`, `/events`
+- POST `/answer`, `/hook`
+
+Everything else 404s before an upstream request is made — `/spawn` and
+`/setup-board` included. The vendored server's `/spawn` handler takes an
+arbitrary filesystem path from an unauthenticated POST and launches a
+detached Node process, so it must never reach the tailnet even by accident.
+
+### Monitors
+
+One `PLAN.md` section per monitor. agenttrail's plan convention has no node
+above a component, so a section is a contiguous run of that monitor's lanes
+with monitor-prefixed ids — the cards land together on the canvas and the
+ids stay unique across monitors. `GET /?monitor=<id>` re-points the bridge
+at one monitor; omit it for all of them. There is no new UI chrome for this.
+
+The filter is one process-wide value, not one per viewer: this is a loopback
+board with one operator in front of it. Per-viewer filtering would need
+agenttrail itself to filter, which it cannot.
 
 ## Mobile
 
-Viewport meta and a single-column layout under 720px (covers the 600px
-target) were already in place. This build adds `manifest.webmanifest` and a
-service worker (`static/sw.js`) that caches the static shell only — the
-page, its CSS and JS, and the manifest — never `/api/state` or `/events`.
-Board data is always live or explicitly marked stale; it is never served
-from a cache pretending to be current.
+agenttrail's canvas does not reflow — at 390 px it stayed a wide pan/zoom
+surface and the page scrolled sideways. Patch 6 on the vendored page is a
+reflow of the same anatomy, not a second design.
 
-### Mobile UI
+Below 600 px (or with `?m=1` at any width, which is how it is screenshotted
+and debugged from a desktop browser):
 
-Under 600px, boardd shows a separate mobile shell (a sibling to the wider
-layout above, which stays unchanged) built from the approved design
-artboards: three views behind a bottom tab bar.
+- the file tree and the canvas step aside;
+- the escalation stack becomes the queue — full width, in normal flow, same
+  red-bordered card anatomy, opening the same four-section panel;
+- the session cards follow it as a single column with the same header,
+  title and `n of m tasks` lines.
 
-- **Lanes.** Header (monitor name, last-updated time), status filter chips
-  (All / Working / Blocked / Done, each with a live count), a "N lanes need
-  you" banner that links to Review when the queue is non-empty, and one
-  card per lane — monospaced lane id, a status badge, the goal, and a
-  one-line now/ask summary reusing the same server-computed, honesty-marked
-  text the wide layout already shows. Done lanes render at 0.72 opacity.
-- **Review.** One card per needs-feedback item, oldest first, with the
-  action pair its lane actually supports: an open ask, or a status-only
-  item for `completion-disputed`/`done-pending-verification`, both get a
-  text box plus Send answer and Acknowledge — chitra-goals has no verb
-  that closes or disputes a done-pending lane (only `resolve-ask`, which
-  needs a literal open ask), so there is no "Accept done" or "Send back"
-  to offer; a status-only item with nothing to resolve reports that
-  honestly (see below), it does not pretend to change the lane. Everything
-  else (`turn-finished-unverified`, or `blocked` with no literal ask) gets
-  Nudge and Open lane (switches to Lanes and scrolls to the card); Nudge is
-  the same no-op-safe answer call, so it only succeeds when the lane
-  actually has an open ask to attach the note to. The card is removed only
-  when the server reports the lane actually changed; a no-op or failed
-  action shows a toast and leaves the card in place. The Review tab
-  carries an unread-count badge.
-- **Activity.** The same agenttrail iframe as the wide layout's Activity
-  tab, loaded lazily when the tab is first opened.
-- **Monitor picker.** A bottom sheet (tap the monitor pill in the header)
-  listing every monitor from `/api/monitors` — a state dot colored by unit
-  state, lane count, and needs-you count. A monitor with no state root on
-  disk yet shows a disabled row. Selection is multi-select, persisted to
-  `localStorage`, and drives the same `?monitor=` query the wide layout
-  uses: selecting everything (or nothing) maps to `all`, selecting exactly
-  one maps to that id. A genuine partial subset (two of three or more) has
-  no server-side union endpoint yet, so it degrades to `all` until boardd
-  grows a comma-separated filter.
+`manifest.webmanifest`, the two icons, and a shell-only service worker
+(`static/sw.js`) ride on the board page itself, so it installs to a home
+screen with `start_url` `/`. The worker caches the shell only — never
+`/world`, `/escalations` or `/events`. Board data is always live, never
+served from a cache pretending to be current.
 
-### Dark mode (mobile)
+Three cascade traps are worth knowing before touching this CSS, because all
+three were found by screenshotting the running board rather than reading it:
 
-The mobile shell uses agenttrail's own light/dark token set — background,
-card, line, dim/soft text, and the accent, success, danger, and purple
-status colors — as CSS custom properties, following the same
-`prefers-color-scheme` and manual `data-theme` toggle already wired up for
-the wide layout, so both layouts and the embedded Activity iframe read as
-one system.
-
-### A cascade bug this build fixed
-
-Driving the new shell through a real browser (not just the structural CSS
-tests below) surfaced a pre-existing cascade bug: an element toggled by the
-`hidden` attribute stays hidden only if nothing else declares `display` at
-equal or higher specificity. The desktop drawer, and initially the new
-mobile banner/sheet/view sections, all paired `hidden` with an unconditional
-class-level `display: flex`, so the attribute silently lost the cascade tie
-— the drawer, in particular, is `position: fixed` and full-width under
-528px, so it intercepted every click on any narrow viewport regardless of
-its `hidden` state. All are now guarded with `:not([hidden])`.
+1. The `.esc-*` rules are appended **after** the media queries in the
+   stylesheet, so a media query written among them loses on cascade order,
+   not specificity. The reflow is the last thing in the file.
+2. `.app`'s implicit grid column is auto-sized, so one nowrap escalation
+   title widened the page to 983 px inside a 390 px viewport. The reflow
+   clamps the column to `minmax(0,1fr)`.
+3. The canvas section carries class `primary` too, and upstream gives
+   `.primary` `min-height:calc(100dvh - 105px)` below 720 px. That also
+   matched the answer panel's `.esc-btn.primary`, stretching "Send to
+   session" to fill the panel.
 
 ## Dark mode
 
-`prefers-color-scheme: dark` is honoured automatically. A manual toggle in
-the top bar (the half-moon button) forces light or dark via
-`data-theme` on `<html>`, persisted in `localStorage` (`boardd-theme`). Dark
-tokens match the vendored agenttrail UI's own dark palette so the cockpit
-and the embedded Activity tab read as one system.
+The board's own dark-first palette, unchanged. agenttrail's light toggle in
+the top bar still works and still persists.
 
 ## What is stubbed
 
@@ -274,10 +320,15 @@ pytest
 
 Covers: v3 state loading against the bundled fixture dir (including
 structured done-when proof matching), scope-delta detection, the
-needs-feedback review-queue selection and sort order, the two write
-endpoints, monitor discovery from a temp dir tree, the honesty invariants
-above, endpoint + SSE smoke, and a structural no-horizontal-scroll-at-390px
-check.
+needs-feedback review-queue selection and sort order, the write endpoints,
+monitor discovery from a temp dir tree, the honesty invariants above,
+endpoint + SSE smoke, the bridge's goals-to-PLAN/roster rendering, the root
+proxy's allow and deny lists, and the 390px reflow.
+
+The tests are structural, not visual. Every layout defect this build fixed
+was found by screenshotting the running board with Playwright, and the
+tests were written afterwards to hold each fix. Screenshot the board when
+you change its CSS.
 
 ## Deploy
 
@@ -290,9 +341,11 @@ resolutions back into them; reachable only over the tailnet.
    hand-copied files on the host.
 2. Reach it over Tailscale Serve, tailnet only; no public listener. boardd
    spawns and supervises the vendored agenttrail Node process itself
-   (loopback-only, restarted on exit) and proxies its UI at `/activity/*`
-   under boardd's own origin — the raw Node port is never exposed on the
-   tailnet.
+   (loopback-only, restarted on exit) and serves its page at `/` under
+   boardd's own origin — the raw Node port is never exposed on the tailnet.
+   Give the `boardd` user a writable workspace directory
+   (`BOARDD_AGENTTRAIL_CWD`, default `/var/lib/boardd/workspace`); it must
+   not be a chitra state root.
 3. Land `packaging/systemd/boardd.service.example` (draft in this repo) via
    the governed host repo, running a dedicated `boardd` user with
    `ReadWritePaths=/var/lib` (the state roots' ids are discovered at
