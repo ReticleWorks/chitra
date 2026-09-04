@@ -65,3 +65,17 @@ def test_the_right_hand_board_is_hideable():
     assert "const overlays={activity:true,runs:false}" in BOARD
     assert "id=\"ov-runs\"" in BOARD and "toggleOverlay('runs')" in BOARD
     assert "body.hide-runs .runs{display:none!important}" in BOARD
+
+
+def test_the_send_button_cannot_be_stretched_by_the_canvas_rule():
+    """The canvas section carries class `primary` too, and upstream gives it
+    min-height:calc(100dvh - 105px) below 720px. That rule also matched the
+    answer panel's `.esc-btn.primary`, stretching "Send to session" to 739px
+    at 390 — the whole panel below it was pushed off-screen."""
+    assert ".esc-btn{min-height:0}" in BOARD
+
+
+def test_the_reflow_clamps_the_grid_column():
+    """`.app`'s implicit column is auto-sized, so one nowrap escalation title
+    widened the page to 983px at a 390px viewport."""
+    assert "grid-template-columns:minmax(0,1fr)" in MOBILE_RULES.group(1)
