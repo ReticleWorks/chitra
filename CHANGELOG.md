@@ -4,6 +4,14 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+### Fixed
+
+- boardd: an answer sent from the escalation stack now lands on the monitor
+  whose card it came from. The board page POSTs only `{key, answer, at}`, so
+  the escalation key is `<monitor>:<lane>` and `/answer` splits it back
+  apart. Before this every answer resolved against the default monitor's
+  state root, which made every card outside that monitor unanswerable.
+
 ## [0.21.0] - 2026-09-03
 
 ### Changed

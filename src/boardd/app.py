@@ -396,6 +396,23 @@ def _root_for_write(monitor: str | None) -> Path:
     return _resolve_root(monitor or _default_monitor_id(roots), roots)
 
 
+def _root_for_answer(key: str) -> tuple[Path, str]:
+    """Split the board's ``<monitor>:<lane>`` escalation key.
+
+    The board page POSTs only ``{key, answer, at}``, so the monitor rides on
+    the key board_bridge.escalation_key wrote. An unprefixed key, or a prefix
+    that is not a discovered monitor, falls back to the default monitor —
+    the shape /api/lanes/{id}/answer already uses.
+    """
+    roots = discovery.discover_monitors()
+    monitor, sep, lane = key.partition(":")
+    if sep and lane and monitor in roots:
+        return roots[monitor], lane
+    if not roots:
+        return config.STATE_DIR, key
+    return roots[_default_monitor_id(roots)], key
+
+
 def _lane_action_status(e: actions.LaneActionError, *, default: int) -> int:
     if e.not_found:
         return 404
@@ -449,9 +466,10 @@ async def board_answer(request: Request) -> JSONResponse:
     2. `chitra-goals resolve-ask` for that lane, which is what actually
        retires the ask in chitra state.
 
-    The escalation key board_bridge writes is the lane id, which
-    actions._find_record accepts directly. A key that resolves nothing is a
-    409, exactly as /api/lanes/{id}/answer returns — never a false success.
+    The escalation key board_bridge writes is ``<monitor>:<lane>``, so the
+    answer is written to the state root the operator was actually looking
+    at. A key that names no lane is a 404, exactly as
+    /api/lanes/{id}/answer returns — never a false success.
     """
     body = await _read_bounded_json(request, BoardAnswerBody)
     assert isinstance(body, BoardAnswerBody)
@@ -461,9 +479,9 @@ async def board_answer(request: Request) -> JSONResponse:
         _post_upstream, f"http://127.0.0.1:{port}/answer", body.model_dump()
     )
 
-    root = await asyncio.to_thread(_root_for_write, None)
+    root, lane = await asyncio.to_thread(_root_for_answer, body.key)
     try:
-        record = await asyncio.to_thread(actions.answer_lane, root, body.key, body.answer)
+        record = await asyncio.to_thread(actions.answer_lane, root, lane, body.answer)
     except actions.LaneActionError as e:
         raise HTTPException(status_code=_lane_action_status(e, default=400), detail=str(e)) from e
     return JSONResponse({"ok": True, "logged": logged, "lane": record.to_dict()})

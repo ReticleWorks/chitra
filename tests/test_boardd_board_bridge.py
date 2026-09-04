@@ -70,11 +70,13 @@ def test_several_monitors_keep_their_lanes_apart():
 
 def test_only_needs_input_lanes_reach_the_escalation_stack():
     escalations = board_bridge.render_roster(SECTIONS)["escalations"]
-    assert list(escalations) == ["wiki-backfill"]
+    # The key carries the monitor: the page POSTs it back as-is, and it is
+    # the only place /answer can learn which state root to write.
+    assert list(escalations) == ["monitor:wiki-backfill"]
 
 
 def test_an_escalation_carries_the_four_panel_sections_and_the_reveal():
-    esc = board_bridge.render_roster(SECTIONS)["escalations"]["wiki-backfill"]
+    esc = board_bridge.render_roster(SECTIONS)["escalations"]["monitor:wiki-backfill"]
     assert esc["goal"] == "Backfill the Atlas wiki pages."
     assert esc["question"] == "Rename the colliding page, or merge it into the existing one?"
     # Context: the goal, what the lane says it is doing, and when it was last verified.
@@ -108,7 +110,7 @@ def test_render_writes_both_files_into_the_workspace(tmp_path, monkeypatch):
 
     assert "## wiki-backfill" in (tmp_path / "PLAN.md").read_text()
     roster = json.loads((tmp_path / "roster.json").read_text())
-    assert list(roster["escalations"]) == ["wiki-backfill"]
+    assert list(roster["escalations"]) == ["monitor:wiki-backfill"]
 
 
 def test_node_ids_stay_inside_agenttrails_id_grammar():

@@ -79,12 +79,24 @@ def local_hm(iso: str) -> str:
 
 
 def lane_key(record: dict[str, Any]) -> str:
-    """The name the board shows and ``POST /answer`` routes back on.
+    """The lane's own name.
 
     ``actions._find_record`` accepts either a lane_id or a session_ref, so
     whichever this returns is a valid write target.
     """
     return str(record.get("lane_id") or session_name(str(record.get("session_ref", ""))) or "lane")
+
+
+def escalation_key(monitor_id: str, record: dict[str, Any]) -> str:
+    """The name the board shows and ``POST /answer`` routes back on.
+
+    The page sends only ``{key, answer, at}``, so the key is the only place
+    the monitor can ride. ``<monitor>:<lane>`` is the board's own ``sid``
+    shape; app.py splits it back apart to pick the state root to write.
+    Without it every answer landed on the default monitor whatever the
+    stack was showing.
+    """
+    return f"{monitor_id}:{lane_key(record)}"
 
 
 def mark_for(record: dict[str, Any]) -> str:
@@ -231,7 +243,7 @@ def render_roster(sections: list[tuple[str, list[dict[str, Any]]]]) -> dict[str,
         for record in records:
             if mark_for(record) != NEEDS_INPUT:
                 continue
-            escalations[lane_key(record)] = {
+            escalations[escalation_key(monitor_id, record)] = {
                 "at": record.get("updated_at", ""),
                 "goal": clean(record.get("goal", "")),
                 "question": clean(ask_of(record)),

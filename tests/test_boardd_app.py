@@ -129,7 +129,7 @@ def _enrolled_lane(session_ref: str, open_asks: tuple[str, ...]):
     )
 
 
-def _write_endpoint_env(tmp_path):
+def _write_endpoint_env(tmp_path, lane="wiki-backfill", name="boardd_state", open_asks=("Rename the colliding page?",)):
     """A one-lane, fully-enrolled goals.json in an isolated temp dir, plus an
     empty sweep-digest.json, so write-endpoint tests never touch the shared
     display fixture other tests read."""
@@ -137,9 +137,9 @@ def _write_endpoint_env(tmp_path):
 
     from chitra.goals import SCHEMA
 
-    target = tmp_path / "boardd_state"
+    target = tmp_path / name
     target.mkdir()
-    record = _enrolled_lane("roundtop:wiki-backfill", ("Rename the colliding page?",))
+    record = _enrolled_lane(f"roundtop:{lane}", open_asks)
     (target / "goals.json").write_text(
         json.dumps({"schema": SCHEMA, "updated_at": "2026-09-01T00:00:00-04:00", "goals": [record.to_dict()]})
     )
@@ -366,17 +366,39 @@ def test_board_answer_logs_upstream_and_resolves_the_ask(tmp_path, monkeypatch):
     try:
         monkeypatch.setattr(config, "AGENTTRAIL_PUBLIC_URL", f"http://127.0.0.1:{port}/")
 
-        r = client.post("/answer", json={"key": "wiki-backfill", "answer": "Merge it.", "at": "now"})
+        r = client.post("/answer", json={"key": "monitor:wiki-backfill", "answer": "Merge it.", "at": "now"})
         assert r.status_code == 200, r.text
         assert r.json()["logged"] is True
         assert ANSWERS_LOG == ["/answer"]
         assert r.json()["lane"]["open_asks"] == []
 
-        # Nothing left to resolve on that lane, and never a false success.
-        again = client.post("/answer", json={"key": "wiki-backfill", "answer": "Merge it.", "at": "now"})
-        assert again.status_code == 409
+        assert client.post("/answer", json={"key": "monitor:no-such-lane", "answer": "x"}).status_code == 404
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
 
-        assert client.post("/answer", json={"key": "no-such-lane", "answer": "x"}).status_code == 404
+
+def test_an_answer_lands_on_the_monitor_its_card_came_from(tmp_path, monkeypatch):
+    """Two monitors, one lane each. The escalation key carries the monitor,
+    so monitor B's card resolves B's ask and never touches A's."""
+    a = _write_endpoint_env(tmp_path, lane="only-in-a", name="root-a")
+    b = _write_endpoint_env(tmp_path, lane="only-in-b", name="root-b")
+    monkeypatch.setenv("BOARDD_STATE_ROOTS", f"monitor={a},mb={b}")
+
+    server = HTTPServer(("127.0.0.1", 0), _FakeAgenttrailHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setattr(config, "AGENTTRAIL_PUBLIC_URL", f"http://127.0.0.1:{port}/")
+
+        r = client.post("/answer", json={"key": "mb:only-in-b", "answer": "Ship B.", "at": "now"})
+        assert r.status_code == 200, r.text
+        assert r.json()["lane"]["lane_id"] == "only-in-b"
+        assert r.json()["lane"]["open_asks"] == []
+
+        # A's lane is untouched, and B's key does not resolve against A.
+        assert json.loads((a / "goals.json").read_text())["goals"][0]["open_asks"] != []
     finally:
         server.shutdown()
         thread.join(timeout=2)
