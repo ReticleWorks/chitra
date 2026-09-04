@@ -29,7 +29,10 @@ pytest
 
 This repo enforces a secrets-and-PII hygiene check (`scripts/hygiene_check.py`, deny-list in
 `.hygiene-denylist`) plus [gitleaks](https://github.com/gitleaks/gitleaks) via
-[pre-commit](https://pre-commit.com). A repo can't force a hooks path on your clone, so install it once:
+[pre-commit](https://pre-commit.com). The deny-list has two tiers: a `block` line (personal
+names, email addresses, secret shapes) fails the check, while a `warn:` line (internal
+hostnames, project and org terms) is reported but never fails it. A repo can't force a hooks
+path on your clone, so install it once:
 
 ```bash
 pip install pre-commit
@@ -37,7 +40,7 @@ pre-commit install
 ```
 
 After that, both checks run automatically on `git commit`. Run `python3 scripts/hygiene_check.py --fix`
-to rewrite existing matches to neutral placeholders instead of fixing them by hand.
+to rewrite existing block-tier matches to neutral placeholders instead of fixing them by hand.
 
 ## Code of Conduct
 

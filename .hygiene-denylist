@@ -9,39 +9,54 @@
 # A deny line may carry a --fix replacement after a tab character:
 #     <regex><TAB><placeholder>
 # The default placeholder (no tab) is <redacted>.
+#
+# Two tiers. A line is BLOCK by default: it fails the check (exit 1) and is
+# rewritten by --fix. A line prefixed "warn:" is WARN: it is reported but
+# never fails the check and is never touched by --fix. Personal data and
+# real secret shapes stay block. Internal hostnames and project/org terms
+# --  useful for local operators but not personal data -- are warn.
 
-# --- email addresses ---
+# --- email addresses (block: personal-data risk) ---
 [A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}	<redacted-email>
 
-# --- personal names / person-as-host handles ---
+# --- personal names (block: personal data) ---
 \bTrey\b	<redacted-name>
 \bHerr\b	<redacted-name>
 \btiptap\b	<redacted-name>
-\broundtop\b	<redacted-name>
 
-# --- internal hostnames / tailnet ---
-\btwinridge\b	<host>
-\btophand\b	<host>
-\brenegade\b	<host>
-\btrailhead\b	<host>
-\bsatchmo\b	<host>
-\btwister\b	<host>
-\brawhide\b	<host>
-\.ts\.net	<host>
-\b100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b	<host>
+# --- secret token shapes (block: gitleaks is not in the orb toolchain) ---
+ghp_[A-Za-z0-9]{20,}	<redacted-secret>
+github_pat_[A-Za-z0-9_]{20,}	<redacted-secret>
+pypi-AgE[A-Za-z0-9_-]{20,}	<redacted-secret>
+sk-[A-Za-z0-9]{20,}	<redacted-secret>
+xox[abp]-[A-Za-z0-9-]{10,}	<redacted-secret>
+AKIA[0-9A-Z]{16}	<redacted-secret>
+-----BEGIN [A-Z ]*PRIVATE KEY-----	<redacted-secret>
 
-# --- project / org references ---
-\bpolyphony\b	<org>
-\bPolyphony\b	<org>
-\bReticleWorks\b	<org>
-\breticle\b	<org>
-\bBoomtown\b	<org>
-\bAtlas\b	<org>
-\bGCT\b	<org>
-\bKai\b	<org>
-\bCrossroads\b	<org>
-\bDocsHome\b	<org>
-\bOpsHome\b	<org>
+# --- internal hostnames / tailnet (warn: symbolic host labels, not personal data) ---
+warn:\broundtop\b	<host>
+warn:\btwinridge\b	<host>
+warn:\btophand\b	<host>
+warn:\brenegade\b	<host>
+warn:\btrailhead\b	<host>
+warn:\bsatchmo\b	<host>
+warn:\btwister\b	<host>
+warn:\brawhide\b	<host>
+warn:\.ts\.net	<host>
+warn:\b100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b	<host>
+
+# --- project / org references (warn: not personal data) ---
+warn:\bpolyphony\b	<org>
+warn:\bPolyphony\b	<org>
+warn:\bReticleWorks\b	<org>
+warn:\breticle\b	<org>
+warn:\bBoomtown\b	<org>
+warn:\bAtlas\b	<org>
+warn:\bGCT\b	<org>
+warn:\bKai\b	<org>
+warn:\bCrossroads\b	<org>
+warn:\bDocsHome\b	<org>
+warn:\bOpsHome\b	<org>
 
 # --- allow-list ---
 # chitra is this product's own name. polyphony-chitra is the shipped
@@ -49,3 +64,10 @@
 # is a fleet-wide packaging change, out of scope here -- see the PR body.
 !\bchitra\b
 !polyphony-chitra[a-z-]*
+
+# Synthetic addresses the tests assert on, and systemd instance-unit names
+# that the email regex mistakes for addresses (e.g. chitra-monitord@<id>).
+!noreply@
+![A-Za-z0-9._%+-]+@example\.(com|test|invalid)\b
+![A-Za-z0-9._%+-]+@x\.com\b
+![A-Za-z0-9._-]+@[A-Za-z0-9.-]*\.service(\.[a-z]+)?\b
