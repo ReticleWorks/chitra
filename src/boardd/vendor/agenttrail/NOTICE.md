@@ -10,9 +10,13 @@
 
 Neither vendored file is byte-for-byte upstream, and an earlier version of
 this notice wrongly said both were. Both carry local patches, each marked
-in place with a `ponytail: local patch` comment. Five came in with the
-board as it was built and approved on 2026-09-01; the sixth was added when
-boardd made that board its only surface.
+in place with a `ponytail: local patch` comment naming its number. Five came
+in with the board as it was built and approved on 2026-09-01; patches 6, 7
+and 8 were added when boardd made that board its only surface. They were one
+entry until a review pointed out that a single "mobile reflow" line hid two
+changes that are not the reflow — one of which changes the desktop panel.
+`diff` against the approved board is exactly five hunks: three are patch 6,
+one is patch 7, one is patch 8.
 
 `public/index.html`
 
@@ -27,13 +31,23 @@ boardd made that board its only surface.
 5. **The escalation stack and answer panel** — the `.esc-*` rules, the panel
    markup, and `pollEscalations` / `renderEscalations` / `openEscalation` /
    `closeEscalation` / `toggleFind` / `sendAnswer`.
-6. **Mobile reflow, the PWA shell, and generic reveal rows.** Below 600px
-   (or with `?m=1`) the file tree and the canvas step aside, the escalation
-   stack becomes the full-width queue, and the same components render as one
-   column of cards with the same header, title and task lines. The page also
-   links boardd's manifest and registers its shell-only service worker, and
-   the "Find the session" panel renders every `find:` key the feed sends
-   rather than four fixed ones.
+6. **Mobile reflow.** Below 600px (or with `?m=1`) the file tree and the
+   canvas step aside, the escalation stack becomes the full-width queue, and
+   the same components render as one column of cards with the same header,
+   title and task lines — the `.m-*` rules, the `.m-cards` container, and
+   `renderMobileCards()`. `.esc-btn{min-height:0}` rides along: upstream's
+   narrow-screen `.primary` rule stretched "Send to session" to fill the
+   panel. Desktop is unaffected — the rule sits after the `max-width:720px`
+   block at equal specificity, and `min-height:0` is the initial value.
+7. **PWA shell.** The page links boardd's manifest, carries two Apple
+   web-app metas, and registers boardd's shell-only service worker. Five
+   lines in `<head>`, no behaviour change to the page itself.
+8. **Generic reveal rows.** "Find the session" renders every `find:` key the
+   feed sends rather than four fixed ones, and the hard-coded `cmux` row is
+   replaced by the feed's own `how` line. **This one changes the desktop
+   panel, not only the narrow layout**: the upstream `cmux rpc surface.list`
+   hint is wrong for a chitra lane, which has a tmux pane and a monitor, not
+   a cmux surface.
 
 `bin/agenttrail.mjs`
 

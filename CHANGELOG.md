@@ -38,6 +38,12 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   supervisor's operator-facing warnings said "Activity tab will not work"
   where a missing `node` now means the board at `/` returns 502. The
   vendored `NOTICE.md` still called the files unmodified in two places.
+- boardd: the vendored page's local patches are itemised as eight, not six.
+  One entry called "mobile reflow" covered three separate changes, two of
+  which are not the reflow: the installable-shell head block (now patch 7)
+  and the "Find the session" rewrite (now patch 8), which renders every
+  `find:` key the feed sends and replaces the upstream `cmux` hint — a
+  change to the desktop panel, not only the narrow layout.
 
 ## [0.21.0] - 2026-09-03
 

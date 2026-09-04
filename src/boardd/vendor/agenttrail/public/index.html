@@ -8,7 +8,7 @@
 <title>agenttrail</title>
 <link id="fav" rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%201000%201000%22%3E%3Crect%20width=%221000%22%20height=%221000%22%20rx=%22210%22%20fill=%22%2317171a%22/%3E%3Cg%20fill=%22none%22%20stroke=%22%23fff%22%20stroke-width=%2292%22%20stroke-linecap=%22round%22%20stroke-linejoin=%22round%22%3E%3Cpath%20d=%22M180%20810C278%20617%20363%20405%20445%20180C467%20120%20535%20120%20560%20180C650%20414%20733%20625%20820%20810%22/%3E%3Cpath%20d=%22M180%20810C300%20704%20430%20646%20610%20590%22/%3E%3C/g%3E%3Ccircle%20cx=%22180%22%20cy=%22810%22%20r=%2274%22%20fill=%22%23fff%22/%3E%3Ccircle%20cx=%22610%22%20cy=%22590%22%20r=%2274%22%20fill=%22%23fff%22/%3E%3Ccircle%20cx=%22820%22%20cy=%22810%22%20r=%2274%22%20fill=%22%23fff%22/%3E%3Ccircle%20cx=%22820%22%20cy=%22810%22%20r=%2238%22%20fill=%22%23FFB21A%22/%3E%3C/svg%3E">
 <script>try{document.documentElement.dataset.theme=localStorage.getItem('at-theme')==='light'?'light':'dark'}catch{document.documentElement.dataset.theme='dark'}</script>
-<!-- ponytail: local patch 6 — installable shell; boardd serves the manifest, icons and shell-only service worker from /static -->
+<!-- ponytail: local patch 7 — PWA shell; boardd serves the manifest, icons and shell-only service worker from /static -->
 <link rel="manifest" href="/static/manifest.webmanifest">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
@@ -709,7 +709,7 @@ function openEscalation(k){const e=ESC[k];if(!e)return;escOpen=k
   $('esc-panel-key').textContent=k;$('esc-title').textContent=e.goal||'';$('esc-panel-meta').textContent=e.at?'raised '+String(e.at).replace('T',' ').slice(0,16):''
   $('esc-context').textContent=e.context||'—';$('esc-question').textContent=e.question||'—';$('esc-rec').textContent=e.recommendation||'—'
   $('esc-answer').value='';$('esc-send').disabled=false;$('esc-status').textContent=answered[k]?'Handed to the orchestrator at '+answered[k]:''
-  /* ponytail: local patch 6 — extra find: keys from the feed (monitor, lane, …) render as their own rows, and `how` replaces the cmux hint when the feed supplies one */
+  /* ponytail: local patch 8 — extra find: keys from the feed (monitor, lane, …) render as their own rows, and `how` replaces the cmux hint when the feed supplies one. This one changes the desktop panel, not only the reflow. */
   const f=e.find||{},known=new Set(['peer','tty','sid','kind','how']),rows=[['peer',f.peer],['tty',f.tty],[f.kind==='codex'?'thread':'session',f.sid],['kind',f.kind],...Object.entries(f).filter(([k])=>!known.has(k)),['how',f.how||(f.kind==='codex'?'Codex threads cannot be messaged: open the surface that holds this tty and paste the answer':'cmux rpc surface.list — the surface whose resume_binding is this session id')]]
   $('esc-find').innerHTML=rows.filter(([,v])=>v).map(([a,b])=>`<dt>${esc(a)}</dt><dd>${esc(String(b))}</dd>`).join('');$('esc-find').hidden=true
   $('esc-backdrop').hidden=false;$('esc-panel').hidden=false;$('esc-answer').focus()}
