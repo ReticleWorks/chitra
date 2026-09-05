@@ -60,7 +60,7 @@ def test_installable_shell_rides_on_the_board_page():
 
 
 def test_the_right_hand_board_is_hideable():
-    """Trey's L540 ask. The Runs overlay button is the toggle, and run
+    """The operator's L540 ask. The Runs overlay button is the toggle, and run
     cards start hidden — verified here so a re-vendor cannot drop it."""
     assert "const overlays={activity:true,runs:false}" in BOARD
     assert "id=\"ov-runs\"" in BOARD and "toggleOverlay('runs')" in BOARD

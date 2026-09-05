@@ -21,7 +21,7 @@ def _run(target: Path) -> subprocess.CompletedProcess[str]:
 
 def test_hygiene_check_blocks_a_personal_name(tmp_path: Path) -> None:
     target = tmp_path / "sample.txt"
-    target.write_text("ping Trey about the rollout\n", encoding="utf-8")
+    target.write_text("ping the operator about the rollout\n", encoding="utf-8")
 
     result = _run(target)
 
