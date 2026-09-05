@@ -168,24 +168,28 @@ def _default_monitor_id(roots: dict[str, Path]) -> str:
 
 
 def _view_for(monitor_id: str | None) -> dict[str, Any]:
-    roots = discovery.discover_monitors()
+    discovery_errors: list[str] = []
+    roots = discovery.discover_monitors(discovery_errors)
     if not roots:
-        return build_view(config.STATE_DIR, _tcache)
+        view = build_view(config.STATE_DIR, _tcache)
+        view["source"]["errors"] = discovery_errors + view["source"]["errors"]
+        return view
     if monitor_id == "all":
-        return _combined_view(roots)
+        return _combined_view(roots, discovery_errors)
     resolved = monitor_id or _default_monitor_id(roots)
     root = _resolve_root(resolved, roots)
     view = build_view(root, _tcache)
+    view["source"]["errors"] = discovery_errors + view["source"]["errors"]
     view["monitor"] = resolved
     return view
 
 
-def _combined_view(roots: dict[str, Path]) -> dict[str, Any]:
+def _combined_view(roots: dict[str, Path], discovery_errors: list[str] | None = None) -> dict[str, Any]:
     """Merge every monitor's lanes/events/needs_you into one view, tagged by monitor id."""
     lanes: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
     needs_you: list[dict[str, Any]] = []
-    errors: list[str] = []
+    errors: list[str] = list(discovery_errors or [])
     counts: dict[str, int] = {}
     last_view: dict[str, Any] | None = None
     for monitor_id, root in sorted(roots.items()):

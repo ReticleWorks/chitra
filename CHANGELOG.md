@@ -6,6 +6,8 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ### Fixed
 
+- boardd: an unreadable monitor state root is reported in `source.errors`
+  while readable monitor roots continue to render.
 - boardd: an answer sent from the escalation stack now lands on the monitor
   whose card it came from. The board page POSTs only `{key, answer, at}`, so
   the escalation key is `<monitor>:<lane>` and `/answer` splits it back
