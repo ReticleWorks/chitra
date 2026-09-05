@@ -100,6 +100,43 @@ def test_api_state_unknown_monitor_404():
     assert r.status_code == 404
 
 
+def test_unreadable_discovered_root_does_not_hide_readable_state(tmp_path, monkeypatch):
+    from boardd.discovery import ROOT_PREFIX, discover_state_roots
+
+    _write_endpoint_env(tmp_path, lane="visible", name=f"{ROOT_PREFIX}-readable")
+    unreadable = tmp_path / f"{ROOT_PREFIX}-unreadable"
+    unreadable.mkdir()
+    original_exists = Path.exists
+
+    def exists(path):
+        if path == unreadable / "goals.json":
+            raise PermissionError(13, "Permission denied", str(path))
+        return original_exists(path)
+
+    def discover(errors=None):
+        return discover_state_roots(tmp_path, errors)
+
+    monkeypatch.delenv("BOARDD_DEV", raising=False)
+    monkeypatch.setattr(Path, "exists", exists)
+    monkeypatch.setattr(app_module.discovery, "discover_monitors", discover)
+    monkeypatch.setattr(app_module.discovery, "discover_units", lambda: {})
+
+    state = client.get("/api/state")
+    assert state.status_code == 200
+    assert len(state.json()["lanes"]) == 1
+    errors = state.json()["source"]["errors"]
+    assert any(str(unreadable) in error and "Permission denied" in error for error in errors)
+
+    monitors = client.get("/api/monitors")
+    assert monitors.status_code == 200
+    assert monitors.json()[0]["id"] == "readable"
+
+    health = client.get("/healthz")
+    assert health.status_code == 200
+    assert health.json()["ok"] is False
+    assert health.json()["errors"] == errors
+
+
 def _enrolled_lane(session_ref: str, open_asks: tuple[str, ...]):
     """A fully v3-enrolled GoalRecord — the display fixture's lanes are
     intentionally not enrolled (chitra.goals treats an unenrolled record as

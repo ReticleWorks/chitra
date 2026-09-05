@@ -85,19 +85,25 @@ def _id_for_root(dirname: str) -> str | None:
     return None
 
 
-def discover_state_roots(base: Path = ROOT_GLOB_BASE) -> dict[str, Path]:
+def discover_state_roots(base: Path = ROOT_GLOB_BASE, errors: list[str] | None = None) -> dict[str, Path]:
     """Glob `<base>/polyphony-chitra*` dirs that hold a goals.json. Pure, testable."""
     found: dict[str, Path] = {}
     try:
         candidates = sorted(base.glob(f"{ROOT_PREFIX}*"))
-    except OSError:
+    except OSError as e:
+        if errors is not None:
+            errors.append(f"{base}: {e}")
         return found
     for path in candidates:
-        monitor_id = _id_for_root(path.name)
-        if monitor_id is None or not path.is_dir():
-            continue
-        if (path / config.GOALS_FILE).exists():
-            found[monitor_id] = path
+        try:
+            monitor_id = _id_for_root(path.name)
+            if monitor_id is None or not path.is_dir():
+                continue
+            if (path / config.GOALS_FILE).exists():
+                found[monitor_id] = path
+        except OSError as e:
+            if errors is not None:
+                errors.append(f"{path}: {e}")
     return found
 
 
@@ -165,11 +171,11 @@ def is_dev_mode() -> bool:
     return os.environ.get("BOARDD_DEV") == "1"
 
 
-def discover_monitors() -> dict[str, Path]:
+def discover_monitors(errors: list[str] | None = None) -> dict[str, Path]:
     """Return {monitor_id: state_root} — the roots half only, unit state added by the caller."""
     if is_dev_mode():
         return _dev_roots()
-    roots = discover_state_roots()
+    roots = discover_state_roots(errors=errors)
     for monitor_id in discover_units():
         roots.setdefault(monitor_id, root_for_id(monitor_id))
     return roots

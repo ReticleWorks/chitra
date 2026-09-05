@@ -51,7 +51,7 @@ def load_state_files(state_dir: Path) -> dict[str, Any]:
     if raw_doc is not None:
         try:
             records, schema = load_goals_document(state_dir, allow_newer=True)
-        except (ValueError, GoalsSchemaNewerError) as e:
+        except (ValueError, GoalsSchemaNewerError, OSError) as e:
             errors.append(f"{GOALS_FILE} unreadable: {e}")
         else:
             out["goals"] = {
