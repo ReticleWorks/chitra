@@ -4,6 +4,8 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.21.1] - 2026-09-05
+
 ### Fixed
 
 - boardd: an unreadable monitor state root is reported in `source.errors`
