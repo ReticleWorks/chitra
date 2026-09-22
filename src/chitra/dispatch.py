@@ -77,6 +77,7 @@ from typing import Protocol
 
 import structlog
 
+from chitra.journal.normalizers import queued_operator_prompt
 from chitra.orders import DispatchOrder, DispatchResult, DispatchStatus
 from chitra.policy_config import PolicyConfig
 
@@ -1092,6 +1093,8 @@ def _record_role(payload: object) -> str | None:
     """
     if not isinstance(payload, dict):
         return None
+    if queued_operator_prompt(payload) is not None:
+        return "user"
     message = payload.get("message")
     message_role = message.get("role") if isinstance(message, dict) else None
     nested = payload.get("payload")
@@ -1106,8 +1109,21 @@ def _record_role(payload: object) -> str | None:
         payload.get("type"),
     ):
         if isinstance(candidate, str) and candidate in _TRANSCRIPT_RECORD_ROLES:
-            return candidate
+            return _claude_user_role(payload) if candidate == "user" else candidate
     return None
+
+
+def _claude_user_role(payload: dict[str, object]) -> str:
+    """Keep Claude ``user`` records that are not operator input out of the
+    user role: tool results (a lane can echo any text through a shell
+    command), task notifications, and compaction summaries."""
+    message = payload.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, list) and any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content):
+        return "tool_result"
+    if payload.get("isCompactSummary") is True or "<task-notification>" in "\n".join(_json_string_values(content)):
+        return "system"
+    return "user"
 
 
 def _parse_transcript_records(text: str) -> list[tuple[str | None, str]]:
@@ -1142,7 +1158,9 @@ def _structural_transcript_confirms(text: str, marker_norm: str) -> bool:
     in scrollback with no turn ever having started. Confirmation instead
     requires: (1) the normalized marker appears in a record whose role is
     ``"user"`` -- chitra's tmux paste is persisted by Claude Code/Codex
-    exactly like real operator input, as a user-role record -- AND (2) at
+    exactly like real operator input, as a user-role record, or as an
+    origin-bearing ``queued_command`` attachment when the lane is mid-turn
+    (see ``_record_role``) -- AND (2) at
     least one later agent or tool record showing the turn actually started
     (see ``_CONSUMPTION_EVENT_ROLES``). A user record with the marker but no
     follow-up, or only a generic system/progress record, is not confirmation.
@@ -1363,8 +1381,11 @@ def transcript_confirms_nudge(
     transcript lives on the remote host's filesystem, not the caller's; the
     local-only search this function used to perform would never confirm a
     genuine remote delivery.
+
+    The whole nudge must appear in one input record, not only its marker
+    line, so text that merely quotes the marker cannot confirm delivery.
     """
-    marker = nudge_confirmation_marker(nudge)
+    marker = normalized_dispatch_text(nudge)
     if host and not is_local_host(host, local_extra):
         remote_path = find_recent_transcript_remote(
             host,

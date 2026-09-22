@@ -595,16 +595,31 @@ def test_action_queued_transition_restarts_after_order_enqueue_without_duplicate
     assert len(list((queue / "orders").glob("*.json"))) == 1
 
 
-def _append_nudge_and_final_response(transcript: Path, nudge: str, *, session_id: str) -> None:
-    """Append a real Claude user turn and its later final response."""
+def _append_nudge_and_final_response(transcript: Path, nudge: str, *, session_id: str, mid_turn: bool = False) -> None:
+    """Append a real Claude user turn and its later final response.
+
+    ``mid_turn`` records the nudge the way Claude Code does when it arrives
+    while a turn is running: an ``attachment`` record of type
+    ``queued_command`` that carries ``origin``, not a ``user`` record.
+    """
+    delivered: dict[str, Any] = {"type": "user", "message": {"role": "user", "content": nudge}}
+    if mid_turn:
+        delivered = {
+            "type": "attachment",
+            "attachment": {
+                "type": "queued_command",
+                "prompt": nudge,
+                "commandMode": "prompt",
+                "origin": {"kind": "human"},
+            },
+        }
     rows = [
         {
             "parentUuid": "fixture-assistant",
             "sessionId": session_id,
             "uuid": "oversight-user",
             "version": CLAUDE_VERSION,
-            "type": "user",
-            "message": {"role": "user", "content": nudge},
+            **delivered,
         },
         {
             "parentUuid": "oversight-user",
@@ -691,9 +706,11 @@ def _append_repeated_post_consumption_calls(transcript: Path, *, session_id: str
         handle.write("".join(json.dumps(row) + "\n" for row in rows))
 
 
+@pytest.mark.parametrize("mid_turn", [False, True], ids=["idle-user-record", "mid-turn-queued-command"])
 def test_monitor_dispatchd_monitor_reconciles_signed_delivery_and_advances_only_after_consumption(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    mid_turn: bool,
 ) -> None:
     """A signed delivery plus a later assistant turn is the only ladder proof."""
     state, bindings_path, queue, goal = _prepare_repeated_action_case(tmp_path)
@@ -723,7 +740,7 @@ def test_monitor_dispatchd_monitor_reconciles_signed_delivery_and_advances_only_
     def fake_dispatch(dispatch_order: DispatchOrder, **kwargs: Any) -> DispatchResult:
         assert dispatch_order.order_id == order_id
         assert dispatch_order.nudge == order.nudge
-        _append_nudge_and_final_response(transcript, dispatch_order.nudge, session_id=native_session_id)
+        _append_nudge_and_final_response(transcript, dispatch_order.nudge, session_id=native_session_id, mid_turn=mid_turn)
         return DispatchResult(
             order_id=dispatch_order.order_id,
             session_ref=dispatch_order.session_ref,
@@ -768,6 +785,7 @@ def test_monitor_dispatchd_monitor_reconciles_signed_delivery_and_advances_only_
     assert consumed.consumption is not None
     assert consumed.consumption.user_event_id
     assert consumed.consumption.turn_event_id
+    assert not list((queue / "orders").glob("*.json"))  # no second order
 
     # The historical finding alone cannot advance after consumption.
     third = run_once(_live_config(state, bindings_path, queue))

@@ -576,6 +576,88 @@ def test_discover_consumption_proof_accepts_bare_session_ref_but_keeps_lane_exac
     assert discover_consumption_proof(record, wrong_lane_events, entry, key) is None
 
 
+def _mid_turn_proof_case() -> tuple[IncidentRecord, LedgerEntry, bytes, str]:
+    key = b"k" * 32
+    session_ref = f"host:{LANE}:0.0"
+    text = "[C] nudge-midturn please continue"
+    sent_at = "2026-08-21T15:00:00+00:00"
+    entry = LedgerEntry(
+        order_id="order-midturn",
+        session_ref=session_ref,
+        tag="[C]",
+        sig_v=4,
+        message_hash=message_hash(text),
+        sent_at=sent_at,
+        signature=sign(key, session_ref=session_ref, tag="[C]", digest=message_hash(text), sent_at=sent_at),
+    )
+    record = IncidentRecord(
+        lane=LANE,
+        fingerprint="m" * 64,
+        detector="unnecessary_steps",
+        stage="nudge",
+        order_marker="nudge-midturn",
+        opened_at=sent_at,
+        event_refs=(),
+        unmet_item="done-1",
+        expected_next_progress="continue",
+        detail="repeat",
+    )
+    return record, entry, key, text
+
+
+def _queued(text: str, *, origin: bool) -> dict[str, object]:
+    attachment: dict[str, object] = {"type": "queued_command", "prompt": text}
+    if origin:
+        attachment["origin"] = {"kind": "human"}
+    return {"type": "attachment", "attachment": attachment}
+
+
+def test_discover_consumption_proof_accepts_mid_turn_queued_command_at_next_final_response() -> None:
+    record, entry, key, text = _mid_turn_proof_case()
+    session_ref = entry.session_ref
+    events = (
+        _event("q", CanonicalType.UNKNOWN, native_type="attachment", raw_record=_queued(text, origin=True), session_id=session_ref),
+        _event("call", CanonicalType.TOOL_CALL, session_id=session_ref),
+        _event("final", CanonicalType.FINAL_RESPONSE, payload={"text": "done"}, session_id=session_ref),
+    )
+
+    proof = discover_consumption_proof(record, events, entry, key)
+
+    assert proof is not None
+    assert proof.user_event_id == "q"
+    assert proof.turn_event_id == "final"  # not the tool call inside the turn
+
+
+def test_discover_consumption_proof_rejects_marker_outside_operator_input() -> None:
+    record, entry, key, text = _mid_turn_proof_case()
+    session_ref = entry.session_ref
+    notification = f"<task-notification><result>{text}</result></task-notification>"
+    spoofs = (
+        _event("s", CanonicalType.UNKNOWN, native_type="attachment", raw_record=_queued(text, origin=False), session_id=session_ref),
+        _event(
+            "s", CanonicalType.UNKNOWN, native_type="attachment", raw_record=_queued(notification, origin=False), session_id=session_ref
+        ),
+        _event(
+            "s",
+            CanonicalType.TOOL_RESULT,
+            native_type="user",
+            raw_record={"type": "user", "message": {"content": [{"type": "tool_result", "content": text}]}},
+            session_id=session_ref,
+        ),
+        _event(
+            "s",
+            CanonicalType.UNKNOWN,
+            native_type="user",
+            raw_record={"type": "user", "isCompactSummary": True, "message": {"content": text}},
+            session_id=session_ref,
+        ),
+        _event("s", CanonicalType.FINAL_RESPONSE, native_type="assistant", payload={"text": text}, session_id=session_ref),
+    )
+    final = _event("final", CanonicalType.FINAL_RESPONSE, payload={"text": "done"}, session_id=session_ref)
+    for spoof in spoofs:
+        assert discover_consumption_proof(record, (spoof, final), entry, key) is None, spoof.raw_record
+
+
 def test_ladder_does_not_advance_from_historical_finding_after_consumption(tmp_path: Path) -> None:
     key = b"k" * 32
     session_ref = f"host:{LANE}:0.0"
