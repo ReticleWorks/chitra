@@ -199,24 +199,6 @@ def _lane_roots(state_dir: Path) -> list[Path]:
     )
 
 
-def ingest_lane_transcripts(
-    config: MonitordConfig,
-    lane: str,
-    transcripts: tuple[tuple[Path, NormalizationContext], ...],
-) -> tuple[CanonicalEvent, ...]:
-    """Ingest every declared transcript for one lane into its journal."""
-    observed: list[CanonicalEvent] = []
-    for transcript_path, context in transcripts:
-        with JournalIngestor(
-            state_root=config.state_dir,
-            transcript_path=transcript_path,
-            context=context,
-        ) as ingestor:
-            observed.extend(ingestor.poll().observed)
-    logger.info("monitord_ingested", lane=lane, events=len(observed))
-    return tuple(observed)
-
-
 def ingest_transcript_bindings(
     config: MonitordConfig,
     bindings: tuple[TranscriptBinding, ...],

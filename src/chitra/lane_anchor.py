@@ -12,7 +12,7 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from chitra._fsio import write_json_atomic
 from chitra.dispatch import enqueue_dispatch_order
@@ -78,7 +78,6 @@ SETUP_NOTE_NAME = "session-setup.md"
 NATIVE_CONTROLS_NAME = "native-controls.json"
 AGENTTRAIL_PLAN_NAME = "PLAN.md"
 LaneLifecycle = LaneState
-LaneLifecycleAction = Literal["pause", "shelve", "close", "resume", "relaunch"]
 
 
 class LaneLaunchRefused(RuntimeError):
@@ -641,15 +640,6 @@ def enqueue_native_controls(
     return tuple(queued)
 
 
-def rearm_native_controls(lane: LaneSpec, goal: GoalRecord, *, request_id: str) -> tuple[str, ...]:
-    """Idempotently reissue the current provider goal and recurring loop controls."""
-    if not request_id.strip():
-        raise ValueError("native-control rearm requires request_id")
-    if _durable_lifecycle(lane, goal.session_ref) != "active":
-        raise LaneLaunchRefused("native controls may be rearmed only for an active lane")
-    return enqueue_native_controls(lane, goal, request_id=request_id)
-
-
 def _run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, check=False, capture_output=True, text=True)
 
@@ -1102,65 +1092,6 @@ def lane_lifecycle_status(lane: LaneSpec, *, host: str = SANCTIONED_HOST) -> Lan
     if record is None:
         raise LaneLaunchRefused("lane lifecycle is untracked; start the lane to enroll its lifecycle")
     return record.state
-
-
-def execute_lane_lifecycle(
-    lane: LaneSpec,
-    *,
-    action: LaneLifecycleAction,
-    request_id: str | None = None,
-    backend: str = "claude",
-    model: str | None = "sonnet",
-    effort: str | None = "high",
-    host: str = SANCTIONED_HOST,
-    socket_path: Path | None = None,
-    runner: CommandRunner = _run,
-    self_test: bool = True,
-    self_test_ssh_target: str | None = None,
-) -> LaneLifecycle:
-    """Apply one idempotent bridge lifecycle command to its real lane.
-
-    ``request_id`` is persisted by recovery for state-changing actions. A
-    retry with the same request finishes provider work after the durable
-    transition without appending another checkpoint. ``relaunch`` is not a
-    restart transaction: it only ensures an already-active lane is live.
-    """
-    if action == "pause":
-        pause_lane(lane, host=host, request_id=request_id)
-    elif action == "shelve":
-        shelve_lane(lane, host=host, runner=runner, request_id=request_id)
-    elif action == "close":
-        close_lane(lane, host=host, runner=runner, request_id=request_id)
-    elif action == "resume":
-        resume_lane(
-            lane,
-            backend=backend,
-            model=model,
-            effort=effort,
-            host=host,
-            socket_path=socket_path,
-            runner=runner,
-            self_test=self_test,
-            self_test_ssh_target=self_test_ssh_target,
-            request_id=request_id,
-        )
-    elif action == "relaunch":
-        if lane_lifecycle_status(lane, host=host) != "active":
-            raise LaneLaunchRefused("lane relaunch refused: only an active lane may be ensured live")
-        start_lane(
-            lane,
-            backend=backend,
-            model=model,
-            effort=effort,
-            host=host,
-            socket_path=socket_path,
-            runner=runner,
-            self_test=self_test,
-            self_test_ssh_target=self_test_ssh_target,
-        )
-    else:
-        raise ValueError(f"unsupported lane lifecycle action: {action}")
-    return lane_lifecycle_status(lane, host=host)
 
 
 def lane_for_identifier(lanes: Sequence[LaneSpec], identifier: str) -> LaneSpec:

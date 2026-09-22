@@ -795,26 +795,6 @@ def requeue_deferred_for_session(queue_dir: Path, session_ref: str) -> list[str]
     return requeued
 
 
-def _lane_lock_retry_state_path(deferred_dir: Path, order_id: str) -> Path:
-    """Return the durable lane-lock retry sidecar path (see ``chitra.queue_state.LaneLockRetryTracker``)."""
-    return LaneLockRetryTracker(deferred_dir).state_path(order_id)
-
-
-def _read_lane_lock_retry_attempts(deferred_dir: Path, order_id: str) -> int:
-    """Read the durable diagnostic retry count."""
-    return LaneLockRetryTracker(deferred_dir).attempts(order_id)
-
-
-def _record_lane_lock_retry_attempt(deferred_dir: Path, order_id: str) -> int:
-    """Atomically increment and persist one lane-lock timeout count."""
-    return LaneLockRetryTracker(deferred_dir).record_attempt(order_id)
-
-
-def _remove_lane_lock_retry_attempts(deferred_dir: Path, order_id: str) -> None:
-    """Best-effort cleanup after a terminal result has made retry state moot."""
-    LaneLockRetryTracker(deferred_dir).clear(order_id)
-
-
 def _requeue_lane_lock_deferred(queue_dir: Path, orders_dir: Path) -> list[Path]:
     """Atomically return retryable lane-lock deferrals after current pending work.
 
