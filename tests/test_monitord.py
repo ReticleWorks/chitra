@@ -12,6 +12,7 @@ from _goal_fixtures import enrollment_fields
 from structlog.testing import capture_logs
 
 import chitra.monitord as monitord_mod
+from chitra.decisions import DecisionEntry, append_decision
 from chitra.goals import EnrolledDoneWhenItem, GoalRecord, GoalsSchemaNewerError, GoalStatus, get_goal, upsert_goal
 from chitra.journal import ByteRange, CanonicalEvent, CanonicalType, Client, TranscriptIdentity
 from chitra.journal.store import EventJournal, classify_progress
@@ -354,6 +355,42 @@ def test_protected_question_holds_the_goal_without_queueing_an_answer(
     assert stored.status == "held"
     assert stored.open_asks
     assert not list((tmp_path / "queue").glob("**/*.json"))
+
+
+def test_decided_question_queues_the_cited_answer_without_an_operator_ask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_registry(tmp_path, monkeypatch)
+    goal = upsert_goal(tmp_path, _goal("session-1"))
+    append_decision(
+        tmp_path / "decisions.jsonl",
+        DecisionEntry(
+            decision_id="dec-queue-1",
+            at="2026-09-22T00:00:00+00:00",
+            kind="adjudication",
+            decision="Keep the order queue on plain JSONL files; do not add a database.",
+            basis="Recorded test ruling.",
+            citation="test-suite",
+            authority="test authority",
+        ),
+    )
+    final_response = _event("question-decision-1", CanonicalType.FINAL_RESPONSE).model_copy(
+        update={"payload": {"text": "Should the order queue move to a SQLite database?"}}
+    )
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+
+    outcome = handle_agent_question(config, goal, final_response)
+
+    assert outcome == "answer_queued"
+    stored = get_goal(tmp_path, goal.session_ref)
+    assert stored is not None
+    assert stored.open_asks == ()
+    assert stored.foreground_tasks == ()
+    orders = list((tmp_path / "queue" / "orders").glob("*.json"))
+    assert len(orders) == 1
+    payload = json.loads(orders[0].read_text(encoding="utf-8"))
+    assert payload["message_kind"] == "goal_contract_answer"
+    assert "dec-queue-1" in payload["nudge"]
 
 
 def test_residual_question_stays_active_for_foreground_reasoning(

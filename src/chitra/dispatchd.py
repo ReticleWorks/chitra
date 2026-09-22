@@ -127,6 +127,7 @@ import structlog
 
 from . import ledger as ledger_mod
 from .completion_gate import evaluate_completion_claim, is_completion_claim
+from .decisions import read_decisions
 from .dispatch import (
     DISPATCH_VERIFY_WAIT_SECONDS,
     DispatchTuning,
@@ -228,8 +229,11 @@ def _goal_contract_rejection(order: DispatchOrder, goals_root: Path | None) -> s
     if current_goal.status in {"held", "done-pending-verification", "done-pending-close"}:
         return "goal-not-actionable"
     if order.message_kind == "goal_contract_answer":
+        decisions_path = goals_root / "decisions.jsonl" if goals_root is not None else None
         expected_question_result = (
-            handle_question(current_goal, order.question_result.question) if order.question_result is not None else None
+            handle_question(current_goal, order.question_result.question, decisions=read_decisions(decisions_path))
+            if order.question_result is not None
+            else None
         )
         if (
             expected_question_result is None
