@@ -354,7 +354,7 @@ def _idle_pursuit_finding(
         "native_session_id": events[0].session_id,
         "lane": events[0].lane,
         "goal_ref": events[0].goal_ref,
-        "client": events[0].client.value,
+        "client": str(events[0].client),
         "client_version": events[0].client_version,
         "instance": events[0].instance,
     }

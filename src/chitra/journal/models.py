@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class CanonicalType(StrEnum):
@@ -78,7 +78,8 @@ class CanonicalEvent(BaseModel):
     event_id: str
     instance: str
     lane: str
-    client: Client
+    # Known clients stay enum members; any other harness name is kept as a plain string.
+    client: Client | str
     client_version: str
     process_id: str | None
     transcript: TranscriptIdentity
@@ -98,6 +99,14 @@ class CanonicalEvent(BaseModel):
     normalizer_version: str
     payload: dict[str, Any]
     raw_record: dict[str, Any] | None
+
+    @field_validator("client", mode="before")
+    @classmethod
+    def _known_client(cls, value: Any) -> Any:
+        try:
+            return Client(value)
+        except ValueError:
+            return value
 
 
 class ProgressClass(StrEnum):
