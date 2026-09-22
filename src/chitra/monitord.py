@@ -74,6 +74,7 @@ from chitra.journal import (
     CanonicalType,
     JournalIngestor,
     NormalizationContext,
+    UnsupportedClientVersion,
     native_session_identity,
 )
 from chitra.journal.store import EventJournal
@@ -232,12 +233,16 @@ def ingest_transcript_bindings(
             client_version=binding.client_version,
             goal_ref=binding.session_ref,
         )
-        with JournalIngestor(
-            state_root=config.state_dir,
-            transcript_path=transcript_path,
-            context=context,
-        ) as ingestor:
-            observed.extend(ingestor.poll().observed)
+        try:
+            with JournalIngestor(
+                state_root=config.state_dir,
+                transcript_path=transcript_path,
+                context=context,
+            ) as ingestor:
+                observed.extend(ingestor.poll().observed)
+        except UnsupportedClientVersion as exc:
+            # Skip this lane for the pass; one lane's client version must not stop the others.
+            logger.warning("monitord_bound_transcript_unsupported_version", lane=binding.lane, error=str(exc))
     if bindings:
         logger.info("monitord_bound_transcripts_ingested", bindings=len(bindings), events=len(observed))
     return tuple(observed)

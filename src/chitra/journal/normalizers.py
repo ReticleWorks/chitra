@@ -21,7 +21,9 @@ from .reader import JsonlTailReader
 
 NORMALIZER_VERSION = "chitra-journal-normalizer.v1"
 SUPPORTED_VERSIONS: dict[Client, frozenset[str]] = {
-    Client.CLAUDE: frozenset({"2.1.229"}),
+    # Claude Code updates itself mid-session, so one transcript may carry
+    # several of these versions. Each needs a fixture in tests/fixtures/w11.
+    Client.CLAUDE: frozenset({"2.1.229", *(f"2.1.{patch}" for patch in range(270, 281))}),
     Client.CODEX: frozenset({"0.149.0"}),
 }
 
@@ -251,8 +253,8 @@ class ClaudeNormalizer(TranscriptNormalizer):
             return (self._unknown(raw),)
         record = raw.record
         version = record.get("version")
-        if isinstance(version, str) and version != self.context.client_version:
-            raise UnsupportedClientVersion(f"Claude record version changed to {version!r}")
+        if isinstance(version, str) and version not in SUPPORTED_VERSIONS[Client.CLAUDE]:
+            raise UnsupportedClientVersion(f"Claude record version changed to unsupported {version!r}")
         session_id = record.get("sessionId")
         if isinstance(session_id, str):
             if self.session_id is not None and self.session_id != session_id:

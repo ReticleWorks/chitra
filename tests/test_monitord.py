@@ -20,10 +20,12 @@ from chitra.monitord import (
     build_arg_parser,
     check_enrollment_and_receipts,
     handle_agent_question,
+    ingest_transcript_bindings,
     resolve_config,
     run_detectors,
     run_once,
 )
+from chitra.transcript_bindings import TranscriptBinding
 
 LANE = "lane-a:0.0"
 SEEDED_LANE = "lane-a.0.0"
@@ -61,6 +63,25 @@ def _event(
         payload={},
         raw_record=None,
     )
+
+def test_unsupported_version_skips_only_that_lane(tmp_path: Path) -> None:
+    fixture = Path(__file__).parent / "fixtures" / "w11" / "claude-2.1.280-synthetic.jsonl"
+    # The lane's client updated itself past the fixture-gated range mid-session.
+    drifted = tmp_path / "drifted.jsonl"
+    drifted.write_text(fixture.read_text(encoding="utf-8").replace('"2.1.280"', '"2.1.999"'), encoding="utf-8")
+    bindings = tuple(
+        TranscriptBinding(
+            session_ref=f"goal-{lane}", lane=lane, path=str(path), client=Client.CLAUDE, client_version="2.1.280", instance="i"
+        )
+        for lane, path in (("lane-drifted", drifted), ("lane-ok", fixture))
+    )
+
+    observed = ingest_transcript_bindings(_config(tmp_path), bindings)
+
+    assert {event.lane for event in observed} == {"lane-ok"}
+    assert len(EventJournal(tmp_path, "lane-ok").load()) == 12
+    assert not EventJournal(tmp_path, "lane-drifted").load()
+
 
 def test_resolve_config_defaults_to_shadow_mode_on() -> None:
     config = resolve_config()

@@ -77,6 +77,41 @@ CASES = (
         session_id="fixture-codex-session",
         resume_boundary=8,
     ),
+    FixtureCase(
+        client=Client.CLAUDE,
+        version="2.1.280",
+        filename="claude-2.1.280-synthetic.jsonl",
+        line_count=12,
+        event_counts={
+            "compaction": 1,
+            "final_response": 1,
+            "tool_call": 2,
+            "tool_error": 1,
+            "tool_result": 1,
+            "unknown": 6,
+        },
+        event_digest="5915c324d5abe0c7a5e7c431c775eea74e985a59189519490654787332dfd572",
+        session_id="fixture-claude-280-session",
+        resume_boundary=7,
+    ),
+    # Claude Code updated itself mid-session: records switch from 2.1.274 to 2.1.278 at line 8.
+    FixtureCase(
+        client=Client.CLAUDE,
+        version="2.1.274",
+        filename="claude-2.1.274-2.1.278-mixed-synthetic.jsonl",
+        line_count=12,
+        event_counts={
+            "compaction": 1,
+            "final_response": 1,
+            "tool_call": 2,
+            "tool_error": 1,
+            "tool_result": 1,
+            "unknown": 6,
+        },
+        event_digest="f6022de53b65fdba3b14ffb50079ae99b4605fb4e0134751eb731843da52b42b",
+        session_id="fixture-claude-mixed-session",
+        resume_boundary=7,
+    ),
 )
 
 
