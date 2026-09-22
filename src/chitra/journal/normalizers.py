@@ -47,6 +47,25 @@ def _blocks(value: Any) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)]
 
 
+def queued_operator_prompt(record: object) -> str | None:
+    """Return the text of input typed into a busy Claude session, else None.
+
+    Claude Code records such input as an ``attachment`` record of type
+    ``queued_command``, not a ``user`` record. Task notifications use the same
+    shape without ``origin``, and their text can be written by the lane's own
+    subagents, so only an origin-bearing attachment counts as input.
+    """
+    if not isinstance(record, dict) or record.get("type") != "attachment":
+        return None
+    attachment = record.get("attachment")
+    if not isinstance(attachment, dict) or attachment.get("type") != "queued_command":
+        return None
+    if not isinstance(attachment.get("origin"), dict):
+        return None
+    prompt = attachment.get("prompt")
+    return prompt if isinstance(prompt, str) else None
+
+
 def _native_key(record: dict[str, Any], raw_sha256: str) -> str:
     for key in ("uuid", "id"):
         value = record.get(key)

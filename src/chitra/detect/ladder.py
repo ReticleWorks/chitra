@@ -23,6 +23,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict
 
 from chitra.journal.models import CanonicalEvent, CanonicalType
+from chitra.journal.normalizers import queued_operator_prompt
 from chitra.ledger import LedgerEntry, message_hash, verify_entry
 
 from .detectors import Finding
@@ -160,12 +161,17 @@ def discover_delivery_consumption_proof(
             continue
         if user_event.lane != lane or user_event.session_id != native_session_id:
             continue
-        if user_event.native_type != "user" or user_event.normalized_type in {
+        # Input arrives as a user record, or mid-turn as an origin-bearing
+        # queued_command attachment. The boundary stays the next final response.
+        is_input = user_event.native_type == "user" or queued_operator_prompt(user_event.raw_record) is not None
+        if not is_input or user_event.normalized_type in {
             CanonicalType.TOOL_CALL,
             CanonicalType.TOOL_RESULT,
             CanonicalType.TOOL_ERROR,
             CanonicalType.FINAL_RESPONSE,
         }:
+            continue
+        if isinstance(user_event.raw_record, dict) and user_event.raw_record.get("isCompactSummary") is True:
             continue
         user_text = _payload_text(user_event)
         if not user_text or order_marker not in user_text:
@@ -682,6 +688,9 @@ def _payload_text(event: CanonicalEvent) -> str:
     raw = event.raw_record
     if not isinstance(raw, dict):
         return ""
+    queued = queued_operator_prompt(raw)
+    if queued is not None:
+        return queued
     message = raw.get("message")
     if isinstance(message, dict):
         content = message.get("content")

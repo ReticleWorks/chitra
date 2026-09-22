@@ -1673,3 +1673,64 @@ def test_real_tmux_paste_and_pane_in_mode_roundtrip() -> None:
         assert proc.returncode == 0
     finally:
         subprocess.run(["tmux", "kill-session", "-t", session_name], check=False)
+
+
+# --- mid-turn delivery: Claude records a busy-lane paste as queued_command --
+
+_MID_TURN_NUDGE = "please run the lint step next and report the result"
+_ASSISTANT_FOLLOWUP = {"type": "assistant", "message": {"role": "assistant", "content": "Working on it."}}
+
+
+def _queued_command(prompt: str, *, origin: bool) -> dict[str, object]:
+    attachment: dict[str, object] = {"type": "queued_command", "prompt": prompt, "commandMode": "prompt"}
+    if origin:
+        attachment["origin"] = {"kind": "human"}
+    else:
+        attachment["commandMode"] = "task-notification"
+    return {"type": "attachment", "attachment": attachment}
+
+
+def _confirms(tmp_path: Path, delivered: dict[str, object]) -> bool:
+    session_dir = tmp_path / "projects" / "some-project"
+    session_dir.mkdir(parents=True)
+    rows = [delivered, _ASSISTANT_FOLLOWUP]
+    (session_dir / "abc123.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    confirmed, _path = transcript_confirms_nudge(_MID_TURN_NUDGE, projects_root=tmp_path / "projects", now_ts=time.time())
+    return confirmed
+
+
+def test_transcript_confirms_a_mid_turn_queued_command_with_origin(tmp_path: Path) -> None:
+    assert _confirms(tmp_path, _queued_command(_MID_TURN_NUDGE, origin=True)) is True
+
+
+def test_transcript_confirms_needs_the_full_message_not_just_the_marker(tmp_path: Path) -> None:
+    first_line_only = _MID_TURN_NUDGE + "\nsecond line the lane never received"
+    session_dir = tmp_path / "projects" / "some-project"
+    session_dir.mkdir(parents=True)
+    (session_dir / "abc123.jsonl").write_text(user_turn_jsonl(_MID_TURN_NUDGE), encoding="utf-8")
+    confirmed, _path = transcript_confirms_nudge(first_line_only, projects_root=tmp_path / "projects", now_ts=time.time())
+    assert confirmed is False
+
+
+@pytest.mark.parametrize(
+    "delivered",
+    [
+        _queued_command(f"<task-notification><result>{_MID_TURN_NUDGE}</result></task-notification>", origin=False),
+        {
+            "type": "user",
+            "message": {"role": "user", "content": f"<task-notification><result>{_MID_TURN_NUDGE}</result></task-notification>"},
+        },
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu-1", "content": _MID_TURN_NUDGE}],
+            },
+        },
+        {"type": "user", "isCompactSummary": True, "message": {"role": "user", "content": f"Summary: {_MID_TURN_NUDGE}"}},
+        {"type": "assistant", "message": {"role": "assistant", "content": f"You said: {_MID_TURN_NUDGE}"}},
+    ],
+    ids=["notification-attachment", "notification-user-record", "tool-result-echo", "compaction-summary", "assistant-echo"],
+)
+def test_transcript_confirms_rejects_marker_outside_operator_input(tmp_path: Path, delivered: dict[str, object]) -> None:
+    assert _confirms(tmp_path, delivered) is False
