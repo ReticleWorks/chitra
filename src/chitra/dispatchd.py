@@ -379,10 +379,10 @@ def _ensure_delivery_ledger(
     returned without making the proof durable.
 
     When the confirmed result names a lane transcript, its adapter-native
-    session identity is normalized with the journal's own version-gated
+    session identity is normalized with the journal's own
     normalizers and bound into the signed row (signature version 5). The
     value never comes from ``routing_hint``, which stays opaque audit
-    metadata. A transcript that yields no fixture-gated native identity
+    metadata. A transcript that yields no native identity
     still gets a valid v4 row for legacy orders; strict autonomous orders
     fail closed instead of trusting an unbound session.
     """
@@ -395,7 +395,7 @@ def _ensure_delivery_ledger(
             raise OSError(f"strict delivery has no exact bound transcript for order {order.order_id}")
         expected_native_session_id = native_session_identity(expected_transcript_path)
         if not expected_native_session_id:
-            raise OSError(f"strict bound transcript has no fixture-gated native session identity for order {order.order_id}")
+            raise OSError(f"strict bound transcript has no native session identity for order {order.order_id}")
     existing = ledger_mod.verify_delivery(
         resolved_ledger_path,
         key=key,

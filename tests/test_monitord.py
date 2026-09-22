@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from _goal_fixtures import enrollment_fields
+from structlog.testing import capture_logs
 
 import chitra.monitord as monitord_mod
 from chitra.goals import EnrolledDoneWhenItem, GoalRecord, GoalsSchemaNewerError, GoalStatus, get_goal, upsert_goal
@@ -64,23 +65,28 @@ def _event(
         raw_record=None,
     )
 
-def test_unsupported_version_skips_only_that_lane(tmp_path: Path) -> None:
+def test_unseen_version_ingests_and_logs_unknown_count(tmp_path: Path) -> None:
     fixture = Path(__file__).parent / "fixtures" / "w11" / "claude-2.1.280-synthetic.jsonl"
-    # The lane's client updated itself past the fixture-gated range mid-session.
-    drifted = tmp_path / "drifted.jsonl"
-    drifted.write_text(fixture.read_text(encoding="utf-8").replace('"2.1.280"', '"2.1.999"'), encoding="utf-8")
-    bindings = tuple(
-        TranscriptBinding(
-            session_ref=f"goal-{lane}", lane=lane, path=str(path), client=Client.CLAUDE, client_version="2.1.280", instance="i"
-        )
-        for lane, path in (("lane-drifted", drifted), ("lane-ok", fixture))
+    # A client version no fixture covers, plus a record type the normalizer does not know.
+    transcript = tmp_path / "unseen.jsonl"
+    transcript.write_text(
+        fixture.read_text(encoding="utf-8").replace('"2.1.280"', '"9.9.9"')
+        + json.dumps({"type": "brand-new-record", "sessionId": "fixture-claude-280-session", "version": "9.9.9"})
+        + "\n",
+        encoding="utf-8",
+    )
+    binding = TranscriptBinding(
+        session_ref="goal-x", lane="lane-x", path=str(transcript), client=Client.CLAUDE, client_version="9.9.9", instance="i"
     )
 
-    observed = ingest_transcript_bindings(_config(tmp_path), bindings)
+    with capture_logs() as logs:
+        observed = ingest_transcript_bindings(_config(tmp_path), (binding,))
 
-    assert {event.lane for event in observed} == {"lane-ok"}
-    assert len(EventJournal(tmp_path, "lane-ok").load()) == 12
-    assert not EventJournal(tmp_path, "lane-drifted").load()
+    assert len(observed) == 13
+    assert len(EventJournal(tmp_path, "lane-x").load()) == 13
+    assert [entry for entry in logs if entry["event"] == "monitord_unknown_events_ingested"] == [
+        {"event": "monitord_unknown_events_ingested", "lane": "lane-x", "events": 7, "log_level": "info"}
+    ]
 
 
 def test_resolve_config_defaults_to_shadow_mode_on() -> None:

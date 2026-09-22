@@ -1,4 +1,4 @@
-"""Version-gated normalizers for observed Claude Code and Codex JSONL."""
+"""Normalizers for observed Claude Code and Codex JSONL."""
 
 from __future__ import annotations
 
@@ -20,16 +20,6 @@ from .models import (
 from .reader import JsonlTailReader
 
 NORMALIZER_VERSION = "chitra-journal-normalizer.v1"
-SUPPORTED_VERSIONS: dict[Client, frozenset[str]] = {
-    # Claude Code updates itself mid-session, so one transcript may carry
-    # several of these versions. Each needs a fixture in tests/fixtures/w11.
-    Client.CLAUDE: frozenset({"2.1.229", *(f"2.1.{patch}" for patch in range(270, 281))}),
-    Client.CODEX: frozenset({"0.149.0"}),
-}
-
-
-class UnsupportedClientVersion(ValueError):
-    """The transcript has not passed the fixture gate for this client version."""
 
 
 @dataclass(frozen=True)
@@ -92,12 +82,6 @@ class TranscriptNormalizer:
     """Stateful normalizer for one transcript stream."""
 
     def __init__(self, context: NormalizationContext) -> None:
-        supported = SUPPORTED_VERSIONS[context.client]
-        if context.client_version not in supported:
-            raise UnsupportedClientVersion(
-                f"unsupported {context.client.value} version {context.client_version!r}; "
-                f"fixture-gated versions: {', '.join(sorted(supported))}"
-            )
         self.context = context
         self.session_id = context.session_id
         self.resume_id = context.resume_id
@@ -252,9 +236,6 @@ class ClaudeNormalizer(TranscriptNormalizer):
         if raw.record is None:
             return (self._unknown(raw),)
         record = raw.record
-        version = record.get("version")
-        if isinstance(version, str) and version not in SUPPORTED_VERSIONS[Client.CLAUDE]:
-            raise UnsupportedClientVersion(f"Claude record version changed to unsupported {version!r}")
         session_id = record.get("sessionId")
         if isinstance(session_id, str):
             if self.session_id is not None and self.session_id != session_id:
@@ -362,9 +343,6 @@ class CodexNormalizer(TranscriptNormalizer):
         record_type = record.get("type")
         payload = record.get("payload")
         if record_type == "session_meta" and isinstance(payload, dict):
-            version = payload.get("cli_version")
-            if version != self.context.client_version:
-                raise UnsupportedClientVersion(f"Codex session version changed to {version!r}")
             candidate = payload.get("id")
             if isinstance(candidate, str):
                 if self.session_id is not None and self.session_id != candidate:
@@ -463,12 +441,12 @@ def make_normalizer(context: NormalizationContext) -> TranscriptNormalizer:
 def native_session_identity(transcript_path: Path | str) -> str | None:
     """Derive one transcript's adapter-native session identity.
 
-    The transcript is replayed through the same version-gated normalizers the
-    durable journal uses, so the returned value is exactly the ``session_id``
+    The transcript is replayed through the same normalizers the durable
+    journal uses, so the returned value is exactly the ``session_id``
     canonical events for that transcript carry. Any transcript that does not
-    identify a fixture-gated Claude/Codex session -- unreadable, foreign
-    schema, unsupported client version, or inconsistent native identity --
-    yields ``None`` so callers can fail closed instead of binding a guess.
+    identify a Claude/Codex session -- unreadable, foreign schema, no client
+    version, or inconsistent native identity -- yields ``None`` so callers
+    can fail closed instead of binding a guess.
     """
     path = Path(transcript_path)
     try:
@@ -493,7 +471,7 @@ def native_session_identity(transcript_path: Path | str) -> str | None:
             client_version = candidate
         if client is not None and client_version is not None:
             break
-    if client is None or client_version is None or client_version not in SUPPORTED_VERSIONS[client]:
+    if client is None or client_version is None:
         return None
     context = NormalizationContext(
         instance="native-session-identity",
@@ -505,6 +483,6 @@ def native_session_identity(transcript_path: Path | str) -> str | None:
     try:
         for raw in records:
             normalizer.normalize(raw)
-    except (UnsupportedClientVersion, ValueError):
+    except ValueError:
         return None
     return normalizer.session_id

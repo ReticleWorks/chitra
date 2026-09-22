@@ -35,6 +35,7 @@ import json
 import os
 import signal
 import threading
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -74,7 +75,6 @@ from chitra.journal import (
     CanonicalType,
     JournalIngestor,
     NormalizationContext,
-    UnsupportedClientVersion,
     native_session_identity,
 )
 from chitra.journal.store import EventJournal
@@ -223,6 +223,7 @@ def ingest_transcript_bindings(
 ) -> tuple[CanonicalEvent, ...]:
     """Ingest every explicitly bound JSONL transcript before journal discovery."""
     observed: list[CanonicalEvent] = []
+    unknown: Counter[str] = Counter()
     manifest_path = config.transcript_bindings_path or config.state_dir / DEFAULT_FILENAME
     for binding in bindings:
         transcript_path = _resolved_binding_path(config, binding, manifest_path=manifest_path)
@@ -233,16 +234,18 @@ def ingest_transcript_bindings(
             client_version=binding.client_version,
             goal_ref=binding.session_ref,
         )
-        try:
-            with JournalIngestor(
-                state_root=config.state_dir,
-                transcript_path=transcript_path,
-                context=context,
-            ) as ingestor:
-                observed.extend(ingestor.poll().observed)
-        except UnsupportedClientVersion as exc:
-            # Skip this lane for the pass; one lane's client version must not stop the others.
-            logger.warning("monitord_bound_transcript_unsupported_version", lane=binding.lane, error=str(exc))
+        with JournalIngestor(
+            state_root=config.state_dir,
+            transcript_path=transcript_path,
+            context=context,
+        ) as ingestor:
+            result = ingestor.poll()
+        observed.extend(result.observed)
+        # Client versions are not gated. Newly appended records the normalizer
+        # does not recognize are the drift signal.
+        unknown.update(event.lane for event in result.appended if event.normalized_type is CanonicalType.UNKNOWN)
+    for lane, count in sorted(unknown.items()):
+        logger.info("monitord_unknown_events_ingested", lane=lane, events=count)
     if bindings:
         logger.info("monitord_bound_transcripts_ingested", bindings=len(bindings), events=len(observed))
     return tuple(observed)

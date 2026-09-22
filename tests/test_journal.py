@@ -19,7 +19,6 @@ from chitra.journal import (
     LifecycleReceipt,
     NormalizationContext,
     ProgressClass,
-    UnsupportedClientVersion,
     classify_progress,
 )
 
@@ -290,21 +289,6 @@ def test_property_reingest_is_idempotent(tmp_path: Path, case: FixtureCase, chun
     assert semantic_projection(second.observed) == semantic_projection(first.observed)
     assert second.appended == ()
     assert len(second_ingestor.journal.load()) == case.line_count
-
-
-def test_version_gate_fails_closed(tmp_path: Path) -> None:
-    case = CASES[0]
-    with pytest.raises(UnsupportedClientVersion, match="fixture-gated versions"):
-        JournalIngestor(
-            state_root=tmp_path,
-            transcript_path=case.path,
-            context=NormalizationContext(
-                instance="test",
-                lane="unsupported",
-                client=case.client,
-                client_version="2.1.230",
-            ),
-        )
 
 
 def test_progress_classification_stays_evidence_bound(tmp_path: Path) -> None:

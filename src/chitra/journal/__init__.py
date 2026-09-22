@@ -14,9 +14,7 @@ from .models import (
 )
 from .normalizers import (
     NORMALIZER_VERSION,
-    SUPPORTED_VERSIONS,
     NormalizationContext,
-    UnsupportedClientVersion,
     make_normalizer,
     native_session_identity,
 )
@@ -26,7 +24,6 @@ from .store import CLASSIFIER_VERSION, EventJournal, classify_progress
 __all__ = [
     "CLASSIFIER_VERSION",
     "NORMALIZER_VERSION",
-    "SUPPORTED_VERSIONS",
     "ByteRange",
     "CanonicalEvent",
     "CanonicalType",
@@ -43,7 +40,6 @@ __all__ = [
     "ReadBatch",
     "Rotation",
     "TranscriptIdentity",
-    "UnsupportedClientVersion",
     "classify_progress",
     "make_normalizer",
     "native_session_identity",
