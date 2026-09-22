@@ -163,7 +163,7 @@ class SessionReviewSignal(_FrozenModel):
     session_ref: str
     goal_contract_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     behavior_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    verdict: Literal["accept", "reject"]
+    verdict: Literal["accept", "reject", "insufficient"]
     reviewer_ids: tuple[str, ...] = Field(min_length=1)
     findings: tuple[ReviewFinding, ...] = ()
     restarted_after_redirect: bool = False
@@ -187,7 +187,7 @@ class SessionReviewSignal(_FrozenModel):
         session_ref: str,
         goal_contract_id: str,
         behavior_sha256: str,
-        verdict: Literal["accept", "reject"],
+        verdict: Literal["accept", "reject", "insufficient"],
         reviewer_ids: Sequence[str],
         findings: Sequence[ReviewFinding] = (),
         restarted_after_redirect: bool = False,
@@ -344,7 +344,16 @@ def _signal(
     restarted_after_redirect: bool,
 ) -> SessionReviewSignal:
     findings = tuple(finding for review in reviews for finding in review.findings)
-    verdict: Literal["accept", "reject"] = "accept" if all(review.verdict == "accept" for review in reviews) else "reject"
+    # "insufficient" is the middle verdict: it never yields an accept, and it
+    # never softens a reject -- a dissenting reviewer that still found a
+    # grounded adverse finding keeps its force.
+    verdict: Literal["accept", "reject", "insufficient"] = (
+        "accept"
+        if all(review.verdict == "accept" for review in reviews)
+        else "reject"
+        if any(review.verdict == "reject" for review in reviews)
+        else "insufficient"
+    )
     return SessionReviewSignal.create(
         session_ref=behavior.session_ref,
         goal_contract_id=goal.contract_id,

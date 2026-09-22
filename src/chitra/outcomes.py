@@ -127,7 +127,7 @@ class _CompletionReviewRecord(BaseModel):
 
     session_ref: str = Field(min_length=1)
     condition: Literal["completion_claim", "turn_end_without_completion_claim"]
-    review_verdict: Literal["accept", "reject", "unavailable"]
+    review_verdict: Literal["accept", "reject", "unavailable", "insufficient"]
     recorded_at: str = Field(validation_alias=AliasChoices("recorded_at", "logged_at", "reviewed_at"))
 
 
