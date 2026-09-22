@@ -21,7 +21,7 @@ import chitra.ledger as ledger_mod
 import chitra.monitord as monitord_mod
 from chitra.autonomy import AutonomyPolicy
 from chitra.completion_gate import CompletionEvidence
-from chitra.detect import Finding, IncidentStore
+from chitra.detect import Finding, IncidentStore, track_key
 from chitra.goals import GoalRecord, add_ask, get_goal, redirect_goal, update_now, upsert_goal
 from chitra.journal import CanonicalEvent
 from chitra.journal.store import EventJournal
@@ -416,7 +416,7 @@ def _stub_finding(name: str) -> Finding:
         detector=f"test-{name}",
         fingerprint_seed={"name": name},
         event_refs=(),
-        unmet_item="done-1",
+        unmet_item=f"done-{name}",
         expected_next_progress=f"make progress for {name}",
         detail=f"finding {name}",
     )
@@ -498,7 +498,8 @@ def _expected_nudge_order(state: Path, goal: GoalRecord, queue: Path) -> tuple[s
     findings_path = state / "monitord-findings.jsonl"
     records = [json.loads(line) for line in findings_path.read_text(encoding="utf-8").splitlines()]
     repeated = next(record for record in records if record["detector"] == "unnecessary_steps")
-    order_id = deterministic_order_id(goal.session_ref, goal.goal_version, repeated["fingerprint"], "nudge")
+    track_id = track_key(goal_digest(goal), repeated["unmet_item"])
+    order_id = deterministic_order_id(goal.session_ref, goal.goal_version, track_id, "nudge")
     order_path = queue / "orders" / f"{order_id}.json"
     return order_id, DispatchOrder.model_validate_json(order_path.read_text(encoding="utf-8"))
 
@@ -728,7 +729,7 @@ def test_monitor_dispatchd_monitor_reconciles_signed_delivery_and_advances_only_
         )
         if record["detector"] == "unnecessary_steps"
     )
-    initial_incident = IncidentStore(state, goal.lane_id).latest(
+    initial_incident = IncidentStore(state, goal.lane_id).latest_by_fingerprint(
         finding_fingerprint
     )
     assert initial_incident is not None
@@ -779,7 +780,7 @@ def test_monitor_dispatchd_monitor_reconciles_signed_delivery_and_advances_only_
     supervised = SupervisionLedger(state, goal.lane_id).latest()
     assert supervised is not None
     assert supervised.state == "awaiting_progress"
-    consumed = IncidentStore(state, goal.lane_id).latest(initial_incident.fingerprint)
+    consumed = IncidentStore(state, goal.lane_id).latest(initial_incident.track_id)
     assert consumed is not None
     assert consumed.stage == "nudge"
     assert consumed.consumption is not None
@@ -792,13 +793,13 @@ def test_monitor_dispatchd_monitor_reconciles_signed_delivery_and_advances_only_
     assert third["lanes_observed"] == 1
     assert third["findings_opened"] == 0
     assert SupervisionLedger(state, goal.lane_id).latest().state == "observing"  # type: ignore[union-attr]
-    assert IncidentStore(state, goal.lane_id).latest(initial_incident.fingerprint).stage == "nudge"  # type: ignore[union-attr]
+    assert IncidentStore(state, goal.lane_id).latest(initial_incident.track_id).stage == "nudge"  # type: ignore[union-attr]
 
     # Only a genuine post-consumption recurrence may issue the next stage.
     _append_repeated_post_consumption_calls(transcript, session_id=native_session_id)
     fourth = run_once(_live_config(state, bindings_path, queue))
     assert fourth["lanes_observed"] == 1
-    advanced = IncidentStore(state, goal.lane_id).latest(initial_incident.fingerprint)
+    advanced = IncidentStore(state, goal.lane_id).latest(initial_incident.track_id)
     assert advanced is not None
     assert advanced.stage == "redirect"
     assert advanced.consumption is None
@@ -843,7 +844,7 @@ def test_sent_result_without_valid_signed_ledger_proof_cannot_count_as_consumed(
         for record in map(json.loads, (state / "monitord-findings.jsonl").read_text(encoding="utf-8").splitlines())
         if record["detector"] == "unnecessary_steps"
     )
-    incident = IncidentStore(state, goal.lane_id).latest(fingerprint)
+    incident = IncidentStore(state, goal.lane_id).latest_by_fingerprint(fingerprint)
     assert incident is not None
     assert incident.consumption is None
     pending = list((queue / "orders").glob("*.json"))

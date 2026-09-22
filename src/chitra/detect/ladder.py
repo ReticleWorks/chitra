@@ -1,11 +1,17 @@
 """Incident store and the nudge → redirect → RESCUE → relaunch ladder.
 
 The store is durable, append-only per lane, and keyed by
-``(lane, finding fingerprint)``. The ladder advances only when the *same*
-fingerprint recurs after proven consumption of the prior stage's order —
-a signed delivery-ledger entry plus a bound user event and turn boundary in
-the journal (the PR #93 receipt semantics). Elapsed time never establishes
-or advances anything.
+``(lane, frozen goal digest, unmet done-item)`` — the pressure track. A lane
+that rotates its excuse for the same unmet item climbs the existing track
+instead of opening a fresh nudge; the finding fingerprint survives only as a
+per-stage detail field. The ladder advances only when the track recurs after
+proven consumption of the prior stage's order — a signed delivery-ledger
+entry plus a bound user event and turn boundary in the journal (the PR #93
+receipt semantics). Elapsed time never establishes or advances anything.
+
+On-disk rows are versioned: v2 rows carry ``schema_name`` and the
+``goal_digest`` that keys the track. Rows written before this version load
+as :class:`LegacyIncidentRecord` — readable, but never advanced.
 """
 
 from __future__ import annotations
@@ -15,12 +21,12 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from chitra.journal.models import CanonicalEvent, CanonicalType
 from chitra.journal.normalizers import queued_operator_prompt
@@ -30,6 +36,7 @@ from .detectors import Finding
 
 LADDER_STAGES: tuple[str, ...] = ("nudge", "redirect", "rescue", "relaunch")
 
+INCIDENT_SCHEMA: Literal["chitra.detect.incident.v2"] = "chitra.detect.incident.v2"
 CONSUMED_CHECKPOINT_SCHEMA = "chitra.detect.consumed-checkpoint.v1"
 
 _LANE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
@@ -59,8 +66,57 @@ class ConsumptionProof(BaseModel):
     turn_event_id: str
 
 
+def track_key(goal_digest: str, unmet_item: str) -> str:
+    """Hash the durable pressure-track identity ``(goal digest, unmet item)``."""
+    encoded = json.dumps(
+        {"goal_digest": goal_digest, "unmet_item": unmet_item},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 class IncidentRecord(BaseModel):
-    """One durable incident keyed ``(lane, finding fingerprint)``."""
+    """One durable incident keyed ``(lane, goal digest, unmet done-item)``.
+
+    ``fingerprint`` stays on the record as the detail of the finding that
+    opened or last advanced the track — rotating the excuse no longer rotates
+    the track. ``schema_name`` versions the on-disk row.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    schema_name: Literal["chitra.detect.incident.v2"] = INCIDENT_SCHEMA
+    lane: str
+    goal_digest: str = Field(min_length=1)
+    fingerprint: str
+    detector: str
+    stage: IncidentStage
+    order_marker: str
+    opened_at: str
+    event_refs: tuple[str, ...]
+    unmet_item: str
+    expected_next_progress: str
+    detail: str
+    consumption: ConsumptionProof | None = None
+    rescue_bundle_sha256: str = ""
+    checkpoint_ref: str = ""
+
+    @property
+    def track_id(self) -> str:
+        """The pressure-track identity this record belongs to."""
+        return track_key(self.goal_digest, self.unmet_item)
+
+
+class LegacyIncidentRecord(BaseModel):
+    """The pre-v2 incident shape, keyed ``(lane, finding fingerprint)``.
+
+    Rows without ``schema_name`` load here so old incident files stay
+    readable. They are evidence only: the store's mutators take v2
+    ``track_id`` keys, so a legacy row can never be consumed, sealed, or
+    advanced — a recurrence of the same unmet item opens a fresh v2 track.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -209,21 +265,46 @@ class IncidentStore:
         self.path = self.directory / f"{lane}.jsonl"
         self.lock_path = self.directory / f"{lane}.lock"
 
-    def load(self) -> list[IncidentRecord]:
+    def load(self) -> list[IncidentRecord | LegacyIncidentRecord]:
         if not self.path.exists():
             return []
-        records: list[IncidentRecord] = []
+        records: list[IncidentRecord | LegacyIncidentRecord] = []
         with self.path.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, 1):
                 if not line.strip():
                     continue
                 try:
-                    records.append(IncidentRecord.model_validate_json(line))
+                    payload = json.loads(line)
+                except ValueError as exc:
+                    raise ValueError(f"invalid incident row {self.path}:{line_number}: {exc}") from exc
+                if not isinstance(payload, dict):
+                    raise ValueError(f"invalid incident row {self.path}:{line_number}: not an object")
+                schema = payload.get("schema_name")
+                if schema == INCIDENT_SCHEMA:
+                    model: type[IncidentRecord] | type[LegacyIncidentRecord] = IncidentRecord
+                elif schema is None:
+                    model = LegacyIncidentRecord
+                else:
+                    raise ValueError(f"invalid incident row {self.path}:{line_number}: unknown schema {schema!r}")
+                try:
+                    records.append(model.model_validate(payload))
                 except ValueError as exc:
                     raise ValueError(f"invalid incident row {self.path}:{line_number}: {exc}") from exc
         return records
 
-    def latest(self, fingerprint: str) -> IncidentRecord | None:
+    def latest(self, track_id: str) -> IncidentRecord | None:
+        """Return the newest v2 record on one pressure track, if any."""
+        for record in reversed(self.load()):
+            if isinstance(record, IncidentRecord) and record.track_id == track_id:
+                return record
+        return None
+
+    def latest_by_fingerprint(self, fingerprint: str) -> IncidentRecord | LegacyIncidentRecord | None:
+        """Return the newest record carrying ``fingerprint`` as its current detail.
+
+        Diagnostic lookup only — production keys on ``latest(track_id)`` —
+        but it keeps old fingerprint-bearing records reachable for review.
+        """
         for record in reversed(self.load()):
             if record.fingerprint == fingerprint:
                 return record
@@ -255,9 +336,10 @@ class IncidentStore:
             os.close(fd)
         return record
 
-    def open_incident(self, *, lane: str, finding: Finding, order_marker: str) -> IncidentRecord:
+    def open_incident(self, *, lane: str, goal_digest: str, finding: Finding, order_marker: str) -> IncidentRecord:
         record = IncidentRecord(
             lane=lane,
+            goal_digest=goal_digest,
             fingerprint=finding.fingerprint,
             detector=finding.detector,
             stage="nudge",
@@ -273,30 +355,42 @@ class IncidentStore:
     def attach_consumption(
         self,
         *,
-        fingerprint: str,
+        track_id: str,
         order_marker: str,
         proof: ConsumptionProof,
     ) -> IncidentRecord:
-        """Bind proven consumption to the newest open record for a fingerprint."""
+        """Bind proven consumption to the newest open record on a track."""
         records = self.load()
         target = next(
-            (record for record in reversed(records) if record.fingerprint == fingerprint and record.order_marker == order_marker),
+            (
+                record
+                for record in reversed(records)
+                if isinstance(record, IncidentRecord) and record.track_id == track_id and record.order_marker == order_marker
+            ),
             None,
         )
         if target is None:
-            raise KeyError(f"no open incident for fingerprint {fingerprint!r} at marker {order_marker!r}")
+            raise KeyError(f"no open incident for track {track_id!r} at marker {order_marker!r}")
         updated = target.model_copy(update={"consumption": proof})
         return self._append(updated)
 
-    def advance(self, *, fingerprint: str) -> IncidentRecord:
+    def advance(self, *, track_id: str) -> IncidentRecord:
         raise TypeError("advance requires next_order_marker")
 
-    def advance_to_next_stage(self, *, fingerprint: str, next_order_marker: str) -> IncidentRecord:
-        """Move the newest consumed record for a fingerprint to its next stage."""
+    def advance_to_next_stage(self, *, track_id: str, next_order_marker: str, finding: Finding) -> IncidentRecord:
+        """Move the newest consumed record on a track to its next stage.
+
+        The track identity — goal digest and unmet item — never changes; the
+        record instead takes the current finding's fingerprint, detector, and
+        detail so the next stage's order speaks to the latest excuse.
+        """
         records = self.load()
-        target = next((record for record in reversed(records) if record.fingerprint == fingerprint), None)
+        target = next(
+            (record for record in reversed(records) if isinstance(record, IncidentRecord) and record.track_id == track_id),
+            None,
+        )
         if target is None:
-            raise KeyError(f"no incident for fingerprint {fingerprint!r}")
+            raise KeyError(f"no incident for track {track_id!r}")
         if target.consumption is None:
             raise ValueError("ladder cannot advance without proven consumption")
         index = LADDER_STAGES.index(target.stage)
@@ -307,6 +401,11 @@ class IncidentStore:
                 "stage": LADDER_STAGES[index + 1],
                 "order_marker": next_order_marker,
                 "opened_at": _utc_now(),
+                "fingerprint": finding.fingerprint,
+                "detector": finding.detector,
+                "event_refs": finding.event_refs,
+                "expected_next_progress": finding.expected_next_progress,
+                "detail": finding.detail,
                 "consumption": None,
                 "rescue_bundle_sha256": "",
                 "checkpoint_ref": "",
@@ -315,17 +414,21 @@ class IncidentStore:
         return self._append(advanced)
 
     def seal_rescue_checkpoint(
-        self, *, fingerprint: str, order_marker: str, bundle_sha256: str, checkpoint_ref: str
+        self, *, track_id: str, order_marker: str, bundle_sha256: str, checkpoint_ref: str
     ) -> IncidentRecord:
         if _HEX64_RE.fullmatch(bundle_sha256) is None or _SAFE_REF_RE.fullmatch(checkpoint_ref) is None:
             raise ValueError("rescue bundle hash and checkpoint reference are required")
         records = self.load()
         target = next(
-            (record for record in reversed(records) if record.fingerprint == fingerprint and record.order_marker == order_marker),
+            (
+                record
+                for record in reversed(records)
+                if isinstance(record, IncidentRecord) and record.track_id == track_id and record.order_marker == order_marker
+            ),
             None,
         )
         if target is None:
-            raise KeyError(f"no incident for fingerprint {fingerprint!r} at marker {order_marker!r}")
+            raise KeyError(f"no incident for track {track_id!r} at marker {order_marker!r}")
         if target.stage != "rescue":
             raise ValueError("only the rescue stage can be sealed for relaunch")
         if target.consumption is None:
@@ -367,7 +470,7 @@ class IncidentStore:
                     (
                         candidate
                         for candidate in reversed(self.load())
-                        if candidate.fingerprint == record.fingerprint
+                        if isinstance(candidate, IncidentRecord) and candidate.track_id == record.track_id
                     ),
                     None,
                 )
@@ -394,11 +497,14 @@ class ResponseLadder:
 
     ``evaluate`` returns exactly one of:
 
-    - ``open``: first sighting; a nudge order should be dispatched;
+    - ``open``: first sighting of this ``(goal digest, unmet item)`` track; a
+      nudge order should be dispatched;
     - ``hold``: recurrence observed but the previous order's consumption was
       never proven — nothing advances;
-    - ``advance``: the same fingerprint recurred after proven consumption of
-      the prior stage's order, so the incident moves to the next stage.
+    - ``advance``: the track recurred after proven consumption of the prior
+      stage's order, so the incident moves to the next stage. A rotated
+      excuse keeps the same track — the finding fingerprint is detail, never
+      the key.
     """
 
     def __init__(
@@ -412,11 +518,19 @@ class ResponseLadder:
         self._events = tuple(journal_events)
         self._ledger_key = ledger_key
 
-    def evaluate(self, *, lane: str, finding: Finding, order_marker: str) -> LadderDecision:
-        existing = self.store.latest(finding.fingerprint)
+    def evaluate(self, *, lane: str, finding: Finding, order_marker: str, goal_digest: str) -> LadderDecision:
+        if not goal_digest:
+            raise ValueError("evaluate requires the frozen goal digest to key the pressure track")
+        track_id = track_key(goal_digest, finding.unmet_item)
+        existing = self.store.latest(track_id)
         if existing is None:
-            record = self.store.open_incident(lane=lane, finding=finding, order_marker=order_marker)
-            return LadderDecision(action="open", stage=record.stage, record=record, reason="first sighting of this finding fingerprint")
+            record = self.store.open_incident(lane=lane, goal_digest=goal_digest, finding=finding, order_marker=order_marker)
+            return LadderDecision(
+                action="open",
+                stage=record.stage,
+                record=record,
+                reason="first finding on this unmet item under the frozen goal",
+            )
         if existing.stage == "relaunch":
             return LadderDecision(action="hold", stage=existing.stage, record=existing, reason="incident already reached relaunch")
         if existing.consumption is None or not self._consumption_proven(existing, finding):
@@ -433,9 +547,12 @@ class ResponseLadder:
                 record=existing,
                 reason="relaunch requires a sealed RESCUE bundle and checkpoint receipt",
             )
-        advanced = self.store.advance_to_next_stage(fingerprint=finding.fingerprint, next_order_marker=order_marker)
+        advanced = self.store.advance_to_next_stage(track_id=track_id, next_order_marker=order_marker, finding=finding)
         return LadderDecision(
-            action="advance", stage=advanced.stage, record=advanced, reason="same fingerprint recurred after proven consumption"
+            action="advance",
+            stage=advanced.stage,
+            record=advanced,
+            reason="a finding on the same unmet item recurred after proven consumption",
         )
 
     def _consumption_proven(self, record: IncidentRecord, finding: Finding) -> bool:
@@ -455,8 +572,8 @@ class ResponseLadder:
         return any(_position_of(self._events, event_id) > turn_position for event_id in finding.event_refs)
 
 
-def _rescue_bundle_verified(state_root: Path, record: IncidentRecord, bundle_sha256: str) -> Any | None:
-    from .rescue import BUNDLE_SCHEMA, RescueBundle
+def _iter_rescue_bundles(state_root: Path) -> Iterator[Any]:
+    from .rescue import RescueBundle
 
     for path in sorted((state_root / "rescue").glob("*.json")):
         try:
@@ -466,31 +583,49 @@ def _rescue_bundle_verified(state_root: Path, record: IncidentRecord, bundle_sha
         if not isinstance(payload, dict):
             continue
         try:
-            bundle = RescueBundle.model_validate(payload)
+            yield RescueBundle.model_validate(payload)
         except ValueError:
             continue
-        if bundle.schema_name != BUNDLE_SCHEMA or bundle.bundle_sha256 != bundle_sha256:
-            continue
-        if bundle.compute_digest() != bundle_sha256:
-            continue
-        expected_session = record.consumption.session_ref if record.consumption else ""
-        if bundle.lane != record.lane or bundle.session_ref != expected_session:
-            continue
-        if bundle.checkpoint_requested is not True:
-            continue
-        if not _valid_rescue_process_identity(bundle.process_identity, expected_session=expected_session):
-            continue
-        if not _rescue_transcript_hash_verified(bundle.transcript_ref, bundle.transcript_sha256):
-            continue
-        if len(bundle.pane_capture) > 20000:
-            continue
-        if not isinstance(bundle.git_state, dict) or not bundle.git_state.get("head") or not bundle.git_state.get("branch"):
-            continue
-        if not bundle.contract.strip():
-            continue
-        if not any(record.fingerprint in entry for entry in bundle.incident_history):
-            continue
-        return bundle
+
+
+def _bundle_matches_record(bundle: Any, record: IncidentRecord, expected_session: str) -> bool:
+    from .rescue import BUNDLE_SCHEMA
+
+    return bool(
+        bundle.schema_name == BUNDLE_SCHEMA
+        and bundle.compute_digest() == bundle.bundle_sha256
+        and bundle.lane == record.lane
+        and bundle.session_ref == expected_session
+        and bundle.checkpoint_requested is True
+        and _valid_rescue_process_identity(bundle.process_identity, expected_session=expected_session)
+        and _rescue_transcript_hash_verified(bundle.transcript_ref, bundle.transcript_sha256)
+        and len(bundle.pane_capture) <= 20000
+        and isinstance(bundle.git_state, dict)
+        and bundle.git_state.get("head")
+        and bundle.git_state.get("branch")
+        and bundle.contract.strip()
+        and any(record.fingerprint in entry for entry in bundle.incident_history)
+    )
+
+
+def find_rescue_bundle(state_root: Path, record: IncidentRecord, *, session_ref: str) -> Any | None:
+    """Return a verified on-disk RESCUE bundle for ``record``, if one exists.
+
+    ``session_ref`` is the frozen goal session the bundle must be bound to;
+    the seal path additionally requires the incident's proven consumption
+    session, which is identical once the rescue order has been consumed.
+    """
+    for bundle in _iter_rescue_bundles(state_root):
+        if _bundle_matches_record(bundle, record, session_ref):
+            return bundle
+    return None
+
+
+def _rescue_bundle_verified(state_root: Path, record: IncidentRecord, bundle_sha256: str) -> Any | None:
+    expected_session = record.consumption.session_ref if record.consumption else ""
+    for bundle in _iter_rescue_bundles(state_root):
+        if bundle.bundle_sha256 == bundle_sha256 and _bundle_matches_record(bundle, record, expected_session):
+            return bundle
     return None
 
 
@@ -723,12 +858,17 @@ def _next_final_boundary(events: tuple[CanonicalEvent, ...], start_position: int
 
 
 __all__ = [
+    "CONSUMED_CHECKPOINT_SCHEMA",
     "ConsumptionProof",
     "discover_consumption_proof",
     "discover_delivery_consumption_proof",
+    "find_rescue_bundle",
+    "INCIDENT_SCHEMA",
     "IncidentRecord",
     "IncidentStore",
     "LADDER_STAGES",
     "LadderDecision",
+    "LegacyIncidentRecord",
     "ResponseLadder",
+    "track_key",
 ]

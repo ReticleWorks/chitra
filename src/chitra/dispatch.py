@@ -792,6 +792,36 @@ def ensure_pane_not_in_mode(
     return cancel_copy_mode(pane, host=host, runner=runner, local_extra=local_extra, tmux_socket=tmux_socket)
 
 
+def pane_pid(
+    pane: str,
+    *,
+    host: str = "",
+    runner: TmuxRunner | None = None,
+    local_extra: set[str] | None = None,
+    tmux_socket: Path | None = None,
+) -> int | None:
+    """Return the target pane's root process id, or ``None`` when unavailable.
+
+    The pid is only meaningful on the host whose tmux server answered the
+    query — a caller that reads ``/proc`` must gate remote hosts out itself.
+    """
+    proc = run_on_host(
+        host,
+        ["tmux", "display-message", "-p", "-t", pane, "#{pane_pid}"],
+        runner=runner,
+        local_extra=local_extra,
+        tmux_socket=tmux_socket,
+        timeout=5,
+    )
+    if proc.returncode != 0:
+        return None
+    try:
+        pid = int(proc.stdout.strip())
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
 # ---------------------------------------------------------------------------
 # Paste commands (BUG FIX (a): -p on paste-buffer)
 # ---------------------------------------------------------------------------

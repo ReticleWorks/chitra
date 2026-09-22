@@ -21,7 +21,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-from .ladder import IncidentRecord
+from .ladder import IncidentRecord, LegacyIncidentRecord
 
 BUNDLE_SCHEMA = "chitra.detect.rescue-bundle.v1"
 BRIEF_SCHEMA = "chitra.detect.relaunch-brief.v1"
@@ -169,7 +169,7 @@ def collect_rescue_bundle(
     pane_capture: str = "",
     receipt_paths: Sequence[Path] = (),
     contract_text: str = "",
-    incidents: Sequence[IncidentRecord] = (),
+    incidents: Sequence[IncidentRecord | LegacyIncidentRecord] = (),
     open_asks: Sequence[str] = (),
     process_identity: dict[str, Any] | None = None,
 ) -> RescueBundle:
@@ -232,6 +232,23 @@ def collect_rescue_bundle(
         checkpoint_requested=True,
     )
     return bundle.model_copy(update={"bundle_sha256": bundle.compute_digest()})
+
+
+def rescue_bundle_process_fresh(bundle: RescueBundle) -> bool:
+    """Re-observe the captured target identity; False once it no longer matches.
+
+    A bundle proves the lane was alive at capture. If the pane process exited
+    or the pid was recycled since, the bundle's identity is stale and the
+    caller must recapture while a live process still exists.
+    """
+    target_pid = bundle.process_identity.get("target_pid")
+    if type(target_pid) is not int:
+        return False
+    try:
+        observed = _observe_process_identity(target_pid)
+    except RuntimeError:
+        return False
+    return all(bundle.process_identity.get(key) == value for key, value in observed.items())
 
 
 def write_rescue_bundle(bundle: RescueBundle, state_root: Path) -> Path:
@@ -399,6 +416,7 @@ __all__ = [
     "collect_rescue_bundle",
     "generate_relaunch_brief",
     "load_or_create_checkpoint_key",
+    "rescue_bundle_process_fresh",
     "sign_checkpoint_receipt",
     "verify_checkpoint_receipt_signature",
     "write_checkpoint_receipt",

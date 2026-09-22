@@ -8,14 +8,18 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import chitra.detect.rescue as rescue_mod
+import chitra.monitord as monitord_mod
 from chitra.detect import (
     ConsumptionProof,
     Finding,
     IncidentRecord,
     IncidentStore,
+    LegacyIncidentRecord,
     ResponseLadder,
     collect_rescue_bundle,
     detect_document_dithering,
@@ -23,7 +27,9 @@ from chitra.detect import (
     detect_excessive_testing,
     detect_false_done,
     detect_unnecessary_steps,
+    find_rescue_bundle,
     generate_relaunch_brief,
+    track_key,
     write_checkpoint_receipt,
     write_rescue_bundle,
 )
@@ -38,7 +44,7 @@ from chitra.detect.rescue import (
     sign_checkpoint_receipt,
 )
 from chitra.dispatchd import _ensure_delivery_ledger
-from chitra.goals import EnrolledDoneWhenItem
+from chitra.goals import EnrolledDoneWhenItem, GoalRecord
 from chitra.journal import (
     CanonicalEvent,
     CanonicalType,
@@ -50,10 +56,19 @@ from chitra.journal import (
 )
 from chitra.journal.models import ByteRange, TranscriptIdentity
 from chitra.ledger import LedgerEntry, append_entry, message_hash, sign
+from chitra.monitord import reconcile_rescue_checkpoint, resolve_config
 from chitra.orders import DispatchOrder, DispatchResult, DispatchStatus
 
 FIXTURES = Path(__file__).parent / "fixtures" / "failure-modes"
 LANE = "claude"
+GOAL_DIGEST = "g" * 64
+
+
+def _track(finding: Finding) -> str:
+    """The pressure-track key these tests open under ``GOAL_DIGEST``."""
+    return track_key(GOAL_DIGEST, finding.unmet_item)
+
+
 CHECKPOINT_SCHEMA = "chitra.detect.checkpoint-receipt.v1"
 CHECKPOINT_INTEGRITY_SCOPE = "entire checkpoint receipt with /integrity/digest omitted"
 CHECKPOINT_CANONICALIZATION = "json.dumps(sort_keys=True,separators=(',',':'),ensure_ascii=False)"
@@ -358,9 +373,9 @@ def test_ladder_never_advances_without_a_consumption_receipt(tmp_path: Path) -> 
         expected_next_progress="try a different approach",
         detail="three identical reads",
     )
-    first = ladder.evaluate(lane=LANE, finding=finding, order_marker="[C] nudge-1")
+    first = ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="[C] nudge-1")
     assert first.action == "open"
-    second = ladder.evaluate(lane=LANE, finding=finding, order_marker="[C] nudge-2")
+    second = ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="[C] nudge-2")
     assert second.action == "hold"
     assert second.reason and "consumption" in second.reason
 
@@ -428,46 +443,46 @@ def test_ladder_advances_only_after_proven_consumption(tmp_path: Path) -> None:
         expected_next_progress="change something before rerunning",
         detail="suite repeated unchanged",
     )
-    opened = ladder.evaluate(lane=LANE, finding=finding, order_marker="nudge-1")
+    opened = ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="nudge-1")
     assert opened.action == "open"
-    recurrence_without_proof = ladder.evaluate(lane=LANE, finding=finding, order_marker="nudge-2")
+    recurrence_without_proof = ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="nudge-2")
     assert recurrence_without_proof.action == "hold"
 
     store.attach_consumption(
-        fingerprint=finding.fingerprint,
+        track_id=_track(finding),
         order_marker="nudge-1",
         proof=proof("nudge-1", "user-1", "turn-1", proof_session="host:other:0.0"),
     )
-    assert ladder.evaluate(lane=LANE, finding=finding, order_marker="redirect-1").action == "hold"
+    assert ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="redirect-1").action == "hold"
 
-    store.attach_consumption(fingerprint=finding.fingerprint, order_marker="nudge-1", proof=proof("nudge-1", "user-1", "turn-1"))
-    advanced = ladder.evaluate(lane=LANE, finding=finding, order_marker="redirect-1")
+    store.attach_consumption(track_id=_track(finding), order_marker="nudge-1", proof=proof("nudge-1", "user-1", "turn-1"))
+    advanced = ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="redirect-1")
     assert advanced.action == "advance"
     assert advanced.stage == "redirect"
     assert advanced.record.order_marker == "redirect-1"
 
     store.attach_consumption(
-        fingerprint=finding.fingerprint,
+        track_id=_track(finding),
         order_marker="redirect-1",
         proof=proof("redirect-1", "user-2", "turn-2"),
     )
-    rescue = ladder.evaluate(lane=LANE, finding=finding, order_marker="rescue-1")
+    rescue = ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="rescue-1")
     assert rescue.action == "advance"
     assert rescue.stage == "rescue"
-    store.attach_consumption(fingerprint=finding.fingerprint, order_marker="rescue-1", proof=proof("rescue-1", "user-3", "turn-3"))
-    blocked = ladder.evaluate(lane=LANE, finding=finding, order_marker="relaunch-1")
+    store.attach_consumption(track_id=_track(finding), order_marker="rescue-1", proof=proof("rescue-1", "user-3", "turn-3"))
+    blocked = ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="relaunch-1")
     assert blocked.action == "hold"
     assert "RESCUE" in blocked.reason
-    consumed_rescue = store.latest(finding.fingerprint)
+    consumed_rescue = store.latest(_track(finding))
     assert consumed_rescue is not None
     _write_verified_rescue_and_checkpoint(tmp_path, consumed_rescue, session_ref=session_ref, checkpoint_ref="checkpoint-1")
     store.seal_rescue_checkpoint(
-        fingerprint=finding.fingerprint,
+        track_id=_track(finding),
         order_marker="rescue-1",
         bundle_sha256=_latest_rescue_sha(tmp_path),
         checkpoint_ref="checkpoint-1",
     )
-    relaunched = ladder.evaluate(lane=LANE, finding=finding, order_marker="relaunch-1")
+    relaunched = ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="relaunch-1")
     assert relaunched.action == "advance"
     assert relaunched.stage == "relaunch"
 
@@ -493,6 +508,7 @@ def test_discover_consumption_proof_requires_exact_payload_identity_and_boundary
     )
     record = IncidentRecord(
         lane=LANE,
+        goal_digest=GOAL_DIGEST,
         fingerprint="f" * 64,
         detector="unnecessary_steps",
         stage="nudge",
@@ -553,6 +569,7 @@ def test_discover_consumption_proof_accepts_bare_session_ref_but_keeps_lane_exac
     )
     record = IncidentRecord(
         lane=LANE,
+        goal_digest=GOAL_DIGEST,
         fingerprint="b" * 64,
         detector="unnecessary_steps",
         stage="nudge",
@@ -592,6 +609,7 @@ def _mid_turn_proof_case() -> tuple[IncidentRecord, LedgerEntry, bytes, str]:
     )
     record = IncidentRecord(
         lane=LANE,
+        goal_digest=GOAL_DIGEST,
         fingerprint="m" * 64,
         detector="unnecessary_steps",
         stage="nudge",
@@ -685,9 +703,9 @@ def test_ladder_does_not_advance_from_historical_finding_after_consumption(tmp_p
     )
     store = IncidentStore(tmp_path, LANE)
     ladder = ResponseLadder(store, journal_events=journal, ledger_key=key)
-    assert ladder.evaluate(lane=LANE, finding=finding, order_marker="nudge-history").action == "open"
+    assert ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="nudge-history").action == "open"
     store.attach_consumption(
-        fingerprint=finding.fingerprint,
+        track_id=_track(finding),
         order_marker="nudge-history",
         proof=ConsumptionProof(
             ledger_entry=entry,
@@ -697,7 +715,7 @@ def test_ladder_does_not_advance_from_historical_finding_after_consumption(tmp_p
             turn_event_id="history-final",
         ),
     )
-    assert ladder.evaluate(lane=LANE, finding=finding, order_marker="redirect-history").action == "hold"
+    assert ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="redirect-history").action == "hold"
 
 
 def test_ladder_consumption_requires_exact_event_session(tmp_path: Path) -> None:
@@ -735,10 +753,10 @@ def test_ladder_consumption_requires_exact_event_session(tmp_path: Path) -> None
         expected_next_progress="try a different approach",
         detail="three identical reads",
     )
-    opened = ladder.evaluate(lane=LANE, finding=finding, order_marker="nudge-1")
+    opened = ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="nudge-1")
     assert opened.action == "open"
     store.attach_consumption(
-        fingerprint=finding.fingerprint,
+        track_id=_track(finding),
         order_marker="nudge-1",
         proof=ConsumptionProof(
             ledger_entry=entry,
@@ -748,7 +766,7 @@ def test_ladder_consumption_requires_exact_event_session(tmp_path: Path) -> None
             turn_event_id="wrong-final",
         ),
     )
-    assert ladder.evaluate(lane=LANE, finding=finding, order_marker="redirect-1").action == "hold"
+    assert ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="redirect-1").action == "hold"
 
 
 def test_ladder_consumption_binds_governed_session_ref_to_native_session_id(
@@ -798,9 +816,9 @@ def test_ladder_consumption_binds_governed_session_ref_to_native_session_id(
         expected_next_progress="try a different approach",
         detail="three identical reads",
     )
-    assert ladder.evaluate(lane=LANE, finding=finding, order_marker="nudge-1").action == "open"
+    assert ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="nudge-1").action == "open"
     store.attach_consumption(
-        fingerprint=finding.fingerprint,
+        track_id=_track(finding),
         order_marker="nudge-1",
         proof=ConsumptionProof(
             ledger_entry=entry,
@@ -810,7 +828,7 @@ def test_ladder_consumption_binds_governed_session_ref_to_native_session_id(
             turn_event_id="native-final",
         ),
     )
-    advanced = ladder.evaluate(lane=LANE, finding=finding, order_marker="redirect-1")
+    advanced = ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="redirect-1")
     assert advanced.action == "advance"
     assert advanced.stage == "redirect"
 
@@ -902,38 +920,38 @@ def test_rescue_seal_requires_verified_bundle_and_checkpoint(tmp_path: Path) -> 
         expected_next_progress="change something before rerunning",
         detail="suite repeated unchanged",
     )
-    assert ladder.evaluate(lane=LANE, finding=finding, order_marker="nudge-1").action == "open"
+    assert ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="nudge-1").action == "open"
     store.attach_consumption(
-        fingerprint=finding.fingerprint,
+        track_id=_track(finding),
         order_marker="nudge-1",
         proof=proof("nudge-1", "user-1", "turn-1"),
     )
-    redirect = ladder.evaluate(lane=LANE, finding=finding, order_marker="redirect-1")
+    redirect = ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="redirect-1")
     assert redirect.stage == "redirect"
     store.attach_consumption(
-        fingerprint=finding.fingerprint,
+        track_id=_track(finding),
         order_marker="redirect-1",
         proof=proof("redirect-1", "user-2", "turn-2"),
     )
-    rescue = ladder.evaluate(lane=LANE, finding=finding, order_marker="rescue-1")
+    rescue = ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="rescue-1")
     assert rescue.stage == "rescue"
     store.attach_consumption(
-        fingerprint=finding.fingerprint,
+        track_id=_track(finding),
         order_marker="rescue-1",
         proof=proof("rescue-1", "user-3", "turn-3"),
     )
     with pytest.raises(ValueError, match="bundle hash"):
         store.seal_rescue_checkpoint(
-            fingerprint=finding.fingerprint,
+            track_id=_track(finding),
             order_marker="rescue-1",
             bundle_sha256="0" * 64,
             checkpoint_ref="checkpoint-1",
         )
-    consumed_rescue = store.latest(finding.fingerprint)
+    consumed_rescue = store.latest(_track(finding))
     assert consumed_rescue is not None
     _write_verified_rescue_and_checkpoint(tmp_path, consumed_rescue, session_ref=session_ref, checkpoint_ref="checkpoint-1")
     store.seal_rescue_checkpoint(
-        fingerprint=finding.fingerprint,
+        track_id=_track(finding),
         order_marker="rescue-1",
         bundle_sha256=_latest_rescue_sha(tmp_path),
         checkpoint_ref="checkpoint-1",
@@ -970,6 +988,7 @@ def test_relaunch_rejects_self_authored_checkpoint_and_null_target_pid(tmp_path:
     store._append(
         IncidentRecord(
             lane=LANE,
+            goal_digest=GOAL_DIGEST,
             fingerprint=finding.fingerprint,
             detector=finding.detector,
             stage="rescue",
@@ -1044,7 +1063,7 @@ def test_relaunch_rejects_self_authored_checkpoint_and_null_target_pid(tmp_path:
 
     with pytest.raises(ValueError, match="checkpoint reference"):
         store.seal_rescue_checkpoint(
-            fingerprint=finding.fingerprint,
+            track_id=_track(finding),
             order_marker="rescue-1",
             bundle_sha256=str(bundle_payload["bundle_sha256"]),
             checkpoint_ref="checkpoint-1",
@@ -1175,9 +1194,9 @@ def test_dispatch_delivery_ledger_binds_native_session_identity(tmp_path: Path) 
         expected_next_progress="try a different approach",
         detail="three identical reads",
     )
-    assert ladder.evaluate(lane=LANE, finding=finding, order_marker="nudge-native").action == "open"
+    assert ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="nudge-native").action == "open"
     store.attach_consumption(
-        fingerprint=finding.fingerprint,
+        track_id=_track(finding),
         order_marker="nudge-native",
         proof=ConsumptionProof(
             ledger_entry=entry,
@@ -1187,9 +1206,9 @@ def test_dispatch_delivery_ledger_binds_native_session_identity(tmp_path: Path) 
             turn_event_id="dispatch-final",
         ),
     )
-    assert ladder.evaluate(lane=LANE, finding=finding, order_marker="redirect-1").action == "hold"
+    assert ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="redirect-1").action == "hold"
     store.attach_consumption(
-        fingerprint=finding.fingerprint,
+        track_id=_track(finding),
         order_marker="nudge-native",
         proof=ConsumptionProof(
             ledger_entry=entry,
@@ -1199,7 +1218,7 @@ def test_dispatch_delivery_ledger_binds_native_session_identity(tmp_path: Path) 
             turn_event_id="dispatch-final",
         ),
     )
-    advanced = ladder.evaluate(lane=LANE, finding=finding, order_marker="redirect-1")
+    advanced = ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="redirect-1")
     assert advanced.action == "advance"
     assert advanced.stage == "redirect"
 
@@ -1260,12 +1279,12 @@ def _rescue_stage_incident(tmp_path: Path) -> tuple[IncidentStore, Finding, str]
         expected_next_progress="change something before rerunning",
         detail="suite repeated unchanged",
     )
-    assert ladder.evaluate(lane=LANE, finding=finding, order_marker="nudge-1").action == "open"
-    store.attach_consumption(fingerprint=finding.fingerprint, order_marker="nudge-1", proof=proof("nudge-1", "user-1", "turn-1"))
-    assert ladder.evaluate(lane=LANE, finding=finding, order_marker="redirect-1").action == "advance"
-    store.attach_consumption(fingerprint=finding.fingerprint, order_marker="redirect-1", proof=proof("redirect-1", "user-2", "turn-2"))
-    assert ladder.evaluate(lane=LANE, finding=finding, order_marker="rescue-1").action == "advance"
-    store.attach_consumption(fingerprint=finding.fingerprint, order_marker="rescue-1", proof=proof("rescue-1", "user-3", "turn-3"))
+    assert ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="nudge-1").action == "open"
+    store.attach_consumption(track_id=_track(finding), order_marker="nudge-1", proof=proof("nudge-1", "user-1", "turn-1"))
+    assert ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="redirect-1").action == "advance"
+    store.attach_consumption(track_id=_track(finding), order_marker="redirect-1", proof=proof("redirect-1", "user-2", "turn-2"))
+    assert ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="rescue-1").action == "advance"
+    store.attach_consumption(track_id=_track(finding), order_marker="rescue-1", proof=proof("rescue-1", "user-3", "turn-3"))
     return store, finding, session_ref
 
 
@@ -1274,14 +1293,14 @@ def test_checkpoint_seal_rejects_duplicate_receipt_nonce_and_appends_once(tmp_pa
     check, durable consumption, and the incident append are atomic, survive
     restart, and reject replayed refs and replayed nonces alike."""
     store, finding, session_ref = _rescue_stage_incident(tmp_path)
-    consumed_rescue = store.latest(finding.fingerprint)
+    consumed_rescue = store.latest(_track(finding))
     assert consumed_rescue is not None
     _write_verified_rescue_and_checkpoint(tmp_path, consumed_rescue, session_ref=session_ref, checkpoint_ref="checkpoint-1")
     bundle_sha256 = _latest_rescue_sha(tmp_path)
 
     def seal(store_: IncidentStore, checkpoint_ref: str) -> None:
         store_.seal_rescue_checkpoint(
-            fingerprint=finding.fingerprint,
+            track_id=_track(finding),
             order_marker="rescue-1",
             bundle_sha256=bundle_sha256,
             checkpoint_ref=checkpoint_ref,
@@ -1351,7 +1370,7 @@ def test_checkpoint_seal_rejects_duplicate_receipt_nonce_and_appends_once(tmp_pa
     with pytest.raises(ValueError, match="already issued"):
         write_checkpoint_receipt(
             bundle=bundle,
-            record=store.latest(finding.fingerprint),
+            record=store.latest(_track(finding)),
             state_root=tmp_path,
             checkpoint_ref="checkpoint-1",
         )
@@ -1359,3 +1378,339 @@ def test_checkpoint_seal_rejects_duplicate_receipt_nonce_and_appends_once(tmp_pa
     assert consumed_log["schema_name"] == CONSUMED_CHECKPOINT_SCHEMA
     assert consumed_log["checkpoint_ref"] == "checkpoint-1"
     assert consumed_log["anti_replay_nonce"] == receipt["anti_replay_nonce"]
+
+
+def test_rotated_excuse_climbs_the_same_pressure_track(tmp_path: Path) -> None:
+    """A changed excuse for the same unmet item climbs the existing track --
+    the finding fingerprint is a detail field, never the key."""
+    key = b"k" * 32
+    session_ref = f"host:{LANE}:0.0"
+    sent_at = "2026-08-21T15:00:00+00:00"
+    nudge_text = "[C] nudge-1 please continue"
+    nudge_digest = message_hash(nudge_text)
+    entry = LedgerEntry(
+        order_id="order-nudge-1",
+        session_ref=session_ref,
+        tag="[C]",
+        sig_v=4,
+        message_hash=nudge_digest,
+        sent_at=sent_at,
+        signature=sign(key, session_ref=session_ref, tag="[C]", digest=nudge_digest, sent_at=sent_at),
+    )
+    journal = (
+        _event("user-1", CanonicalType.UNKNOWN, native_type="user", payload={"text": nudge_text}, session_id=session_ref),
+        _event("turn-1", CanonicalType.FINAL_RESPONSE, payload={"text": "done"}, session_id=session_ref),
+        _event("user-2", CanonicalType.UNKNOWN, native_type="user", payload={"text": "different excuse"}, session_id=session_ref),
+    )
+    store = IncidentStore(tmp_path, LANE)
+    ladder = ResponseLadder(store, journal_events=journal, ledger_key=key)
+    first_excuse = Finding(
+        detector="excessive_testing",
+        fingerprint_seed={"excuse": "the suite was flaky"},
+        event_refs=("user-2",),
+        unmet_item="done-1",
+        expected_next_progress="change something before rerunning",
+        detail="suite repeated unchanged",
+    )
+    rotated_excuse = Finding(
+        detector="drift",
+        fingerprint_seed={"excuse": "blocked on upstream"},
+        event_refs=("user-2",),
+        unmet_item="done-1",
+        expected_next_progress="return to the bounded goal",
+        detail="the lane drifted from the frozen scope",
+    )
+    sibling_item = Finding(
+        detector="drift",
+        fingerprint_seed={"excuse": "blocked on upstream"},
+        event_refs=("user-2",),
+        unmet_item="done-2",
+        expected_next_progress="return to the bounded goal",
+        detail="the lane drifted from the frozen scope",
+    )
+    assert first_excuse.fingerprint != rotated_excuse.fingerprint
+
+    opened = ladder.evaluate(lane=LANE, finding=first_excuse, goal_digest=GOAL_DIGEST, order_marker="nudge-1")
+    assert opened.action == "open"
+    track_id = track_key(GOAL_DIGEST, "done-1")
+    assert opened.record.track_id == track_id
+
+    # The rotated excuse recurs on the same track: hold, not a fresh nudge.
+    held = ladder.evaluate(lane=LANE, finding=rotated_excuse, goal_digest=GOAL_DIGEST, order_marker="nudge-2")
+    assert held.action == "hold"
+    assert len(store.load()) == 1
+
+    # After proven consumption the rotated excuse advances the SAME track.
+    store.attach_consumption(
+        track_id=track_id,
+        order_marker="nudge-1",
+        proof=ConsumptionProof(
+            ledger_entry=entry,
+            session_ref=session_ref,
+            native_session_id=session_ref,
+            user_event_id="user-1",
+            turn_event_id="turn-1",
+        ),
+    )
+    advanced = ladder.evaluate(lane=LANE, finding=rotated_excuse, goal_digest=GOAL_DIGEST, order_marker="redirect-1")
+    assert advanced.action == "advance"
+    assert advanced.stage == "redirect"
+    assert advanced.record.track_id == track_id
+    assert advanced.record.fingerprint == rotated_excuse.fingerprint
+    assert all(
+        record.track_id == track_id for record in store.load() if isinstance(record, IncidentRecord)
+    )
+
+    # A different unmet item is a different track even under the same excuse.
+    other = ladder.evaluate(lane=LANE, finding=sibling_item, goal_digest=GOAL_DIGEST, order_marker="nudge-1")
+    assert other.action == "open"
+    assert other.record.track_id != track_id
+
+
+def test_legacy_incident_rows_load_as_evidence_but_never_advance(tmp_path: Path) -> None:
+    """Pre-v2 rows (no ``schema_name``) stay readable; the ladder treats them
+    as closed history -- a recurrence opens a fresh v2 track instead."""
+    store = IncidentStore(tmp_path, LANE)
+    store.directory.mkdir(parents=True)
+    legacy_row = {
+        "lane": LANE,
+        "fingerprint": "f" * 64,
+        "detector": "drift",
+        "stage": "redirect",
+        "order_marker": "redirect-9",
+        "opened_at": "2026-08-20T00:00:00+00:00",
+        "event_refs": [],
+        "unmet_item": "done-1",
+        "expected_next_progress": "return to scope",
+        "detail": "pre-v2 incident row",
+    }
+    store.path.write_text(json.dumps(legacy_row) + "\n", encoding="utf-8")
+
+    loaded = store.load()
+    assert len(loaded) == 1
+    assert isinstance(loaded[0], LegacyIncidentRecord)
+    assert loaded[0].stage == "redirect"
+    assert loaded[0].fingerprint == "f" * 64
+    assert store.latest(track_key(GOAL_DIGEST, "done-1")) is None
+    assert isinstance(store.latest_by_fingerprint("f" * 64), LegacyIncidentRecord)
+
+    # The legacy row is not addressable by any track key -- not even the old
+    # fingerprint value -- so it can never be consumed or advanced.
+    with pytest.raises(KeyError):
+        store.attach_consumption(
+            track_id="f" * 64,
+            order_marker="redirect-9",
+            proof=ConsumptionProof(
+                ledger_entry=LedgerEntry(
+                    order_id="order-legacy",
+                    session_ref=f"host:{LANE}:0.0",
+                    tag="[C]",
+                    sig_v=4,
+                    message_hash="d" * 64,
+                    sent_at="2026-08-20T00:00:00+00:00",
+                    signature="s" * 64,
+                ),
+                user_event_id="user-x",
+                turn_event_id="turn-x",
+            ),
+        )
+
+    finding = Finding(
+        detector="drift",
+        fingerprint_seed={"legacy": "same observation"},
+        event_refs=("evt-1",),
+        unmet_item="done-1",
+        expected_next_progress="return to scope",
+        detail="the lane drifted from the frozen scope",
+    )
+    decision = ResponseLadder(store).evaluate(
+        lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="nudge-1"
+    )
+    assert decision.action == "open"
+    rows = store.load()
+    assert isinstance(rows[0], LegacyIncidentRecord)
+    assert isinstance(rows[1], IncidentRecord)
+    assert rows[1].stage == "nudge"
+    assert rows[1].track_id == track_key(GOAL_DIGEST, "done-1")
+
+
+def test_unknown_incident_schema_is_rejected(tmp_path: Path) -> None:
+    store = IncidentStore(tmp_path, LANE)
+    store.directory.mkdir(parents=True)
+    store.path.write_text(
+        json.dumps({"schema_name": "chitra.detect.incident.v9", "lane": LANE}) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unknown schema"):
+        store.load()
+
+
+def _patch_live_lane(monkeypatch: pytest.MonkeyPatch, *, pid: int | None, worktree: Path) -> None:
+    """Give the rescue reconcile path a locally observable lane process."""
+    monkeypatch.setattr(monitord_mod, "is_local_host", lambda *_a, **_k: True)
+    monkeypatch.setattr(monitord_mod, "pane_pid", lambda *_a, **_k: pid)
+    monkeypatch.setattr(monitord_mod, "capture", lambda *_a, **_k: ["lane tail output"])
+    monkeypatch.setattr(
+        monitord_mod,
+        "load_worktree_checkpoints",
+        lambda *_a, **_k: [SimpleNamespace(binding=SimpleNamespace(worktree_realpath=str(worktree)))],
+    )
+    monkeypatch.setattr(monitord_mod, "list_receipts", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        rescue_mod,
+        "_observe_process_identity",
+        lambda target_pid: {
+            "target_pid": target_pid,
+            "target_uid": 1000,
+            "target_gid": 1000,
+            "target_start_time": "424242",
+            "target_comm": "fake-agent",
+            "target_exe": "/tmp/fake-agent",
+        },
+    )
+
+
+def _rescue_goal(session_ref: str) -> GoalRecord:
+    return GoalRecord(
+        session_ref=session_ref,
+        goal="finish item done-1",
+        done_when="tests green",
+        source="test",
+        status="working",
+        lane_id=LANE,
+    )
+
+
+def test_rescue_reconcile_collects_while_alive_seals_after_consumption_then_relaunches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The production rescue wiring in order: capture the bundle while the
+    pane process is alive, seal only once the rescue order's consumption is
+    proven, then let the next recurrence on the track advance to relaunch."""
+    key = b"k" * 32
+    session_ref = f"host:{LANE}:0.0"
+    sent_at = "2026-08-21T15:00:00+00:00"
+    rescue_text = "[C] rescue-1 please continue"
+    rescue_digest = message_hash(rescue_text)
+    entry = LedgerEntry(
+        order_id="order-rescue-1",
+        session_ref=session_ref,
+        tag="[C]",
+        sig_v=4,
+        message_hash=rescue_digest,
+        sent_at=sent_at,
+        signature=sign(key, session_ref=session_ref, tag="[C]", digest=rescue_digest, sent_at=sent_at),
+    )
+    journal = (
+        _event("user-3", CanonicalType.UNKNOWN, native_type="user", payload={"text": rescue_text}, session_id=session_ref),
+        _event("turn-3", CanonicalType.FINAL_RESPONSE, payload={"text": "done"}, session_id=session_ref),
+        _event("user-4", CanonicalType.UNKNOWN, native_type="user", payload={"text": "still stuck"}, session_id=session_ref),
+    )
+    store = IncidentStore(tmp_path, LANE)
+    finding = Finding(
+        detector="excessive_testing",
+        fingerprint_seed={"signature": "suite"},
+        event_refs=("user-4",),
+        unmet_item="done-1",
+        expected_next_progress="change something before rerunning",
+        detail="suite repeated unchanged",
+    )
+    record = IncidentRecord(
+        lane=LANE,
+        goal_digest=GOAL_DIGEST,
+        fingerprint=finding.fingerprint,
+        detector=finding.detector,
+        stage="rescue",
+        order_marker="rescue-1",
+        opened_at="2026-08-21T15:00:00+00:00",
+        event_refs=finding.event_refs,
+        unmet_item="done-1",
+        expected_next_progress=finding.expected_next_progress,
+        detail=finding.detail,
+    )
+    store._append(record)
+    track_id = record.track_id
+
+    goal = _rescue_goal(session_ref)
+    worktree = tmp_path / "lane-worktree"
+    worktree.mkdir()
+    subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "w3@example.invalid"], cwd=worktree, check=True)
+    subprocess.run(["git", "config", "user.name", "W3 Test"], cwd=worktree, check=True)
+    (worktree / "tracked.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=worktree, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, capture_output=True, text=True)
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type":"user"}\n', encoding="utf-8")
+    config = resolve_config(state_dir=tmp_path)
+    _patch_live_lane(monkeypatch, pid=os.getpid(), worktree=worktree)
+
+    # Phase 1: the bundle is captured while the process is alive. Consumption
+    # is not proven yet, so nothing seals.
+    reconcile_rescue_checkpoint(
+        config, lane=LANE, goal=goal, track_id=track_id, transcript_path=transcript
+    )
+    bundle = find_rescue_bundle(tmp_path, record, session_ref=session_ref)
+    assert bundle is not None
+    unsealed = store.latest(track_id)
+    assert unsealed is not None
+    assert unsealed.checkpoint_ref == "" and unsealed.rescue_bundle_sha256 == ""
+
+    # Phase 2: the rescue order's consumption is proven; the reconcile seals
+    # exactly once.
+    store.attach_consumption(
+        track_id=track_id,
+        order_marker="rescue-1",
+        proof=ConsumptionProof(
+            ledger_entry=entry,
+            session_ref=session_ref,
+            native_session_id=session_ref,
+            user_event_id="user-3",
+            turn_event_id="turn-3",
+        ),
+    )
+    reconcile_rescue_checkpoint(
+        config, lane=LANE, goal=goal, track_id=track_id, transcript_path=transcript
+    )
+    sealed = store.latest(track_id)
+    assert sealed is not None
+    assert sealed.rescue_bundle_sha256 == bundle.bundle_sha256
+    assert sealed.checkpoint_ref
+    reconcile_rescue_checkpoint(
+        config, lane=LANE, goal=goal, track_id=track_id, transcript_path=transcript
+    )
+    assert store.latest(track_id).checkpoint_ref == sealed.checkpoint_ref  # type: ignore[union-attr]
+
+    # Phase 3: a recurrence on the same track now advances to relaunch.
+    ladder = ResponseLadder(store, journal_events=journal, ledger_key=key)
+    advanced = ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="relaunch-1")
+    assert advanced.action == "advance"
+    assert advanced.stage == "relaunch"
+
+
+def test_rescue_reconcile_holds_when_the_lane_process_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``collect_rescue_bundle`` needs a live pane process: with the pane dead
+    no sealable bundle can exist, so the incident holds at rescue."""
+    store, finding, session_ref = _rescue_stage_incident(tmp_path)
+    record = store.latest(_track(finding))
+    assert record is not None and record.stage == "rescue" and record.consumption is not None
+
+    goal = _rescue_goal(session_ref)
+    config = resolve_config(state_dir=tmp_path)
+    _patch_live_lane(monkeypatch, pid=None, worktree=tmp_path)
+
+    reconcile_rescue_checkpoint(
+        config,
+        lane=LANE,
+        goal=goal,
+        track_id=record.track_id,
+        transcript_path=tmp_path / "transcript.jsonl",
+    )
+
+    assert not (tmp_path / "rescue").exists()
+    held = store.latest(record.track_id)
+    assert held is not None
+    assert held.stage == "rescue"
+    assert held.checkpoint_ref == "" and held.rescue_bundle_sha256 == ""
