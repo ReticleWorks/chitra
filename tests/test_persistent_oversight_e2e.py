@@ -998,6 +998,35 @@ def test_passing_validator_and_structured_claim_mark_goal_verified_and_supervisi
     assert supervision.session_ref == goal.session_ref
 
 
+def test_passing_validator_and_plain_claim_mark_goal_verified_and_supervision_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
+    ingest_passing_receipt(state, goal.session_ref)
+    _append_completion_response(
+        transcript,
+        session_id="native-alpha",
+        claim="Done. The enrolled check passes.",
+    )
+
+    def passing_run(root: Path, session_ref: str, items: object) -> tuple[CompletionEvidence, ...]:
+        del root, session_ref, items
+        return (passing_completion_evidence(),)
+
+    monkeypatch.setattr(monitord_mod, "record_enrolled_validator_runs", passing_run)
+    summary = run_once(_live_config(state, bindings_path, queue))
+
+    assert summary["completion_disputed"] is False
+    assert summary["validator_receipts_recorded"] == 1
+    stored = get_goal(state, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "done-pending-close"
+    supervision = SupervisionLedger(state, goal.lane_id).latest()
+    assert supervision is not None
+    assert supervision.state == "completion_verified"
+
+
 def test_fabricated_or_cross_goal_receipt_cannot_mark_claiming_goal_verified(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
