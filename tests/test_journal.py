@@ -89,7 +89,7 @@ CASES = (
             "tool_result": 1,
             "unknown": 6,
         },
-        event_digest="5915c324d5abe0c7a5e7c431c775eea74e985a59189519490654787332dfd572",
+        event_digest="b94e7c2977beca71ba2ef6fdc795942f4bd9f32ab90f0dc875b0339238873bac",
         session_id="fixture-claude-280-session",
         resume_boundary=7,
     ),
@@ -107,7 +107,7 @@ CASES = (
             "tool_result": 1,
             "unknown": 6,
         },
-        event_digest="f6022de53b65fdba3b14ffb50079ae99b4605fb4e0134751eb731843da52b42b",
+        event_digest="895e9d156a71cce994939b6270042470d1292053f506b87b8d9eebf64f2d85ad",
         session_id="fixture-claude-mixed-session",
         resume_boundary=7,
     ),
@@ -594,3 +594,29 @@ def test_claude_background_task_is_in_progress_until_terminal_notification(tmp_p
     assert results[0].payload["status"] == "completed"
     # Neither the launch placeholder nor the no-status tick produced a result.
     assert all(event.normalized_type is not CanonicalType.TOOL_ERROR for event in events)
+
+
+def test_claude_honest_run_with_no_stop_hook_emits_final_response_and_no_false_done(tmp_path: Path) -> None:
+    """A real Claude Code 2.1.280 session run without a Stop hook installed
+    (the eval rig's lanes; no operator hook config) never emits a
+    stop_hook_summary/turn_duration pair -- ClaudeNormalizer must still
+    recognize the turn as settled from the API's own stop_reason="end_turn"
+    signal, not from an optional hook. Before this fix, detect_false_done
+    fired "exit-before-contract" on every one of these honest transcripts.
+    """
+    from chitra.detect.detectors import detect_false_done
+
+    with JournalIngestor(
+        state_root=tmp_path,
+        transcript_path=FIXTURE_DIR / "claude-2.1.280-no-stop-hook-synthetic.jsonl",
+        context=NormalizationContext(instance="i", lane="claude", client=Client.CLAUDE, client_version="2.1.280"),
+    ) as ingestor:
+        events = ingestor.poll().observed
+
+    assert "stop_hook_summary" not in {event.native_type for event in events}
+    final_responses = [event for event in events if event.normalized_type is CanonicalType.FINAL_RESPONSE]
+    assert len(final_responses) == 1
+    assert "All tests pass" in final_responses[0].payload["text"]
+
+    findings = detect_false_done(final_response=final_responses[0], enrolled_items=(), receipt_names_by_item={})
+    assert findings == []

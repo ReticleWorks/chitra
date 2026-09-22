@@ -319,11 +319,30 @@ class ClaudeNormalizer(TranscriptNormalizer):
                         )
                 elif block.get("type") == "text" and isinstance(block.get("text"), str):
                     message_id = message.get("id")
-                    self._pending_text = (
-                        block["text"],
-                        message_id if isinstance(message_id, str) else None,
-                    )
-                    self._stop_hook_seen = False
+                    if message.get("stop_reason") == "end_turn":
+                        # The API's own turn-boundary signal: this message ends
+                        # the turn (no further tool_use will follow it), so the
+                        # text is the final response now. Older transcripts
+                        # (and any client that omits stop_reason) fall through
+                        # to the stop_hook_summary/turn_duration path below,
+                        # which a Stop hook may or may not ever produce.
+                        events.append(
+                            self._event(
+                                raw,
+                                CanonicalType.FINAL_RESPONSE,
+                                slot="turn_boundary",
+                                native_join_id=message_id if isinstance(message_id, str) else None,
+                                payload={"text": block["text"], "message_id": message_id},
+                            )
+                        )
+                        self._pending_text = None
+                        self._stop_hook_seen = False
+                    else:
+                        self._pending_text = (
+                            block["text"],
+                            message_id if isinstance(message_id, str) else None,
+                        )
+                        self._stop_hook_seen = False
         elif record_type == "user" and isinstance(message, dict):
             content = message.get("content")
             if isinstance(content, str):
