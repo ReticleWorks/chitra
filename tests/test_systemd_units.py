@@ -93,9 +93,6 @@ def test_systemd_ownership_manifest_is_explicit_and_deterministic() -> None:
     assert shared["parameter_mode"] == "literal"
     assert set(shared["units"]) == {
         "chitra-dispatchd.service",
-        "chitra-sweepd.service",
-        "chitra-triaged.service",
-        "chitra-watchd.service",
     }
     for filename, expected_hash in shared["units"].items():
         unit = SYSTEMD_DIR / filename
@@ -202,10 +199,10 @@ def test_shipped_systemd_environment_variables_are_consumed_by_their_entrypoints
     """
     expected = {
         "boardd.service.example": {"BOARDD_STATE_DIR"},
-        # The single monitord example is the per-instance template fleet
+        # The shipped monitord unit is the per-instance template fleet
         # renders; shadow mode is consumed by the daemon, CHITRA_STATE_DIR
         # isolates each %i instance's state root.
-        "chitra-monitord@.service.example": {"CHITRA_MONITORD_SHADOW_MODE", "CHITRA_STATE_DIR"},
+        "chitra-monitord@.service": {"CHITRA_MONITORD_SHADOW_MODE", "CHITRA_STATE_DIR"},
         "chitra-ownership-provider.service.example": {"CHITRA_HOST_ID"},
         "chitra-petra.service.example": {"PETRA_HOST_UUID"},
         "chitra-rate-limit-guard.service.example": set(),
@@ -216,6 +213,7 @@ def test_shipped_systemd_environment_variables_are_consumed_by_their_entrypoints
         "polyphony-chitra-merged.service.example": set(),
     }
     actual = {unit_path.name: _environment_names(unit_path) for unit_path in sorted(SYSTEMD_DIR.glob("*.example"))}
+    actual["chitra-monitord@.service"] = _environment_names(SYSTEMD_DIR / "chitra-monitord@.service")
 
     assert actual == expected
 
@@ -249,15 +247,21 @@ def test_shared_daemon_units_are_the_canonical_package_layout() -> None:
     """
     units = {
         "chitra-dispatchd.service": "chitra.dispatchd",
-        "chitra-triaged.service": "chitra.triaged",
     }
     for filename, module in units.items():
         unit = (SYSTEMD_DIR / filename).read_text(encoding="utf-8")
         assert f"ExecStart=/opt/chitra/venv/bin/python -m {module} --lanes-file /etc/chitra/lanes.yaml" in unit
         assert "/path/to/venv" not in unit
 
+    # The deprecated watchd/triaged/sweepd chain is retired: monitord composes
+    # their logic, so no unit — shipped or example — may remain for them.
+    for retired in ("chitra-watchd", "chitra-triaged", "chitra-sweepd"):
+        assert not (SYSTEMD_DIR / f"{retired}.service").exists()
+        assert not (SYSTEMD_DIR / f"{retired}.service.example").exists()
+
     assert not (SYSTEMD_DIR / "chitra-dispatchd.service.example").exists()
-    assert not (SYSTEMD_DIR / "chitra-triaged.service.example").exists()
+    assert not (SYSTEMD_DIR / "chitra-monitord@.service.example").exists()
+    assert (SYSTEMD_DIR / "chitra-monitord@.service").is_file()
 
     dispatch_docs = (REPO_ROOT / "docs" / "daemons" / "delivery" / "dispatchd.md").read_text(encoding="utf-8")
     triaged_docs = (REPO_ROOT / "docs" / "daemons" / "delivery" / "triaged.md").read_text(encoding="utf-8")
@@ -265,17 +269,17 @@ def test_shared_daemon_units_are_the_canonical_package_layout() -> None:
     configuration_docs = (REPO_ROOT / "docs" / "configuration" / "README.md").read_text(encoding="utf-8")
     assert "packaging/systemd/chitra-dispatchd.service`" in dispatch_docs
     assert "packaging/systemd/chitra-dispatchd.service.example" not in dispatch_docs
-    assert "packaging/systemd/chitra-triaged.service`" in triaged_docs
-    assert "packaging/systemd/chitra-triaged.service.example" not in triaged_docs
-    assert "packaging/systemd/chitra-sweepd.service`" in sweep_docs
-    assert "packaging/systemd/chitra-sweepd.service.example" not in sweep_docs
+    assert "packaging/systemd/chitra-triaged.service" not in triaged_docs
+    assert "packaging/systemd/chitra-sweepd.service" not in sweep_docs
     assert "ExecStart=/usr/local/bin/dispatchd" not in configuration_docs
     assert "chitra-dispatchd.service" in configuration_docs
+    assert "chitra-monitord@.service" in configuration_docs
+    assert "chitra-monitord@.service.example" not in configuration_docs
 
 
 def test_persistent_supervision_units_share_lane_queue_and_binding_topology() -> None:
     """The monitor's per-lane queue must be the dispatcher's lane queue."""
-    monitor = (SYSTEMD_DIR / "chitra-monitord@.service.example").read_text(encoding="utf-8")
+    monitor = (SYSTEMD_DIR / "chitra-monitord@.service").read_text(encoding="utf-8")
     dispatch = (SYSTEMD_DIR / "chitra-dispatchd.service").read_text(encoding="utf-8")
 
     assert "ConditionPathExists=/etc/chitra/transcript-bindings.json" in monitor

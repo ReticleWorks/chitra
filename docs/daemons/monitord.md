@@ -57,7 +57,8 @@ entrypoint:
 - `sweepd` (fleet-state digest) — superseded by monitord's per-pass summary.
 
 No new deployment should declare them; no new daemon beyond `monitord` and
-`dispatchd` will be added.
+`dispatchd` will be added. Their packaged systemd units are retired —
+`chitra-monitord@<instance>` is the only shipped supervisor unit.
 
 ## Running
 
@@ -67,8 +68,8 @@ One-shot pass (prints the pass summary as JSON and exits):
 chitra-monitord --state-dir /var/lib/chitra --once
 ```
 
-Continuous operation: see
-[`packaging/systemd/chitra-monitord@.service.example`](../../packaging/systemd/chitra-monitord@.service.example),
+Continuous operation: see the shipped unit
+[`packaging/systemd/chitra-monitord@.service`](../../packaging/systemd/chitra-monitord@.service),
 one instance-template unit per fleet-style isolated instance
 (`systemctl enable --now chitra-monitord@<instance>.service`).
 

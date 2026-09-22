@@ -639,13 +639,10 @@ def test_shared_dispatch_wrapper_uses_only_enabled_lane_roots(tmp_path, monkeypa
     assert calls[0][1]["goals_root"] == tmp_path / "alpha-state"
 
 
-def test_package_units_define_four_shared_daemons_and_one_anchor_template():
+def test_package_units_define_one_shared_daemon_and_one_anchor_template():
     package_root = Path(__file__).parents[1] / "packaging/systemd"
     shared = {
         "chitra-dispatchd.service": "chitra.dispatchd",
-        "chitra-watchd.service": "chitra.watchd",
-        "chitra-triaged.service": "chitra.triaged",
-        "chitra-sweepd.service": "chitra.sweepd",
     }
     for filename, module in shared.items():
         content = (package_root / filename).read_text(encoding="utf-8")
