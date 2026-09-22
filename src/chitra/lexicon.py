@@ -4,30 +4,15 @@ from __future__ import annotations
 
 import re
 
-# Incident scar tissue lives in chitra.policy_config (see
-# INCIDENT_COMPLETION_DEFERRAL_PHRASES), not here: these are cue-derived,
-# reviewer-judged phrases, and the lexicon stays free of one-off findings.
-COMPLETION_DEFERRAL_PHRASES: tuple[str, ...] = (
-    "you'll need to",
-    "you will need to",
-    "todo",
-    "not implemented",
-    "notimplemented",
-    "out of scope",
-    "leaving for",
-    "leave for",
-    "deferred",
-    "deferring",
-    "close follow-up",
-    "close follow-ups",
-    "follow-up items",
-    "left as an exercise",
-    "in a future pr",
-    "future work",
-    "conditionally healthy",
-    "parse-only",
-    "not publication-ready",
-)
+from chitra.taxonomy import cue_phrases
+
+# The shipped deferral vocabulary lives in the packaged evasion taxonomy
+# (taxonomy.json, DEFERRAL_STUB entry), the single source for the completion
+# gate's cue phrases; this re-exports it for lexicon callers. Incident scar
+# tissue lives in chitra.policy_config (see
+# INCIDENT_COMPLETION_DEFERRAL_PHRASES), not in the taxonomy: those are
+# one-off findings named verbatim, not cue-derived reviewer phrases.
+COMPLETION_DEFERRAL_PHRASES: tuple[str, ...] = cue_phrases("DEFERRAL_STUB")
 
 COMPLETION_CLAIM_RE = re.compile(
     r"^\s*(?:"

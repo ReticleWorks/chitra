@@ -4,7 +4,9 @@
 
 `src/chitra/taxonomy.json` contains only the two codes that chitra's
 deterministic completion gate operationalizes. `src/chitra/taxonomy.py`
-loads these `code`/`cue` entries as validated `TaxonomyEntry` models.
+loads these `code`/`cue` entries as validated `TaxonomyEntry` models; the
+`DEFERRAL_STUB` entry's `phrases` are the gate's shipped deferral
+vocabulary.
 
 | Code | Observable cue |
 | --- | --- |
@@ -24,8 +26,8 @@ The gate also checks per-item verification and blocked todo posture. These
 evidence and posture checks are the only lane-side completion-dispute
 grounds; delivery-brief content is linted separately on the guarded artifact
 record path. `scan_deferral_language` is deliberately simple,
-case-insensitive substring matching. The taxonomy does not alter that fixed
-behavior at runtime.
+case-insensitive substring matching over the shipped `DEFERRAL_STUB`
+phrases; operator policy can still replace the list via `deferral_phrases`.
 
 ## Documentation-only codes
 
