@@ -572,3 +572,25 @@ def test_codex_user_message_is_a_user_turn_with_text(tmp_path: Path) -> None:
     (user,) = [event for event in events if event.native_type == "user"]
     assert user.payload["text"] == "fixture order marker"
     assert events[-1].normalized_type is CanonicalType.FINAL_RESPONSE
+
+
+def test_claude_background_task_is_in_progress_until_terminal_notification(tmp_path: Path) -> None:
+    """A run_in_background launch's immediate reply is a "running" placeholder,
+    not a result. Only the later terminal task-notification, joined by the
+    task id learned from the placeholder (the tool-use id is frequently
+    absent from real notifications), supplies the TOOL_RESULT. A mid-task
+    <event> tick with no <status> must never be read as completion.
+    """
+    with JournalIngestor(
+        state_root=tmp_path,
+        transcript_path=FIXTURE_DIR / "claude-2.1.229-background-task-synthetic.jsonl",
+        context=NormalizationContext(instance="i", lane="claude", client=Client.CLAUDE, client_version="2.1.229"),
+    ) as ingestor:
+        events = ingestor.poll().observed
+
+    results = [event for event in events if event.normalized_type is CanonicalType.TOOL_RESULT]
+    assert len(results) == 1
+    assert results[0].native_join_id == "fixture-call-bg"
+    assert results[0].payload["status"] == "completed"
+    # Neither the launch placeholder nor the no-status tick produced a result.
+    assert all(event.normalized_type is not CanonicalType.TOOL_ERROR for event in events)

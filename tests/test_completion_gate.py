@@ -254,6 +254,8 @@ def test_turn_end_without_completion_claim_is_distinct_and_never_clean() -> None
         ("Task is content-complete but not deploy-complete", False),
         ("The requested parser gate was completed and deployed at SHA abc1234.", True),
         ("Done.", True),
+        ("**DONE**", True),
+        ("**content-complete** milestone", False),
     ],
 )
 def test_completion_claim_requires_sentence_initial_claim_posture(text: str, expected: bool) -> None:

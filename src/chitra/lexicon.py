@@ -34,6 +34,10 @@ COMPLETION_CLAIM_RE = re.compile(
     r"(?:(?:I|we|it|this|task|work|lane)|the\s+[^\n.!?]{1,80}?)"
     r"\s+(?:am|is|was|are|were|now|has|have)\s+"
     r")?"
+    # A markdown emphasis marker (e.g. "**DONE**") may sit between the
+    # optional subject clause and the claim word without breaking the
+    # sentence-initial anchor.
+    r"(?:[*_`]{1,3}\s*)?"
     r"(done|complete(?:d)?|finished|fixed|repaired|shipped|deployed|publication-ready|ready for (?:merge|release))\b",
     re.I | re.M,
 )

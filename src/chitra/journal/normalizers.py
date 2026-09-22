@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -60,6 +61,35 @@ def _native_key(record: dict[str, Any], raw_sha256: str) -> str:
                 return f"payload.{key}:{value}:sha256:{raw_sha256}"
     timestamp = record.get("timestamp")
     return f"timestamp:{timestamp!s}:sha256:{raw_sha256}"
+
+
+_TASK_NOTIFICATION_TASK_ID_RE = re.compile(r"<task-id>(.*?)</task-id>", re.S)
+_TASK_NOTIFICATION_STATUS_RE = re.compile(r"<status>(.*?)</status>", re.S)
+_TASK_NOTIFICATION_SUMMARY_RE = re.compile(r"<summary>(.*?)</summary>", re.S)
+
+
+def _parse_task_notification(content: str) -> dict[str, str | None] | None:
+    """Parse a background-task notification's task id and terminal status.
+
+    A launched background command's tool-use id is absent from roughly a
+    third of real notifications (measured), so the caller must join back to
+    the originating tool call by ``task-id``, learned from the launch
+    placeholder -- never by tool-use id alone. A notification with no
+    ``<status>`` is a mid-task ``<event>`` tick, not a completion; callers
+    must not treat it as one.
+    """
+    if "<task-notification>" not in content:
+        return None
+    task_id_match = _TASK_NOTIFICATION_TASK_ID_RE.search(content)
+    if task_id_match is None:
+        return None
+    status_match = _TASK_NOTIFICATION_STATUS_RE.search(content)
+    summary_match = _TASK_NOTIFICATION_SUMMARY_RE.search(content)
+    return {
+        "task_id": task_id_match.group(1).strip(),
+        "status": status_match.group(1).strip() if status_match else None,
+        "summary": summary_match.group(1).strip() if summary_match else None,
+    }
 
 
 def _nested_exit_code(output: Any) -> int | None:
@@ -227,11 +257,13 @@ class ClaudeNormalizer(TranscriptNormalizer):
         super().__init__(context)
         self._pending_text: tuple[str, str | None] | None = None
         self._stop_hook_seen = False
+        self._background_tasks: dict[str, str] = {}
 
     def begin_replay(self) -> None:
         super().begin_replay()
         self._pending_text = None
         self._stop_hook_seen = False
+        self._background_tasks = {}
 
     def normalize(self, raw: RawRecord) -> tuple[CanonicalEvent, ...]:
         self._begin_record(raw)
@@ -274,27 +306,63 @@ class ClaudeNormalizer(TranscriptNormalizer):
                     )
                     self._stop_hook_seen = False
         elif record_type == "user" and isinstance(message, dict):
-            for index, block in enumerate(_blocks(message.get("content"))):
-                if block.get("type") != "tool_result":
-                    continue
-                call_id = block.get("tool_use_id")
-                if not isinstance(call_id, str):
-                    continue
-                is_error = block.get("is_error") is True
-                events.append(
-                    self._event(
-                        raw,
-                        CanonicalType.TOOL_ERROR if is_error else CanonicalType.TOOL_RESULT,
-                        slot=f"tool_result:{index}",
-                        native_join_id=call_id,
-                        payload={
-                            "call_id": call_id,
-                            "content": block.get("content"),
-                            "is_error": is_error,
-                            "tool_use_result": record.get("toolUseResult"),
-                        },
+            content = message.get("content")
+            if isinstance(content, str):
+                notification = _parse_task_notification(content)
+                if notification is not None and notification["status"] is not None:
+                    call_id = self._background_tasks.pop(notification["task_id"] or "", None)
+                    if call_id is not None:
+                        is_error = notification["status"] != "completed"
+                        events.append(
+                            self._event(
+                                raw,
+                                CanonicalType.TOOL_ERROR if is_error else CanonicalType.TOOL_RESULT,
+                                slot="task_notification",
+                                native_join_id=call_id,
+                                payload={
+                                    "call_id": call_id,
+                                    "task_id": notification["task_id"],
+                                    "status": notification["status"],
+                                    "summary": notification["summary"],
+                                    "is_error": is_error,
+                                },
+                            )
+                        )
+                # A notification with no <status> is a mid-task <event> tick,
+                # never a completion; an unmapped task id is left unknown.
+            else:
+                for index, block in enumerate(_blocks(content)):
+                    if block.get("type") != "tool_result":
+                        continue
+                    call_id = block.get("tool_use_id")
+                    if not isinstance(call_id, str):
+                        continue
+                    tool_use_result = record.get("toolUseResult")
+                    background_task_id = (
+                        tool_use_result.get("backgroundTaskId") if isinstance(tool_use_result, dict) else None
                     )
-                )
+                    if isinstance(background_task_id, str):
+                        # A background launch's immediate result is a
+                        # "running" placeholder, not the tool's outcome. Track
+                        # it as in progress; only the later terminal
+                        # task-notification supplies the real result.
+                        self._background_tasks[background_task_id] = call_id
+                        continue
+                    is_error = block.get("is_error") is True
+                    events.append(
+                        self._event(
+                            raw,
+                            CanonicalType.TOOL_ERROR if is_error else CanonicalType.TOOL_RESULT,
+                            slot=f"tool_result:{index}",
+                            native_join_id=call_id,
+                            payload={
+                                "call_id": call_id,
+                                "content": block.get("content"),
+                                "is_error": is_error,
+                                "tool_use_result": record.get("toolUseResult"),
+                            },
+                        )
+                    )
         elif record_type == "system" and record.get("subtype") == "stop_hook_summary":
             if self._pending_text is not None:
                 self._stop_hook_seen = True
