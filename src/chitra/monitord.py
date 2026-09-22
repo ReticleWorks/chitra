@@ -223,7 +223,7 @@ def ingest_transcript_bindings(
 ) -> tuple[CanonicalEvent, ...]:
     """Ingest every explicitly bound JSONL transcript before journal discovery."""
     observed: list[CanonicalEvent] = []
-    unknown: Counter[str] = Counter()
+    unknown: dict[str, Counter[str]] = {}
     manifest_path = config.transcript_bindings_path or config.state_dir / DEFAULT_FILENAME
     for binding in bindings:
         transcript_path = _resolved_binding_path(config, binding, manifest_path=manifest_path)
@@ -243,9 +243,12 @@ def ingest_transcript_bindings(
         observed.extend(result.observed)
         # Client versions are not gated. Newly appended records the normalizer
         # does not recognize are the drift signal.
-        unknown.update(event.lane for event in result.appended if event.normalized_type is CanonicalType.UNKNOWN)
-    for lane, count in sorted(unknown.items()):
-        logger.info("monitord_unknown_events_ingested", lane=lane, events=count)
+        # Logging the native record types, not just a count, makes a new type stand out.
+        for event in result.appended:
+            if event.normalized_type is CanonicalType.UNKNOWN:
+                unknown.setdefault(event.lane, Counter())[str(event.payload.get("native_type"))] += 1
+    for lane, types in sorted(unknown.items()):
+        logger.info("monitord_unknown_events_ingested", lane=lane, events=sum(types.values()), types=dict(sorted(types.items())))
     if bindings:
         logger.info("monitord_bound_transcripts_ingested", bindings=len(bindings), events=len(observed))
     return tuple(observed)

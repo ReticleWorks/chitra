@@ -84,9 +84,10 @@ def test_unseen_version_ingests_and_logs_unknown_count(tmp_path: Path) -> None:
 
     assert len(observed) == 13
     assert len(EventJournal(tmp_path, "lane-x").load()) == 13
-    assert [entry for entry in logs if entry["event"] == "monitord_unknown_events_ingested"] == [
-        {"event": "monitord_unknown_events_ingested", "lane": "lane-x", "events": 7, "log_level": "info"}
-    ]
+    (drift,) = [entry for entry in logs if entry["event"] == "monitord_unknown_events_ingested"]
+    assert drift["lane"] == "lane-x"
+    assert drift["events"] == 7
+    assert drift["types"]["brand-new-record"] == 1
 
 
 def test_resolve_config_defaults_to_shadow_mode_on() -> None:
