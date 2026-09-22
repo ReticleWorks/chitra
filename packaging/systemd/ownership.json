@@ -24,6 +24,8 @@
       ],
       "units": {
         "chitra-dispatchd.service": "be17b0bf352b40973e7b109df266c3e5de999855b227379198b92fe18c66a2ab",
+        "chitra-rate-limit-guard.service": "7b0f5087bb9380e016165754b9cb21e6aabd8d30432e7bc5adaf8549aa68d728",
+        "chitra-rate-limit-guard.timer": "ff83236f80b7af58710ba01e8fafcecee2a294d19cd3b5fd5c634bb424cdfae4",
         "chitra-sweepd.service": "745bb62b968ee96595ba8f161abed9fe1d647d392327a2201dd9618a66387857",
         "chitra-triaged.service": "e9e390dc8acfaf7a559c6f14e2b6bc0a1af9fb3aaf86fb1aa4e0a4731bdf4ca4",
         "chitra-watchd.service": "40850fcdca1347942b8f5374f31aa4381cd7282cf6cf2b7bf87a3b32f4f040cf"

@@ -9,7 +9,6 @@ to reconcile the state without inventing a second queue or recovery system.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import hashlib
 import json
 import os
@@ -21,6 +20,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from chitra._fsio import exclusive_lock
 from chitra.autonomy import DEFAULT_AUTONOMY_POLICY
 
 SCHEMA = "chitra.supervision.v1"
@@ -200,16 +200,8 @@ class SupervisionLedger:
     def _lock(self) -> Iterator[None]:
         self.directory.mkdir(parents=True, exist_ok=True)
         os.chmod(self.directory, 0o700)
-        fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        with exclusive_lock(self.lock_path, mode=0o600):
+            yield
 
     def _load_unlocked(self) -> list[SupervisionRecord]:
         try:

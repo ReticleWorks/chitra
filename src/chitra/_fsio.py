@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 import tempfile
@@ -11,21 +10,36 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
+import filelock
+
+
+@contextlib.contextmanager
+def exclusive_lock(lock_path: Path, *, mode: int = -1, timeout: float = -1.0) -> Iterator[bool]:
+    """Hold an exclusive advisory lock on ``lock_path`` for one critical section.
+
+    Yields False instead of blocking when ``timeout`` expires before the lock
+    is acquired; a negative ``timeout`` waits indefinitely. ``mode`` sets the
+    lock file's permissions once the lock is held; -1 leaves them to the
+    process umask.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = filelock.FileLock(str(lock_path), mode=mode, timeout=timeout)
+    try:
+        lock.acquire()
+    except filelock.Timeout:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        lock.release()
+
 
 @contextlib.contextmanager
 def locked_json_store(path: Path) -> Iterator[None]:
     """Serialize a full read-modify-write transaction for ``path``."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.parent / f".{path.name}.lock"
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+    with exclusive_lock(path.parent / f".{path.name}.lock", mode=0o600):
+        yield
 
 
 def write_json_atomic(

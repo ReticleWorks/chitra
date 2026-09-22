@@ -35,7 +35,6 @@ No LLM calls in this module's own code path — deterministic signing/logging on
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import hmac
 import os
@@ -44,6 +43,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, PrivateAttr, model_validator
 
+from ._fsio import exclusive_lock
 from .reasoning import DecisionAttestation
 from .state_paths import default_ledger_key_path
 
@@ -115,23 +115,18 @@ def append_attestation(
         attestation=attestation,
         logged_at=datetime.now(UTC).isoformat(),
     )
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = ledger_path.with_name(ledger_path.name + ".lock")
-    with lock_path.open("a", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            if ledger_path.exists():
-                for line in ledger_path.read_text(encoding="utf-8").splitlines():
-                    try:
-                        existing = AttestationLedgerEntry.model_validate_json(line)
-                    except ValueError:
-                        continue
-                    if existing.order_id == order_id and existing.attestation.attestation_id == attestation.attestation_id:
-                        return existing
-            with ledger_path.open("a", encoding="utf-8") as output:
-                output.write(entry.model_dump_json() + "\n")
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    with exclusive_lock(lock_path):
+        if ledger_path.exists():
+            for line in ledger_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    existing = AttestationLedgerEntry.model_validate_json(line)
+                except ValueError:
+                    continue
+                if existing.order_id == order_id and existing.attestation.attestation_id == attestation.attestation_id:
+                    return existing
+        with ledger_path.open("a", encoding="utf-8") as output:
+            output.write(entry.model_dump_json() + "\n")
     return entry
 
 

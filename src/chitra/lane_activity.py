@@ -8,15 +8,13 @@ lifetimes without teaching the load ladder to inspect conversation content.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
-import os
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
-from chitra._fsio import write_json_atomic
+from chitra._fsio import exclusive_lock, write_json_atomic
 from chitra.state_paths import state_dir
 
 SCHEMA = "chitra.lane-activity.v1"
@@ -71,16 +69,8 @@ def activity_path(root: Path | None = None) -> Path:
 @contextlib.contextmanager
 def _activity_lock(root: Path | None) -> Iterator[None]:
     path = activity_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path.with_name(f".{path.name}.lock")), os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+    with exclusive_lock(path.with_name(f".{path.name}.lock"), mode=0o600):
+        yield
 
 
 def load_lane_activity(root: Path | None = None) -> list[LaneActivity]:

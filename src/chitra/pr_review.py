@@ -24,7 +24,6 @@ which is a single isolated subprocess call with no shared conversation state —
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import subprocess
@@ -35,6 +34,7 @@ from typing import Literal, Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from chitra._fsio import exclusive_lock
 from chitra.policy_config import PRReviewPolicy
 
 REVIEW_LOG_NAME = "pr_reviews.jsonl"
@@ -375,22 +375,17 @@ def pr_review_log_path(root: Path) -> Path:
 
 def append_pr_review(path: Path, report: PRReviewReport) -> None:
     """Append one deduplicated report under a lock, keyed by its content id."""
-    path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".lock")
-    with lock_path.open("a", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            if path.exists():
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    try:
-                        if json.loads(line).get("report_id") == report.report_id:
-                            return
-                    except (ValueError, AttributeError):
-                        continue
-            with path.open("a", encoding="utf-8") as output:
-                output.write(report.model_dump_json() + "\n")
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    with exclusive_lock(lock_path):
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    if json.loads(line).get("report_id") == report.report_id:
+                        return
+                except (ValueError, AttributeError):
+                    continue
+        with path.open("a", encoding="utf-8") as output:
+            output.write(report.model_dump_json() + "\n")
 
 
 def load_latest_pr_review(path: Path, pr_ref: str) -> PRReviewReport | None:

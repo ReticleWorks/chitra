@@ -10,7 +10,6 @@ or advances anything.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -22,6 +21,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from chitra._fsio import exclusive_lock
 from chitra.journal.models import CanonicalEvent, CanonicalType
 from chitra.journal.normalizers import queued_operator_prompt
 from chitra.ledger import LedgerEntry, message_hash, verify_entry
@@ -232,13 +232,8 @@ class IncidentStore:
     def _append(self, record: IncidentRecord) -> IncidentRecord:
         self.directory.mkdir(parents=True, exist_ok=True)
         os.chmod(self.directory, 0o700)
-        with self.lock_path.open("a", encoding="utf-8") as lock:
-            os.chmod(self.lock_path, 0o600)
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            try:
-                return self._append_locked(record)
-            finally:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        with exclusive_lock(self.lock_path, mode=0o600):
+            return self._append_locked(record)
 
     def _append_locked(self, record: IncidentRecord) -> IncidentRecord:
         """Durably append one record. The caller must hold ``lock_path``."""
@@ -354,35 +349,30 @@ class IncidentStore:
         """
         self.directory.mkdir(parents=True, exist_ok=True)
         os.chmod(self.directory, 0o700)
-        with self.lock_path.open("a", encoding="utf-8") as lock:
-            os.chmod(self.lock_path, 0o600)
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            try:
-                consumed_refs, consumed_nonces = _load_consumed_checkpoints(self.state_root)
-                if checkpoint_ref in consumed_refs or nonce in consumed_nonces:
-                    raise ValueError(
-                        f"checkpoint receipt {checkpoint_ref!r} was already consumed; a receipt seals exactly once"
-                    )
-                latest = next(
-                    (
-                        candidate
-                        for candidate in reversed(self.load())
-                        if candidate.fingerprint == record.fingerprint
-                    ),
-                    None,
+        with exclusive_lock(self.lock_path, mode=0o600):
+            consumed_refs, consumed_nonces = _load_consumed_checkpoints(self.state_root)
+            if checkpoint_ref in consumed_refs or nonce in consumed_nonces:
+                raise ValueError(
+                    f"checkpoint receipt {checkpoint_ref!r} was already consumed; a receipt seals exactly once"
                 )
-                if latest is not None and (latest.checkpoint_ref or latest.rescue_bundle_sha256):
-                    raise ValueError("incident rescue stage is already sealed")
-                _append_consumed_checkpoint(
-                    self.state_root,
-                    checkpoint_ref=checkpoint_ref,
-                    nonce=nonce,
-                    lane=self.lane,
-                    fingerprint=record.fingerprint,
-                )
-                return self._append_locked(record)
-            finally:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            latest = next(
+                (
+                    candidate
+                    for candidate in reversed(self.load())
+                    if candidate.fingerprint == record.fingerprint
+                ),
+                None,
+            )
+            if latest is not None and (latest.checkpoint_ref or latest.rescue_bundle_sha256):
+                raise ValueError("incident rescue stage is already sealed")
+            _append_consumed_checkpoint(
+                self.state_root,
+                checkpoint_ref=checkpoint_ref,
+                nonce=nonce,
+                lane=self.lane,
+                fingerprint=record.fingerprint,
+            )
+            return self._append_locked(record)
 
 
 def _utc_now() -> str:

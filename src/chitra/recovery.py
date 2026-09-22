@@ -8,10 +8,8 @@ second state writer merely because it is paused for longer than a usage hold.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import hashlib
 import json
-import os
 import subprocess
 import uuid
 from collections.abc import Iterator
@@ -22,7 +20,7 @@ from typing import Any, Literal, cast
 
 import structlog
 
-from ._fsio import write_json_atomic
+from ._fsio import exclusive_lock, write_json_atomic
 from .goals import LOAD_SHED_HOLD_REASON_PREFIX, GoalRecord, done_when_with_delta, get_goal
 from .rate_limit_state import Transaction
 from .state_paths import state_dir
@@ -241,16 +239,8 @@ def recovery_records_path(root: Path | None = None) -> Path:
 @contextlib.contextmanager
 def _recovery_lock(root: Path | None) -> Iterator[None]:
     path = recovery_records_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path.parent / f".{path.name}.lock"), os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+    with exclusive_lock(path.parent / f".{path.name}.lock", mode=0o600):
+        yield
 
 
 def _empty_document() -> dict[str, object]:
