@@ -13,7 +13,12 @@ collapsed out of watchd, triaged, and sweepd:
    and wait for a completed agent turn before judging recurrence.
 4. **Enrollment and receipts** -- run registered validators only for an exact
    completion claim, isolate receipts by goal session, and close only after
-   the stored evidence verifies independently.
+   the stored evidence verifies independently. When the lane provably runs as
+   another OS user, validators execute on a bounded worker pool (one run in
+   flight per lane) and the pass consumes the recorded result once the
+   worktree digest it tested still matches; a lane sharing Chitra's OS user
+   keeps the synchronous run and second-execution check, because it could
+   write the record itself.
 5. **Presence** -- publish one advisory presence record per pass so peers can
    see which instance is observing which lanes.
 
@@ -37,6 +42,7 @@ import signal
 import threading
 from collections import Counter
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -46,7 +52,13 @@ import structlog
 
 from chitra._fsio import locked_json_store, write_json_atomic
 from chitra.canonical_choices import CanonicalChoicesPolicy, detect_canonical_choices
-from chitra.completion_gate import CompletionEvidence, extract_completion_evidence, has_structured_completion_line, is_completion_claim
+from chitra.completion_gate import (
+    CompletionEvidence,
+    EnrolledDoneWhenItemLike,
+    extract_completion_evidence,
+    has_structured_completion_line,
+    is_completion_claim,
+)
 from chitra.detect import (
     Finding,
     IncidentStore,
@@ -87,7 +99,14 @@ from chitra.supervision import SupervisionLedger, goal_digest
 from chitra.supervisor import reconcile_corrective_action, reconcile_question_action, record_observing
 from chitra.systemd_notify import notify_ready, notify_watchdog
 from chitra.transcript_bindings import DEFAULT_FILENAME, TranscriptBinding, load_transcript_bindings
-from chitra.validation_receipts import record_enrolled_validator_runs
+from chitra.validation_receipts import (
+    record_enrolled_validator_runs,
+    recorded_result_lane,
+    recorded_validator_run_fresh,
+    recorded_validator_run_proof,
+    run_enrolled_validators_on_worker,
+    worktree_git_digest,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -95,6 +114,7 @@ DEFAULT_POLL_SECONDS = 60.0
 PRESENCE_INSTANCE = "chitra-monitord"
 MONITORD_SCHEMA = "chitra.monitord.pass.v1"
 IDLE_PURSUIT_SCHEMA = "chitra.monitord.idle-pursuit.v1"
+_VALIDATOR_RUN_MAX_ATTEMPTS = 3
 _DETECTOR_ORDER = (
     "canonical_choices.deprecated_path",
     "drift",
@@ -316,6 +336,7 @@ def _idle_pursuit_finding(
     events: tuple[CanonicalEvent, ...],
     findings: list[Finding],
     question_outcome: str,
+    validator_pending: bool = False,
 ) -> Finding | None:
     """Persist clean-pass count and emit one deterministic idle finding."""
     path = _idle_pursuit_path(config, lane)
@@ -334,6 +355,7 @@ def _idle_pursuit_finding(
         and not findings
         and question_outcome == "none"
         and not delivery_pending
+        and not validator_pending
         and not goal.open_asks
         and not goal.needs
     )
@@ -513,35 +535,143 @@ def evaluate_findings(
     return actions
 
 
+class _ValidatorRunPool:
+    """Bounded worker pool that keeps validator execution off the monitor loop.
+
+    At most one run is ever in flight per lane key: a lane whose previous
+    run is still executing is not requeued, so validators cannot pile up on
+    a tree that is still moving. A worker records its result under
+    ``validation-runs/`` and a later pass reads the record instead of
+    waiting on the future. ``attempts`` bounds catastrophic retries so a
+    worker that fails before it can record still surfaces the same loud
+    error the old inline path produced.
+    """
+
+    def __init__(self, max_workers: int = 4) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="chitra-validator-run")
+        self._lock = threading.Lock()
+        self._in_flight: dict[str, Future[None]] = {}
+        self._attempts: dict[str, int] = {}
+
+    def submit(self, lane_key: str, work: Callable[[], None]) -> None:
+        """Queue ``work`` unless this lane already has a run in flight."""
+        with self._lock:
+            current = self._in_flight.get(lane_key)
+            if current is not None and not current.done():
+                return
+            self._attempts[lane_key] = self._attempts.get(lane_key, 0) + 1
+            future = self._executor.submit(work)
+            self._in_flight[lane_key] = future
+        future.add_done_callback(lambda done: self._completed(lane_key, done))
+
+    def _completed(self, lane_key: str, future: Future[None]) -> None:
+        try:
+            future.result()
+        except Exception as exc:
+            logger.error("monitord_validator_run_failed", lane=lane_key, error=str(exc))
+            return
+        with self._lock:
+            if self._in_flight.get(lane_key) is future:
+                self._in_flight.pop(lane_key, None)
+                self._attempts.pop(lane_key, None)
+
+    def attempts(self, lane_key: str) -> int:
+        """Return how many queued runs for this lane have not yet succeeded."""
+        with self._lock:
+            return self._attempts.get(lane_key, 0)
+
+    def wait_idle(self, timeout: float | None = None) -> bool:
+        """Block until no lane has a run in flight; used by tests and shutdown."""
+        with self._lock:
+            futures = [future for future in self._in_flight.values() if not future.done()]
+        if not futures:
+            return True
+        _finished, pending = wait(futures, timeout=timeout)
+        return not pending
+
+    def shutdown(self) -> None:
+        """Stop accepting work without blocking exit on running validators."""
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+
+_VALIDATOR_RUN_POOL = _ValidatorRunPool()
+
+
+def _claimed_run_evidence(
+    config: MonitordConfig,
+    goal: GoalRecord,
+    session_ref: str,
+    items: tuple[EnrolledDoneWhenItemLike, ...],
+) -> tuple[CompletionEvidence, ...] | None:
+    """Return validator evidence for a structured claim, or None while a run is pending.
+
+    When the lane provably runs as another OS user, the enrolled validators
+    execute on the worker pool — one run in flight per lane — and the
+    recorded result, stamped with the worktree digest it tested, stands in
+    for the gate's re-execution. When the lane shares Chitra's user a record
+    file proves nothing, so both the run and the gate's second execution
+    stay synchronous, exactly as before.
+    """
+    lane = recorded_result_lane(config.state_dir, session_ref)
+    current_digest = worktree_git_digest(lane.workdir) if lane is not None else None
+    if lane is None or current_digest is None:
+        return record_enrolled_validator_runs(config.state_dir, session_ref, items)
+    if all(
+        recorded_validator_run_fresh(config.state_dir, session_ref, item, current_digest=current_digest)
+        for item in items
+    ):
+        return tuple(recorded_validator_run_proof(config.state_dir, session_ref, item) for item in items)
+    lane_key = f"{config.state_dir}:{goal.lane_id or session_ref}"
+    if _VALIDATOR_RUN_POOL.attempts(lane_key) >= _VALIDATOR_RUN_MAX_ATTEMPTS:
+        # A worker that keeps failing before it can record is surfaced
+        # through the same synchronous call the inline path made instead of
+        # queueing forever.
+        return record_enrolled_validator_runs(config.state_dir, session_ref, items)
+    _VALIDATOR_RUN_POOL.submit(
+        lane_key,
+        lambda: run_enrolled_validators_on_worker(
+            config.state_dir,
+            session_ref,
+            items,
+            workdir=lane.workdir,
+        ),
+    )
+    return None
+
+
 def check_enrollment_and_receipts(
     config: MonitordConfig,
     session_ref: str,
     final_response: CanonicalEvent | None = None,
-) -> tuple[int, bool, list[Finding]]:
+) -> tuple[int, bool, list[Finding], bool]:
     """Verify an explicit completion claim against its enrolled contract.
 
     Validators run only when the latest unconsumed final response contains a
     structured completion line. The lane's claimed result is ignored; Chitra
     executes and stores each enrolled validator itself. A missing or held
-    goal and a turn without a completion claim are silent.
+    goal and a turn without a completion claim are silent. For a lane that
+    runs as another OS user the execution happens on the worker pool and a
+    claim is neither passed nor disputed while that run is in flight; the
+    fourth return value reports that pending state so the pass does not
+    treat a lane under active validation as idle.
     """
     try:
         goal = get_goal(config.state_dir, session_ref)
     except Exception:
-        return 0, False, []
+        return 0, False, [], False
     if goal is None or goal.status not in {
         "working",
         "blocked",
         "turn-finished-unverified",
         "completion-disputed",
     }:
-        return 0, False, []
+        return 0, False, [], False
     final_text = ""
     if final_response is not None:
         payload_text = final_response.payload.get("text")
         final_text = payload_text if isinstance(payload_text, str) else ""
     if not final_text or not is_completion_claim(final_text):
-        return 0, False, []
+        return 0, False, [], False
 
     items = tuple(getattr(goal, "enrolled_done_when_items", ()) or ())
     if not items:
@@ -562,7 +692,7 @@ def check_enrollment_and_receipts(
                 now=findings[0].detail,
                 status="completion-disputed",
             )
-        return 0, True, findings
+        return 0, True, findings, False
 
     claimed_evidence = tuple(extract_completion_evidence(final_text))
     claim_bindings: dict[str, str] = {}
@@ -577,7 +707,12 @@ def check_enrollment_and_receipts(
 
     run_evidence: tuple[CompletionEvidence, ...] = ()
     if has_structured_completion_line(final_text):
-        run_evidence = record_enrolled_validator_runs(config.state_dir, session_ref, items)
+        claimed = _claimed_run_evidence(config, goal, session_ref, items)
+        if claimed is None:
+            # A worker run is in flight or was just queued: the claim
+            # neither passes nor disputes until the recorded result lands.
+            return 0, False, [], True
+        run_evidence = claimed
 
     material_questions = (*goal.open_asks, *((goal.needs,) if goal.needs else ()))
     findings = detect_false_done(
@@ -617,7 +752,7 @@ def check_enrollment_and_receipts(
             now="; ".join(finding.detail for finding in findings),
             status="completion-disputed",
         )
-    return len(run_evidence), disputed, findings
+    return len(run_evidence), disputed, findings, False
 
 
 def handle_agent_question(
@@ -828,7 +963,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                     detector_events = events[boundary + 1 :]
         if goal is not None:
             final_response = _final_response(detector_events)
-            receipts_recorded, completion_disputed, enrollment_findings = check_enrollment_and_receipts(
+            receipts_recorded, completion_disputed, enrollment_findings, validator_pending = check_enrollment_and_receipts(
                 config,
                 goal.session_ref,
                 final_response,
@@ -839,7 +974,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
         else:
             # Legacy or unresolved bindings remain observable, but no other
             # goal may be borrowed for detector context or receipt checks.
-            receipts_recorded, completion_disputed, enrollment_findings = 0, False, []
+            receipts_recorded, completion_disputed, enrollment_findings, validator_pending = 0, False, [], False
             final_response = None
 
         completion_verified = bool(goal is not None and goal.status == "done-pending-close")
@@ -889,6 +1024,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
             events,
             findings,
             question_outcome,
+            validator_pending=validator_pending,
         )
         if idle_finding is not None:
             findings.append(idle_finding)
@@ -1005,10 +1141,15 @@ def run_forever(config: MonitordConfig, *, stop_event: threading.Event | None = 
     active_stop_event = stop_event or threading.Event()
     logger.info("monitord_started", state_dir=str(config.state_dir), poll_seconds=config.poll_seconds)
     notify_ready()
-    while not active_stop_event.is_set():
-        run_once(config)
-        notify_watchdog()
-        active_stop_event.wait(config.poll_seconds)
+    try:
+        while not active_stop_event.is_set():
+            run_once(config)
+            notify_watchdog()
+            active_stop_event.wait(config.poll_seconds)
+    finally:
+        # Running validators keep their threads; an unfinished run simply
+        # never records a result and the next daemon start re-queues it.
+        _VALIDATOR_RUN_POOL.shutdown()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

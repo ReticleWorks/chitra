@@ -301,18 +301,18 @@ def test_check_enrollment_disputes_when_the_validator_fails(tmp_path: Path, monk
             }
         }
     )
-    recorded, disputed, findings = check_enrollment_and_receipts(
+    recorded, disputed, findings, pending = check_enrollment_and_receipts(
         _config(tmp_path),
         "session-1",
         final_response,
     )
     assert disputed is True
     assert recorded == 1
+    assert pending is False
     assert all(finding.detector == "false_done" for finding in findings)
 
 def test_check_enrollment_is_silent_for_unenrolled_sessions(tmp_path: Path) -> None:
-    recorded, disputed, findings = check_enrollment_and_receipts(_config(tmp_path), "no-such-session")
-    assert (recorded, disputed, findings) == (0, False, [])
+    assert check_enrollment_and_receipts(_config(tmp_path), "no-such-session") == (0, False, [], False)
 
 
 def test_routine_question_is_queued_as_an_exact_goal_contract_answer(

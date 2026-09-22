@@ -20,6 +20,13 @@ enrolled goal until completion evidence verifies:
    inspect state, change tactics, and continue.
 4. **Completion and questions** — runs enrolled validators only after a
    structured completion claim. Receipts are isolated by exact goal session.
+   For a lane the manifest binds to a different OS user, the validators run
+   on a bounded worker pool (one run in flight per lane) and the pass
+   consumes the recorded result only while the worktree digest it tested
+   still matches; a lane sharing Chitra's OS user keeps the synchronous run
+   and re-execution, since it could write the record itself. A pending run
+   leaves the claim untouched — it is neither a pass, a dispute, nor an
+   idle pass.
    Routine goal questions and explicit small reversible changes get answers
    derived from the frozen contract. An unresolved routine question becomes a
    foreground Chitra investigation: it may inspect, replan, and direct several

@@ -9,6 +9,10 @@ inconsistent binding must never be guessed from another goal.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -1032,3 +1036,165 @@ def test_fabricated_or_cross_goal_receipt_cannot_mark_claiming_goal_verified(
     assert not claiming_goal.completion_proofs
     supervision = SupervisionLedger(state, goal.lane_id).latest()
     assert supervision is None or supervision.state != "completion_verified"
+
+
+def _init_lane_worktree(path: Path) -> Path:
+    """Create a real git worktree so the lane digest is computable."""
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
+    (path / "tracked.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(path), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "-c", "user.email=lane@chitra.test", "-c", "user.name=lane", "commit", "-qm", "init"],
+        check=True,
+    )
+    return path
+
+
+def _separate_user_lane_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    workdir: Path,
+) -> Path:
+    """Declare lane ``alpha`` as a different OS user so recorded results count."""
+    manifest = tmp_path / "lanes.yaml"
+    manifest.write_text(
+        json.dumps(
+            {
+                "lanes": [
+                    {
+                        "id": "alpha",
+                        "account": "alpha",
+                        "uid": os.geteuid() + 1,
+                        "home": str(tmp_path / "lane-home"),
+                        "workdir": str(workdir),
+                        "config_dir": str(tmp_path / "lane-config"),
+                        "state_dir": str(tmp_path / "lane-state"),
+                        "tmux_socket": str(tmp_path / "lane-tmux.sock"),
+                        "tmux_session": "alpha",
+                        "credentials": {
+                            "claude_credentials": str(tmp_path / "lane-creds" / "claude.json"),
+                            "ssh_dispatch_key": str(tmp_path / "lane-creds" / "ssh_key"),
+                        },
+                        "enabled": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CHITRA_LANES_FILE", str(manifest))
+    return manifest
+
+
+def _slow_validator_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, seconds: float) -> Path:
+    """Register the enrolled ``pytest`` validator as a command that sleeps."""
+    registry = tmp_path / "validators.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "pytest": {
+                    "argv": [sys.executable, "-c", f"import time; time.sleep({seconds})"],
+                    "timeout_s": max(seconds * 3, 15),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CHITRA_VALIDATORS_FILE", str(registry))
+    return registry
+
+
+def test_slow_enrolled_validator_does_not_stall_the_monitor_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A five-second validator must finish far outside the monitor pass."""
+    state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
+    _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=_init_lane_worktree(tmp_path / "lane-worktree"))
+    _slow_validator_registry(tmp_path, monkeypatch, seconds=5)
+    _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
+
+    started = time.monotonic()
+    run_once(_live_config(state, bindings_path, queue))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+
+
+def test_goal_status_stays_unchanged_until_the_worker_result_lands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While the worker runs, the claim neither passes nor disputes."""
+    state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
+    _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=_init_lane_worktree(tmp_path / "lane-worktree"))
+    _slow_validator_registry(tmp_path, monkeypatch, seconds=5)
+    _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
+
+    run_once(_live_config(state, bindings_path, queue))
+
+    stored = get_goal(state, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "working"
+
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+    run_once(_live_config(state, bindings_path, queue))
+
+    stored = get_goal(state, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "done-pending-close"
+
+
+def test_same_user_lane_keeps_the_synchronous_second_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lane sharing Chitra's OS user could forge a record, so it stays inline."""
+    state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
+    workdir = _init_lane_worktree(tmp_path / "lane-worktree")
+    manifest = _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=workdir)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    lanes = payload["lanes"]
+    assert isinstance(lanes, list)
+    lanes[0]["uid"] = os.geteuid()
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
+
+    summary = run_once(_live_config(state, bindings_path, queue))
+
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=0)
+    assert summary["validator_receipts_recorded"] == 1
+    stored = get_goal(state, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "done-pending-close"
+
+
+def test_tree_change_after_validation_requeues_instead_of_passing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worktree that moved since the worker ran can never pass on its record."""
+    state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
+    workdir = _init_lane_worktree(tmp_path / "lane-worktree")
+    _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=workdir)
+    _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
+
+    run_once(_live_config(state, bindings_path, queue))
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+
+    (workdir / "lane-edit.txt").write_text("edited after the validator ran\n", encoding="utf-8")
+    run_once(_live_config(state, bindings_path, queue))
+
+    stored = get_goal(state, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "working"
+
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+    run_once(_live_config(state, bindings_path, queue))
+
+    stored = get_goal(state, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "done-pending-close"

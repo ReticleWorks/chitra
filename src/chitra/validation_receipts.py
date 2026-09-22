@@ -28,6 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from chitra._fsio import locked_json_store, parse_iso8601, write_json_atomic
 from chitra.completion_gate import CompletionEvidence, EnrolledDoneWhenItemLike, completion_receipt_issues
+from chitra.lane_config import LaneSpec, load_lanes
 from chitra.state_paths import state_dir
 from chitra.validator_registry import (
     UNRUNNABLE_EXIT_CODE,
@@ -51,6 +52,7 @@ _CANONICALIZATION = "UTF-8 JSON; keys sorted; separators comma and colon; ensure
 _INTEGRITY_SCOPE = "entire receipt with /integrity/digest omitted"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_RECEIPT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+_VALIDATOR_RUN_SCHEMA = "chitra.validator-run.v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,9 +183,38 @@ class ReceiptVerification:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ValidatorRunRecord:
+    """One worker-executed validator run and the exact worktree it tested."""
+
+    session_ref: str
+    receipt_name: str
+    validator: str
+    exit_code: int
+    receipt_digest: str
+    tree_digest_before: str | None
+    tree_digest_after: str | None
+    recorded_at: str
+
+
 def receipts_root(root: Path | None = None) -> Path:
     """Return the instance receipt directory."""
     return (state_dir() if root is None else root) / "validation-receipts"
+
+
+def validator_runs_root(root: Path | None = None) -> Path:
+    """Return the instance directory for worker-recorded validator executions."""
+    return (state_dir() if root is None else root) / "validation-runs"
+
+
+def validator_run_record_path(root: Path | None, session_ref: str, receipt_name: str) -> Path:
+    """Return the run-record path bound to one exact session and receipt."""
+    if not session_ref.strip():
+        raise ReceiptError("session_ref must be non-empty")
+    if _SAFE_RECEIPT_NAME_RE.fullmatch(receipt_name) is None:
+        raise ReceiptError("receipt_name must be a path-safe stable name")
+    session_key = hashlib.sha256(session_ref.encode("utf-8")).hexdigest()
+    return validator_runs_root(root) / session_key / f"{receipt_name}.json"
 
 
 def _session_receipts_root(root: Path | None, session_ref: str) -> Path:
@@ -925,6 +956,119 @@ def _trusted_validator_target_issues(receipt: ValidationReceipt, approved_root: 
     return []
 
 
+def worktree_git_digest(workdir: Path) -> str | None:
+    """Digest the exact worktree content a validator could observe.
+
+    HEAD, the full ``git diff HEAD`` patch, and a blob hash of every
+    untracked file cover commits, staged and unstaged edits, and new files —
+    the digest tracks file content, not modification flags, so a lane that
+    edits a file it already touched still changes the digest. ``None`` means
+    the directory cannot be digested (not a worktree, or git failed) and
+    every caller fails closed on it.
+    """
+
+    def _git(*args: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(workdir), *args],
+                check=False,
+                capture_output=True,
+                timeout=30.0,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout.decode("utf-8", "surrogateescape")
+
+    head = _git("rev-parse", "--verify", "HEAD")
+    patch = _git("diff", "HEAD", "--binary")
+    untracked = _git("ls-files", "--others", "--exclude-standard", "-z")
+    if head is None or patch is None or untracked is None:
+        return None
+    digest = hashlib.sha256(head.strip().encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(patch.encode("utf-8", "surrogateescape"))
+    for relative in sorted(path for path in untracked.split("\0") if path):
+        blob = _git("hash-object", "--", relative)
+        if blob is None:
+            return None
+        digest.update(b"\0")
+        digest.update(relative.encode("utf-8", "surrogateescape"))
+        digest.update(blob.strip().encode("ascii"))
+    return digest.hexdigest()
+
+
+def recorded_result_lane(root: Path | None, session_ref: str) -> LaneSpec | None:
+    """Return the goal lane's spec only while it provably runs as another OS user.
+
+    A worker's recorded result can stand in for a second execution only when
+    the lane could not have written the record itself: the lanes manifest
+    must bind this goal to a lane whose declared ``uid`` differs from this
+    process's effective uid — the same check ``lane_anchor`` uses to decide
+    whether ``runuser`` is required. A missing manifest, goal, or lane — or
+    a lane sharing Chitra's OS user — returns ``None`` and every caller
+    keeps the synchronous second execution.
+    """
+    from chitra.goals import get_goal
+
+    try:
+        goal = get_goal(root, session_ref)
+        lanes = load_lanes()
+    except (OSError, ValueError):
+        return None
+    if goal is None:
+        return None
+    lane = next((candidate for candidate in lanes if candidate.tmux_session == goal.lane_id), None)
+    if lane is None or lane.uid == os.geteuid():
+        return None
+    return lane
+
+
+def _recorded_validator_result(
+    receipt: ValidationReceipt,
+    base: Path,
+    approved_root: Path | None,
+) -> int | None:
+    """Return a worker-recorded exit code only while it is fresh and unforgeable.
+
+    A lane that shares Chitra's OS user could write the record file itself,
+    so a recorded result stands in for re-execution only when the lanes
+    manifest binds this receipt's goal to a lane whose declared uid differs
+    from this process's euid — the same check ``lane_anchor`` uses to decide
+    whether ``runuser`` is required. Every other shape — no record, no
+    manifest, a shared uid, a record not bound to this receipt, or a
+    worktree that cannot be digested — returns ``None`` and the caller
+    re-executes the validator exactly as before. A bound record whose tree
+    digests no longer match the current worktree is stale: it can never
+    pass, so the result is the fail-closed 125 and the monitor re-queues the
+    run on its next pass.
+    """
+    root = approved_root if approved_root is not None else _state_root_for_receipt_dir(base)
+    record = _load_run_record(root / "validation-runs" / base.name / f"{receipt.receipt_name}.json")
+    if record is None:
+        return None
+    if record.receipt_name != receipt.receipt_name:
+        return None
+    if record.validator != _text(receipt.validator, "name", parent="validator"):
+        return None
+    if record.receipt_digest != receipt.integrity.digest:
+        return None
+    if hashlib.sha256(record.session_ref.encode("utf-8")).hexdigest() != base.name:
+        return None
+    lane = recorded_result_lane(root, record.session_ref)
+    if lane is None:
+        return None
+    if record.tree_digest_before is None or record.tree_digest_after is None:
+        return None
+    current = worktree_git_digest(lane.workdir)
+    if current is None:
+        return None
+    if record.tree_digest_before != record.tree_digest_after or record.tree_digest_after != current:
+        return UNRUNNABLE_EXIT_CODE
+    return record.exit_code
+
+
 def _trusted_validator_result(receipt: ValidationReceipt, base: Path, approved_root: Path | None) -> int:
     """Run the frozen identity's trusted verifier against the exact current target.
 
@@ -944,6 +1088,9 @@ def _trusted_validator_result(receipt: ValidationReceipt, base: Path, approved_r
     if _validator_binding_issues(receipt, base, approved_root):
         return 125
     if registered is not None:
+        recorded = _recorded_validator_result(receipt, base, approved_root)
+        if recorded is not None:
+            return recorded
         exit_code, output = run_registered_validator(registered)
         del output
         return exit_code
@@ -1257,6 +1404,185 @@ def record_enrolled_validator_runs(
     """
     registry = load_validators(root)
     return tuple(record_registered_run(root, session_ref, item, registry.get(item.validator)) for item in items)
+
+
+def _load_run_record(path: Path) -> ValidatorRunRecord | None:
+    """Read one worker run record, returning ``None`` for any malformed shape."""
+    try:
+        payload: Any = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema") != _VALIDATOR_RUN_SCHEMA:
+        return None
+    fields = cast(dict[str, object], payload)
+    session_ref = fields.get("session_ref")
+    receipt_name_value = fields.get("receipt_name")
+    validator = fields.get("validator")
+    exit_code = fields.get("exit_code")
+    receipt_digest = fields.get("receipt_digest")
+    digest_before = fields.get("tree_digest_before")
+    digest_after = fields.get("tree_digest_after")
+    recorded_at = fields.get("recorded_at")
+    if not (
+        isinstance(session_ref, str)
+        and isinstance(receipt_name_value, str)
+        and isinstance(validator, str)
+        and isinstance(exit_code, int)
+        and not isinstance(exit_code, bool)
+        and isinstance(receipt_digest, str)
+        and (digest_before is None or isinstance(digest_before, str))
+        and (digest_after is None or isinstance(digest_after, str))
+        and isinstance(recorded_at, str)
+    ):
+        return None
+    return ValidatorRunRecord(
+        session_ref=session_ref,
+        receipt_name=receipt_name_value,
+        validator=validator,
+        exit_code=exit_code,
+        receipt_digest=receipt_digest,
+        tree_digest_before=digest_before,
+        tree_digest_after=digest_after,
+        recorded_at=recorded_at,
+    )
+
+
+def _write_validator_run_record(
+    root: Path | None,
+    session_ref: str,
+    item: EnrolledDoneWhenItemLike,
+    *,
+    exit_code: int,
+    receipt_digest: str,
+    digest_before: str | None,
+    digest_after: str | None,
+) -> None:
+    """Atomically publish the record a worker produced for one item."""
+    path = validator_run_record_path(root, session_ref, item.required_receipt)
+    write_json_atomic(
+        path,
+        {
+            "schema": _VALIDATOR_RUN_SCHEMA,
+            "session_ref": session_ref,
+            "receipt_name": item.required_receipt,
+            "validator": item.validator,
+            "exit_code": exit_code,
+            "receipt_digest": receipt_digest,
+            "tree_digest_before": digest_before,
+            "tree_digest_after": digest_after,
+            "recorded_at": datetime.now(UTC).isoformat(),
+        },
+        fsync=True,
+    )
+    os.chmod(path, 0o600)
+
+
+def _stored_report_exit_code(root: Path | None, session_ref: str, receipt_name: str) -> int:
+    """Return the exit code the stored validator report recorded, else 125."""
+    report_path = receipt_path(root, session_ref, receipt_name).parent / f"{receipt_name}.report.json"
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return UNRUNNABLE_EXIT_CODE
+    exit_code = report.get("exit_code") if isinstance(report, dict) else None
+    return exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else UNRUNNABLE_EXIT_CODE
+
+
+def _stored_receipt_integrity_digest(root: Path | None, session_ref: str, receipt_name: str) -> str | None:
+    """Return the stored receipt's integrity digest, or ``None`` when unreadable."""
+    try:
+        stored, _raw = load_receipt_file(receipt_path(root, session_ref, receipt_name))
+    except ReceiptError:
+        return None
+    return stored.integrity.digest
+
+
+def run_enrolled_validators_on_worker(
+    root: Path | None,
+    session_ref: str,
+    items: Sequence[EnrolledDoneWhenItemLike],
+    *,
+    workdir: Path,
+) -> None:
+    """Execute enrolled validators off the monitor loop and stamp the tested tree.
+
+    For each enrolled item the worker digests the lane worktree immediately
+    before and after running the registered validator, stores the receipt
+    exactly as the synchronous path does, and writes a run record under
+    ``validation-runs/`` carrying the exit code, the receipt's integrity
+    digest, and both tree digests. A lane edit mid-run makes the digests
+    differ, which marks the record stale so the completion gate never
+    accepts it.
+    """
+    registry = load_validators(root)
+    for item in items:
+        digest_before = worktree_git_digest(workdir)
+        exit_code = UNRUNNABLE_EXIT_CODE
+        receipt_digest = ""
+        try:
+            record_registered_run(root, session_ref, item, registry.get(item.validator))
+            exit_code = _stored_report_exit_code(root, session_ref, item.required_receipt)
+            receipt_digest = _stored_receipt_integrity_digest(root, session_ref, item.required_receipt) or ""
+        except Exception:
+            # A run that cannot record its receipt still needs a landed
+            # record: the gate treats it as a completed non-passing result
+            # rather than a reason to block the monitor pass.
+            pass
+        _write_validator_run_record(
+            root,
+            session_ref,
+            item,
+            exit_code=exit_code,
+            receipt_digest=receipt_digest,
+            digest_before=digest_before,
+            digest_after=worktree_git_digest(workdir),
+        )
+
+
+def recorded_validator_run_fresh(
+    root: Path | None,
+    session_ref: str,
+    item: EnrolledDoneWhenItemLike,
+    *,
+    current_digest: str,
+) -> bool:
+    """Return whether a worker record covers this item and the current tree.
+
+    The record counts as fresh only while it names this exact session,
+    receipt, and validator, both run-time digests exist, and the worktree
+    still matches the digest taken immediately before and after the run.
+    Anything else — no record, a moved tree, a lane edit mid-run — is not
+    fresh, and the caller queues a new run instead of passing on stale
+    evidence.
+    """
+    try:
+        record = _load_run_record(validator_run_record_path(root, session_ref, item.required_receipt))
+    except ReceiptError:
+        return False
+    if record is None:
+        return False
+    if record.session_ref != session_ref or record.receipt_name != item.required_receipt or record.validator != item.validator:
+        return False
+    before, after = record.tree_digest_before, record.tree_digest_after
+    return before is not None and before == after == current_digest
+
+
+def recorded_validator_run_proof(
+    root: Path | None,
+    session_ref: str,
+    item: EnrolledDoneWhenItemLike,
+) -> CompletionEvidence:
+    """Reproduce the in-memory proof a synchronous run would have returned."""
+    record = _load_run_record(validator_run_record_path(root, session_ref, item.required_receipt))
+    exit_code = record.exit_code if record is not None else UNRUNNABLE_EXIT_CODE
+    return CompletionEvidence(
+        kind="artifact",
+        done_when_item_id=item.id,
+        receipt_name=item.required_receipt,
+        validator=item.validator,
+        validator_result="pass" if exit_code == 0 else "fail",
+        citation=str(receipt_path(root, session_ref, item.required_receipt)),
+    )
 
 
 def verified_disk_results(
