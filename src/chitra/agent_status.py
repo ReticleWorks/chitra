@@ -225,6 +225,8 @@ class DetectionExplain:
     # A cap with no readable resume time still reports the state; the response
     # protocol then has to source the time from the provider reading instead.
     resume_at: str | None = None
+    # Names blocker-shaped text displaced by a newer working or idle signal.
+    suppressed_blocker_rule: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -242,6 +244,7 @@ class DetectionExplain:
             "evaluated_rules": [evaluation.to_dict() for evaluation in self.evaluated_rules],
             "warning": self.warning,
             "resume_at": self.resume_at,
+            "suppressed_blocker_rule": self.suppressed_blocker_rule,
         }
 
 
@@ -512,15 +515,26 @@ def classify_snapshot(
     # until the cap lifts the lane is going nowhere, and calling it idle is
     # what made the last one invisible for two days.
     rate_limited = next((rule for rule in matched_rules if rule.state in RATE_LIMITED_STATES), None)
+    suppressed_blocker_rule: str | None = None
     if rate_limited is not None:
         matched_rule = rate_limited
-    elif matched_rule is not None and matched_rule.state == "blocked" and snapshot_live is not False:
-        # A live working footer is newer evidence than blocker-shaped text
-        # retained above it in the bounded capture. Working rules therefore
-        # suppress a simultaneous screen-derived blocker match regardless of
-        # manifest priority. Bundled working rules are anchored to live footer
-        # shapes so ordinary prose cannot trigger this override.
-        matched_rule = next((rule for rule in matched_rules if rule.state == "working"), matched_rule)
+    elif matched_rule is not None and matched_rule.state == "blocked":
+        blocker_rule = matched_rule
+        working_rule = next((rule for rule in matched_rules if rule.state == "working"), None)
+        idle_rule = next((rule for rule in matched_rules if rule.state == "idle"), None)
+        if working_rule is not None and snapshot_live is not False:
+            # A live working footer is newer evidence than blocker-shaped text
+            # retained above it in the bounded capture. Bundled working rules
+            # are anchored to live footer shapes so ordinary prose cannot
+            # trigger this override. Repeated identical snapshots are treated
+            # as stale by the broker, allowing the blocker to win instead.
+            matched_rule = working_rule
+            suppressed_blocker_rule = blocker_rule.identifier
+        elif working_rule is None and idle_rule is not None:
+            # An anchored idle input row, without a working footer, means the
+            # visible blocker-shaped text is retained from an answered prompt.
+            matched_rule = idle_rule
+            suppressed_blocker_rule = blocker_rule.identifier
     if matched_rule is None:
         return DetectionExplain(
             agent=agent,
@@ -554,4 +568,5 @@ def classify_snapshot(
         screen_detection_skipped=False,
         screen_detection_skip_reason=None,
         evaluated_rules=tuple(evaluations),
+        suppressed_blocker_rule=suppressed_blocker_rule,
     )

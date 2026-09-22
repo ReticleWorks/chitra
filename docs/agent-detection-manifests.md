@@ -91,7 +91,11 @@ anchored approval, question, or permission control, including exact answer
 tokens where the interface supplies them. Broad matches on prompt prose,
 scrollback, an error word, a status sentence, or silence are invalid uses of
 the contract. A simultaneous anchored working footer wins over older blocker
-text in the capture.
+text in the capture. The broker treats that footer as stale after the same
+snapshot is observed twice for the same pane and session, allowing the blocker
+to win. When no working footer matches, an anchored idle input row takes
+precedence over leftover blocker text from an answered prompt. Explain output
+names any displaced blocker in `suppressed_blocker_rule`.
 
 When no rule matches a known agent, Chitra returns idle with
 `default_known_agent_idle_fallback`. This is a safety bias, not evidence that

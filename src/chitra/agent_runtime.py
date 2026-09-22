@@ -273,6 +273,9 @@ def _optional_text(raw: dict[str, Any], key: str, *, name: str) -> str | None:
 def detection_explain_from_dict(payload: object) -> DetectionExplain:
     """Validate the handoff-safe subset of persisted explain output."""
     raw = _object(payload, name="detection explain")
+    # Older persisted handoffs predate this additive diagnostic field.
+    if "suppressed_blocker_rule" not in raw:
+        raw = {**raw, "suppressed_blocker_rule": None}
     _exact_fields(
         raw,
         {
@@ -290,6 +293,7 @@ def detection_explain_from_dict(payload: object) -> DetectionExplain:
             "evaluated_rules",
             "warning",
             "resume_at",
+            "suppressed_blocker_rule",
         },
         name="detection explain",
     )
@@ -385,6 +389,7 @@ def detection_explain_from_dict(payload: object) -> DetectionExplain:
         evaluated_rules=tuple(evaluations),
         warning=_optional_text(raw, "warning", name="detection explain"),
         resume_at=_optional_text(raw, "resume_at", name="detection explain"),
+        suppressed_blocker_rule=_optional_text(raw, "suppressed_blocker_rule", name="detection explain"),
     )
 
 

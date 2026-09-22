@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from chitra.agent_runtime import AgentStatusBroker
+from chitra.agent_runtime import AgentStatusBroker, detection_explain_from_dict
 from chitra.agent_status import (
     DEFAULT_KNOWN_AGENT_IDLE_FALLBACK,
     LIFECYCLE_AUTHORITY_SKIP_REASON,
@@ -86,6 +86,44 @@ Trust recorded; the task cannot be cancelled now.
     assert result.state == "working"
     assert result.matched_rule == "working_spinner"
     assert result.blocker_kind is None
+    assert result.suppressed_blocker_rule == "trust_directory"
+
+
+def test_answered_prompt_with_idle_input_row_does_not_page() -> None:
+    cases = (
+        (
+            "codex",
+            """Do you trust the contents of this directory?
+  1. Yes
+  2. No
+Trust recorded; the task cannot be cancelled now.
+›
+""",
+            "trust_directory",
+        ),
+        (
+            "claude",
+            """Do you want to proceed with this change?
+❯ 1. Yes
+  2. No
+Permission granted; continuing.
+❯
+""",
+            "permission_prompt",
+        ),
+    )
+
+    for agent, snapshot, suppressed_rule in cases:
+        result = classify_snapshot(snapshot, agent=agent, repository=ManifestRepository())
+
+        assert result.state == "idle"
+        assert result.matched_rule == "input_row"
+        assert result.suppressed_blocker_rule == suppressed_rule
+        assert detection_explain_from_dict(result.to_dict()) == result
+
+        legacy_payload = result.to_dict()
+        legacy_payload.pop("suppressed_blocker_rule")
+        assert detection_explain_from_dict(legacy_payload).suppressed_blocker_rule is None
 
 
 def test_broker_classifies_a_frozen_spinner_below_a_real_prompt_as_blocked(tmp_path: Path) -> None:
