@@ -234,12 +234,17 @@ def ingest_transcript_bindings(
             client_version=binding.client_version,
             goal_ref=binding.session_ref,
         )
-        with JournalIngestor(
-            state_root=config.state_dir,
-            transcript_path=transcript_path,
-            context=context,
-        ) as ingestor:
-            result = ingestor.poll()
+        try:
+            with JournalIngestor(
+                state_root=config.state_dir,
+                transcript_path=transcript_path,
+                context=context,
+            ) as ingestor:
+                result = ingestor.poll()
+        except ValueError as exc:
+            # One malformed transcript skips its own lane this pass, not every lane.
+            logger.error("monitord_binding_ingest_failed", lane=binding.lane, error=str(exc))
+            continue
         observed.extend(result.observed)
         # Client versions are not gated. Newly appended records the normalizer
         # does not recognize are the drift signal.

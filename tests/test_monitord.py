@@ -409,3 +409,25 @@ def test_deprecated_daemon_entrypoints_warn_toward_monitord() -> None:
     for module in (watchd, triaged, sweepd):
         with pytest.warns(DeprecationWarning, match="deprecated by chitra-monitord"), contextlib.suppress(SystemExit):
             module.main(["--help"])
+
+
+def test_bad_binding_skips_its_lane_and_other_lanes_still_ingest(tmp_path: Path) -> None:
+    fixture = Path(__file__).parent / "fixtures" / "w11" / "claude-2.1.280-synthetic.jsonl"
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text(
+        fixture.read_text(encoding="utf-8")
+        + json.dumps({"type": "user", "sessionId": "another-session", "version": "2.1.280"})
+        + "\n",
+        encoding="utf-8",
+    )
+    common = {"client": Client.CLAUDE, "client_version": "2.1.280", "instance": "i"}
+    bindings = (
+        TranscriptBinding(session_ref="g-bad", lane="lane-bad", path=str(bad), **common),
+        TranscriptBinding(session_ref="g-ok", lane="lane-ok", path=str(fixture), **common),
+    )
+
+    with capture_logs() as logs:
+        observed = ingest_transcript_bindings(_config(tmp_path), bindings)
+
+    assert observed and {event.lane for event in observed} == {"lane-ok"}
+    assert any(entry["event"] == "monitord_binding_ingest_failed" and entry["lane"] == "lane-bad" for entry in logs)

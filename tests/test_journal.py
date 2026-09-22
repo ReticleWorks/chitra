@@ -543,3 +543,32 @@ def test_same_inode_truncate_to_zero_rotation_preserves_original_event(tmp_path:
     assert restored.appended == ()
     assert len(stored) == 1
     assert stored[0].event_id == original_event_id
+
+
+def _codex_155_subagent_events(tmp_path: Path) -> tuple[CanonicalEvent, ...]:
+    with JournalIngestor(
+        state_root=tmp_path,
+        transcript_path=FIXTURE_DIR / "codex-0.155.1-subagent-synthetic.jsonl",
+        context=NormalizationContext(instance="i", lane="codex", client=Client.CODEX, client_version="0.155.1"),
+    ) as ingestor:
+        return ingestor.poll().observed
+
+
+def test_codex_subagent_rollout_keeps_own_session_despite_parent_meta(tmp_path: Path) -> None:
+    events = _codex_155_subagent_events(tmp_path)
+    assert {event.session_id for event in events} == {"fixture-codex-155-child"}
+
+
+def test_codex_function_call_normalizes_as_tool_call_and_result(tmp_path: Path) -> None:
+    events = _codex_155_subagent_events(tmp_path)
+    call = next(event for event in events if event.normalized_type is CanonicalType.TOOL_CALL)
+    result = next(event for event in events if event.normalized_type is CanonicalType.TOOL_RESULT)
+    assert call.payload["tool_name"] == "exec_command"
+    assert call.native_join_id == result.native_join_id == "fixture-call-1"
+
+
+def test_codex_user_message_is_a_user_turn_with_text(tmp_path: Path) -> None:
+    events = _codex_155_subagent_events(tmp_path)
+    (user,) = [event for event in events if event.native_type == "user"]
+    assert user.payload["text"] == "fixture order marker"
+    assert events[-1].normalized_type is CanonicalType.FINAL_RESPONSE

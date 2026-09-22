@@ -160,12 +160,14 @@ class TranscriptNormalizer:
         slot: str,
         payload: dict[str, Any],
         native_join_id: str | None = None,
+        native_type: str | None = None,
     ) -> CanonicalEvent:
         record = raw.record or {}
         native_time_value = record.get("timestamp")
         native_time = native_time_value if isinstance(native_time_value, str) else None
-        native_type_value = record.get("type")
-        native_type = native_type_value if isinstance(native_type_value, str) else "invalid_json"
+        if native_type is None:
+            native_type_value = record.get("type")
+            native_type = native_type_value if isinstance(native_type_value, str) else "invalid_json"
         payload_digest = _canonical_digest(payload)
         event_id = _canonical_digest(
             {
@@ -330,6 +332,7 @@ class CodexNormalizer(TranscriptNormalizer):
             raise ValueError("CodexNormalizer requires the codex client")
         super().__init__(context)
         self._pending_text: tuple[str, str | None] | None = None
+        self._parent_thread_id: str | None = None
 
     def begin_replay(self) -> None:
         super().begin_replay()
@@ -344,14 +347,61 @@ class CodexNormalizer(TranscriptNormalizer):
         payload = record.get("payload")
         if record_type == "session_meta" and isinstance(payload, dict):
             candidate = payload.get("id")
-            if isinstance(candidate, str):
+            # A subagent rollout replays its parent's session_meta after its own.
+            if isinstance(candidate, str) and candidate != self._parent_thread_id:
+                source = payload.get("source")
+                spawn = source.get("subagent", {}).get("thread_spawn") if isinstance(source, dict) else None
+                if isinstance(spawn, dict) and isinstance(spawn.get("parent_thread_id"), str):
+                    self._parent_thread_id = spawn["parent_thread_id"]
                 if self.session_id is not None and self.session_id != candidate:
                     raise ValueError("Codex session id changed within one transcript")
                 self.session_id = candidate
             return (self._unknown(raw),)
         if record_type == "response_item" and isinstance(payload, dict):
             payload_type = payload.get("type")
-            if payload_type == "custom_tool_call":
+            if payload_type == "function_call":
+                call_id = payload.get("call_id")
+                if isinstance(call_id, str):
+                    return (
+                        self._event(
+                            raw,
+                            CanonicalType.TOOL_CALL,
+                            slot="function_call",
+                            native_join_id=call_id,
+                            payload={
+                                "call_id": call_id,
+                                "tool_name": payload.get("name"),
+                                "namespace": payload.get("namespace"),
+                                "input": payload.get("arguments"),
+                            },
+                        ),
+                    )
+            elif payload_type == "function_call_output":
+                call_id = payload.get("call_id")
+                if isinstance(call_id, str):
+                    return (
+                        self._event(
+                            raw,
+                            CanonicalType.TOOL_RESULT,
+                            slot="function_call_output",
+                            native_join_id=call_id,
+                            payload={"call_id": call_id, "output": payload.get("output")},
+                        ),
+                    )
+            elif payload_type == "message" and payload.get("role") == "user":
+                # Claude's user turns carry native_type "user". The ladder's
+                # consumption proof keys on that and on payload text.
+                texts = [block["text"] for block in _blocks(payload.get("content")) if isinstance(block.get("text"), str)]
+                return (
+                    self._event(
+                        raw,
+                        CanonicalType.UNKNOWN,
+                        slot="user_message",
+                        native_type="user",
+                        payload={"native_type": "user", "text": "\n".join(texts)},
+                    ),
+                )
+            elif payload_type == "custom_tool_call":
                 call_id = payload.get("call_id")
                 if isinstance(call_id, str):
                     return (
