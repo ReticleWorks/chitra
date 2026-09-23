@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import posixpath
 import re
-from collections.abc import Sequence
+from collections.abc import Sequence, Set
 from typing import TYPE_CHECKING, Literal, Self
 
 from pydantic import BaseModel, Field, model_validator
@@ -99,19 +99,12 @@ def _explicit_targets(input_value: object) -> tuple[str, ...]:
     return tuple(targets)
 
 
-def _first_unmet_item(enrolled_items: Sequence[object]) -> str:
-    for item in enrolled_items:
-        item_id = getattr(item, "id", None)
-        if isinstance(item_id, str):
-            return item_id
-    return ""
-
-
 def detect_canonical_choices(
     events: Sequence[CanonicalEvent],
     policy: CanonicalChoicesPolicy,
     *,
     enrolled_items: Sequence[object] = (),
+    met_items: Set[str] = frozenset(),
 ) -> list[Finding]:
     """Find exact deprecated-path writes backed by explicit tool fields.
 
@@ -119,10 +112,10 @@ def detect_canonical_choices(
     event-local working directory are not evidence. The resolver never probes
     the filesystem, so lexical normalization is deterministic.
     """
-    from chitra.detect.detectors import Finding
+    from chitra.detect.detectors import Finding, first_unmet_item_id
 
     findings: list[Finding] = []
-    unmet = _first_unmet_item(enrolled_items)
+    unmet = first_unmet_item_id(enrolled_items, met_items)
     path_choices = tuple((key, choice) for key, choice in policy.choices.items() if choice.kind == "deprecated_path")
     for event in events:
         if event.normalized_type is not CanonicalType.TOOL_CALL:
