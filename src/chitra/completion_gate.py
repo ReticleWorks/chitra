@@ -22,6 +22,7 @@ from chitra.lexicon import (
     COMPLETION_EVIDENCE_PATH_RE,
     COMPLETION_EVIDENCE_PR_RE,
     COMPLETION_EVIDENCE_SHA_RE,
+    COMPLETION_NEGATION_RE,
 )
 from chitra.policy_config import INCIDENT_COMPLETION_DEFERRAL_PHRASES, GatePolicy
 
@@ -173,8 +174,17 @@ class CompletionReviewRecord(BaseModel):
 
 
 def is_completion_claim(text: str) -> bool:
-    """Return whether a completed turn adopts a literal completion posture."""
-    return COMPLETION_CLAIM_RE.search(text) is not None
+    """Return whether a completed turn adopts a literal completion posture.
+
+    The single shared claim vocabulary: a line anchored by
+    ``COMPLETION_CLAIM_RE`` counts unless the same line negates it
+    (``COMPLETION_NEGATION_RE``), so "the work is done, tests remain to
+    run" still claims while "still working; not done" does not.
+    """
+    return any(
+        COMPLETION_CLAIM_RE.search(line) and not COMPLETION_NEGATION_RE.search(line)
+        for line in text.splitlines()
+    )
 
 
 def check_todo_residue(todo_items: list[TodoItem], *, complete_statuses: Sequence[str] = ("done",)) -> list[str]:

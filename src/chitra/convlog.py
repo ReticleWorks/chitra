@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 
 from chitra._fsio import parse_iso8601
 from chitra.autonomy import AuthorizationDecision, Capability, CapabilityUse, authorize_action, capability_target_from_text
+from chitra.decisions import DecisionEntry, append_decision, read_decisions
 from chitra.evidence import EvidenceHandle, EvidenceResolver, FilesystemEvidenceResolver
 from chitra.goals import GoalNotFoundError, GoalRecord, add_foreground_task, get_goal
 from chitra.plain_english import require_plain_english
@@ -829,16 +830,50 @@ def open_thread(
     return thread_id
 
 
-def append_ruling(convlog_path: Path, *, thread_id: str, text: str, via: Literal["chat", "in-pane", "slack"] = "chat") -> ConversationEntry:
-    """Record one explicit operator ruling for an existing thread."""
+def append_ruling(
+    convlog_path: Path,
+    *,
+    thread_id: str,
+    text: str,
+    via: Literal["chat", "in-pane", "slack"] = "chat",
+    decisions_path: Path | None = None,
+) -> ConversationEntry:
+    """Record one explicit operator ruling for an existing thread.
+
+    The ruling lands in two places: the conversation log keeps the thread's
+    rungs truthful, and ``decisions.jsonl`` gains one bound
+    ``adjudication`` entry carrying the verbatim text, so the question gate
+    consults the same canonical ruling store as every other answer. The
+    decision id is deterministic (``convlog-<thread>-<seq>``), so a retry
+    after a crash between the two writes converges instead of duplicating.
+    """
     entries = _require_thread(convlog_path, thread_id)
     if not text:
         raise ValueError("operator ruling text must be non-empty")
+    session_ref = entries[-1].session_ref
+    decisions_path = decisions_path if decisions_path is not None else convlog_path.parent / "decisions.jsonl"
+    seq = _next_seq(convlog_path, thread_id)
+    decision_id = f"convlog-{thread_id}-{seq}"
+    if all(entry.decision_id != decision_id for entry in read_decisions(decisions_path)):
+        append_decision(
+            decisions_path,
+            DecisionEntry(
+                decision_id=decision_id,
+                at=_utc_now(),
+                kind="adjudication",
+                decision="The operator ruled on a recorded conversation thread.",
+                basis="The ruling was recorded verbatim in the conversation log.",
+                citation=f"convlog:{thread_id}:{seq}",
+                authority="operator",
+                session_ref=session_ref,
+                answer=text.strip(),
+            ),
+        )
     return append_entry(
         convlog_path,
         thread_id=thread_id,
         kind="operator_ruling",
-        session_ref=entries[-1].session_ref,
+        session_ref=session_ref,
         payload={"text": text, "via": via},
     )
 

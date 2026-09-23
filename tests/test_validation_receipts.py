@@ -462,3 +462,55 @@ def test_traversal_receipt_name_never_writes_outside_the_store(tmp_path: Path, m
     assert not (tmp_path.parent / "escaped.output.log").exists()
     assert not (tmp_path.parent / "escaped.report.json").exists()
     assert not (tmp_path.parent / "escaped.json").exists()
+
+
+def test_hash_file_deadline_trip_fails_closed(tmp_path: Path) -> None:
+    import chitra.validation_receipts as validation_receipts
+
+    target = tmp_path / "evidence.bin"
+    target.write_bytes(b"x" * 1024)
+
+    with pytest.raises(ReceiptError, match="deadline"):
+        validation_receipts._hash_file(target, deadline_seconds=0.0)
+
+
+def test_git_target_timeout_reports_unreadable_never_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    import chitra.validation_receipts as validation_receipts
+    from chitra.validation_receipts import ReceiptIntegrity, ValidationReceipt
+
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    receipt = ValidationReceipt(
+        receipt_name="tests-green",
+        validator={"name": "pytest", "version": "test"},
+        target={"commit": {"repository": str(repository), "sha": "0" * 40}},
+        exercise={"command": ["/bin/true"]},
+        result={"status": "PASS", "validator_acceptance": True},
+        not_exercised=[],
+        artifacts=[],
+        produced_at="2026-08-21T12:00:00Z",
+        integrity=ReceiptIntegrity(
+            algorithm="sha256",
+            canonicalization="test",
+            scope="test",
+            digest="0" * 64,
+        ),
+    )
+
+    class _StalledSubprocess:
+        SubprocessError = subprocess.SubprocessError
+        TimeoutExpired = subprocess.TimeoutExpired
+
+        @staticmethod
+        def run(*args: object, **kwargs: object) -> object:
+            raise subprocess.TimeoutExpired(cmd=["git"], timeout=60.0)
+
+    monkeypatch.setattr(validation_receipts, "subprocess", _StalledSubprocess)
+
+    issues = validation_receipts._target_issues(receipt, tmp_path, tmp_path)
+
+    assert issues
+    assert all("unreadable" in issue for issue in issues)
+    assert not any("missing" in issue or "does not match" in issue for issue in issues)

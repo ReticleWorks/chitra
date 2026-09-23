@@ -263,6 +263,41 @@ def test_monitor_ask_retirement_requires_cited_basis(tmp_path: Path) -> None:
         resolve_ask(tmp_path, stored.session_ref, all=True, retired_by="monitor", basis="", citation="", authority="")
 
 
+def test_operator_ask_dismissal_does_not_claim_an_answer(tmp_path: Path) -> None:
+    """A bare ack retires the ask as a dismissal; only a real basis reads as answered."""
+    stored = upsert_goal(tmp_path, _record())
+    answered = "Approve the new route?"
+    dismissed = "Seen the status note?"
+    add_ask(tmp_path, stored.session_ref, answered)
+    add_ask(tmp_path, stored.session_ref, dismissed)
+
+    resolved = resolve_ask(tmp_path, stored.session_ref, ask=answered, basis="Yes, use the new route.")
+    acked = resolve_ask(tmp_path, stored.session_ref, ask=dismissed)
+
+    assert resolved.retired_asks[-1]["state"] == "resolved-by-operator"
+    assert resolved.retired_asks[-1]["basis"] == "Yes, use the new route."
+    assert acked.retired_asks[-1]["state"] == "dismissed-by-operator"
+    assert acked.retired_asks[-1]["citation"] == "operator-dismissal"
+
+
+def test_foreground_task_resolution_records_answered_and_dismissed_states(tmp_path: Path) -> None:
+    stored = upsert_goal(tmp_path, _record())
+    add_foreground_task(tmp_path, stored.session_ref, kind="question", text="Pick a cache backend.", source="monitord")
+    add_foreground_task(tmp_path, stored.session_ref, kind="investigate", text="Check the stale lock.", source="monitord")
+    tasks = get_goal(tmp_path, stored.session_ref).foreground_tasks
+
+    answered = resolve_foreground_task(tmp_path, stored.session_ref, task_id=tasks[0].task_id, basis="Use sqlite.")
+    dismissed = resolve_foreground_task(tmp_path, stored.session_ref, task_id=tasks[1].task_id)
+
+    assert dismissed.foreground_tasks == ()
+    assert answered.retired_foreground_tasks[-1]["state"] == "resolved-by-operator"
+    assert answered.retired_foreground_tasks[-1]["basis"] == "Use sqlite."
+    assert dismissed.retired_foreground_tasks[-1]["state"] == "dismissed-by-operator"
+    # The retirement audit survives a routine tactical write.
+    tactical = update_now(tmp_path, stored.session_ref, now="investigating")
+    assert tactical.retired_foreground_tasks == dismissed.retired_foreground_tasks
+
+
 def test_lane_authored_ask_is_preserved_without_plain_english_gate(tmp_path: Path) -> None:
     stored = upsert_goal(tmp_path, _record())
     verbatim = "F2 lane blocked pls?"

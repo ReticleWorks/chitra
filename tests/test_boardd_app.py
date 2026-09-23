@@ -460,7 +460,8 @@ def test_answers_log_records_what_reached_chitra(tmp_path, monkeypatch):
 def test_a_status_only_lane_accepts_an_answer(tmp_path, monkeypatch):
     """A blocked lane with no literal ask is on the stack and offers a Send.
     That Send used to 409 every time, because resolve-ask had nothing to
-    retire. The answer is recorded as the basis of the board's review ask."""
+    retire. The answer is now a canonical bound decision and a verbatim
+    operator_relay order; no ask is fabricated to carry it."""
     root = _write_endpoint_env(tmp_path, lane="status-only", open_asks=())
     monkeypatch.setenv("BOARDD_STATE_ROOTS", f"monitor={root}")
 
@@ -474,9 +475,21 @@ def test_a_status_only_lane_accepts_an_answer(tmp_path, monkeypatch):
         r = client.post("/answer", json={"key": "monitor:status-only", "answer": "Unblock it.", "at": "now"})
         assert r.status_code == 200, r.text
         assert r.json()["lane"]["open_asks"] == []
-        retired = json.loads((root / "goals.json").read_text())["goals"][0]["retired_asks"]
-        assert retired[-1]["basis"] == "Unblock it."
-        assert retired[-1]["authority"] == "operator"
+        goal = json.loads((root / "goals.json").read_text())["goals"][0]
+        assert goal["retired_asks"] == []
+        decisions = [
+            json.loads(line)
+            for line in (root / "decisions.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        assert decisions[-1]["answer"] == "Unblock it."
+        assert decisions[-1]["authority"] == "operator"
+        assert decisions[-1]["session_ref"] == goal["session_ref"]
+        orders = list((root / "queue" / "orders").glob("*.json"))
+        assert len(orders) == 1
+        order = json.loads(orders[0].read_text())
+        assert order["message_kind"] == "operator_relay"
+        assert order["nudge"] == "[O] Unblock it."
     finally:
         server.shutdown()
         thread.join(timeout=2)

@@ -305,6 +305,84 @@ def test_transcript_confirms_nudge_accepts_codex_agent_and_tool_envelopes(tmp_pa
     assert path == transcript
 
 
+def test_transcript_confirms_nudge_accepts_posttooluse_hook_delivery(tmp_path: Path) -> None:
+    """A nudge a PostToolUse hook injected lands as a ``hook_success``
+    attachment, not a user record — the delivered order text in its stdout
+    JSON still confirms delivery."""
+    projects_root = tmp_path / "projects"
+    session_dir = projects_root / "some-project"
+    session_dir.mkdir(parents=True)
+    transcript = session_dir / "abc123.jsonl"
+    nudge = "please check lane f3 status now"
+    transcript.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "attachment",
+                        "sessionId": "abc123",
+                        "attachment": {
+                            "type": "hook_success",
+                            "hook_name": "PostToolUse:chitra-order",
+                            "stdout": json.dumps(
+                                {
+                                    "hookSpecificOutput": {
+                                        "hookEventName": "PostToolUse",
+                                        "additionalContext": nudge,
+                                    }
+                                }
+                            ),
+                        },
+                    }
+                ),
+                json.dumps({"type": "assistant", "message": {"role": "assistant", "content": "Working on it."}}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    confirmed, path = transcript_confirms_nudge(nudge, projects_root=projects_root, now_ts=time.time())
+
+    assert confirmed is True
+    assert path == transcript
+
+
+def test_transcript_confirms_nudge_rejects_hook_output_without_context(tmp_path: Path) -> None:
+    """Hook stdout that carries no additionalContext is ordinary hook output,
+    not delivered input — the marker elsewhere in the record cannot confirm."""
+    projects_root = tmp_path / "projects"
+    session_dir = projects_root / "some-project"
+    session_dir.mkdir(parents=True)
+    transcript = session_dir / "abc123.jsonl"
+    nudge = "please check lane f3 status now"
+    transcript.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "attachment",
+                        "sessionId": "abc123",
+                        "attachment": {
+                            "type": "hook_success",
+                            "stdout": json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse"}}),
+                        },
+                    }
+                ),
+                # The marker shows up only inside an assistant echo.
+                json.dumps({"type": "assistant", "message": {"role": "assistant", "content": nudge}}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    confirmed, path = transcript_confirms_nudge(nudge, projects_root=projects_root, now_ts=time.time())
+
+    assert confirmed is False
+    assert path is None
+
+
 def test_transcript_confirms_nudge_rejects_marker_only_in_an_assistant_echo(tmp_path: Path) -> None:
     """A marker that only ever appears inside an assistant reply (an echo of
     the instruction back, not chitra's own paste) must not confirm delivery

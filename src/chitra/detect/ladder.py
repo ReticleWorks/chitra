@@ -29,7 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from chitra._fsio import exclusive_lock
 from chitra.journal.models import CanonicalEvent, CanonicalType
-from chitra.journal.normalizers import queued_operator_prompt
+from chitra.journal.normalizers import hook_additional_context, queued_operator_prompt
 from chitra.ledger import LedgerEntry, message_hash, verify_entry
 
 from .detectors import Finding
@@ -218,8 +218,13 @@ def discover_delivery_consumption_proof(
         if user_event.lane != lane or user_event.session_id != native_session_id:
             continue
         # Input arrives as a user record, or mid-turn as an origin-bearing
-        # queued_command attachment. The boundary stays the next final response.
-        is_input = user_event.native_type == "user" or queued_operator_prompt(user_event.raw_record) is not None
+        # queued_command attachment or a hook-injected hook_success context.
+        # The boundary stays the next final response.
+        is_input = (
+            user_event.native_type == "user"
+            or queued_operator_prompt(user_event.raw_record) is not None
+            or hook_additional_context(user_event.raw_record) is not None
+        )
         if not is_input or user_event.normalized_type in {
             CanonicalType.TOOL_CALL,
             CanonicalType.TOOL_RESULT,
@@ -819,6 +824,9 @@ def _payload_text(event: CanonicalEvent) -> str:
     queued = queued_operator_prompt(raw)
     if queued is not None:
         return queued
+    hooked = hook_additional_context(raw)
+    if hooked is not None:
+        return hooked
     message = raw.get("message")
     if isinstance(message, dict):
         content = message.get("content")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -14,6 +15,7 @@ from _goal_fixtures import enrollment_fields, ingest_passing_receipt, passing_co
 from structlog.testing import capture_logs
 
 import chitra.monitord as monitord_mod
+import chitra.run_pool as run_pool_mod
 from chitra.completion_gate import CompletionEvidence
 from chitra.decisions import DecisionEntry, append_decision
 from chitra.goals import EnrolledDoneWhenItem, GoalRecord, GoalsSchemaNewerError, GoalStatus, get_goal, upsert_goal
@@ -123,7 +125,7 @@ def test_cli_flag_turns_shadow_mode_off_over_environment(monkeypatch: pytest.Mon
 def test_run_detectors_orders_findings_by_detector_order(tmp_path: Path) -> None:
     config = _config(tmp_path)
     events = (
-        _event("e1", CanonicalType.TOOL_CALL),
+        _event("e1", CanonicalType.TOOL_CALL, lane=SEEDED_LANE),
         _event("e2", CanonicalType.FINAL_RESPONSE),
     )
     findings = run_detectors(config, LANE, None, events)
@@ -359,7 +361,7 @@ def test_check_enrollment_disputes_when_the_validator_fails(tmp_path: Path, monk
         }
     )
     recorded, disputed, findings, pending = check_enrollment_and_receipts(
-        _config(tmp_path),
+        resolve_config(state_dir=tmp_path, shadow_mode=False),
         "session-1",
         final_response,
     )
@@ -377,9 +379,18 @@ def test_check_enrollment_accepts_a_plain_claim_when_the_validator_passes(
     final_response = _event("completion-plain", CanonicalType.FINAL_RESPONSE).model_copy(
         update={"payload": {"text": "Done. The digest file exists and is verified."}}
     )
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+
+    # The isolated review runs on the worker pool: the first pass queues it
+    # and reports pending, a later pass consumes the durable signal.
+    recorded, disputed, findings, pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=_StubReviewer("accept")
+    )
+    assert (recorded, disputed, findings, pending) == (1, False, [], True)
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
 
     recorded, disputed, findings, pending = check_enrollment_and_receipts(
-        resolve_config(state_dir=tmp_path, shadow_mode=False),
+        config,
         "session-1",
         final_response,
         reviewer=_StubReviewer("accept"),
@@ -451,6 +462,216 @@ def test_check_enrollment_is_silent_for_unenrolled_sessions(tmp_path: Path) -> N
     assert check_enrollment_and_receipts(_config(tmp_path), "no-such-session") == (0, False, [], False)
 
 
+def _claim_event(event_id: str) -> CanonicalEvent:
+    return _event(event_id, CanonicalType.FINAL_RESPONSE).model_copy(
+        update={"payload": {"text": "Done. The digest file exists and is verified."}}
+    )
+
+
+def test_check_enrollment_replays_the_stored_outcome_for_an_unchanged_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """proof.md gap 7: a repeated claim must not re-execute its validators.
+
+    The first evaluation runs them and stores a durable outcome marker; the
+    second identical evaluation replays it. Changing the registry bytes
+    reopens the check.
+    """
+    _write_registry(tmp_path, monkeypatch, exit_code=1)
+    upsert_goal(tmp_path, _goal("session-1"))
+    real = monitord_mod.record_enrolled_validator_runs
+    calls: list[str] = []
+
+    def counting(root: Path, session_ref: str, items: object) -> tuple[CompletionEvidence, ...]:
+        calls.append(session_ref)
+        return real(root, session_ref, items)
+
+    monkeypatch.setattr(monitord_mod, "record_enrolled_validator_runs", counting)
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+    claim = _claim_event("claim-1")
+
+    first = check_enrollment_and_receipts(config, "session-1", claim)
+    second = check_enrollment_and_receipts(config, "session-1", claim)
+
+    assert calls == ["session-1"]
+    assert first[0] == 1 and first[1] is True and first[3] is False
+    assert second[0] == first[0] and second[1] == first[1]
+    assert [finding.fingerprint for finding in second[2]] == [finding.fingerprint for finding in first[2]]
+
+    _write_registry(tmp_path, monkeypatch, exit_code=0)
+    third = check_enrollment_and_receipts(
+        config, "session-1", claim, reviewer=_StubReviewer("accept")
+    )
+    assert calls == ["session-1", "session-1"]
+    # The registry pin is frozen at enrollment, so edited registry bytes
+    # reopen the check but cannot flip the frozen item to a pass: the
+    # drifted validator refuses to run and the claim stays disputed.
+    assert third[1] is True
+    fourth = check_enrollment_and_receipts(
+        config, "session-1", claim, reviewer=_StubReviewer("accept")
+    )
+    assert calls == ["session-1", "session-1"]
+    assert fourth[1] == third[1]
+    assert [finding.fingerprint for finding in fourth[2]] == [finding.fingerprint for finding in third[2]]
+
+
+def test_check_enrollment_evaluates_every_claim_in_the_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """detect.md gap 9: the newest final response must not erase an earlier one."""
+    _write_registry(tmp_path, monkeypatch, exit_code=1)
+    upsert_goal(tmp_path, _goal("session-1"))
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+    earlier = _claim_event("claim-earlier")
+    latest = _claim_event("claim-latest")
+
+    recorded, disputed, findings, pending = check_enrollment_and_receipts(
+        config,
+        "session-1",
+        latest,
+        final_responses=(earlier, latest),
+    )
+
+    assert (recorded, disputed, pending) == (2, True, False)
+    assert monitord_mod._load_claim_checks(config, "session-1").keys() == {"claim-earlier", "claim-latest"}
+    refs = {ref for finding in findings for ref in finding.event_refs}
+    assert "claim-earlier" in refs
+
+
+def test_check_enrollment_surfaces_a_goal_store_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """proof.md gap 11: a failed get_goal is a finding, not a silent pass."""
+    _write_registry(tmp_path, monkeypatch)
+    upsert_goal(tmp_path, _goal("session-1"))
+
+    def broken(root: Path, session_ref: str, **kwargs: object) -> None:
+        raise OSError("goal store read failed")
+
+    monkeypatch.setattr(monitord_mod, "get_goal", broken)
+
+    with capture_logs() as logs:
+        recorded, disputed, findings, pending = check_enrollment_and_receipts(
+            _config(tmp_path), "session-1", _claim_event("claim-1")
+        )
+
+    assert (recorded, disputed, pending) == (0, True, False)
+    (finding,) = findings
+    assert finding.detector == "monitor-internal-error"
+    assert finding.fingerprint_seed["reason"] == "goal-lookup-failed"
+    assert any(entry["event"] == "monitord_goal_lookup_failed" for entry in logs)
+
+
+def test_check_enrollment_flags_exit_before_contract_when_the_turn_ended(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A turn that ended with no final response fails its enrolled contract."""
+    _write_registry(tmp_path, monkeypatch)
+    upsert_goal(tmp_path, _goal("session-1", status="turn-finished-unverified"))
+    boundary = _event("resume-1", CanonicalType.RESUME)
+
+    recorded, disputed, findings, pending = check_enrollment_and_receipts(
+        _config(tmp_path),
+        "session-1",
+        None,
+        final_responses=(),
+        turn_ended=True,
+        turn_end_event=boundary,
+    )
+
+    assert (recorded, disputed, pending) == (0, True, False)
+    (finding,) = findings
+    assert finding.detector == "false_done"
+    assert finding.fingerprint_seed["reason"] == "exit-before-contract"
+    assert finding.event_refs == ("resume-1",)
+
+
+def test_load_lane_events_parses_only_new_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _config(tmp_path)
+    journal = EventJournal(tmp_path, SEEDED_LANE)
+    journal.append((_event("e1", CanonicalType.TOOL_CALL, lane=SEEDED_LANE),))
+    assert [event.event_id for event in monitord_mod.load_lane_events(config, SEEDED_LANE)] == ["e1"]
+
+    parses: list[object] = []
+    original = CanonicalEvent.model_validate_json
+
+    def counting(cls: type[CanonicalEvent], data: object, *args: object, **kwargs: object) -> CanonicalEvent:
+        parses.append(data)
+        return original(data, *args, **kwargs)
+
+    monkeypatch.setattr(CanonicalEvent, "model_validate_json", classmethod(counting))
+    try:
+        journal.append((_event("e2", CanonicalType.TOOL_CALL, lane=SEEDED_LANE),))
+        assert [event.event_id for event in monitord_mod.load_lane_events(config, SEEDED_LANE)] == ["e1", "e2"]
+        assert len(parses) == 1
+        assert [event.event_id for event in monitord_mod.load_lane_events(config, SEEDED_LANE)] == ["e1", "e2"]
+        assert len(parses) == 1
+    finally:
+        monitord_mod._LANE_JOURNALS.clear()
+
+
+def test_load_lane_events_reloads_after_rewrite_and_truncate(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    journal = EventJournal(tmp_path, SEEDED_LANE)
+    journal.append((_event("e1", CanonicalType.TOOL_CALL, lane=SEEDED_LANE),))
+    assert [event.event_id for event in monitord_mod.load_lane_events(config, SEEDED_LANE)] == ["e1"]
+
+    try:
+        # Same-size rewrite: a different event row of identical serialized length.
+        replacement = _event("e2", CanonicalType.TOOL_CALL, lane=SEEDED_LANE)
+        journal.path.write_text(replacement.model_dump_json() + "\n", encoding="utf-8")
+        stat = journal.path.stat()
+        os.utime(journal.path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+        assert [event.event_id for event in monitord_mod.load_lane_events(config, SEEDED_LANE)] == ["e2"]
+
+        journal.path.write_text("", encoding="utf-8")
+        assert monitord_mod.load_lane_events(config, SEEDED_LANE) == ()
+    finally:
+        monitord_mod._LANE_JOURNALS.clear()
+
+
+def test_ingest_transcript_bindings_pools_the_ingestor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """detect.md gap 15: a second pass must not replay the whole transcript."""
+    fixture = Path(__file__).parent / "fixtures" / "w11" / "claude-2.1.229-synthetic.jsonl"
+    transcript = tmp_path / "pooled.jsonl"
+    transcript.write_bytes(fixture.read_bytes())
+    binding = TranscriptBinding(
+        session_ref="goal-x",
+        lane="lane-x",
+        path=str(transcript),
+        client=Client.CLAUDE,
+        client_version="2.1.229",
+        instance="i",
+    )
+    config = _config(tmp_path)
+    try:
+        first = ingest_transcript_bindings(config, (binding,))
+        key = (str(config.state_dir), str(transcript.resolve()))
+        assert key in monitord_mod._INGESTOR_POOL
+        pooled = monitord_mod._INGESTOR_POOL[key][1]
+
+        assert ingest_transcript_bindings(config, (binding,)) == ()
+        assert monitord_mod._INGESTOR_POOL[key][1] is pooled
+
+        # The pooled normalizer answers the session id without a fresh replay.
+        def never(_path: Path) -> str:
+            raise AssertionError("native_session_identity replayed the transcript")
+
+        monkeypatch.setattr(monitord_mod, "native_session_identity", never)
+        assert monitord_mod._bound_native_session_id(config, transcript.resolve()) == "fixture-claude-session"
+
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps({"type": "brand-new-record", "sessionId": "fixture-claude-session"}) + "\n"
+            )
+        assert len(ingest_transcript_bindings(config, (binding,))) == 1
+        assert len(first) == 10
+    finally:
+        for _key, (_context, ingestor) in monitord_mod._INGESTOR_POOL.items():
+            ingestor.close()
+        monitord_mod._INGESTOR_POOL.clear()
+
+
 class _StubReviewer:
     """Deterministic stand-in for the isolated ``claude -p`` reviewer."""
 
@@ -513,6 +734,14 @@ def test_completion_claim_reaches_the_isolated_reviewer_and_applies_rejection(
     reviewer = _StubReviewer("reject")
     config = resolve_config(state_dir=tmp_path, shadow_mode=False)
 
+    # First pass queues the isolated review on the worker pool; its durable
+    # signal is what a later pass consumes.
+    _recorded, disputed, _findings, pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=reviewer
+    )
+    assert pending is True
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+
     _recorded, disputed, findings, _pending = check_enrollment_and_receipts(
         config, "session-1", final_response, reviewer=reviewer
     )
@@ -541,9 +770,16 @@ def test_completion_claim_the_isolated_reviewer_accepts_is_verified(
 ) -> None:
     final_response = _verified_claim_setup(tmp_path, monkeypatch)
     reviewer = _StubReviewer("accept")
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+
+    _recorded, disputed, _findings, pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=reviewer
+    )
+    assert pending is True
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
 
     _recorded, disputed, findings, _pending = check_enrollment_and_receipts(
-        resolve_config(state_dir=tmp_path, shadow_mode=False), "session-1", final_response, reviewer=reviewer
+        config, "session-1", final_response, reviewer=reviewer
     )
 
     assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
@@ -577,6 +813,12 @@ def test_insufficient_review_holds_the_claim_until_lane_work_finishes(
     result = check_enrollment_and_receipts(
         config, "session-1", final_response, reviewer=undecided, still_running=running
     )
+    assert result[1:] == (False, [], True)
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+
+    result = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=undecided, still_running=running
+    )
 
     assert result[1:] == (False, [], True)
     assert undecided.still_running == [running, running]
@@ -585,8 +827,14 @@ def test_insufficient_review_holds_the_claim_until_lane_work_finishes(
     assert stored.status == "working"
 
     # Once the lane work finishes, the stored "insufficient" signal no longer
-    # holds and the same claim is judged afresh.
+    # holds and the same claim is judged afresh — again on the worker pool.
     accepting = _RecordingReviewer("accept")
+    _recorded, disputed, findings, pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=accepting
+    )
+    assert (disputed, findings, pending) == (False, [], True)
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+
     _recorded, disputed, findings, pending = check_enrollment_and_receipts(
         config, "session-1", final_response, reviewer=accepting
     )
@@ -620,7 +868,7 @@ def test_lane_work_in_flight_names_only_unanswered_background_calls(tmp_path: Pa
 
 
 def test_validator_pool_accepts_work_after_shutdown() -> None:
-    pool = monitord_mod._ValidatorRunPool(max_workers=1)
+    pool = run_pool_mod.RunPool(max_workers=1)
     pool.shutdown()
     ran: list[str] = []
 
@@ -640,7 +888,7 @@ def test_routine_question_is_queued_as_an_exact_goal_contract_answer(
     )
     config = resolve_config(state_dir=tmp_path, shadow_mode=False)
 
-    outcome = handle_agent_question(config, goal, final_response)
+    outcome = handle_agent_question(config, goal, (final_response,))
 
     assert outcome == "answer_queued"
     orders = list((tmp_path / "queue" / "orders").glob("*.json"))
@@ -661,7 +909,7 @@ def test_protected_question_holds_the_goal_without_queueing_an_answer(
     )
     config = resolve_config(state_dir=tmp_path, shadow_mode=False)
 
-    outcome = handle_agent_question(config, goal, final_response)
+    outcome = handle_agent_question(config, goal, (final_response,))
 
     assert outcome == "operator_required"
     stored = get_goal(tmp_path, goal.session_ref)
@@ -693,7 +941,7 @@ def test_decided_question_queues_the_cited_answer_without_an_operator_ask(
     )
     config = resolve_config(state_dir=tmp_path, shadow_mode=False)
 
-    outcome = handle_agent_question(config, goal, final_response)
+    outcome = handle_agent_question(config, goal, (final_response,))
 
     assert outcome == "answer_queued"
     stored = get_goal(tmp_path, goal.session_ref)
@@ -717,7 +965,7 @@ def test_residual_question_stays_active_for_foreground_reasoning(
     )
     config = resolve_config(state_dir=tmp_path, shadow_mode=False)
 
-    outcome = handle_agent_question(config, goal, final_response)
+    outcome = handle_agent_question(config, goal, (final_response,))
 
     assert outcome == "reasoning_required"
     stored = get_goal(tmp_path, goal.session_ref)
@@ -729,6 +977,81 @@ def test_residual_question_stays_active_for_foreground_reasoning(
     assert stored.foreground_tasks[0].source == "monitord"
     assert "Should I redesign the workflow?" in stored.foreground_tasks[0].text
     assert not list((tmp_path / "queue").glob("**/*.json"))
+
+
+def test_operator_ask_text_carries_the_gate_reasons(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gap 8: the persisted ask shows why the question was gated."""
+    _write_registry(tmp_path, monkeypatch)
+    goal = upsert_goal(tmp_path, _goal("session-1"))
+    final_response = _event("question-gated", CanonicalType.FINAL_RESPONSE).model_copy(
+        update={"payload": {"text": "May I use a production API key?"}}
+    )
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+
+    assert handle_agent_question(config, goal, (final_response,)) == "operator_required"
+    stored = get_goal(tmp_path, goal.session_ref)
+    assert stored is not None
+    assert len(stored.open_asks) == 1
+    assert "Gates: credentials" in stored.open_asks[0]
+    assert "May I use a production API key?" in stored.open_asks[0]
+    assert "credentials" in stored.hold_reason
+
+
+def test_two_questions_in_one_turn_are_handled_independently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gap 3/16: every extracted question gets its own durable outcome."""
+    _write_registry(tmp_path, monkeypatch)
+    goal = upsert_goal(tmp_path, _goal("session-1"))
+    final_response = _event("question-pair", CanonicalType.FINAL_RESPONSE).model_copy(
+        update={
+            "payload": {
+                "text": (
+                    "What proves the goal is done?\n"
+                    "Should I redesign the workflow?\n"
+                )
+            }
+        }
+    )
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+
+    outcome = handle_agent_question(config, goal, (final_response,))
+
+    # The routine question queues an answer; the unsettled one becomes a
+    # residual task -- both in one pass over one event.
+    assert outcome == "reasoning_required"
+    stored = get_goal(tmp_path, goal.session_ref)
+    assert stored is not None
+    assert len(stored.foreground_tasks) == 1
+    assert "Should I redesign the workflow?" in stored.foreground_tasks[0].text
+    orders = list((tmp_path / "queue" / "orders").glob("*.json"))
+    assert len(orders) == 1
+    payload = json.loads(orders[0].read_text(encoding="utf-8"))
+    assert payload["message_kind"] == "goal_contract_answer"
+
+
+def test_reasked_question_in_a_later_turn_is_a_new_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gap 16: the same words asked again get a fresh occurrence-bound request."""
+    _write_registry(tmp_path, monkeypatch)
+    goal = upsert_goal(tmp_path, _goal("session-1"))
+    first_turn = _event("question-first", CanonicalType.FINAL_RESPONSE).model_copy(
+        update={"payload": {"text": "What proves the goal is done?"}}
+    )
+    second_turn = _event("question-second", CanonicalType.FINAL_RESPONSE).model_copy(
+        update={"payload": {"text": "What proves the goal is done?"}}
+    )
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+
+    handle_agent_question(config, goal, (first_turn,))
+    handle_agent_question(config, goal, (second_turn,))
+
+    orders = sorted((tmp_path / "queue" / "orders").glob("*.json"))
+    assert len(orders) == 2
+    results = [json.loads(path.read_text())["question_result"] for path in orders]
+    assert results[0]["request_id"] != results[1]["request_id"]
+    assert {result["occurrence"] for result in results} == {"question-first", "question-second"}
 
 
 def test_shadow_questions_neither_queue_answers_nor_mutate_the_goal(
@@ -744,8 +1067,8 @@ def test_shadow_questions_neither_queue_answers_nor_mutate_the_goal(
         update={"payload": {"text": "May I use a production API key?"}}
     )
 
-    assert handle_agent_question(config, goal, routine) == "shadow_answer"
-    assert handle_agent_question(config, goal, protected) == "operator_required"
+    assert handle_agent_question(config, goal, (routine,)) == "shadow_answer"
+    assert handle_agent_question(config, goal, (protected,)) == "operator_required"
     stored = get_goal(tmp_path, goal.session_ref)
     assert stored is not None
     assert stored.status == "working"
@@ -782,3 +1105,32 @@ def test_bad_binding_skips_its_lane_and_other_lanes_still_ingest(tmp_path: Path)
 
     assert observed and {event.lane for event in observed} == {"lane-ok"}
     assert any(entry["event"] == "monitord_binding_ingest_failed" and entry["lane"] == "lane-bad" for entry in logs)
+
+
+def test_run_forever_wakes_when_a_worker_completes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import threading
+    import time
+
+    passes = 0
+
+    def _counting_pass(_config: MonitordConfig) -> dict[str, int]:
+        nonlocal passes
+        passes += 1
+        if passes == 1:
+            # A worker landing during the sleep must wake the loop, not wait
+            # out the poll interval.
+            monitord_mod._VALIDATOR_RUN_POOL.submit(f"{tmp_path}:wake-test", lambda: None)
+        return {}
+
+    monkeypatch.setattr(monitord_mod, "run_once", _counting_pass)
+    monkeypatch.setattr(monitord_mod, "notify_ready", lambda: None)
+    monkeypatch.setattr(monitord_mod, "notify_watchdog", lambda: None)
+
+    stop = threading.Event()
+    threading.Timer(3.0, stop.set).start()
+    started = time.monotonic()
+    monitord_mod.run_forever(replace(_config(tmp_path), poll_seconds=30.0), stop_event=stop)
+    elapsed = time.monotonic() - started
+
+    assert passes >= 2
+    assert elapsed < 10.0

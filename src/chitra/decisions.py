@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import uuid
 from datetime import UTC, datetime
@@ -26,9 +27,18 @@ DecisionKind = Literal[
     "lane-architecture-change",
 ]
 
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
 
 class DecisionEntry(BaseModel):
-    """One immutable decision and the authority that supports it."""
+    """One immutable decision and the authority that supports it.
+
+    ``session_ref``/``goal_version``/``goal_digest`` optionally bind a ruling
+    to one lane's frozen goal contract so the question gate can tell a ruling
+    recorded for this lane from an unrelated precedent. ``question`` and
+    ``answer`` carry verbatim quoted text (the lane's ask, the operator's
+    reply); they are never rewritten or plain-English gated.
+    """
 
     schema_: Literal["chitra.decisions.v1"] = Field(default="chitra.decisions.v1", alias="schema")
     decision_id: str = Field(min_length=1)
@@ -38,6 +48,11 @@ class DecisionEntry(BaseModel):
     basis: str = Field(min_length=1)
     citation: str = Field(min_length=1)
     authority: str = Field(min_length=1)
+    session_ref: str = ""
+    goal_version: int = Field(default=0, ge=0)
+    goal_digest: str = ""
+    question: str = ""
+    answer: str = ""
 
     @field_validator("at")
     @classmethod
@@ -56,6 +71,21 @@ class DecisionEntry(BaseModel):
     def _citation_not_blank(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("citation must be non-empty")
+        return value
+
+    @field_validator("goal_digest")
+    @classmethod
+    def _digest_shape(cls, value: str) -> str:
+        if value and _SHA256_RE.fullmatch(value) is None:
+            raise ValueError("goal_digest must be a lowercase SHA-256 digest or empty")
+        return value
+
+    @field_validator("question", "answer")
+    @classmethod
+    def _verbatim_text_not_blank(cls, value: str, info: object) -> str:
+        if value != value.strip():
+            field_name = getattr(info, "field_name", "text")
+            raise ValueError(f"{field_name} must be stored stripped")
         return value
 
 

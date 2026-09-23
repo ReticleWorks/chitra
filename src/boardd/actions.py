@@ -3,21 +3,16 @@ already-governed `chitra-goals` CLI (chitra.goals_cli), the same tool an
 operator would run by hand. boardd never touches goals.json itself.
 
 - ack:    `chitra-goals resolve-ask --all` — clears every open ask on the
-          lane with the CLI's own default basis, no answer text needed.
-- answer: `chitra-goals resolve-ask --all --basis <text>` — same, but the
-          operator's answer becomes the recorded basis for retiring them.
+          lane as a dismissal; no answer text, no claimed ruling.
+- answer: `chitra-goals answer --text <text>` — the operator's words become
+          a canonical decision bound to this lane, retire the open ask
+          truthfully, and land on the dispatch queue as an `operator_relay`
+          order the lane's session actually reads. If the lane was held for
+          that question, the same verb resumes it once no open ask remains.
 
-Neither is a status change: it only retires open_asks.
-
-A status-only review item — blocked, completion-disputed, ... with no
-literal ask — is on the board's stack all the same, and the operator must
-still be able to say something to it. `answer` records that text the way an
-answered ask records it: the board's own review ask is added and retired in
-one go, with the operator's words as its basis. The lane's agent reads
-`retired_asks` off its own goal record, so the answer reaches the session by
-the route a real answer takes. `ack` has no text to record, so a lane with
-nothing to clear still raises LaneActionError(no_op=True) and app.py turns
-that into 409, never a false success.
+`ack` is not a status change and never fabricates an answer: a lane with
+nothing to dismiss raises LaneActionError(no_op=True) and app.py turns that
+into 409, never a false success.
 """
 
 import subprocess
@@ -27,11 +22,6 @@ from pathlib import Path
 from chitra.goals import GoalRecord, load_goals
 
 CHITRA_GOALS_TIMEOUT = 10.0
-
-# The ask recorded for a lane that carried none, so the operator's answer has
-# a question to be the answer to. It is the board's own review prompt, not a
-# question the lane asked.
-BOARD_REVIEW_ASK = "Operator review of this lane's status, from the board."
 
 
 class LaneActionError(Exception):
@@ -84,22 +74,17 @@ def ack_lane(state_dir: Path, lane_id: str) -> GoalRecord:
 
 
 def answer_lane(state_dir: Path, lane_id: str, text: str) -> GoalRecord:
-    """Record the operator's answer on the lane, ask or no ask.
+    """Deliver the operator's answer through the governed answer path.
 
-    A status-only review lane carries nothing for resolve-ask to retire, but
-    the board still offers it a Send, so give the answer somewhere to land:
-    add the board's own review ask, then retire it with the answer as its
-    basis. That is the same `retired_asks` entry an answered ask leaves, in
-    the same record the lane's agent reads.
-
-    ponytail: two chitra-goals calls, not one — the lane holds the review ask
-    between them, which a monitor tick inside that window would read as a
-    live ask. One verb that records an operator note would replace both.
+    `chitra-goals answer` writes the canonical decision, retires the open
+    ask or foreground task that held the lane, enqueues the verbatim
+    `operator_relay` order, resumes the lane when the answer cleared its
+    question hold, and requeues anything deferred while it waited — one
+    transaction, not the board's old add-ask/resolve-ask pair.
     """
     text = text.strip()
     if not text:
         raise LaneActionError("answer text must not be empty")
     record = _find_record(state_dir, lane_id)
-    if not record.open_asks:
-        _run_goals(state_dir, "add-ask", "--session-ref", record.session_ref, "--ask", BOARD_REVIEW_ASK)
-    return _resolve_ask(state_dir, lane_id, basis=text)
+    _run_goals(state_dir, "answer", "--session-ref", record.session_ref, "--text", text)
+    return _find_record(state_dir, lane_id)

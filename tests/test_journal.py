@@ -647,3 +647,96 @@ def test_claude_honest_run_with_no_stop_hook_emits_final_response_and_no_false_d
 
     findings = detect_false_done(final_response=final_responses[0], enrolled_items=(), receipt_names_by_item={})
     assert findings == []
+
+
+def test_quiet_poll_does_not_rescan_consumed_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A poll that finds size and mtime untouched must not re-verify the
+    consumed prefix — steady-state polls stay O(1); any real change still
+    runs the full integrity check."""
+    transcript = tmp_path / "quiet.jsonl"
+    transcript.write_bytes(b'{"a": 1}\n' * 8)
+
+    with JsonlTailReader(transcript) as reader:
+        assert len(reader.poll().records) == 8
+        scans: list[str] = []
+        original = reader._consumed_intact
+
+        def counting() -> bool:
+            scans.append("scan")
+            return original()
+
+        monkeypatch.setattr(reader, "_consumed_intact", counting)
+        assert reader.poll().records == ()
+        assert scans == []
+        with transcript.open("ab") as handle:
+            handle.write(b'{"a": 2}\n')
+        assert len(reader.poll().records) == 1
+        assert scans == ["scan"]
+
+
+def test_append_unique_rescans_only_new_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The dedupe id index must not re-parse rows below its byte watermark."""
+    import chitra.journal.store as store_mod
+
+    journal = EventJournal(tmp_path, "claude")
+    first = ingest(CASES[0], tmp_path / "state-a")
+    extra = ingest(CASES[0], tmp_path / "state-b")[0].model_copy(update={"event_id": "extra-1"})
+    journal.append(tuple(first))
+
+    loads: list[object] = []
+    real_loads = json.loads
+
+    def counting(value: object, *args: object, **kwargs: object) -> object:
+        loads.append(value)
+        return real_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(store_mod.json, "loads", counting)
+    journal.append((extra,))
+    assert len(loads) == 0
+    # A row appended by another writer is the only new content to scan, and
+    # it is deduped without re-parsing the rows below the watermark.
+    extra2 = extra.model_copy(update={"event_id": "extra-2"})
+    with journal.path.open("a", encoding="utf-8") as handle:
+        handle.write(extra2.model_dump_json() + "\n")
+    assert journal.append((extra2,)) == ()
+    assert len(loads) == 1
+    assert journal.load()[-1].event_id == "extra-2"
+
+
+def test_append_unique_rescans_after_same_size_rewrite(tmp_path: Path) -> None:
+    """A same-size rewrite of the journal must invalidate the id watermark:
+    the rescan sees the replacement row's id, so re-adding it dedupes."""
+    journal = EventJournal(tmp_path, "claude")
+    first = ingest(CASES[0], tmp_path / "state-a")
+    journal.append(tuple(first[:2]))
+    size = journal.path.stat().st_size
+    # Rewrite the whole file with a different row of the same serialized size.
+    replacement = first[0].model_copy(update={"event_id": "f" * 64})
+    rewritten = "\n".join(
+        event.model_dump_json() for event in (replacement, first[1])
+    ) + "\n"
+    assert len(rewritten.encode()) == size
+    journal.path.write_text(rewritten)
+    stat = journal.path.stat()
+    os.utime(journal.path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+
+    assert journal.append((replacement,)) == ()
+
+
+def test_load_from_reads_only_the_tail(tmp_path: Path) -> None:
+    journal = EventJournal(tmp_path, "claude")
+    events = ingest(CASES[0], tmp_path / "state-a")
+    journal.append(tuple(events[:3]))
+    offset = journal.path.stat().st_size
+    journal.append(tuple(events[3:5]))
+
+    loaded, start, end, fd_stat = journal.load_from(offset, inode=journal.path.stat().st_ino)
+
+    assert start == offset
+    assert end == journal.path.stat().st_size
+    assert fd_stat is not None
+    assert [event.event_id for event in loaded] == [event.event_id for event in events[3:5]]
+    # A hint pointing at the wrong incarnation restarts the read at zero.
+    loaded_all, start_all, _end_all, _ = journal.load_from(offset, inode=fd_stat.st_ino + 1)
+    assert start_all == 0
+    assert [event.event_id for event in loaded_all] == [event.event_id for event in events[:5]]

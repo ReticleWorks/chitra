@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import posixpath
 import re
-from collections.abc import Sequence
+from collections.abc import Sequence, Set
 from typing import TYPE_CHECKING, Literal, Self
 
 from pydantic import BaseModel, Field, model_validator
 
 from chitra.journal.models import CanonicalEvent, CanonicalType
+from chitra.journal.tools import coerce_tool_input, target_paths, tool_class
 
 if TYPE_CHECKING:
     from chitra.detect.detectors import Finding
@@ -23,8 +24,6 @@ CanonicalChoiceKind = Literal[
 ]
 
 _REGISTRY_KEY_RE = re.compile(r"[a-z][a-z0-9_.-]{0,63}\Z")
-_WRITE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
-_TARGET_FIELDS = frozenset({"file_path", "path", "target", "target_path", "files", "paths"})
 
 
 class CanonicalChoice(BaseModel):
@@ -85,33 +84,12 @@ def _event_cwd(event: CanonicalEvent, input_value: dict[str, object]) -> str | N
     return payload_cwd if isinstance(payload_cwd, str) else None
 
 
-def _explicit_targets(input_value: object) -> tuple[str, ...]:
-    if not isinstance(input_value, dict):
-        return ()
-    targets: list[str] = []
-    for field_name, value in input_value.items():
-        if field_name not in _TARGET_FIELDS:
-            continue
-        if isinstance(value, str) and value:
-            targets.append(value)
-        elif field_name in {"files", "paths"} and isinstance(value, list):
-            targets.extend(item for item in value if isinstance(item, str) and item)
-    return tuple(targets)
-
-
-def _first_unmet_item(enrolled_items: Sequence[object]) -> str:
-    for item in enrolled_items:
-        item_id = getattr(item, "id", None)
-        if isinstance(item_id, str):
-            return item_id
-    return ""
-
-
 def detect_canonical_choices(
     events: Sequence[CanonicalEvent],
     policy: CanonicalChoicesPolicy,
     *,
     enrolled_items: Sequence[object] = (),
+    met_items: Set[str] = frozenset(),
 ) -> list[Finding]:
     """Find exact deprecated-path writes backed by explicit tool fields.
 
@@ -119,24 +97,22 @@ def detect_canonical_choices(
     event-local working directory are not evidence. The resolver never probes
     the filesystem, so lexical normalization is deterministic.
     """
-    from chitra.detect.detectors import Finding
+    from chitra.detect.detectors import Finding, first_unmet_item_id
 
     findings: list[Finding] = []
-    unmet = _first_unmet_item(enrolled_items)
+    unmet = first_unmet_item_id(enrolled_items, met_items)
     path_choices = tuple((key, choice) for key, choice in policy.choices.items() if choice.kind == "deprecated_path")
     for event in events:
         if event.normalized_type is not CanonicalType.TOOL_CALL:
             continue
         tool_name = event.payload.get("tool_name")
-        if not isinstance(tool_name, str) or tool_name not in _WRITE_TOOLS:
+        if not isinstance(tool_name, str) or tool_class(tool_name) != "write":
             continue
-        input_value = event.payload.get("input")
-        if not isinstance(input_value, dict):
-            continue
-        cwd = _event_cwd(event, input_value)
+        coerced = coerce_tool_input(event.payload.get("input"))
+        cwd = _event_cwd(event, coerced if isinstance(coerced, dict) else {})
         targets = tuple(
             normalized
-            for raw_target in _explicit_targets(input_value)
+            for raw_target in target_paths(event)
             if (normalized := _lexical_path(raw_target, cwd=cwd)) is not None
         )
         if not targets:

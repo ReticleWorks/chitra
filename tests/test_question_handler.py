@@ -3,7 +3,8 @@ from __future__ import annotations
 from chitra.autonomy import AutonomyPolicy, CapabilityGrant
 from chitra.decisions import DecisionEntry
 from chitra.goals import GoalRecord
-from chitra.question_handler import QuestionHandlerResult, handle_question
+from chitra.question_handler import QuestionHandlerResult, extract_questions, handle_question
+from chitra.supervision import goal_digest
 
 
 def _goal(**updates: object) -> GoalRecord:
@@ -154,7 +155,7 @@ def test_result_is_typed_and_does_not_claim_review_authority() -> None:
     assert not hasattr(result, "reviewer")
 
 
-def _decision(decision: str, *, decision_id: str = "dec-test-1") -> DecisionEntry:
+def _decision(decision: str, *, decision_id: str = "dec-test-1", **fields: object) -> DecisionEntry:
     return DecisionEntry(
         decision_id=decision_id,
         at="2026-09-22T00:00:00+00:00",
@@ -163,6 +164,7 @@ def _decision(decision: str, *, decision_id: str = "dec-test-1") -> DecisionEntr
         basis="Recorded test ruling.",
         citation="test-suite",
         authority="test authority",
+        **fields,  # type: ignore[arg-type]
     )
 
 
@@ -216,4 +218,105 @@ def test_shared_function_words_do_not_let_an_unrelated_ruling_answer() -> None:
     result = handle_question(_goal(), "Should I continue with this approach or stop?", decisions=[ruling])
 
     assert result.source != "decisions_log"
-    assert result.answer is None or "decision" not in result.answer
+
+
+def test_reask_in_a_new_occurrence_is_a_new_request() -> None:
+    goal = _goal()
+    first = handle_question(goal, "What proves the goal is done?", occurrence="event-1")
+    repeated = handle_question(goal, "What proves the goal is done?", occurrence="event-2")
+
+    assert first.occurrence == "event-1"
+    assert repeated.occurrence == "event-2"
+    assert first.request_id != repeated.request_id
+
+
+def test_bound_decision_only_answers_its_own_lane_and_contract() -> None:
+    goal = _goal()
+    digest = goal_digest(goal)
+    question = "Should the order queue move to a SQLite database?"
+    other_lane = _decision(
+        "Keep the order queue on plain JSONL files; do not add a database.",
+        session_ref="host:other_lane:0",
+        goal_version=goal.goal_version,
+        goal_digest=digest,
+    )
+    other_version = _decision(
+        "Keep the order queue on plain JSONL files; do not add a database.",
+        decision_id="dec-old-version",
+        session_ref=goal.session_ref,
+        goal_version=goal.goal_version + 1,
+        goal_digest=digest,
+    )
+    matching = _decision(
+        "Keep the order queue on plain JSONL files; do not add a database.",
+        decision_id="dec-bound",
+        session_ref=goal.session_ref,
+        goal_version=goal.goal_version,
+        goal_digest=digest,
+    )
+
+    missed = handle_question(goal, question, decisions=[other_lane, other_version])
+    assert missed.source != "decisions_log"
+
+    hit = handle_question(goal, question, decisions=[other_lane, other_version, matching])
+    assert hit.source == "decisions_log"
+    assert hit.answer == f"{matching.decision} (decision dec-bound)"
+
+
+def test_verbatim_answer_is_the_relayed_text_for_a_bound_ruling() -> None:
+    goal = _goal()
+    ruling = _decision(
+        "The operator answered this work session's open ask on the board.",
+        decision_id="board-answer-1",
+        session_ref=goal.session_ref,
+        goal_version=goal.goal_version,
+        goal_digest=goal_digest(goal),
+        question="Which database should the feed cache use?",
+        answer="Use the existing sqlite cache.",
+    )
+    result = handle_question(goal, "Which database should the feed cache use?", decisions=[ruling])
+
+    assert result.disposition == "answered"
+    assert result.source == "decisions_log"
+    assert result.answer == "Use the existing sqlite cache. (decision board-answer-1)"
+
+
+def test_extract_questions_finds_each_real_question_and_ignores_code() -> None:
+    text = (
+        "I finished the migration.\n"
+        "```python\n"
+        "value = ok ? a : b  # not a question\n"
+        "url = \"https://x.test/?a=b&c=d\"\n"
+        "```\n"
+        "Should I use the existing cache for this?\n"
+        "The flag is `verbose?` in config.\n"
+        "See https://docs.test/path?q=1 for details.\n"
+        "Which database should the feed use?\n"
+    )
+
+    assert extract_questions(text) == (
+        "Should I use the existing cache for this?",
+        "Which database should the feed use?",
+    )
+
+
+def test_extract_questions_catches_declarative_blockers_without_a_question_mark() -> None:
+    text = (
+        "The build is ready.\n"
+        "I am waiting for your confirmation before I deploy.\n"
+        "Please confirm which approach to take.\n"
+    )
+
+    assert extract_questions(text) == (
+        "I am waiting for your confirmation before I deploy.",
+        "Please confirm which approach to take.",
+    )
+
+
+def test_extract_questions_deduplicates_within_one_turn_but_not_across_calls() -> None:
+    text = "What is the next step?\nWHAT IS THE NEXT STEP?\nDone."
+    questions = extract_questions(text)
+
+    assert questions == ("What is the next step?",)
+    # A re-ask in a later response is a fresh occurrence, not a duplicate.
+    assert extract_questions(text) == questions

@@ -13,11 +13,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
+import structlog
+
 from chitra.autonomy import autonomy_policy_sha256
 from chitra.detect import Finding, IncidentStore, LadderDecision
 from chitra.detect.ladder import discover_consumption_proof, discover_delivery_consumption_proof
 from chitra.dispatch import directive_voice_violation, enqueue_dispatch_order
-from chitra.goals import GoalRecord, add_foreground_task, hold_goal
+from chitra.goals import GoalNotFoundError, GoalRecord, add_foreground_task, hold_goal
 from chitra.journal import CanonicalEvent
 from chitra.ledger import verify_delivery
 from chitra.orders import DispatchOrder, DispatchResult, DispatchStatus
@@ -36,6 +38,8 @@ class CorrectiveActionResult:
     enqueued: bool
     reason: str
 
+
+logger = structlog.get_logger(__name__)
 
 DeliveryFailureDisposition = Literal["foreground_replan", "lifecycle_wait", "transport_retry"]
 
@@ -194,6 +198,52 @@ def _record_foreground_replan(
             "Inspect current goal, evidence, and delivery contract; then replan or issue a corrected action."
         ),
     )
+
+
+# Lifecycle waits that resolve themselves (``lane-lifecycle-*-deferred``) stay
+# silent; every other lifecycle rejection means the lane cannot receive the
+# corrective order at all, which the foreground must see.
+_NON_TRANSIENT_LIFECYCLE_REASONS = frozenset(
+    {"goal-not-actionable", "goals-schema-newer-than-installed", "lane-lifecycle-closed"}
+)
+
+
+def _is_non_transient_lifecycle_wait(result: DispatchResult) -> bool:
+    return result.reason in _NON_TRANSIENT_LIFECYCLE_REASONS
+
+
+def record_terminal_pursuit_alert(
+    state_root: Path,
+    goal: GoalRecord,
+    *,
+    detail: str,
+) -> None:
+    """Surface a terminal supervision state once through the foreground path.
+
+    The task text carries no per-pass data, so ``add_foreground_task``'s
+    content-addressed ``task_id`` deduplicates repeat passes; a fresh goal
+    version intentionally re-arms the alert. A goal that vanished from the
+    store has no board to write to, so the alert is dropped rather than
+    failing the reconcile that surfaced it.
+    """
+    try:
+        add_foreground_task(
+            state_root,
+            goal.session_ref,
+            kind="investigate",
+            source="supervisor",
+            text=(
+                "Corrective pursuit reached a terminal state for this goal; the lane cannot "
+                "make progress on more corrective orders without intervention. "
+                f"{detail}"
+            ),
+        )
+    except GoalNotFoundError:
+        logger.warning(
+            "supervisor_terminal_alert_dropped",
+            session_ref=goal.session_ref,
+            detail=detail,
+        )
 
 
 def _stored_result(path: Path | None) -> DispatchResult | None:
@@ -432,6 +482,15 @@ def reconcile_corrective_action(
                     finding=f"corrective finding {finding.fingerprint}",
                     reason=reason,
                 )
+            elif _is_non_transient_lifecycle_wait(result):
+                record_terminal_pursuit_alert(
+                    state_root,
+                    goal,
+                    detail=(
+                        f"The corrective order was rejected by lane lifecycle policy: {result.reason}. "
+                        f"Track {track_id} cannot receive further orders until the lane or goal state changes."
+                    ),
+                )
             if not (
                 latest is not None
                 and _same_action(latest, order, track_id, stage)
@@ -463,7 +522,19 @@ def reconcile_corrective_action(
                 f"{stage!r} for finding {finding.fingerprint} all ended in "
                 f"transport failure ({reason})"
             )
-            hold_goal(state_root, goal.session_ref, reason=hold_reason)
+            # A held lane without ``resume_at`` leaves ``due_goals`` forever;
+            # re-admit on the capped-backoff schedule so the pursuit is
+            # reviewed again instead of expiring silently.
+            resume_at = (datetime.now(UTC) + timedelta(seconds=MAX_CORRECTIVE_RETRY_DELAY_SECONDS)).isoformat()
+            hold_goal(state_root, goal.session_ref, reason=hold_reason, resume_at=resume_at)
+            record_terminal_pursuit_alert(
+                state_root,
+                goal,
+                detail=(
+                    f"The corrective order exhausted {next_attempt} transport retries; "
+                    f"the lane is held until {resume_at}. Track {track_id}."
+                ),
+            )
             if not (
                 latest is not None
                 and _same_action(latest, order, track_id, stage)

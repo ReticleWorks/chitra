@@ -28,7 +28,7 @@ from chitra.plain_english import require_plain_english
 from chitra.state_paths import state_dir
 from chitra.validation_receipts import ReceiptError, require_verified_completion_receipts
 from chitra.validation_receipts import receipt_name as safe_receipt_name
-from chitra.validator_registry import load_validators
+from chitra.validator_registry import load_validators, registered_validator_digest
 
 logger = structlog.get_logger(__name__)
 
@@ -150,12 +150,19 @@ class InterviewReceipt:
 
 @pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True))
 class EnrolledDoneWhenItem:
-    """One immutable completion condition and its exact required proof name."""
+    """One immutable completion condition and its exact required proof name.
+
+    ``validator_sha256`` pins the item to the registered-validator definition
+    present at enrollment so a later registry edit cannot silently redefine
+    the check a frozen item named. Caller-built records leave it empty; the
+    upsert fills it from the instance registry before the item is stored.
+    """
 
     id: str
     text: str
     validator: str
     required_receipt: str
+    validator_sha256: str = ""
 
 
 @pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True))
@@ -210,6 +217,11 @@ class GoalRecord:
     completion_proofs: tuple[CompletionEvidence, ...] = ()
     autonomy_policy: AutonomyPolicy = DEFAULT_AUTONOMY_POLICY
     foreground_tasks: tuple[ForegroundTask, ...] = ()
+    # Append-only audit of retired foreground work: {task_id, kind, text,
+    # state, basis, retired_at}. ``state`` says whether a recorded answer
+    # closed the item ("resolved-by-operator") or it was retired without one
+    # ("dismissed-by-operator").
+    retired_foreground_tasks: tuple[dict[str, str], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return cast(dict[str, object], _GOAL_RECORD_ADAPTER.dump_python(self, mode="json"))
@@ -287,7 +299,11 @@ class GoalRecord:
                 raise ValueError("goal record retired_asks entries must contain the complete retirement record")
             if not all(isinstance(value, str) for value in entry.values()):
                 raise ValueError("goal record retired_asks entries must contain strings")
-            if entry["state"] not in ("resolved-by-operator", "retired-by-monitor-with-cited-basis"):
+            if entry["state"] not in (
+                "resolved-by-operator",
+                "dismissed-by-operator",
+                "retired-by-monitor-with-cited-basis",
+            ):
                 raise ValueError("goal record retired ask state is invalid")
         normalized["retired_asks"] = raw_retired_asks
         goal_version = payload.get("goal_version", 1)
@@ -354,6 +370,18 @@ class GoalRecord:
                 require_timezone=True,
             )
         normalized["foreground_tasks"] = raw_foreground_tasks
+        raw_retired_tasks = payload.get("retired_foreground_tasks", [])
+        retired_task_fields = {"task_id", "kind", "text", "state", "basis", "retired_at"}
+        if not isinstance(raw_retired_tasks, list):
+            raise ValueError("goal record retired_foreground_tasks must be a list of objects")
+        for entry in raw_retired_tasks:
+            if not isinstance(entry, dict) or set(entry) != retired_task_fields:
+                raise ValueError("goal record retired_foreground_tasks entries must contain the complete retirement record")
+            if not all(isinstance(value, str) for value in entry.values()):
+                raise ValueError("goal record retired_foreground_tasks entries must contain strings")
+            if entry["state"] not in ("resolved-by-operator", "dismissed-by-operator"):
+                raise ValueError("goal record retired foreground task state is invalid")
+        normalized["retired_foreground_tasks"] = raw_retired_tasks
         normalized["autonomy_policy"] = payload.get("autonomy_policy", DEFAULT_AUTONOMY_POLICY.model_dump(mode="json"))
         return normalized
 
@@ -441,6 +469,15 @@ def validate_enrollment_contract(rec: GoalRecord, *, root: Path | None = None) -
         seen_receipts.add(item.required_receipt)
         if registered_validators is not None and item.validator not in registered_validators:
             issues.append(f"enrolled done item {item.id!r} validator not registered: {item.validator!r}")
+        elif (
+            registered_validators is not None
+            and item.validator_sha256
+            and registered_validator_digest(registered_validators[item.validator]) != item.validator_sha256
+        ):
+            issues.append(
+                f"enrolled done item {item.id!r} validator {item.validator!r} "
+                "no longer matches the definition pinned at enrollment"
+            )
     rendered = render_done_when_items(rec.enrolled_done_when_items)
     if rec.enrolled_done_when_items and rec.done_when.strip() != rendered:
         issues.append("done_when must be generated from enrolled_done_when_items")
@@ -676,6 +713,52 @@ def upsert_goal(
     return stored
 
 
+def _pin_enrolled_validators(root: Path | None, rec: GoalRecord) -> GoalRecord:
+    """Bind each enrolled item to the registry definition present at enrollment.
+
+    The stored item then carries the digest of the exact argv, timeout, and
+    run-as the operator provisioned, so a later registry edit cannot silently
+    redefine the check a frozen item named.
+    """
+    registry = load_validators(root)
+    return replace(
+        rec,
+        enrolled_done_when_items=tuple(
+            (
+                replace(item, validator_sha256=registered_validator_digest(entry))
+                if (entry := registry.get(item.validator)) is not None
+                else item
+            )
+            for item in rec.enrolled_done_when_items
+        ),
+    )
+
+
+def _enrolled_items_match(
+    incoming: tuple[EnrolledDoneWhenItem, ...],
+    stored: tuple[EnrolledDoneWhenItem, ...],
+) -> bool:
+    """Compare enrolled items while treating an unpinned incoming pin as unspecified.
+
+    Caller-built records never carry the registry pin — the upsert fills it at
+    enrollment — so an empty ``validator_sha256`` matches whatever the stored
+    enrollment pinned. A non-empty pin that differs is a real edit and fails.
+    """
+    if len(incoming) != len(stored):
+        return False
+    for candidate, frozen in zip(incoming, stored, strict=True):
+        if (
+            candidate.id != frozen.id
+            or candidate.text != frozen.text
+            or candidate.validator != frozen.validator
+            or candidate.required_receipt != frozen.required_receipt
+        ):
+            return False
+        if candidate.validator_sha256 and candidate.validator_sha256 != frozen.validator_sha256:
+            return False
+    return True
+
+
 def _upsert_goal_locked(
     root: Path | None,
     rec: GoalRecord,
@@ -711,6 +794,7 @@ def _upsert_goal_locked(
         enrollment_issues = validate_enrollment_contract(rec, root=root)
         if enrollment_issues:
             raise GoalValidationError("; ".join(enrollment_issues))
+        rec = _pin_enrolled_validators(root, rec)
     now = _utc_now() if mutation_time is None else mutation_time
     derived_lane_id = lane_id_from_session_ref(rec.session_ref)
     lane_id = derived_lane_id
@@ -724,7 +808,7 @@ def _upsert_goal_locked(
             raise EnrolledScopeImmutableError("enrolled_at is immutable once a goal is enrolled")
         if rec.interview_receipt != existing.interview_receipt:
             raise EnrolledScopeImmutableError("interview_receipt is immutable once a goal is enrolled")
-        if rec.enrolled_done_when_items != existing.enrolled_done_when_items:
+        if not _enrolled_items_match(rec.enrolled_done_when_items, existing.enrolled_done_when_items):
             raise EnrolledScopeImmutableError("enrolled_done_when_items are immutable once a goal is enrolled")
         if rec.completion_proofs != existing.completion_proofs and not allow_completion_proofs:
             raise GoalValidationError("completion proofs may only be written by the completion gate")
@@ -777,7 +861,9 @@ def _upsert_goal_locked(
         created_at=existing.created_at if existing is not None else now,
         updated_at=now,
         open_asks=open_asks,
-        retired_asks=rec.retired_asks,
+        # Retirement history is append-only audit. A routine write that says
+        # nothing about it must not silently erase it.
+        retired_asks=rec.retired_asks or (existing.retired_asks if existing is not None else ()),
         needs=rec.needs,
         hold_reason=hold_reason,
         resume_at=resume_at,
@@ -789,10 +875,17 @@ def _upsert_goal_locked(
         successor_of=rec.successor_of or (existing.successor_of if existing is not None else ""),
         transferred_to=rec.transferred_to or (existing.transferred_to if existing is not None else ""),
         interview_receipt=rec.interview_receipt,
-        enrolled_done_when_items=rec.enrolled_done_when_items,
+        # On update the stored pinned items win: a caller-built record cannot
+        # carry (or clear) the registry pin the enrollment computed.
+        enrolled_done_when_items=(
+            rec.enrolled_done_when_items if existing is None else existing.enrolled_done_when_items
+        ),
         completion_proofs=rec.completion_proofs,
         autonomy_policy=rec.autonomy_policy,
         foreground_tasks=foreground_tasks,
+        retired_foreground_tasks=(
+            rec.retired_foreground_tasks or (existing.retired_foreground_tasks if existing is not None else ())
+        ),
     )
     records = [record for record in records if record.session_ref != rec.session_ref]
     records.append(stored)
@@ -979,19 +1072,44 @@ def resolve_foreground_task(
     session_ref: str,
     *,
     task_id: str,
+    basis: str | None = None,
     lock_dir: Path | None = None,
 ) -> GoalRecord:
-    """Remove one completed foreground task without touching operator asks."""
+    """Retire one foreground task, recording whether an answer closed it.
+
+    A supplied ``basis`` records the operator's verbatim answer
+    ("resolved-by-operator"); its absence records a dismissal without a
+    fabricated answer ("dismissed-by-operator").
+    """
     with goal_lane_lock(root, session_ref, lock_dir=lock_dir), locked_json_store(goals_path(root)):
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
-        tasks = tuple(task for task in existing.foreground_tasks if task.task_id != task_id)
-        if len(tasks) == len(existing.foreground_tasks):
+        removed = next((task for task in existing.foreground_tasks if task.task_id == task_id), None)
+        if removed is None:
             raise ValueError(f"foreground task not found: {task_id}")
+        tasks = tuple(task for task in existing.foreground_tasks if task.task_id != task_id)
+        if basis is not None and basis.strip():
+            state = "resolved-by-operator"
+            record_basis = basis.strip()
+        else:
+            state = "dismissed-by-operator"
+            record_basis = "The item was retired without a recorded answer."
+        retired = {
+            "task_id": removed.task_id,
+            "kind": removed.kind,
+            "text": removed.text,
+            "state": state,
+            "basis": record_basis,
+            "retired_at": _utc_now(),
+        }
         stored = _upsert_goal_locked(
             root,
-            replace(existing, foreground_tasks=tasks),
+            replace(
+                existing,
+                foreground_tasks=tasks,
+                retired_foreground_tasks=(*existing.retired_foreground_tasks, retired),
+            ),
             clear_foreground_tasks=True,
         )
     logger.info("goal_foreground_task_resolved", session_ref=session_ref, task_id=task_id)
@@ -1012,7 +1130,7 @@ def mark_completion_gate_passed(
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
-        enrollment_issues = validate_enrollment_contract(existing)
+        enrollment_issues = validate_enrollment_contract(existing, root=root)
         if enrollment_issues:
             raise GoalValidationError("completion requires a valid interview enrollment: " + "; ".join(enrollment_issues))
         try:
@@ -1241,12 +1359,19 @@ def resolve_ask(
     index: int | None = None,
     all: bool = False,
     retired_by: Literal["operator", "monitor"] = "operator",
-    basis: str = "Operator answered the ask.",
-    citation: str = "operator-ruling",
+    basis: str | None = None,
+    citation: str | None = None,
     authority: str = "operator",
     lock_dir: Path | None = None,
 ) -> GoalRecord:
-    """Retire asks while preserving who decided and the cited basis."""
+    """Retire asks while preserving who decided and the cited basis.
+
+    An operator retirement with a non-empty ``basis`` records
+    "resolved-by-operator" with the answer as its basis. Without one the ask
+    is recorded "dismissed-by-operator" — a bare acknowledgement must not
+    leave a record claiming an answer exists. Monitor retirement always
+    requires a monitor-authored basis, citation, and authority.
+    """
     selector_count = int(ask is not None) + int(index is not None) + int(all)
     if selector_count != 1:
         raise ValueError("select exactly one of ask, index, or all")
@@ -1268,15 +1393,34 @@ def resolve_ask(
                 raise ValueError("open ask index is out of range")
             remaining = existing.open_asks[:index] + existing.open_asks[index + 1 :]
             removed = (existing.open_asks[index],)
-        if retired_by == "monitor" and (not basis.strip() or not citation.strip() or not authority.strip()):
-            raise ValueError("monitor retirement requires a non-empty basis, citation, and authority")
+        answered = basis is not None and bool(basis.strip())
         if retired_by == "monitor":
-            require_plain_english(basis, field="ask-retirement basis")
+            if not answered or citation is None or not citation.strip() or not authority.strip():
+                raise ValueError("monitor retirement requires a non-empty basis, citation, and authority")
+            require_plain_english(cast(str, basis), field="ask-retirement basis")
             require_plain_english(authority, field="ask-retirement authority")
-        state = "retired-by-monitor-with-cited-basis" if retired_by == "monitor" else "resolved-by-operator"
+        if retired_by == "monitor":
+            state = "retired-by-monitor-with-cited-basis"
+            resolved_basis = cast(str, basis)
+            resolved_citation = cast(str, citation)
+        elif answered:
+            state = "resolved-by-operator"
+            resolved_basis = cast(str, basis)
+            resolved_citation = "operator-ruling" if citation is None else citation
+        else:
+            state = "dismissed-by-operator"
+            resolved_basis = "The operator retired the ask without recording an answer."
+            resolved_citation = "operator-dismissal" if citation is None else citation
         retired_at = _utc_now()
         retirements = tuple(
-            {"ask": item, "state": state, "basis": basis, "citation": citation, "authority": authority, "retired_at": retired_at}
+            {
+                "ask": item,
+                "state": state,
+                "basis": resolved_basis,
+                "citation": resolved_citation,
+                "authority": authority,
+                "retired_at": retired_at,
+            }
             for item in removed
         )
         stored = _upsert_goal_locked(
@@ -1349,7 +1493,7 @@ def close_goal(
                 )
             if closed.status != "done-pending-close":
                 raise GoalValidationError("completion close requires done-pending-close from the completion gate")
-            enrollment_issues = validate_enrollment_contract(closed)
+            enrollment_issues = validate_enrollment_contract(closed, root=root)
             if enrollment_issues:
                 raise GoalValidationError("completion close requires a valid interview enrollment: " + "; ".join(enrollment_issues))
             claimed_proofs = tuple(completion_evidence) or closed.completion_proofs
