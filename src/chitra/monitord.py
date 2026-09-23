@@ -695,7 +695,8 @@ class _ValidatorRunPool:
     """
 
     def __init__(self, max_workers: int = 4) -> None:
-        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="chitra-validator-run")
+        self._max_workers = max_workers
+        self._executor = self._new_executor()
         self._lock = threading.Lock()
         self._in_flight: dict[str, Future[None]] = {}
         self._attempts: dict[str, int] = {}
@@ -710,6 +711,15 @@ class _ValidatorRunPool:
             future = self._executor.submit(work)
             self._in_flight[lane_key] = future
         future.add_done_callback(lambda done: self._completed(lane_key, done))
+
+    def _new_executor(self) -> ThreadPoolExecutor:
+        return ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="chitra-validator-run")
+
+    def in_flight(self, lane_key: str) -> bool:
+        """Return whether this lane has a queued or running validator run."""
+        with self._lock:
+            current = self._in_flight.get(lane_key)
+            return current is not None and not current.done()
 
     def _completed(self, lane_key: str, future: Future[None]) -> None:
         try:
@@ -737,8 +747,15 @@ class _ValidatorRunPool:
         return not pending
 
     def shutdown(self) -> None:
-        """Stop accepting work without blocking exit on running validators."""
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        """Cancel queued runs without blocking exit on running validators.
+
+        The module-level pool outlives one ``run_forever`` call, so a fresh
+        executor replaces the stopped one; a later pass in the same process
+        can still queue work instead of failing on a shut-down executor.
+        """
+        with self._lock:
+            stopped, self._executor = self._executor, self._new_executor()
+        stopped.shutdown(wait=False, cancel_futures=True)
 
 
 _VALIDATOR_RUN_POOL = _ValidatorRunPool()
@@ -763,12 +780,16 @@ def _claimed_run_evidence(
     current_digest = worktree_git_digest(lane.workdir) if lane is not None else None
     if lane is None or current_digest is None:
         return record_enrolled_validator_runs(config.state_dir, session_ref, items)
+    lane_key = f"{config.state_dir}:{goal.lane_id or session_ref}"
+    if _VALIDATOR_RUN_POOL.in_flight(lane_key):
+        # A running worker may be rewriting these receipts and records right
+        # now: neither read them nor start a second run beside it.
+        return None
     if all(
         recorded_validator_run_fresh(config.state_dir, session_ref, item, current_digest=current_digest)
         for item in items
     ):
         return tuple(recorded_validator_run_proof(config.state_dir, session_ref, item) for item in items)
-    lane_key = f"{config.state_dir}:{goal.lane_id or session_ref}"
     if _VALIDATOR_RUN_POOL.attempts(lane_key) >= _VALIDATOR_RUN_MAX_ATTEMPTS:
         # A worker that keeps failing before it can record is surfaced
         # through the same synchronous call the inline path made instead of
