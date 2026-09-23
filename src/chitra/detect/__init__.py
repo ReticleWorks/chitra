@@ -7,6 +7,7 @@ from .detectors import (
     detect_drift,
     detect_excessive_testing,
     detect_false_done,
+    detect_stall,
     detect_unnecessary_steps,
 )
 from .ladder import (
@@ -51,6 +52,7 @@ __all__ = [
     "detect_drift",
     "detect_excessive_testing",
     "detect_false_done",
+    "detect_stall",
     "detect_unnecessary_steps",
     "find_rescue_bundle",
     "generate_relaunch_brief",

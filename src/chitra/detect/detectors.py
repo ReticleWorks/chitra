@@ -1,39 +1,49 @@
-"""Five event-based detectors over the W1 canonical journal (DESIGN-v3 §4).
+"""Six event-based detectors over the W1 canonical journal (DESIGN-v3 §4).
 
 Every detector consumes canonical events plus frozen goal data and returns a
 list of :class:`Finding`. A finding binds the exact journal event references
 that establish it, the unmet enrolled item it blocks, and the expected next
 progress that would clear it. Findings never derive from elapsed time; each
-predicate is a pure function of event content.
+predicate is a pure function of event content. Tool calls are classified by
+behavior through :mod:`chitra.journal.tools`, so a Claude ``Bash`` call and a
+Codex ``exec_command`` call land on the same predicate, and completion claims
+share the one vocabulary in :mod:`chitra.completion_gate`.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
+import posixpath
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from chitra.completion_gate import is_completion_claim
 from chitra.journal.models import CanonicalEvent, CanonicalType, ProgressClass, ProgressClassification
+from chitra.journal.tools import (
+    action_kind,
+    call_signature,
+    check_signature,
+    coerce_tool_input,
+    command_segments_argv,
+    command_text,
+    result_class,
+    shell_write_targets,
+    target_paths,
+    tool_class,
+    unanswered_tail_calls,
+)
 from chitra.validation_receipts import load_receipt_file, receipt_path, verify_receipt
 
-DETECTOR_VERSION = "chitra-detectors.v1"
+DETECTOR_VERSION = "chitra-detectors.v2"
 
-_DRIFT_TOOL_RE = re.compile(r"^(Edit|Write|MultiEdit|NotebookEdit)$")
-_WORK_TOOLS = frozenset({"Bash", "Shell", "Edit", "Write", "MultiEdit", "NotebookEdit"})
-_DOC_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
+_WORK_CAPABLE_CLASSES = frozenset({"write", "shell", "other"})
 _CODE_SUFFIXES = frozenset({".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".c", ".cc", ".cpp", ".h", ".sh", ".rb"})
 _DOC_SUFFIXES = frozenset({".md", ".rst", ".txt", ".adoc", ".org"})
-_COMPLETION_CLAIM_RE = re.compile(
-    r"\b(done|complete(?:d)?|finished|fixed|implemented|ready|shipped|all tests pass(?:ed)?|tests (?:are )?green)\b",
-    re.IGNORECASE,
-)
-_NEGATED_COMPLETION_RE = re.compile(
-    r"\b(not done|not complete|still working|remain(?:s)? to|left to|todo|to do|pending|need(?:s)? .*run)\b",
-    re.IGNORECASE,
-)
 
 
 def _canonical_digest(value: Any) -> str:
@@ -92,23 +102,6 @@ def _joined_results(events: Sequence[CanonicalEvent]) -> dict[str, CanonicalEven
     return joined
 
 
-def _result_signature(call: CanonicalEvent, result: CanonicalEvent | None) -> str:
-    result_value: dict[str, Any] | None = None
-    if result is not None:
-        result_value = {
-            "content": result.payload.get("content"),
-            "is_error": result.payload.get("is_error"),
-            "tool_use_result": result.payload.get("tool_use_result"),
-        }
-    return _canonical_digest(
-        {
-            "tool_name": call.payload.get("tool_name"),
-            "target": call.payload.get("input") if call.payload.get("input") is not None else call.payload,
-            "result": result_value,
-        }
-    )
-
-
 def _has_progress_between(
     events: Sequence[CanonicalEvent], progress_rows: Sequence[ProgressClassification], start: int, end: int
 ) -> bool:
@@ -133,33 +126,6 @@ def _has_progress_at(
     )
 
 
-def _strings_from(value: object) -> tuple[str, ...]:
-    strings: list[str] = []
-    if isinstance(value, str):
-        strings.append(value)
-    elif isinstance(value, dict):
-        for nested in value.values():
-            strings.extend(_strings_from(nested))
-    elif isinstance(value, list | tuple):
-        for nested in value:
-            strings.extend(_strings_from(nested))
-    return tuple(strings)
-
-
-def _target_paths(input_value: object) -> tuple[str, ...]:
-    if not isinstance(input_value, dict):
-        return ()
-    paths: list[str] = []
-    for key, value in input_value.items():
-        if key in {"cwd", "old", "new", "edit", "command"}:
-            continue
-        if key in {"file_path", "path", "target", "target_path"} and isinstance(value, str):
-            paths.append(value)
-        elif key in {"files", "paths"} and isinstance(value, list):
-            paths.extend(entry for entry in value if isinstance(entry, str))
-    return tuple(paths)
-
-
 def _contained_in_worktree(path: str, *, declared_worktree: str, cwd: str | None = None) -> bool:
     if not declared_worktree:
         return True
@@ -180,42 +146,290 @@ def _semantic_path(path: str, *, declared_worktree: str, cwd: str | None = None)
     return str(candidate.resolve(strict=False))
 
 
-def _violated_scope_clause(text: str, clauses: Sequence[str]) -> str | None:
-    for clause in clauses:
-        if clause in text:
-            return clause
-        if "remote install" in clause and "install.sh" in text and ("curl" in text or "http" in text):
-            return clause
-        if "/etc" in clause and "/etc" in text:
-            return clause
+# --- frozen-scope parsing ---------------------------------------------------
+# The OverReach mechanism: extract the authorized set from the frozen scope,
+# parse what the lane actually touched (tool targets plus the real worktree
+# diff), and flag the difference structurally instead of substring-matching
+# prose. A clause that yields no typed exclusion stays a residual literal
+# match against tool input, exactly as before.
+
+_SCOPE_SPLIT_RE = re.compile(r"[;\n]+")
+_SCOPE_DENY_RE = re.compile(
+    r"\b(?:never|no|not|don't|dont|do not|avoid|must not|mustn't|prohibit\w*|forbid\w*|forbidden|"
+    r"exclude\w*|except|off[- ]?limits|stay out|keep out|keep away|out[- ]of[- ]scope|without|refrain)\b",
+    re.IGNORECASE,
+)
+_SCOPE_ALLOW_RE = re.compile(
+    r"\b(?:only|just|restricted to|limited to|confined to|in scope|within|inside)\b", re.IGNORECASE
+)
+_SCOPE_READONLY_RE = re.compile(
+    r"\bread[- ]?only|inspection[- ]?only|observe[- ]?only|look[- ]?only|analysis[- ]?only|no[- ]?edit\b|"
+    r"\bno\s+(?:changes|edits|writes|modifications)\b|\bmake\s+no\s+changes\b",
+    re.IGNORECASE,
+)
+_SCOPE_READONLY_GLOBAL_RE = re.compile(
+    r"\bread[- ]?only|inspection[- ]?only|observe[- ]?only|look[- ]?only|analysis[- ]?only|no[- ]?edit\b|"
+    r"\bmake\s+no\s+changes\b",
+    re.IGNORECASE,
+)
+_REMOTE_INSTALL_SCOPE_RE = re.compile(
+    r"\b(?:remote|download\w*|internet|web|external|piped|pipe|online)\b[^\n]*\b(?:install|setup|bootstrap|script)s?\b"
+    r"|\b(?:install|setup|bootstrap|script)s?\b[^\n]*\b(?:remote|download\w*|internet|web|external|piped|pipe|online|curl|wget)\b",
+    re.IGNORECASE,
+)
+_REMOTE_INSTALL_CMD_RE = re.compile(
+    r"(?:\b(?:curl|wget|fetch|iwr|invoke-webrequest)\b[^|;&]*\|\s*(?:sudo\s+)?(?:ba?sh|zsh|sh|dash|ksh|python[\d.]*|perl|ruby|node)\b"
+    r"|\b(?:curl|wget)\b[^|;&]*\b(?:install|setup|bootstrap)\.sh\b"
+    r"|\b(?:ba?sh|zsh|sh|dash)\b[^|;&]*\b(?:install|setup|bootstrap)\.sh\b"
+    r"|\b(?:install|setup|bootstrap)\.sh\b[^|;&]*\|"
+    r"|\b(?:ba?sh|zsh|sh|dash|python[\d.]*)\s+-c\s*[\"']?\s*\$?\(?\s*(?:curl|wget)\b)",
+    re.IGNORECASE,
+)
+_SCOPE_RUN_VERB_RE = re.compile(
+    r"\b(?:run|runs|execute|executes|invoke|invokes|launch|launchs|start|starts|perform|issue|issues|"
+    r"trigger|triggers|push|deploy|publish|delete|remove|drop|migrate|install|download|upload|"
+    r"send|restart|kill|stop|reboot|shutdown)\b",
+    re.IGNORECASE,
+)
+_SCOPE_FILEISH_RE = re.compile(
+    r"\b(?:file|files|code|edit|edits|touch|touches|change|changes|modify|write|writes|writing|update|updates|"
+    r"directory|directories|folder|folders|module|modules|doc|docs|document\w*|worktree|tree|path|paths|"
+    r"component\w*|subsystem\w*|config\w*|schema\w*|production|prod|tests?|spec\w*|migration\w*|"
+    r"area|section|portion|out of|outside|under|inside|within|into)\b",
+    re.IGNORECASE,
+)
+_SCOPE_PATH_TOKEN_RE = re.compile(r"^(?:[/~.]|[A-Za-z]:[\\/])|[/\\]|\.\w{1,8}$|\*")
+_SCOPE_FLAG_TOKEN_RE = re.compile(r"^-{1,2}[A-Za-z][A-Za-z0-9-]*$")
+
+_SCOPE_STOPWORDS = frozenset(
+    {
+        "a", "an", "the", "and", "or", "to", "of", "in", "on", "for", "from", "with", "at", "by", "into",
+        "never", "no", "not", "don't", "dont", "do", "does", "did", "cannot", "can't", "cant", "must",
+        "mustn't", "mustnt", "avoid", "avoiding", "prohibit", "prohibited", "prohibiting", "forbid",
+        "forbids", "forbidden", "exclude", "excludes", "excluding", "except", "without", "refrain",
+        "keep", "stay", "off", "out", "outside", "inside", "only", "just", "restricted", "limited",
+        "confined", "scope", "scoped", "within", "any", "all", "none", "every", "everything", "anything",
+        "something", "nothing", "run", "runs", "execute", "executes", "invoke", "invokes", "launch",
+        "start", "starts", "perform", "issue", "issues", "trigger", "triggers", "touch", "touches",
+        "touched", "change", "changes", "changed", "edit", "edits", "edited", "modify", "modifies",
+        "modified", "write", "writes", "writing", "update", "updates", "updated", "create", "creates",
+        "delete", "deletes", "remove", "removes", "make", "makes", "made", "use", "using", "work",
+        "works", "working", "file", "files", "directory", "directories", "folder", "folders", "module",
+        "modules", "code", "codes", "coding", "path", "paths", "area", "areas", "section", "sections",
+        "part", "parts", "portion", "component", "components", "system", "systems", "repo", "repository",
+        "worktree", "tree", "stuff", "thing", "things", "else", "other", "others", "anywhere",
+        "everywhere", "please", "ever", "etc", "own", "new", "existing", "your", "their", "its", "our",
+        "my", "read", "reads", "readonly", "read-only", "inspection", "observe", "observing", "analysis",
+        "look", "looking", "remote", "remotely", "download", "downloads", "downloaded", "install",
+        "installs", "installed", "installing", "script", "scripts", "setup", "bootstrap", "pipe",
+        "piped", "piping", "external", "online", "internet", "web", "curl", "wget", "fetch", "this",
+        "that", "these", "those", "them", "it", "be", "been", "being", "is", "are", "was", "were",
+    }
+)
+
+_SCOPE_SUFFIX_STRIP = (
+    "ational", "ation", "tional", "tion", "sion",
+    "ings", "ing", "ers", "er", "ies", "ied", "es",
+    "ments", "ment", "s", "ed", "ly",
+)
+
+
+def _scope_stem(word: str) -> str:
+    for suffix in _SCOPE_SUFFIX_STRIP:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[: len(word) - len(suffix)]
+    return word
+
+
+def _scope_tokens(clause: str) -> list[str]:
+    return [token.strip("\"'`.,:;()[]{}<>") for token in clause.split()]
+
+
+def _scope_content_words(clause: str) -> list[str]:
+    words: list[str] = []
+    for token in _scope_tokens(clause):
+        if not token or token in _SCOPE_STOPWORDS or _SCOPE_FLAG_TOKEN_RE.match(token):
+            continue
+        if _SCOPE_PATH_TOKEN_RE.search(token):
+            continue
+        words.append(token)
+    return words
+
+
+def _is_scope_path_token(token: str) -> bool:
+    return bool(token) and token not in _SCOPE_STOPWORDS and bool(_SCOPE_PATH_TOKEN_RE.search(token))
+
+
+@dataclass(frozen=True, slots=True)
+class _ScopeModel:
+    """Typed exclusions and allowed set extracted from the frozen scope text."""
+
+    denied_paths: tuple[str, ...]
+    denied_command_patterns: tuple[re.Pattern[str], ...]
+    denied_command_words: tuple[tuple[str | None, frozenset[str], tuple[str, ...]], ...]
+    deny_writes: bool
+    allowed_paths: tuple[str, ...]
+    residual_clauses: tuple[str, ...]
+
+
+def _compile_scope(scope_text: str) -> _ScopeModel:
+    denied_paths: list[str] = []
+    denied_patterns: list[re.Pattern[str]] = []
+    denied_words: list[tuple[str | None, frozenset[str], tuple[str, ...]]] = []
+    allowed_paths: list[str] = []
+    residual: list[str] = []
+    deny_writes = False
+    for raw_clause in _SCOPE_SPLIT_RE.split(scope_text):
+        clause = raw_clause.strip().lower()
+        if len(clause) <= 3:
+            continue
+        has_deny = bool(_SCOPE_DENY_RE.search(clause))
+        has_allow = bool(_SCOPE_ALLOW_RE.search(clause))
+        path_tokens = [token for token in _scope_tokens(clause) if _is_scope_path_token(token)]
+        words = _scope_content_words(clause)
+        flag_tokens = [token for token in _scope_tokens(clause) if _SCOPE_FLAG_TOKEN_RE.match(token)]
+        if has_allow and not has_deny:
+            if _SCOPE_READONLY_RE.search(clause):
+                deny_writes = True
+            else:
+                allowed_paths.extend(path_tokens)
+                allowed_paths.extend(words)
+            continue
+        if not has_deny:
+            continue
+        consumed = False
+        if _REMOTE_INSTALL_SCOPE_RE.search(clause):
+            denied_patterns.append(_REMOTE_INSTALL_CMD_RE)
+            consumed = True
+        if _SCOPE_READONLY_RE.search(clause) and (
+            _SCOPE_READONLY_GLOBAL_RE.search(clause) or not (path_tokens or words)
+        ):
+            deny_writes = True
+            consumed = True
+        denied_paths.extend(path_tokens)
+        if consumed:
+            continue
+        actionish = bool(_SCOPE_RUN_VERB_RE.search(clause)) or bool(flag_tokens)
+        fileish = bool(_SCOPE_FILEISH_RE.search(clause)) or bool(path_tokens)
+        extracted = False
+        if actionish:
+            flags: set[str] = set()
+            for token in flag_tokens:
+                if token.startswith("--"):
+                    flags.add(token[2:].lower())
+                else:
+                    flags.update(letter.lower() for letter in token[1:] if letter.isalpha())
+            stems = tuple(dict.fromkeys(_scope_stem(word) for word in words))
+            argv0: str | None = None
+            if flag_tokens and stems:
+                argv0, stems = stems[0], stems[1:]
+            if argv0 or stems or flags:
+                denied_words.append((argv0, frozenset(flags), stems))
+                extracted = True
+        if fileish:
+            denied_paths.extend(words)
+            extracted = True
+        if not extracted and not path_tokens:
+            residual.append(clause)
+    return _ScopeModel(
+        denied_paths=tuple(dict.fromkeys(denied_paths)),
+        denied_command_patterns=tuple(denied_patterns),
+        denied_command_words=tuple(denied_words),
+        deny_writes=deny_writes,
+        allowed_paths=tuple(dict.fromkeys(allowed_paths)),
+        residual_clauses=tuple(residual),
+    )
+
+
+def _scope_path_hit(path: str, term: str) -> bool:
+    """Whether one touched path matches one scope term (dir, file, glob, stem)."""
+    normalized = path.replace("\\", "/").lstrip("./").rstrip("/")
+    cleaned = term.replace("\\", "/").lstrip("./").rstrip("/")
+    if not normalized or not cleaned:
+        return False
+    if term.startswith(("/", "~")):
+        absolute = normalized if path.startswith("/") else "/" + normalized
+        return absolute == cleaned or absolute.startswith(cleaned + "/")
+    if "*" in cleaned:
+        return fnmatch.fnmatch(normalized, cleaned) or fnmatch.fnmatch(posixpath.basename(normalized), cleaned)
+    components = [component for component in normalized.split("/") if component]
+    if cleaned in components or normalized == cleaned or normalized.startswith(cleaned + "/"):
+        return True
+    basename = components[-1] if components else ""
+    stem = posixpath.splitext(basename)[0]
+    return bool(stem) and stem == cleaned
+
+
+def _scope_flag_set(argv: Sequence[str]) -> frozenset[str]:
+    flags: set[str] = set()
+    for token in argv[1:]:
+        if token.startswith("--"):
+            flags.add(token[2:].split("=", 1)[0].lower())
+        elif token.startswith("-") and len(token) > 1:
+            flags.update(letter for letter in token[1:] if letter.isalpha())
+    return frozenset(flags)
+
+
+def _command_words_match(command: str, argv0_stem: str | None, flags: frozenset[str], stems: tuple[str, ...]) -> bool:
+    stem_res = tuple(re.compile(rf"\b{re.escape(stem)}\w*\b", re.IGNORECASE) for stem in stems)
+    for argv in command_segments_argv(command):
+        if not argv:
+            continue
+        head = posixpath.basename(argv[0]).lower()
+        if argv0_stem is not None and not re.search(rf"\b{re.escape(argv0_stem)}\w*\b", head, re.IGNORECASE):
+            continue
+        if not flags <= _scope_flag_set(argv):
+            continue
+        segment_words = " ".join(argv).lower()
+        if all(stem_re.search(segment_words) for stem_re in stem_res):
+            return True
+    return False
+
+
+def _denied_command_hit(command: str, scope: _ScopeModel) -> str | None:
+    if any(pattern.search(command) for pattern in scope.denied_command_patterns):
+        return "a denied command pattern"
+    for argv0, flags, stems in scope.denied_command_words:
+        if _command_words_match(command, argv0, flags, stems):
+            return f"the denied command terms {stems!r}"
     return None
 
 
-def _semantic_scope_seed(
-    event: CanonicalEvent, input_value: object, *, violated: str, declared_worktree: str
-) -> dict[str, Any]:
-    cwd = event.payload.get("cwd")
-    input_cwd = input_value.get("cwd") if isinstance(input_value, dict) else None
-    work_cwd = input_cwd if isinstance(input_cwd, str) else cwd if isinstance(cwd, str) else None
-    paths = tuple(
-        sorted(
-            _semantic_path(path, declared_worktree=declared_worktree, cwd=work_cwd)
-            for path in _target_paths(input_value)
-        )
-    )
-    command = ""
+def _denied_path_hit(path: str, scope: _ScopeModel) -> str | None:
+    for term in scope.denied_paths:
+        if _scope_path_hit(path, term):
+            return term
+    return None
+
+
+def _outside_allowed(path: str, scope: _ScopeModel) -> bool:
+    return bool(scope.allowed_paths) and not any(_scope_path_hit(path, term) for term in scope.allowed_paths)
+
+
+def _input_strings(value: dict[str, Any] | str | None) -> str:
+    strings: list[str] = []
+    if isinstance(value, str):
+        strings.append(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            if isinstance(item, str):
+                strings.append(item)
+            elif isinstance(item, Sequence) and not isinstance(item, (str, bytes)):
+                strings.extend(entry for entry in item if isinstance(entry, str))
+    return " ".join(strings).lower()
+
+
+def _call_cwd(event: CanonicalEvent, input_value: dict[str, Any] | str | None) -> str | None:
     if isinstance(input_value, dict):
-        raw_command = input_value.get("command")
-        if isinstance(raw_command, str):
-            command = " ".join(raw_command.lower().split())
-    elif isinstance(input_value, str):
-        command = " ".join(input_value.lower().split())
-    return {
-        "clause": violated,
-        "tool_name": event.payload.get("tool_name"),
-        "paths": paths,
-        "command": command,
-    }
+        cwd = input_value.get("cwd")
+        if isinstance(cwd, str):
+            return cwd
+    cwd = event.payload.get("cwd")
+    return cwd if isinstance(cwd, str) else None
+
+
+def _normalized_command_text(command: str) -> str:
+    return " ".join(command.lower().split())
 
 
 def detect_drift(
@@ -224,78 +438,168 @@ def detect_drift(
     scope_text: str,
     declared_worktree: str,
     enrolled_items: Sequence[object] = (),
+    changed_files: Sequence[str] = (),
 ) -> list[Finding]:
-    """Flag scoped work events conflicting with the goal's frozen boundaries.
+    """Flag actual work conflicting with the goal's frozen boundaries.
 
-    The predicate is content-only: an edit-family tool whose target path or
-    command text names an excluded action from ``scope_text``, or a worktree
-    call whose cwd leaves ``declared_worktree``. An allowed diagnostic does
-    not drift.
+    The check is structural: the frozen ``scope_text`` compiles into denied
+    paths, denied command terms, an optional write prohibition, and an
+    optional allowed file set; a call is drift when the command it runs, the
+    paths it targets, or the files the worktree diff shows changed fall on
+    the wrong side of that model — or when a work-capable call leaves
+    ``declared_worktree``. Prose clauses the compiler cannot type stay
+    residual literal matches, so unrecognized wording keeps its old meaning.
     """
     findings: list[Finding] = []
     unmet = _first_unmet_item(enrolled_items)
-    excluded_clauses = tuple(clause.strip().lower() for clause in re.split(r"[;\n]", scope_text) if len(clause.strip()) > 3)
+    scope = _compile_scope(scope_text)
+    declared_root = str(Path(declared_worktree).resolve(strict=False)) if declared_worktree else ""
     for event in events:
         if event.normalized_type is not CanonicalType.TOOL_CALL:
             continue
-        tool_name = event.payload.get("tool_name")
-        input_value = event.payload.get("input")
-        text = " ".join(_strings_from(input_value)).lower()
-        violated = _violated_scope_clause(text, excluded_clauses)
-        if violated is not None:
+        cls = tool_class(event.payload.get("tool_name"))
+        if cls == "plan":
+            continue
+        input_value = coerce_tool_input(event.payload.get("input"))
+        command = command_text(event)
+        paths = target_paths(event)
+        write_targets = paths if cls == "write" else shell_write_targets(event)
+        cwd = _call_cwd(event, input_value)
+
+        denied_command = _denied_command_hit(command, scope) if command else None
+        if denied_command is not None:
             findings.append(
                 Finding(
                     detector="drift",
-                    fingerprint_seed=_semantic_scope_seed(
-                        event,
-                        input_value,
-                        violated=violated,
-                        declared_worktree=declared_worktree,
-                    ),
+                    fingerprint_seed={
+                        "excluded_command": _normalized_command_text(command),
+                        "scope_term": denied_command,
+                    },
                     event_refs=(event.event_id,),
                     unmet_item=unmet,
                     expected_next_progress="return to the enrolled scope and produce evidence toward the first unmet done-when item",
-                    detail=f"scoped work conflicts with the goal boundary clause {violated!r}",
+                    detail=f"the command run hits {denied_command} from the goal's frozen scope",
                 )
             )
             continue
-        if isinstance(tool_name, str) and tool_name in _WORK_TOOLS and declared_worktree:
-            paths = _target_paths(input_value)
-            cwd = event.payload.get("cwd")
-            input_cwd = input_value.get("cwd") if isinstance(input_value, dict) else None
-            work_cwd = input_cwd if isinstance(input_cwd, str) else cwd if isinstance(cwd, str) else None
+        if scope.deny_writes and write_targets:
+            outside = _semantic_path(write_targets[0], declared_worktree=declared_worktree, cwd=cwd)
+            findings.append(
+                Finding(
+                    detector="drift",
+                    fingerprint_seed={"write_denied": outside},
+                    event_refs=(event.event_id,),
+                    unmet_item=unmet,
+                    expected_next_progress="return to the enrolled scope and produce evidence toward the first unmet done-when item",
+                    detail=f"the frozen scope forbids writes but the call wrote {write_targets[0]!r}",
+                )
+            )
+            continue
+        excluded = next((term for path in paths if (term := _denied_path_hit(path, scope)) is not None), None)
+        if excluded is not None:
+            hit_path = next(path for path in paths if _denied_path_hit(path, scope) is not None)
+            findings.append(
+                Finding(
+                    detector="drift",
+                    fingerprint_seed={
+                        "excluded_path": _semantic_path(hit_path, declared_worktree=declared_worktree, cwd=cwd),
+                        "scope_term": excluded,
+                    },
+                    event_refs=(event.event_id,),
+                    unmet_item=unmet,
+                    expected_next_progress="return to the enrolled scope and produce evidence toward the first unmet done-when item",
+                    detail=f"the call targeted {hit_path!r}, excluded by the frozen scope term {excluded!r}",
+                )
+            )
+            continue
+        if write_targets and (outside_allowed := next((p for p in write_targets if _outside_allowed(p, scope)), None)):
+            findings.append(
+                Finding(
+                    detector="drift",
+                    fingerprint_seed={
+                        "outside_allowed": _semantic_path(outside_allowed, declared_worktree=declared_worktree, cwd=cwd)
+                    },
+                    event_refs=(event.event_id,),
+                    unmet_item=unmet,
+                    expected_next_progress="return to the enrolled scope and produce evidence toward the first unmet done-when item",
+                    detail=f"the call wrote {outside_allowed!r} outside the scope's allowed file set",
+                )
+            )
+            continue
+        residual = next(
+            (clause for clause in scope.residual_clauses if clause in _input_strings(input_value)),
+            None,
+        )
+        if residual is not None:
+            findings.append(
+                Finding(
+                    detector="drift",
+                    fingerprint_seed={
+                        "clause": residual,
+                        "tool_name": event.payload.get("tool_name"),
+                        "paths": tuple(sorted(_semantic_path(p, declared_worktree=declared_worktree, cwd=cwd) for p in paths)),
+                        "command": _normalized_command_text(command),
+                    },
+                    event_refs=(event.event_id,),
+                    unmet_item=unmet,
+                    expected_next_progress="return to the enrolled scope and produce evidence toward the first unmet done-when item",
+                    detail=f"scoped work conflicts with the goal boundary clause {residual!r}",
+                )
+            )
+            continue
+        if cls in _WORK_CAPABLE_CLASSES and declared_root:
             outside_target = next(
-                (
-                    path
-                    for path in paths
-                    if not _contained_in_worktree(path, declared_worktree=declared_worktree, cwd=work_cwd)
-                ),
+                (p for p in paths if not _contained_in_worktree(p, declared_worktree=declared_worktree, cwd=cwd)),
                 None,
             )
-            outside_cwd = next(
-                (
-                    path
-                    for path in (cwd, input_cwd)
-                    if isinstance(path, str) and not _contained_in_worktree(path, declared_worktree=declared_worktree)
-                ),
-                None,
+            outside_cwd = (
+                cwd
+                if isinstance(cwd, str) and not _contained_in_worktree(cwd, declared_worktree=declared_worktree)
+                else None
             )
             if outside_target is not None or outside_cwd is not None:
                 outside = outside_target or outside_cwd or ""
-                outside_semantic = _semantic_path(outside, declared_worktree=declared_worktree, cwd=work_cwd)
                 findings.append(
                     Finding(
                         detector="drift",
                         fingerprint_seed={
-                            "wrong_worktree": outside_semantic,
-                            "declared_worktree": str(Path(declared_worktree).resolve(strict=False)),
+                            "wrong_worktree": _semantic_path(outside, declared_worktree=declared_worktree, cwd=cwd),
+                            "declared_worktree": declared_root,
                         },
                         event_refs=(event.event_id,),
                         unmet_item=unmet,
                         expected_next_progress="resume work inside the declared worktree",
-                        detail=f"{tool_name} targeted {outside!r} outside the declared worktree {declared_worktree!r}",
+                        detail=(
+                            f"{event.payload.get('tool_name')} targeted {outside!r} "
+                            f"outside the declared worktree {declared_worktree!r}"
+                        ),
                     )
                 )
+    for changed in dict.fromkeys(changed_files):
+        excluded = _denied_path_hit(changed, scope)
+        if excluded is not None:
+            findings.append(
+                Finding(
+                    detector="drift",
+                    fingerprint_seed={"diff_path": changed, "scope_term": excluded},
+                    event_refs=(),
+                    unmet_item=unmet,
+                    expected_next_progress="return to the enrolled scope and produce evidence toward the first unmet done-when item",
+                    detail=f"the worktree diff touches {changed!r}, excluded by the frozen scope term {excluded!r}",
+                )
+            )
+            continue
+        if _outside_allowed(changed, scope):
+            findings.append(
+                Finding(
+                    detector="drift",
+                    fingerprint_seed={"diff_path": changed, "outside_allowed": True},
+                    event_refs=(),
+                    unmet_item=unmet,
+                    expected_next_progress="return to the enrolled scope and produce evidence toward the first unmet done-when item",
+                    detail=f"the worktree diff touches {changed!r} outside the scope's allowed file set",
+                )
+            )
     return findings
 
 
@@ -306,22 +610,25 @@ def detect_unnecessary_steps(
     threshold: int = 2,
     enrolled_items: Sequence[object] = (),
 ) -> list[Finding]:
-    """Flag one normalized tool+target+result signature repeated without progress.
+    """Flag one normalized tool call repeated without progress.
 
-    The recurrence counter resets on any verified progress between repeats;
-    a changed result signature starts a new identity rather than extending
-    the old one. Two identical outcomes are the first evidence of a loop.
+    The repeat identity is the Cline-style signature — normalized tool name
+    plus normalized parameters — qualified by the result's coarse outcome
+    class, never by result bytes. The recurrence counter resets on verified
+    progress between repeats; a changed outcome class starts a new identity
+    rather than extending the old one. Two identical outcomes are the first
+    evidence of a loop.
     """
     findings: list[Finding] = []
     unmet = _first_unmet_item(enrolled_items)
     results = _joined_results(events)
     positions = {event.event_id: position for position, event in enumerate(events)}
-    seen: dict[str, list[tuple[int, str]]] = {}
+    seen: dict[tuple[str, str], list[tuple[int, str]]] = {}
     for position, event in enumerate(events):
         if event.normalized_type is not CanonicalType.TOOL_CALL:
             continue
         result = results.get(event.native_join_id or "")
-        signature = _result_signature(event, result)
+        signature = (call_signature(event), result_class(result))
         outcome_position = positions.get(result.event_id, position) if result is not None else position
         occurrences = seen.setdefault(signature, [])
         if _has_progress_at(events, progress_rows, outcome_position):
@@ -339,14 +646,15 @@ def detect_unnecessary_steps(
             occurrences.append((position, event.event_id))
             continue
         refs = tuple(entry[1] for entry in occurrences[-threshold:])
+        kind = action_kind(event)
         findings.append(
             Finding(
                 detector="unnecessary_steps",
                 fingerprint_seed={"signature": signature},
                 event_refs=refs,
                 unmet_item=unmet,
-                expected_next_progress="change approach so the repeated read produces new scoped state",
-                detail=f"identical tool, target, and result occurred {threshold} times with no intervening verified progress",
+                expected_next_progress=f"change approach so the repeated {kind} produces new scoped state",
+                detail=f"the identical normalized tool call repeated {threshold} times with no intervening verified progress",
             )
         )
         occurrences.clear()
@@ -361,29 +669,30 @@ def detect_excessive_testing(
     enrolled_items: Sequence[object] = (),
 ) -> list[Finding]:
     """Flag a check suite repeating with no artifact change, new failure
-    signature, or newly exercised required surface."""
+    signature, or newly exercised required surface.
+
+    The suite identity comes from the command actually run — ``pytest``,
+    ``uv run pytest``, ``npm test``, ``make check`` — parsed by
+    :func:`chitra.journal.tools.check_signature`, qualified by the result's
+    coarse outcome class so a flipped result starts a new streak.
+    """
     findings: list[Finding] = []
     unmet = _first_unmet_item(enrolled_items)
     results = _joined_results(events)
     positions = {event.event_id: position for position, event in enumerate(events)}
-    runs: list[tuple[int, str, CanonicalEvent]] = []
+    runs: list[tuple[int, tuple[tuple[str, tuple[str, ...]], str], CanonicalEvent]] = []
     for position, event in enumerate(events):
         if event.normalized_type is not CanonicalType.TOOL_CALL:
             continue
-        input_value = event.payload.get("input")
-        text = ""
-        if isinstance(input_value, str):
-            text = input_value
-        elif isinstance(input_value, dict):
-            text = " ".join(value for value in input_value.values() if isinstance(value, str))
-        if _is_check_invocation(text):
+        check = check_signature(event)
+        if check is not None:
             result = results.get(event.native_join_id or "")
-            signature = _result_signature(event, result)
+            signature = (check, result_class(result))
             outcome_position = positions.get(result.event_id, position) if result is not None else position
             if _has_progress_at(events, progress_rows, outcome_position):
                 continue
             runs.append((outcome_position, signature, event))
-    streak: list[tuple[int, str, CanonicalEvent]] = []
+    streak: list[tuple[int, tuple[tuple[str, tuple[str, ...]], str], CanonicalEvent]] = []
     for run in runs:
         if streak and streak[-1][1] == run[1] and not _has_progress_between(events, progress_rows, streak[-1][0], run[0]):
             streak.append(run)
@@ -412,10 +721,15 @@ def detect_excessive_testing(
     return findings
 
 
-def _is_check_invocation(text: str) -> bool:
-    lowered = text.lower()
-    tokens = ("pytest", "ruff", "mypy", "tox", "unittest", "npm test", "cargo test", "go test")
-    return any(token in lowered for token in tokens)
+def _write_targets(event: CanonicalEvent) -> tuple[str, ...]:
+    """Paths a call actually writes: explicit targets for write tools,
+    redirect/exec targets for shell commands."""
+    cls = tool_class(event.payload.get("tool_name"))
+    if cls == "write":
+        return target_paths(event)
+    if cls in {"shell", "other"}:
+        return shell_write_targets(event)
+    return ()
 
 
 def detect_document_dithering(
@@ -426,7 +740,13 @@ def detect_document_dithering(
     enrolled_items: Sequence[object] = (),
 ) -> list[Finding]:
     """For a non-document goal, flag recurring document edits while required
-    implementation items gain no evidence. Disabled entirely for doc goals."""
+    implementation items gain no evidence. Disabled entirely for doc goals.
+
+    A document churn event is any write-class call whose targets are all
+    prose files — Edit on ``notes.md``, or ``apply_patch``/redirects hitting
+    only docs. Validation runs and code-path writes are implementation
+    evidence and reset the dithering case.
+    """
     if goal_is_document:
         return []
     unmet = _first_unmet_item(enrolled_items)
@@ -435,28 +755,20 @@ def detect_document_dithering(
     for event in events:
         if event.normalized_type is not CanonicalType.TOOL_CALL:
             continue
-        tool_name = event.payload.get("tool_name")
-        input_value = event.payload.get("input")
-        text = input_value if isinstance(input_value, str) else ""
-        paths = _target_paths(input_value)
-        targets_docs = bool(paths) and isinstance(tool_name, str) and tool_name in _DOC_TOOLS and all(
-            path.lower().endswith(tuple(_DOC_SUFFIXES)) for path in paths
-        )
-        if targets_docs:
+        cls = tool_class(event.payload.get("tool_name"))
+        if cls not in _WORK_CAPABLE_CLASSES:
+            continue
+        targets = _write_targets(event)
+        if targets and all(path.lower().endswith(tuple(_DOC_SUFFIXES)) for path in targets):
             doc_events.append(event)
-        elif _looks_like_implementation(text):
+            continue
+        if any(path.lower().endswith(tuple(_CODE_SUFFIXES)) for path in targets) or check_signature(event) is not None:
             implementation_evidence = True
     if implementation_evidence or len(doc_events) < minimum_recurrence:
         return []
     refs = tuple(event.event_id for event in doc_events[:minimum_recurrence])
     semantic_targets = tuple(
-        sorted(
-            {
-                path.lower()
-                for event in doc_events[:minimum_recurrence]
-                for path in _target_paths(event.payload.get("input"))
-            }
-        )
+        sorted({path.lower() for event in doc_events[:minimum_recurrence] for path in _write_targets(event)})
     )
     return [
         Finding(
@@ -472,14 +784,51 @@ def detect_document_dithering(
     ]
 
 
-def _looks_like_path(value: str) -> bool:
-    return "/" in value or value.endswith(tuple(_DOC_SUFFIXES | _CODE_SUFFIXES))
+def detect_stall(
+    events: Sequence[CanonicalEvent],
+    *,
+    minimum_turns: int = 2,
+    enrolled_items: Sequence[object] = (),
+) -> list[Finding]:
+    """Flag consecutive turn-ends that produced narration without action.
 
-
-def _looks_like_implementation(text: str) -> bool:
-    lowered = text.lower()
-    markers = ("def ", "class ", "function ", "impl ", "fix ", "refactor", "src/", "import ")
-    return any(marker in lowered for marker in markers)
+    The codexmon distinction: a lane with a tool call still in flight is
+    mid-command, not idle, so any unanswered tail call suppresses the
+    finding. A lane whose last ``minimum_turns`` completed turns emitted
+    only final-response text — no tool call, no result — is stalling.
+    Completion claims and questions are left to the detectors and handlers
+    that own them.
+    """
+    if unanswered_tail_calls(events):
+        return []
+    trailing: list[CanonicalEvent] = []
+    for event in reversed(events):
+        if event.normalized_type in {
+            CanonicalType.TOOL_CALL,
+            CanonicalType.TOOL_RESULT,
+            CanonicalType.TOOL_ERROR,
+        }:
+            break
+        if event.normalized_type is CanonicalType.FINAL_RESPONSE:
+            trailing.append(event)
+    if len(trailing) < minimum_turns:
+        return []
+    latest_text = trailing[0].payload.get("text")
+    if isinstance(latest_text, str) and (is_completion_claim(latest_text) or "?" in latest_text):
+        return []
+    return [
+        Finding(
+            detector="stall",
+            fingerprint_seed={"streak_anchor": trailing[-1].event_id},
+            event_refs=tuple(event.event_id for event in reversed(trailing)),
+            unmet_item=_first_unmet_item(enrolled_items),
+            expected_next_progress="take the next in-scope tool action or answer the pending question instead of narrating",
+            detail=(
+                f"the last {len(trailing)} completed turns produced narration "
+                "with no tool call, result, or in-flight command"
+            ),
+        )
+    ]
 
 
 def detect_false_done(
@@ -516,7 +865,7 @@ def detect_false_done(
             )
         ]
     final_text = _final_response_text(final_response)
-    if not _makes_completion_claim(final_text):
+    if not is_completion_claim(final_text):
         return []
     root: Path | None = None
     root_available = False
@@ -624,10 +973,6 @@ def _final_response_text(event: CanonicalEvent) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _makes_completion_claim(text: str) -> bool:
-    return bool(_COMPLETION_CLAIM_RE.search(text)) and not _NEGATED_COMPLETION_RE.search(text)
-
-
 __all__ = [
     "DETECTOR_VERSION",
     "Finding",
@@ -635,5 +980,6 @@ __all__ = [
     "detect_drift",
     "detect_excessive_testing",
     "detect_false_done",
+    "detect_stall",
     "detect_unnecessary_steps",
 ]

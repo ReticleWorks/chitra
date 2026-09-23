@@ -999,6 +999,44 @@ def worktree_git_digest(workdir: Path) -> str | None:
     return digest.hexdigest()
 
 
+def worktree_changed_files(workdir: Path) -> tuple[str, ...] | None:
+    """Return the worktree-relative paths the real diff touches.
+
+    ``git diff HEAD --name-only`` covers modified, staged, and deleted
+    tracked files; ``git ls-files --others`` adds untracked ones. ``None``
+    means the directory is not an inspectable worktree, so callers treat
+    the diff as unknown rather than empty.
+    """
+
+    def _git(*args: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(workdir), *args],
+                check=False,
+                capture_output=True,
+                timeout=30.0,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout.decode("utf-8", "surrogateescape")
+
+    head = _git("rev-parse", "--verify", "HEAD")
+    tracked = _git("diff", "HEAD", "--name-only", "--diff-filter=ACDMRT", "-z")
+    staged_new = _git("diff", "--cached", "--name-only", "--diff-filter=ACDMRT", "-z")
+    untracked = _git("ls-files", "--others", "--exclude-standard", "-z")
+    if head is None or tracked is None or staged_new is None or untracked is None:
+        return None
+    files = {
+        path
+        for listing in (tracked, staged_new, untracked)
+        for path in listing.split("\0")
+        if path
+    }
+    return tuple(sorted(files))
+
+
 def recorded_result_lane(root: Path | None, session_ref: str) -> LaneSpec | None:
     """Return the goal lane's spec only while it provably runs as another OS user.
 

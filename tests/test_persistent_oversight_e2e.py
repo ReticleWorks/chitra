@@ -217,7 +217,9 @@ def test_lane_rebinding_filters_prior_transcript_events(
     )
     observed: list[tuple[str, ...]] = []
 
-    def capture(_config: object, _lane: str, _goal: object, events: tuple[CanonicalEvent, ...]) -> list[Finding]:
+    def capture(
+        _config: object, _lane: str, _goal: object, events: tuple[CanonicalEvent, ...], **_kwargs: object
+    ) -> list[Finding]:
         observed.append(tuple(event.session_id for event in events))
         return []
 
@@ -249,7 +251,9 @@ def test_same_path_native_session_replacement_filters_old_events(
     )
     observed: list[tuple[str, ...]] = []
 
-    def capture(_config: object, _lane: str, _goal: object, events: tuple[CanonicalEvent, ...]) -> list[Finding]:
+    def capture(
+        _config: object, _lane: str, _goal: object, events: tuple[CanonicalEvent, ...], **_kwargs: object
+    ) -> list[Finding]:
         observed.append(tuple(event.session_id for event in events))
         return []
 

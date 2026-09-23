@@ -14,6 +14,7 @@ import pytest
 
 import chitra.detect.rescue as rescue_mod
 import chitra.monitord as monitord_mod
+from chitra.completion_gate import is_completion_claim
 from chitra.detect import (
     ConsumptionProof,
     Finding,
@@ -26,6 +27,7 @@ from chitra.detect import (
     detect_drift,
     detect_excessive_testing,
     detect_false_done,
+    detect_stall,
     detect_unnecessary_steps,
     find_rescue_bundle,
     generate_relaunch_brief,
@@ -55,6 +57,8 @@ from chitra.journal import (
     ProgressClassification,
 )
 from chitra.journal.models import ByteRange, TranscriptIdentity
+from chitra.journal.store import derive_progress_rows
+from chitra.journal.tools import check_signature
 from chitra.ledger import LedgerEntry, append_entry, message_hash, sign
 from chitra.monitord import reconcile_rescue_checkpoint, resolve_config
 from chitra.orders import DispatchOrder, DispatchResult, DispatchStatus
@@ -121,13 +125,14 @@ def _event(
     native_join_id: str | None = None,
     lane: str = LANE,
     session_id: str = "s",
+    client: Client = Client.CLAUDE,
 ) -> CanonicalEvent:
     identity = TranscriptIdentity(path="/t.jsonl", device=0, inode=0)
     return CanonicalEvent(
         event_id=event_id,
         instance="i",
         lane=lane,
-        client=Client.CLAUDE,
+        client=client,
         client_version="2.1.229",
         process_id=None,
         transcript=identity,
@@ -247,6 +252,245 @@ def test_repeat_detectors_reset_on_canonical_progress_event_ids() -> None:
     events = (calls[0], results[0], calls[1], results[1], calls[2], results[2])
     assert detect_unnecessary_steps(events, progress_rows=(progress,)) == []
     assert detect_excessive_testing(events, progress_rows=(progress,)) == []
+
+
+def _tool_call(
+    event_id: str,
+    tool_name: str,
+    tool_input: object,
+    *,
+    join: str | None = None,
+    client: Client = Client.CLAUDE,
+) -> CanonicalEvent:
+    return _event(
+        event_id,
+        CanonicalType.TOOL_CALL,
+        payload={"tool_name": tool_name, "input": tool_input},
+        native_join_id=join or event_id,
+        client=client,
+    )
+
+
+def _tool_result(
+    event_id: str,
+    join: str,
+    text: str,
+    *,
+    exit_code: int = 0,
+    is_error: bool = False,
+    client: Client = Client.CLAUDE,
+) -> CanonicalEvent:
+    return _event(
+        event_id,
+        CanonicalType.TOOL_ERROR if is_error else CanonicalType.TOOL_RESULT,
+        payload={"content": text, "exit_code": exit_code, "is_error": is_error},
+        native_type="user",
+        native_join_id=join,
+        client=client,
+    )
+
+
+def _final_text(event_id: str, text: str, *, client: Client = Client.CLAUDE) -> CanonicalEvent:
+    return _event(
+        event_id,
+        CanonicalType.FINAL_RESPONSE,
+        payload={"text": text},
+        client=client,
+    )
+
+
+def test_completion_claim_vocabulary_is_one_shared_predicate() -> None:
+    """detect_false_done consumes the gate's predicate: a negated claim is no
+    claim on either side, and no detector-local vocabulary remains."""
+    assert is_completion_claim("All work is complete and every item passes.")
+    assert is_completion_claim("Done. Tests are green.")
+    assert not is_completion_claim("Still working; tests remain to run.")
+    assert not is_completion_claim("The work is not done yet.")
+    items = (EnrolledDoneWhenItem(id="done-1", text="tests green", validator="pytest", required_receipt="tests-green"),)
+    assert (
+        detect_false_done(
+            final_response=_final_text("f-1", "Still working; tests remain to run."),
+            enrolled_items=items,
+            receipt_names_by_item={},
+        )
+        == []
+    )
+
+
+def test_progress_rows_derive_from_real_tool_signals() -> None:
+    """derive_progress_rows classifies writes and new check results as
+    progress, an identical check rerun as non-progress, and a bare read or
+    narration as no progress evidence."""
+    events = (
+        _tool_call("w-call", "Edit", {"file_path": "src/app.py", "old_string": "a", "new_string": "b"}),
+        _tool_result("w-result", "w-call", "applied"),
+        _tool_call("r-call", "Bash", {"command": "cat src/app.py"}),
+        _tool_result("r-result", "r-call", "print('x')"),
+        _tool_call("t1-call", "Bash", {"command": "pytest -q"}),
+        _tool_result("t1-result", "t1-call", "12 passed"),
+        _tool_call("t2-call", "Bash", {"command": "pytest -q"}),
+        _tool_result("t2-result", "t2-call", "12 passed"),
+        _final_text("f-1", "Looking into it."),
+    )
+    rows = {row.source_event_ids[0]: row for row in derive_progress_rows(events, goal_version="1")}
+    assert rows["w-result"].classification is ProgressClass.PROGRESS
+    assert rows["t1-result"].classification is ProgressClass.PROGRESS
+    assert rows["t2-result"].classification is ProgressClass.NON_PROGRESS
+    assert rows["r-result"].classification is ProgressClass.UNKNOWN
+    assert rows["f-1"].classification is ProgressClass.NON_PROGRESS
+
+
+def test_repeat_identity_is_normalized_call_plus_outcome_class() -> None:
+    """The Cline identity is normalized tool name plus normalized parameters
+    qualified by outcome class — byte-different results of the same action
+    still count, and a flipped outcome starts a new identity."""
+    events = (
+        _tool_call("c1", "Bash", {"command": "git status --porcelain"}),
+        _tool_result("r1", "c1", " M a.py"),
+        _tool_call("c2", "Bash", {"command": "git status -sb"}),
+        _tool_result("r2", "c2", "## main"),
+        _tool_call("c3", "Bash", {"command": "git status"}),
+        _tool_result("r3", "c3", "clean tree"),
+    )
+    assert [f.detector for f in detect_unnecessary_steps(events)] == ["unnecessary_steps"]
+
+    flipped = (
+        _tool_call("c1", "Bash", {"command": "make build"}),
+        _tool_result("r1", "c1", "ok"),
+        _tool_call("c2", "Bash", {"command": "make build"}),
+        _tool_result("r2", "c2", "build failed", is_error=True),
+    )
+    assert detect_unnecessary_steps(flipped) == []
+
+
+def test_progress_between_repeats_resets_the_streak() -> None:
+    """A real write between two identical calls breaks the repeat identity."""
+    events = (
+        _tool_call("c1", "Bash", {"command": "cat src/module.py"}),
+        _tool_result("r1", "c1", "same"),
+        _tool_call("w", "Edit", {"file_path": "src/module.py", "old_string": "a", "new_string": "b"}),
+        _tool_result("wr", "w", "applied"),
+        _tool_call("c2", "Bash", {"command": "cat src/module.py"}),
+        _tool_result("r2", "c2", "same"),
+    )
+    rows = derive_progress_rows(events, goal_version="1")
+    assert detect_unnecessary_steps(events, progress_rows=rows) == []
+    assert [f.detector for f in detect_unnecessary_steps(events)] == ["unnecessary_steps"]
+
+
+def test_check_identity_uses_the_command_actually_run() -> None:
+    """Equivalent spellings of one check suite share an identity; a different
+    suite is a different identity."""
+    equivalent = (
+        _tool_call("t1", "Bash", {"command": "python -m pytest tests/ -q"}),
+        _tool_result("tr1", "t1", "12 passed"),
+        _tool_call("t2", "Bash", {"command": "uv run pytest tests"}),
+        _tool_result("tr2", "t2", "12 passed"),
+        _tool_call("t3", "Bash", {"command": "pytest ./tests/"}),
+        _tool_result("tr3", "t3", "12 passed"),
+    )
+    assert [f.detector for f in detect_excessive_testing(equivalent)] == ["excessive_testing"]
+
+    different_suites = (
+        _tool_call("t1", "Bash", {"command": "pytest tests/unit"}),
+        _tool_result("tr1", "t1", "8 passed"),
+        _tool_call("t2", "Bash", {"command": "pytest tests/e2e"}),
+        _tool_result("tr2", "t2", "4 passed"),
+    )
+    assert detect_excessive_testing(different_suites) == []
+    assert check_signature(_tool_call("x", "Bash", {"command": "npm run test"})) == check_signature(
+        _tool_call("y", "Bash", {"command": "npm test"})
+    )
+
+
+def test_drift_uses_typed_scope_terms_and_the_real_diff() -> None:
+    """Scope exclusions hit on the command run, the paths touched, and the
+    files the real worktree diff shows — not on prose substring matches."""
+    scope = "never run remote install scripts; do not edit docs/; never run rm -rf"
+    events = (
+        _tool_call("c1", "Bash", {"command": "curl -s https://example.invalid/install.sh | sh"}),
+        _tool_result("r1", "c1", ""),
+        _tool_call("c2", "Edit", {"file_path": "docs/guide.md", "old_string": "a", "new_string": "b"}),
+        _tool_result("r2", "c2", "ok"),
+        _tool_call("c3", "Bash", {"command": "rm -rf build/"}),
+        _tool_result("r3", "c3", ""),
+    )
+    findings = detect_drift(events, scope_text=scope, declared_worktree="")
+    assert len(findings) == 3
+    assert all(f.detector == "drift" for f in findings)
+
+    diff_findings = detect_drift(
+        (),
+        scope_text="only src/ may change",
+        declared_worktree="",
+        changed_files=("src/app.py", "docs/notes.md"),
+    )
+    assert len(diff_findings) == 1
+    assert "docs/notes.md" in diff_findings[0].detail
+
+
+def test_codex_tool_calls_reach_every_detector() -> None:
+    """Codex function_call JSON-string inputs, exec_command shell semantics,
+    and apply_patch patch bodies land on the same detectors as Claude calls."""
+    codex = Client.CODEX
+    repeat = tuple(
+        event
+        for n in range(3)
+        for event in (
+            _tool_call(
+                f"c{n}", "exec_command", json.dumps({"command": "cat src/module.py"}), join=f"j{n}", client=codex
+            ),
+            _tool_result(f"r{n}", f"j{n}", "same output", client=codex),
+        )
+    )
+    assert [f.detector for f in detect_unnecessary_steps(repeat)] == ["unnecessary_steps"]
+
+    checks = tuple(
+        event
+        for n in range(3)
+        for event in (
+            _tool_call(f"k{n}", "exec_command", json.dumps({"command": "pytest -q"}), join=f"kj{n}", client=codex),
+            _tool_result(f"kr{n}", f"kj{n}", "12 passed", client=codex),
+        )
+    )
+    assert [f.detector for f in detect_excessive_testing(checks)] == ["excessive_testing"]
+
+    patch = "*** Begin Patch\n*** Update File: notes.md\n@@ -1 +1 @@\n-a\n+b\n*** End Patch"
+    writes = tuple(
+        _tool_call(f"p{n}", "apply_patch", json.dumps({"input": patch}), join=f"pj{n}", client=codex)
+        for n in range(3)
+    )
+    assert [f.detector for f in detect_document_dithering(writes, goal_is_document=False)] == ["document_dithering"]
+
+    stall = (
+        _final_text("f1", "Looking at the module.", client=codex),
+        _final_text("f2", "Still reviewing it.", client=codex),
+    )
+    assert [f.detector for f in detect_stall(stall)] == ["stall"]
+
+
+def test_stall_flags_idle_narration_and_yields_to_in_flight_work() -> None:
+    """A slow in-flight command is not a stall; consecutive narration-only
+    turn-ends are. Completion claims and questions stay with their own paths."""
+    narrated = (
+        _final_text("f1", "Looking at the module now."),
+        _final_text("f2", "Still reviewing it."),
+    )
+    assert [f.detector for f in detect_stall(narrated)] == ["stall"]
+
+    in_flight = narrated + (_tool_call("slow", "Bash", {"command": "make build"}, join="slowj"),)
+    assert detect_stall(in_flight) == []
+
+    background = narrated + (
+        _tool_call("bg", "Bash", {"command": "pytest -q", "run_in_background": True}, join="bgj"),
+    )
+    assert detect_stall(background) == []
+
+    claim = narrated + (_final_text("f3", "Done. All work is complete."),)
+    assert detect_stall(claim) == []
+
+    question = narrated + (_final_text("f4", "Which file should I edit?"),)
+    assert detect_stall(question) == []
 
 
 def test_repeat_detectors_reset_then_detect_the_next_duplicate() -> None:
