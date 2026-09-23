@@ -934,6 +934,24 @@ def _completion_case(tmp_path: Path, *, session_ref: str = "host:alpha:0.0") -> 
     return state, bindings_path, queue, goal, transcript
 
 
+def _settle_claim(config: object, state: Path, session_ref: str, status: str, *, max_passes: int = 12) -> GoalRecord:
+    """Drive monitor passes until the worker pool drains and the goal reaches
+    ``status``.
+
+    A claim now settles over several passes — validators, receipt
+    verification, the isolated review, and the gate close each run on the
+    worker pool and are consumed by later passes.
+    """
+    stored: GoalRecord | None = None
+    for _ in range(max_passes):
+        monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+        run_once(config)  # type: ignore[arg-type]
+        stored = get_goal(state, session_ref)
+        if stored is not None and stored.status == status:
+            return stored
+    raise AssertionError(f"goal {session_ref} never reached {status!r} (last: {stored.status if stored else None!r})")
+
+
 def test_monitor_does_not_run_enrolled_validators_without_a_completion_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1007,12 +1025,13 @@ def test_passing_validator_and_structured_claim_mark_goal_verified_and_supervisi
     # The completion path gates on the isolated reviewer now; stub the process
     # boundary so the acceptance check stays credential-free.
     monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
-    summary = run_once(_live_config(state, bindings_path, queue))
+    config = _live_config(state, bindings_path, queue)
+    summary = run_once(config)
 
     assert summary["completion_disputed"] is False
-    stored = get_goal(state, goal.session_ref)
-    assert stored is not None
-    assert stored.status == "done-pending-close"
+    # The isolated review runs on the worker pool, so the verdict lands on a
+    # later pass.
+    stored = _settle_claim(config, state, goal.session_ref, "done-pending-close")
     assert stored.completion_proofs
     supervision = SupervisionLedger(state, goal.lane_id).latest()
     assert supervision is not None
@@ -1040,13 +1059,12 @@ def test_passing_validator_and_plain_claim_mark_goal_verified_and_supervision_co
     # The completion path gates on the isolated reviewer now; stub the process
     # boundary so the acceptance check stays credential-free.
     monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
-    summary = run_once(_live_config(state, bindings_path, queue))
+    config = _live_config(state, bindings_path, queue)
+    summary = run_once(config)
 
     assert summary["completion_disputed"] is False
     assert summary["validator_receipts_recorded"] == 1
-    stored = get_goal(state, goal.session_ref)
-    assert stored is not None
-    assert stored.status == "done-pending-close"
+    _settle_claim(config, state, goal.session_ref, "done-pending-close")
     supervision = SupervisionLedger(state, goal.lane_id).latest()
     assert supervision is not None
     assert supervision.state == "completion_verified"
@@ -1174,6 +1192,74 @@ def test_slow_enrolled_validator_does_not_stall_the_monitor_pass(
     assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
 
 
+def test_slow_isolated_review_does_not_stall_the_monitor_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A five-second ``claude -p`` reviewer must finish far outside the pass."""
+    state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
+    ingest_passing_receipt(state, goal.session_ref)
+    _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
+    monkeypatch.setattr(
+        monitord_mod,
+        "record_enrolled_validator_runs",
+        lambda *_args, **_kwargs: (passing_completion_evidence(),),
+    )
+
+    class _SlowAccepting(_AcceptingReviewer):
+        def review(self, goal: object, behavior: object, reviewer_id: str) -> ReviewerVerdict:
+            time.sleep(5)
+            return super().review(goal, behavior, reviewer_id)
+
+    monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _SlowAccepting)
+    config = _live_config(state, bindings_path, queue)
+
+    started = time.monotonic()
+    run_once(config)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    stored = get_goal(state, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "working"
+
+    _settle_claim(config, state, goal.session_ref, "done-pending-close")
+
+
+def test_slow_receipt_verification_does_not_stall_the_monitor_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The git-digest and hashing verification stage must run on the pool."""
+    state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
+    _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=_init_lane_worktree(tmp_path / "lane-worktree"))
+    monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
+    _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
+    config = _live_config(state, bindings_path, queue)
+
+    real_verify = monitord_mod.run_receipt_verification_on_worker
+
+    def slow_verify(*args: object, **kwargs: object) -> None:
+        time.sleep(5)
+        real_verify(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(monitord_mod, "run_receipt_verification_on_worker", slow_verify)
+
+    run_once(config)
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+
+    started = time.monotonic()
+    run_once(config)  # queues the sleeping verification worker
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    stored = get_goal(state, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "working"
+
+    _settle_claim(config, state, goal.session_ref, "done-pending-close")
+
+
 def test_goal_status_stays_unchanged_until_the_worker_result_lands(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1191,19 +1277,16 @@ def test_goal_status_stays_unchanged_until_the_worker_result_lands(
     assert stored is not None
     assert stored.status == "working"
 
-    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
-    run_once(_live_config(state, bindings_path, queue))
-
-    stored = get_goal(state, goal.session_ref)
-    assert stored is not None
-    assert stored.status == "done-pending-close"
+    stored = _settle_claim(
+        _live_config(state, bindings_path, queue), state, goal.session_ref, "done-pending-close"
+    )
 
 
 def test_same_user_lane_keeps_the_synchronous_second_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A lane sharing Chitra's OS user could forge a record, so it stays inline."""
+    """A lane sharing Chitra's OS user could forge a record, so validators stay inline."""
     state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
     workdir = _init_lane_worktree(tmp_path / "lane-worktree")
     manifest = _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=workdir)
@@ -1214,14 +1297,14 @@ def test_same_user_lane_keeps_the_synchronous_second_run(
     manifest.write_text(json.dumps(payload), encoding="utf-8")
     monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
     _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
+    config = _live_config(state, bindings_path, queue)
 
-    summary = run_once(_live_config(state, bindings_path, queue))
+    summary = run_once(config)
 
-    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=0)
+    # The validators ran inline on this pass (recorded == 1); the isolated
+    # review is the piece that went to the pool for every lane.
     assert summary["validator_receipts_recorded"] == 1
-    stored = get_goal(state, goal.session_ref)
-    assert stored is not None
-    assert stored.status == "done-pending-close"
+    _settle_claim(config, state, goal.session_ref, "done-pending-close")
 
 
 def test_gate_waits_for_an_in_flight_run_even_when_records_look_fresh(
@@ -1243,7 +1326,9 @@ def test_gate_waits_for_an_in_flight_run_even_when_records_look_fresh(
     def still_running() -> None:
         release.wait(15)
 
-    monitord_mod._VALIDATOR_RUN_POOL.submit(f"{state}:{goal.lane_id}", still_running)
+    # Occupy the lane's verification slot: the gate must not read records a
+    # running worker could still be rewriting.
+    monitord_mod._VALIDATOR_RUN_POOL.submit(f"{state}:{goal.lane_id}:verify", still_running)
     try:
         run_once(config)
         stored = get_goal(state, goal.session_ref)
@@ -1253,10 +1338,7 @@ def test_gate_waits_for_an_in_flight_run_even_when_records_look_fresh(
         release.set()
     assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
 
-    run_once(config)
-    stored = get_goal(state, goal.session_ref)
-    assert stored is not None
-    assert stored.status == "done-pending-close"
+    _settle_claim(config, state, goal.session_ref, "done-pending-close")
 
 
 def test_validator_that_writes_into_its_tree_falls_back_instead_of_requeueing_forever(
@@ -1282,11 +1364,7 @@ def test_validator_that_writes_into_its_tree_falls_back_instead_of_requeueing_fo
         assert stored is not None
         assert stored.status == "working"
 
-    run_once(config)
-
-    stored = get_goal(state, goal.session_ref)
-    assert stored is not None
-    assert stored.status == "done-pending-close"
+    _settle_claim(config, state, goal.session_ref, "done-pending-close")
 
 
 def test_tree_change_after_validation_requeues_instead_of_passing(
@@ -1304,15 +1382,11 @@ def test_tree_change_after_validation_requeues_instead_of_passing(
     assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
 
     (workdir / "lane-edit.txt").write_text("edited after the validator ran\n", encoding="utf-8")
-    run_once(_live_config(state, bindings_path, queue))
+    config = _live_config(state, bindings_path, queue)
+    run_once(config)
 
     stored = get_goal(state, goal.session_ref)
     assert stored is not None
     assert stored.status == "working"
 
-    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
-    run_once(_live_config(state, bindings_path, queue))
-
-    stored = get_goal(state, goal.session_ref)
-    assert stored is not None
-    assert stored.status == "done-pending-close"
+    _settle_claim(config, state, goal.session_ref, "done-pending-close")

@@ -1696,8 +1696,14 @@ def test_rescue_reconcile_collects_while_alive_seals_after_consumption_then_rela
     config = resolve_config(state_dir=tmp_path)
     _patch_live_lane(monkeypatch, pid=os.getpid(), worktree=worktree)
 
-    # Phase 1: the bundle is captured while the process is alive. Consumption
-    # is not proven yet, so nothing seals.
+    # Phase 1: the bundle is captured while the process is alive. Capture
+    # runs on the worker pool, so the first reconcile queues it and the
+    # second consumes the landed bundle file. Consumption is not proven
+    # yet, so nothing seals.
+    reconcile_rescue_checkpoint(
+        config, lane=LANE, goal=goal, track_id=track_id, transcript_path=transcript
+    )
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
     reconcile_rescue_checkpoint(
         config, lane=LANE, goal=goal, track_id=track_id, transcript_path=transcript
     )

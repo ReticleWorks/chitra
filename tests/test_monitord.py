@@ -14,6 +14,7 @@ from _goal_fixtures import enrollment_fields, ingest_passing_receipt, passing_co
 from structlog.testing import capture_logs
 
 import chitra.monitord as monitord_mod
+import chitra.run_pool as run_pool_mod
 from chitra.completion_gate import CompletionEvidence
 from chitra.decisions import DecisionEntry, append_decision
 from chitra.goals import EnrolledDoneWhenItem, GoalRecord, GoalsSchemaNewerError, GoalStatus, get_goal, upsert_goal
@@ -377,9 +378,18 @@ def test_check_enrollment_accepts_a_plain_claim_when_the_validator_passes(
     final_response = _event("completion-plain", CanonicalType.FINAL_RESPONSE).model_copy(
         update={"payload": {"text": "Done. The digest file exists and is verified."}}
     )
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+
+    # The isolated review runs on the worker pool: the first pass queues it
+    # and reports pending, a later pass consumes the durable signal.
+    recorded, disputed, findings, pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=_StubReviewer("accept")
+    )
+    assert (recorded, disputed, findings, pending) == (1, False, [], True)
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
 
     recorded, disputed, findings, pending = check_enrollment_and_receipts(
-        resolve_config(state_dir=tmp_path, shadow_mode=False),
+        config,
         "session-1",
         final_response,
         reviewer=_StubReviewer("accept"),
@@ -513,6 +523,14 @@ def test_completion_claim_reaches_the_isolated_reviewer_and_applies_rejection(
     reviewer = _StubReviewer("reject")
     config = resolve_config(state_dir=tmp_path, shadow_mode=False)
 
+    # First pass queues the isolated review on the worker pool; its durable
+    # signal is what a later pass consumes.
+    _recorded, disputed, _findings, pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=reviewer
+    )
+    assert pending is True
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+
     _recorded, disputed, findings, _pending = check_enrollment_and_receipts(
         config, "session-1", final_response, reviewer=reviewer
     )
@@ -541,9 +559,16 @@ def test_completion_claim_the_isolated_reviewer_accepts_is_verified(
 ) -> None:
     final_response = _verified_claim_setup(tmp_path, monkeypatch)
     reviewer = _StubReviewer("accept")
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+
+    _recorded, disputed, _findings, pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=reviewer
+    )
+    assert pending is True
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
 
     _recorded, disputed, findings, _pending = check_enrollment_and_receipts(
-        resolve_config(state_dir=tmp_path, shadow_mode=False), "session-1", final_response, reviewer=reviewer
+        config, "session-1", final_response, reviewer=reviewer
     )
 
     assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
@@ -577,6 +602,12 @@ def test_insufficient_review_holds_the_claim_until_lane_work_finishes(
     result = check_enrollment_and_receipts(
         config, "session-1", final_response, reviewer=undecided, still_running=running
     )
+    assert result[1:] == (False, [], True)
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+
+    result = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=undecided, still_running=running
+    )
 
     assert result[1:] == (False, [], True)
     assert undecided.still_running == [running, running]
@@ -585,8 +616,14 @@ def test_insufficient_review_holds_the_claim_until_lane_work_finishes(
     assert stored.status == "working"
 
     # Once the lane work finishes, the stored "insufficient" signal no longer
-    # holds and the same claim is judged afresh.
+    # holds and the same claim is judged afresh — again on the worker pool.
     accepting = _RecordingReviewer("accept")
+    _recorded, disputed, findings, pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=accepting
+    )
+    assert (disputed, findings, pending) == (False, [], True)
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+
     _recorded, disputed, findings, pending = check_enrollment_and_receipts(
         config, "session-1", final_response, reviewer=accepting
     )
@@ -620,7 +657,7 @@ def test_lane_work_in_flight_names_only_unanswered_background_calls(tmp_path: Pa
 
 
 def test_validator_pool_accepts_work_after_shutdown() -> None:
-    pool = monitord_mod._ValidatorRunPool(max_workers=1)
+    pool = run_pool_mod.RunPool(max_workers=1)
     pool.shutdown()
     ran: list[str] = []
 
@@ -782,3 +819,32 @@ def test_bad_binding_skips_its_lane_and_other_lanes_still_ingest(tmp_path: Path)
 
     assert observed and {event.lane for event in observed} == {"lane-ok"}
     assert any(entry["event"] == "monitord_binding_ingest_failed" and entry["lane"] == "lane-bad" for entry in logs)
+
+
+def test_run_forever_wakes_when_a_worker_completes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import threading
+    import time
+
+    passes = 0
+
+    def _counting_pass(_config: MonitordConfig) -> dict[str, int]:
+        nonlocal passes
+        passes += 1
+        if passes == 1:
+            # A worker landing during the sleep must wake the loop, not wait
+            # out the poll interval.
+            monitord_mod._VALIDATOR_RUN_POOL.submit(f"{tmp_path}:wake-test", lambda: None)
+        return {}
+
+    monkeypatch.setattr(monitord_mod, "run_once", _counting_pass)
+    monkeypatch.setattr(monitord_mod, "notify_ready", lambda: None)
+    monkeypatch.setattr(monitord_mod, "notify_watchdog", lambda: None)
+
+    stop = threading.Event()
+    threading.Timer(3.0, stop.set).start()
+    started = time.monotonic()
+    monitord_mod.run_forever(replace(_config(tmp_path), poll_seconds=30.0), stop_event=stop)
+    elapsed = time.monotonic() - started
+
+    assert passes >= 2
+    assert elapsed < 10.0
