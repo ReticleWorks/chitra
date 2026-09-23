@@ -1181,6 +1181,7 @@ def test_goal_status_stays_unchanged_until_the_worker_result_lands(
     state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
     _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=_init_lane_worktree(tmp_path / "lane-worktree"))
     _slow_validator_registry(tmp_path, monkeypatch, seconds=5)
+    monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
     _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
 
     run_once(_live_config(state, bindings_path, queue))
@@ -1210,6 +1211,7 @@ def test_same_user_lane_keeps_the_synchronous_second_run(
     assert isinstance(lanes, list)
     lanes[0]["uid"] = os.geteuid()
     manifest.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
     _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
 
     summary = run_once(_live_config(state, bindings_path, queue))
@@ -1229,6 +1231,7 @@ def test_tree_change_after_validation_requeues_instead_of_passing(
     state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
     workdir = _init_lane_worktree(tmp_path / "lane-worktree")
     _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=workdir)
+    monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
     _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
 
     run_once(_live_config(state, bindings_path, queue))
