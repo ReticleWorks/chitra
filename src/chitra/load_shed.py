@@ -209,7 +209,7 @@ def build_shed_candidates(
     registry: list[RegistryEntry],
     host: str,
 ) -> list[ShedCandidate]:
-    """Build actionable candidates from durable goals plus watchd recency facts."""
+    """Build actionable candidates from durable goals plus pane-activity recency facts."""
     activity_by_ref = {item.session_ref: item for item in activities}
     registry_by_session = {item.tmux_session: item for item in registry}
     candidates: list[ShedCandidate] = []

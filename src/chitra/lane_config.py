@@ -49,30 +49,6 @@ class LaneSpec:
     def queue_dir(self) -> Path:
         return self.state_dir / "queue"
 
-    @property
-    def events_log(self) -> Path:
-        return self.state_dir / "events.log"
-
-    @property
-    def triage_state_file(self) -> Path:
-        return self.state_dir / "triaged-state.json"
-
-    @property
-    def triage_log(self) -> Path:
-        return self.state_dir / "triaged.log"
-
-    @property
-    def sweep_digest_path(self) -> Path:
-        return self.state_dir / "sweep-digest.json"
-
-    @property
-    def sweep_snapshot_path(self) -> Path:
-        return self.state_dir / "sweep-digest-state.json"
-
-    @property
-    def flags_path(self) -> Path:
-        return self.state_dir / "flags.log"
-
 
 def _reject_model_keys(value: Any, *, path: str = "manifest") -> None:
     """Reject the old lane-level model contract at every manifest depth."""

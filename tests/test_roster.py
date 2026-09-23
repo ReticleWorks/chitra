@@ -10,7 +10,6 @@ import pytest
 from chitra.artifacts import ARTIFACT_URL_PREFIX, ArtifactRecord, ReviewStatus
 from chitra.board import (
     compute_marker,
-    marker_for,
     render_roster,
 )
 from chitra.goals import GoalRecord, GoalStatus
@@ -56,19 +55,6 @@ def _artifact(
         review_status=review_status,
         reviewed_at="2026-07-11T00:00:00+00:00" if review_status == "reviewed" else "",
     )
-
-
-def test_marker_for_covers_every_status_and_rejects_unknown() -> None:
-    assert marker_for("blocked") == "🔴"
-    assert marker_for("held") == "🟡"
-    assert marker_for("idle") == "🟡"
-    assert marker_for("working") == "🟢"
-    assert marker_for("turn-finished-unverified") == "🟡"
-    assert marker_for("completion-disputed") == "🔴"
-    assert marker_for("done-pending-verification") == "🟡"
-    assert marker_for("done-pending-close") == "🟢"
-    with pytest.raises(ValueError, match="unknown goal status"):
-        marker_for(cast(GoalStatus, "unknown"))
 
 
 @pytest.mark.parametrize(

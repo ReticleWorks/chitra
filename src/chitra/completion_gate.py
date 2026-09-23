@@ -2,18 +2,13 @@
 
 from __future__ import annotations
 
-import enum
-import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
-from pathlib import Path
 from typing import Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from chitra._fsio import exclusive_lock
 from chitra.lexicon import (
     COMPLETION_CLAIM_RE,
     COMPLETION_DEFERRAL_PHRASES,
@@ -29,11 +24,6 @@ from chitra.policy_config import INCIDENT_COMPLETION_DEFERRAL_PHRASES, GatePolic
 # Fallback for callers that scan without a GatePolicy: the shipped default
 # vocabulary, including the incident phrases that live in policy config.
 _DEFERRAL_PHRASES = COMPLETION_DEFERRAL_PHRASES + INCIDENT_COMPLETION_DEFERRAL_PHRASES
-
-
-class CompletionClaimEvent(enum.StrEnum):
-    COMPLETION_CLAIM = "completion_claim"
-    TURN_END_WITHOUT_CLAIM = "turn_end_without_completion_claim"
 
 
 class TodoItem(BaseModel):
@@ -150,27 +140,6 @@ class CompletionAudit(BaseModel):
     per_item_evidence_gap: list[str]
     posture_mismatch: bool
     summary: str
-
-
-class TurnEndAudit(BaseModel):
-    condition: Literal["completion_claim", "turn_end_without_completion_claim"]
-    completion: CompletionAudit | None = None
-    summary: str
-
-
-class CompletionReviewRecord(BaseModel):
-    """Our-side record; never included in text pasted to a lane."""
-
-    session_ref: str
-    pane_id: str
-    behavior_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    condition: Literal["completion_claim", "turn_end_without_completion_claim"]
-    completion_verdict: Literal["CLEAN", "COMPLETION_DISPUTE"] | None = None
-    review_signal_id: str | None = None
-    review_verdict: Literal["accept", "reject", "unavailable", "insufficient"]
-    status: str
-    summary: str
-    recorded_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
 
 def is_completion_claim(text: str) -> bool:
@@ -373,50 +342,4 @@ def evaluate_completion_claim(
     )
 
 
-def evaluate_turn_end(
-    transcript_text: str,
-    *,
-    todo_items: list[TodoItem],
-    evidence: Sequence[CompletionEvidence],
-    policy: GatePolicy | None = None,
-    open_asks: Sequence[str] = (),
-    blockers: Sequence[str] = (),
-    verified_results: Mapping[str, str] | None = None,
-) -> TurnEndAudit:
-    """Force a review at turn-end while distinguishing a non-completion turn."""
-    if not is_completion_claim(transcript_text):
-        return TurnEndAudit(
-            condition="turn_end_without_completion_claim",
-            summary="turn ended without a completion claim; lane is not complete",
-        )
-    completion = evaluate_completion_claim(
-        todo_items,
-        transcript_text,
-        evidence,
-        policy=policy,
-        open_asks=open_asks,
-        blockers=blockers,
-        verified_results=verified_results,
-    )
-    return TurnEndAudit(condition="completion_claim", completion=completion, summary=completion.summary)
 
-
-def append_completion_review(path: Path, record: CompletionReviewRecord) -> None:
-    """Append one deduplicated internal turn-end review record under a lock."""
-    lock_path = path.with_name(path.name + ".lock")
-    key = (record.session_ref, record.behavior_sha256)
-    with exclusive_lock(lock_path):
-        if path.exists():
-            for line in path.read_text(encoding="utf-8").splitlines():
-                try:
-                    payload = json.loads(line)
-                except ValueError:
-                    continue
-                if (payload.get("session_ref"), payload.get("behavior_sha256")) == key:
-                    return
-        with path.open("a", encoding="utf-8") as output:
-            output.write(record.model_dump_json() + "\n")
-
-
-def behavior_hash(text: str) -> str:
-    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()

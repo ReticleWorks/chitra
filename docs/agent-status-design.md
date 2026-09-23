@@ -19,7 +19,7 @@ MIT-licensed architecture; it does not copy Herdr's Rust runtime.
 | Workspace, tab, and pane | Governed lane, tmux target, and server-unique tmux pane ID |
 | Server-owned terminal process | Process owned by the existing tmux server |
 | Lifecycle hook authority | Integration report sent to Chitra's local socket |
-| Screen detection manifest | Chitra TOML manifest evaluated against `watchd`'s bounded recent pane capture |
+| Screen detection manifest | Chitra TOML manifest evaluated against `monitord`'s bounded recent pane capture |
 | Agent `done` | Chitra's completion gate reached `done-pending-close` |
 | Live PTY transfer | Transfer of Chitra's status authority, API socket, and ownership lease; tmux already keeps the pane process alive |
 
@@ -31,14 +31,15 @@ and proves that each recorded tmux pane is still the same live pane.
 ## One semantic status authority
 
 `chitra.agent_runtime.AgentStatusBroker` is the single semantic status
-authority shared by `watchd` and the local socket server.
+authority shared by `monitord`'s sensing pass and the local socket server it
+hosts.
 
 1. An integration may report `idle`, `working`, or `blocked` for an exact
    `CHITRA_PANE_ID` and optional `CHITRA_SESSION_REF`.
 2. While that report remains bound to the same pane and session, it is
-   authoritative. `watchd` still captures the pane for completion evidence,
+   authoritative. `monitord` still captures the pane for completion evidence,
    but it skips manifest classification for status.
-3. Without integration authority, `watchd` evaluates the active local or
+3. Without integration authority, `monitord` evaluates the active local or
    bundled TOML manifest against a bounded capture of recent pane lines.
 4. If no rule matches, the pane is `idle` with
    `default_known_agent_idle_fallback`. An unknown agent is also idle, with
@@ -73,7 +74,7 @@ sends input.
 ## Local socket API
 
 The socket defaults to `/run/chitra/chitra.sock` and can be changed with
-`CHITRA_SOCKET_PATH` or `watchd --socket-path`. It is mode `0600` and uses one
+`CHITRA_SOCKET_PATH` or `chitra-monitord --socket-path`. It is mode `0600` and uses one
 JSON object per newline. Every request requires `id`, `method`, and `params`.
 Every response and subscription event echoes the request ID.
 Request IDs must be unique within one connection; separate clients have
@@ -111,7 +112,7 @@ chitra-agent explain --file screen.txt --agent codex
 
 ## Injected supervised identity
 
-`chitra-lane-session` supplies these variables to the agent process:
+`chitra-lane-anchor` supplies these variables to the agent process:
 
 | Variable | Meaning |
 |---|---|
@@ -128,8 +129,9 @@ to launch when the runtime pane identity is missing or malformed.
 
 ## Live handoff
 
-Start a replacement `watchd` with `--handoff-from` pointing at the running
-server socket. The source and replacement use this fail-closed protocol:
+A replacement server drives the `server.handoff.prepare`,
+`server.handoff.commit`, and `server.handoff.abort` methods against the
+running socket. The source and replacement use this fail-closed protocol:
 
 1. The source checks the protocol and exact resolved state directory, freezes
    status mutations, and verifies every recorded target still resolves to the
@@ -157,6 +159,6 @@ directory and are neither copied nor bypassed.
 
 Manifest parsing, regex matching, source precedence, predicates, waits,
 identity binding, pane verification, checksums, leases, and socket switching
-are pure control and transport logic. Watchd's already-sanctioned isolated
+are pure control and transport logic. monitord's already-sanctioned isolated
 completion reviewers remain the only LLM-backed part of this path, and they
 run only after a semantic working-to-idle turn boundary.

@@ -22,10 +22,27 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   `chitra-triaged.service`, and `chitra-sweepd.service` units. The Debian
   package now installs `chitra-monitord@.service` — promoted from the former
   `.service.example` template — alongside `chitra-dispatchd.service` and
-  `chitra@.service`. The `watchd`, `triaged`, and `sweepd` modules remain
-  installed for existing declarations that invoke them directly (the
-  `triaged` and `chitra-sweepd` console scripts, `python -m chitra.watchd`);
-  only their standalone-daemon systemd surface is gone.
+  `chitra@.service`.
+- Retire the `watchd`, `triaged`, and `sweepd` daemon modules outright along
+  with their console scripts. `monitord` now owns the still-live watchd
+  behaviors — pane sensing against the agent-detection manifests, rate-limit
+  banner alerts, transcript-pipe liveness, the `lane_activity` facts the
+  rate-limit guard reads, and the local status socket that `chitra-agent`
+  queries.
+- `chitra-capabilities`, `capabilities.yaml`, and the `dispatch_control`
+  kill switch, which no daemon consulted.
+- The duplicate `monitord` and `chitra-lane-session` console-script aliases;
+  use `chitra-monitord` and `chitra-lane-anchor`.
+- `tools/` no longer ships in the wheel; `chitra-convert` now lives at
+  `chitra.convert.topology`.
+- The never-called `load_progress` reader, the `lint_done_when` surfacing
+  linter, the dead text-inventory close path in `close_gate`, the test-only
+  `ROSTER_MARKERS`/`marker_for` table, `CompletionClaimEvent`,
+  `behavior_hash`, the watchd-only turn-end review writers
+  (`evaluate_turn_end`, `TurnEndAudit`, `CompletionReviewRecord`,
+  `append_completion_review`), the `DecisionReasoner` oracle machinery in
+  `reasoning.py` (the immutable attestation contract remains), and the
+  orphaned principles manifest and compiler.
 
 ### Fixed
 

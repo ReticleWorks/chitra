@@ -83,8 +83,8 @@ them itself, every time it is asked, instead of trusting a hand-edited map
 that goes stale the day a monitor is added or removed:
 
 - **Unit discovery.** `systemctl list-units --all --plain --no-legend` for
-  the four chitra unit templates (`polyphony-chitra-watchd@*`, `triaged@*`,
-  `dispatchd@*`, `sweepd@*`). The instance name is the monitor id.
+  the shipped chitra unit templates (`polyphony-chitra-monitord@*`,
+  `polyphony-chitra-dispatchd@*`). The instance name is the monitor id.
 - **Root discovery.** Every `/var/lib/polyphony-chitra*` directory that
   actually contains a `goals.json`. The bare root is monitor id `monitor`;
   `/var/lib/polyphony-chitra-boomtown` is id `boomtown`.

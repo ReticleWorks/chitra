@@ -2,7 +2,7 @@
 
 A done item's ``validator`` must name an entry in the instance's
 ``validators.json`` registry. The lane never runs its own proof and never
-supplies the result: watchd executes the registered argv at a completion
+supplies the result: monitord executes the registered argv at a completion
 claim, writes the hash-bound receipt, and the gate reads that disk result.
 """
 

@@ -10,9 +10,9 @@ paired `set --interview-result <file>` performs the atomic enrollment. The
 launcher also refuses held or unreadable usage-pause state.
 
 ```bash
-chitra-lane-session --lane atlas --host tophand --backend claude --model sonnet --effort high start
-chitra-lane-session --lane editorial --host tophand --backend claude --model opus --effort max start
-chitra-lane-session --lane repair --host tophand --backend codex --model gpt-5.6-sol --effort xhigh start
+chitra-lane-anchor --lane atlas --host tophand --backend claude --model sonnet --effort high start
+chitra-lane-anchor --lane editorial --host tophand --backend claude --model opus --effort max start
+chitra-lane-anchor --lane repair --host tophand --backend codex --model gpt-5.6-sol --effort xhigh start
 ```
 
 The launcher stores a versioned launch receipt under the lane state root. It
@@ -25,8 +25,8 @@ digest. Unreadable launch, worktree, or tmux state is `UNKNOWN` and cannot
 count as complete.
 
 Once launched, existing Chitra machinery supplies lifecycle parity:
-`dispatchd` steers the pane and records HMAC delivery evidence; `watchd` and
-`lane_activity` observe it; `draft_scanner` protects typed input;
+`dispatchd` steers the pane and records HMAC delivery evidence; `monitord`
+pane sensing and `lane_activity` observe it; `draft_scanner` protects typed input;
 `completion_gate` and `goal_enforcement` review completion; and
 `rate_limit_guard` checkpoints, stops, verifies quiescence, and resumes the
 same frozen goal. Steering is performed by enqueueing a normal dispatch order
@@ -154,7 +154,7 @@ screen fallback.
 
 | Contract point | Chitra mapping | Coverage after this change |
 |---|---|---|
-| One agent in each pane | Manifest lane identity plus `chitra-lane-session` | Enforced: one dedicated tmux session and primary pane per lane. |
+| One agent in each pane | Manifest lane identity plus `chitra-lane-anchor` | Enforced: one dedicated tmux session and primary pane per lane. |
 | Coordinator assigns, waits, reads, and follows up itself | `dispatchd`, signed results/ledger, transcripts, `agent.wait`, and typed status subscriptions | Deterministic transport, semantic waiting, and observation are covered. Coordinator scheduling remains caller policy; Chitra does not run an LLM coordinator. |
 | One outcome, deliverable, check, allowed changes, forbidden changes | Goal ingestion fields plus dispatch brief | Partly covered. Outcome/check map to `goal`/`done_when`; intent/scope/source are required. A typed brief field split for “may change” and “must not touch” remains a gap. Put both boundaries explicitly in `scope` until that schema lands. |
 | Read-only reviewers share a workspace; every writer gets a worktree | Lane brief/scope, immutable lane identity, and v2 worktree receipt/checkpoint | The receipt records identity and drift evidence. Filesystem permissions and review role assignment remain external policy. |

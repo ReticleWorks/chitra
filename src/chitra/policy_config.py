@@ -88,7 +88,7 @@ class UsagePolicy(BaseModel):
     codex_warn_weekly_pct: float = 85.0
     max_running: int | None = None
     auto_resume: bool = True
-    # Whether a lane that reaches a pause verdict, or that watchd sees capped,
+    # Whether a lane that reaches a pause verdict, or that monitord sees capped,
     # may be transferred to the other backend without an operator ruling. The
     # escalation cases -- irreversible or security-material work mid-flight,
     # or both backends capped -- go up as a brief regardless of this knob.

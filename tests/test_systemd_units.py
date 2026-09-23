@@ -214,8 +214,9 @@ def test_shipped_systemd_environment_variables_are_consumed_by_their_entrypoints
         "boardd.service.example": {"BOARDD_STATE_DIR"},
         # The shipped monitord unit is the per-instance template fleet
         # renders; shadow mode is consumed by the daemon, CHITRA_STATE_DIR
-        # isolates each %i instance's state root.
-        "chitra-monitord@.service": {"CHITRA_MONITORD_SHADOW_MODE", "CHITRA_STATE_DIR"},
+        # isolates each %i instance's state root, and CHITRA_LANES_FILE turns
+        # on pane sensing for the lanes the instance owns.
+        "chitra-monitord@.service": {"CHITRA_MONITORD_SHADOW_MODE", "CHITRA_STATE_DIR", "CHITRA_LANES_FILE"},
         "chitra-ownership-provider.service.example": {"CHITRA_HOST_ID"},
         "chitra-petra.service.example": {"PETRA_HOST_UUID"},
         # The merge daemon takes its GitHub App token from an EnvironmentFile,
@@ -244,6 +245,9 @@ def test_shipped_systemd_environment_variables_are_consumed_by_their_entrypoints
 
     monitord_source = (REPO_ROOT / "src" / "chitra" / "monitord.py").read_text(encoding="utf-8")
     assert 'os.environ.get("CHITRA_MONITORD_SHADOW_MODE"' in monitord_source
+
+    lane_config_source = (REPO_ROOT / "src" / "chitra" / "lane_config.py").read_text(encoding="utf-8")
+    assert '"CHITRA_LANES_FILE"' in lane_config_source
 
     state_paths_source = (REPO_ROOT / "src" / "chitra" / "state_paths.py").read_text(encoding="utf-8")
     assert '"CHITRA_STATE_DIR"' in state_paths_source
@@ -278,14 +282,10 @@ def test_shared_daemon_units_are_the_canonical_package_layout() -> None:
     assert not (SYSTEMD_DIR / "chitra-rate-limit-guard.timer.example").exists()
 
     dispatch_docs = (REPO_ROOT / "docs" / "daemons" / "delivery" / "dispatchd.md").read_text(encoding="utf-8")
-    triaged_docs = (REPO_ROOT / "docs" / "daemons" / "delivery" / "triaged.md").read_text(encoding="utf-8")
-    sweep_docs = (REPO_ROOT / "docs" / "daemons" / "delivery" / "sweepd.md").read_text(encoding="utf-8")
     guard_docs = (REPO_ROOT / "docs" / "daemons" / "delivery" / "rate-limit-guard.md").read_text(encoding="utf-8")
     configuration_docs = (REPO_ROOT / "docs" / "configuration" / "README.md").read_text(encoding="utf-8")
     assert "packaging/systemd/chitra-dispatchd.service`" in dispatch_docs
     assert "packaging/systemd/chitra-dispatchd.service.example" not in dispatch_docs
-    assert "packaging/systemd/chitra-triaged.service" not in triaged_docs
-    assert "packaging/systemd/chitra-sweepd.service" not in sweep_docs
     assert "packaging/systemd/chitra-rate-limit-guard@.service`" in guard_docs
     assert "packaging/systemd/chitra-rate-limit-guard.service.example" not in guard_docs
     assert "packaging/systemd/chitra-rate-limit-guard.timer.example" not in guard_docs

@@ -24,15 +24,21 @@ collapsed out of watchd, triaged, and sweepd:
    and a ``running`` record with no live worker counts as lost.
 5. **Presence** -- publish one advisory presence record per pass so peers can
    see which instance is observing which lanes.
+6. **Pane sensing** -- for lanes declared in the shared lane manifest that
+   this instance owns, classify each governed pane through the status broker,
+   publish the local status socket ``chitra-agent`` talks to, record the
+   lane-activity facts the rate-limit guard's quiescence check reads, and
+   alert on a hard rate-limit banner or a transcript pipe that stopped
+   writing.
 
 The daemon never writes to tmux. It publishes durable orders to ``dispatchd``,
 which remains the sole terminal writer. It also answers only questions that
 the frozen goal settles exactly; protected or ambiguous questions hold the
 goal and become explicit asks.
 
-``watchd``, ``triaged``, and ``sweepd`` remain shipped for existing
-declarations but are deprecated by this entrypoint; new deployments declare
-one ``monitord`` process per instance instead of the three-daemon chain.
+``watchd``, ``triaged``, and ``sweepd`` are retired; this entrypoint absorbs
+their still-live duties. New deployments declare one ``monitord`` process per
+lane state root instead of the three-daemon chain.
 """
 
 from __future__ import annotations
@@ -50,7 +56,7 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -60,6 +66,8 @@ import structlog
 from chitra._fsio import locked_json_store, write_json_atomic
 from chitra.adapter.contract import AdapterError
 from chitra.adapter.registry import plug_for_client
+from chitra.agent_runtime import AgentStatusBroker
+from chitra.agent_status import ManifestRepository
 from chitra.canonical_choices import CanonicalChoicesPolicy, detect_canonical_choices
 from chitra.completion_gate import (
     CompletionEvidence,
@@ -106,6 +114,7 @@ from chitra.goal_enforcement import (
     review_watched_session,
 )
 from chitra.goals import (
+    RATE_LIMIT_HOLD_REASON_PREFIX,
     GoalNotFoundError,
     GoalRecord,
     GoalsSchemaNewerError,
@@ -129,14 +138,16 @@ from chitra.journal import (
     native_session_identity,
 )
 from chitra.journal.store import EventJournal
-from chitra.lane_config import LaneSpec
+from chitra.lane_config import LANES_FILE_ENV_VAR, LaneSpec, enabled_lanes
 from chitra.orders import DispatchOrder
+from chitra.pane_sensing import DEFAULT_TRANSCRIPT_STALE_SECONDS, PaneSenseState, sense_lane_panes
 from chitra.policy_config import load_policy_config
 from chitra.presence import append_presence
 from chitra.question_handler import QuestionHandlerResult, extract_questions, handle_question
 from chitra.queue_state import QueueSubdir
 from chitra.recovery import get_lane_lifecycle, load_worktree_checkpoints
 from chitra.run_pool import RunPool
+from chitra.socket_api import ApiRuntime, ControlServer, default_socket_path
 from chitra.state_paths import state_dir as default_state_dir
 from chitra.supervision import SupervisionLedger, goal_digest
 from chitra.supervisor import (
@@ -217,6 +228,16 @@ class MonitordConfig:
     ledger_path: Path | None = None
     ledger_key_path: Path | None = None
     retry_delay_seconds: float = 60.0
+    # Lane manifest declaring which tmux sessions this instance's pane sensing
+    # owns. Only specs whose state_dir matches this config's are polled.
+    lanes_file: Path | None = None
+    # Local status socket that `chitra-agent` talks to; bound by the daemon
+    # (not by --once runs).
+    socket_path: Path | None = None
+    # Agent detection manifests; ManifestRepository resolves its own default
+    # (including CHITRA_AGENT_MANIFEST_DIR) when unset.
+    manifest_dir: Path | None = None
+    transcript_stale_seconds: int = DEFAULT_TRANSCRIPT_STALE_SECONDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +266,10 @@ def resolve_config(
     ledger_path: Path | None = None,
     ledger_key_path: Path | None = None,
     retry_delay_seconds: float = 60.0,
+    lanes_file: Path | None = None,
+    socket_path: Path | None = None,
+    manifest_dir: Path | None = None,
+    transcript_stale_seconds: int | None = None,
 ) -> MonitordConfig:
     """Resolve CLI arguments, then explicit environment overrides, then defaults."""
     resolved_state_dir = state_dir or default_state_dir()
@@ -279,7 +304,21 @@ def resolve_config(
         ledger_path=ledger_path or resolved_state_dir / "ledger.jsonl",
         ledger_key_path=ledger_key_path or resolved_state_dir / "ledger.key",
         retry_delay_seconds=retry_delay_seconds,
+        lanes_file=lanes_file,
+        socket_path=socket_path or default_socket_path(),
+        manifest_dir=manifest_dir,
+        transcript_stale_seconds=(
+            transcript_stale_seconds
+            if transcript_stale_seconds is not None
+            else DEFAULT_TRANSCRIPT_STALE_SECONDS
+        ),
     )
+
+
+def _env_lanes_file() -> Path | None:
+    """Pane sensing is opt-in: only an explicit flag or the shared env enables it."""
+    configured = os.environ.get(LANES_FILE_ENV_VAR, "").strip()
+    return Path(configured) if configured else None
 
 
 def _lane_roots(state_dir: Path) -> list[Path]:
@@ -1105,7 +1144,7 @@ def _lane_work_in_flight(
 ) -> tuple[str, ...]:
     """Name this lane's work still in flight, for the completion reviewer.
 
-    Mirrors watchd's turn-end list: a ``run_in_background`` tool call in the
+    Mirrors the retired watchd's turn-end list: a ``run_in_background`` tool call in the
     journal's latest session with no joined result or error is still
     running, and an order dispatchd has claimed under ``in_flight/`` for
     this session is being delivered right now.
@@ -1866,7 +1905,7 @@ def _evaluate_completion_claim(
     pending = False
     cacheable = True
     if not findings and not config.shadow_mode:
-        # The same isolated reviewer that gates completion claims under watchd
+        # The same isolated reviewer that gated completion claims under watchd
         # now gates them here: a deterministic pass alone does not release a
         # claimed "done". A stored signal for this exact behavior and contract
         # is reused so an unchanged disputed claim does not pay for a fresh
@@ -1909,7 +1948,7 @@ def _evaluate_completion_claim(
             ]
         if not findings and signal is not None and signal.verdict == "insufficient":
             # The reviewers could not decide while lane work is still in
-            # flight: like watchd, leave the goal untouched and report the
+            # flight: like the retired watchd, leave the goal untouched and report the
             # claim as pending rather than disputing it.
             pending = True
         elif not findings and signal is not None and signal.verdict != "accept":
@@ -2343,8 +2382,96 @@ def append_finding_records(config: MonitordConfig, lane: str, findings: list[Fin
     return len(findings)
 
 
-def run_once(config: MonitordConfig) -> dict[str, Any]:
+@dataclass(slots=True)
+class MonitorRuntime:
+    """Per-process state that must survive across monitor passes.
+
+    The status broker feeds both pane classification and the local status
+    socket; ``pane_state`` carries the revision/fault memory that turns a
+    poll into a transition.
+    """
+
+    broker: AgentStatusBroker
+    pane_state: PaneSenseState = field(default_factory=PaneSenseState)
+
+
+def _pane_alert(config: MonitordConfig, session_ref: str, text: str) -> None:
+    """Raise one operator-visible alert for a pane-level condition.
+
+    The log line always lands; the foreground task is the durable surface and
+    is skipped in shadow mode, for a goal that is already rate-limit-held
+    (the guard owns that alert), and for a goal that does not exist on this
+    instance's state root. Task ids are content-addressed, so a still-open
+    alert deduplicates itself across passes and restarts.
+    """
+    logger.warning("monitord_pane_alert", session_ref=session_ref, detail=text)
+    if config.shadow_mode:
+        return
+    with contextlib.suppress(GoalNotFoundError):
+        goal = get_goal(config.state_dir, session_ref)
+        if goal is None or (
+            goal.status == "held" and goal.hold_reason.startswith(RATE_LIMIT_HOLD_REASON_PREFIX)
+        ):
+            return
+        add_foreground_task(
+            config.state_dir,
+            session_ref,
+            kind="investigate",
+            source="monitord",
+            text=text,
+        )
+
+
+def _sense_governed_panes(
+    config: MonitordConfig,
+    runtime: MonitorRuntime,
+    *,
+    goals_by_session: dict[str, GoalRecord],
+    bindings: tuple[TranscriptBinding, ...],
+) -> int:
+    """Run the pane-side checks for lanes this instance's state root owns.
+
+    Ownership is the lane manifest: a spec is polled only when its declared
+    ``state_dir`` is this instance's, which keeps per-lane systemd instances
+    from double-sensing each other's panes. Everything the pass establishes
+    lands in the lane's own state dir, so a stale or missing manifest only
+    costs this instance's lane its sensing pass.
+    """
+    if config.lanes_file is None:
+        return 0
+    try:
+        specs = tuple(
+            spec
+            for spec in enabled_lanes(config.lanes_file)
+            if spec.state_dir.resolve() == config.state_dir.resolve()
+        )
+    except ValueError as exc:
+        logger.warning("monitord_lanes_manifest_unusable", error=str(exc))
+        return 0
+    if not specs:
+        return 0
+    known_session_refs = tuple(
+        dict.fromkeys([*goals_by_session.keys(), *(binding.session_ref for binding in bindings)])
+    )
+    emitted = 0
+    for spec in specs:
+        emitted += sense_lane_panes(
+            spec,
+            broker=runtime.broker,
+            state=runtime.pane_state,
+            known_session_refs=known_session_refs,
+            activity_root=config.state_dir,
+            transcript_stale_seconds=config.transcript_stale_seconds,
+            alert=lambda session_ref, text: _pane_alert(config, session_ref, text),
+        )
+    return emitted
+
+
+def run_once(config: MonitordConfig, *, runtime: MonitorRuntime | None = None) -> dict[str, Any]:
     """Run one full observe-classify-record-publish pass and return its summary."""
+    runtime = runtime or MonitorRuntime(
+        broker=AgentStatusBroker(config.state_dir, ManifestRepository(config.manifest_dir))
+    )
     bindings = load_transcript_bindings(
         config.transcript_bindings_path,
         transcript_root=config.transcript_root,
@@ -2384,6 +2511,9 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
             "results": [],
         }
         logger.error("monitord_goals_schema_newer_than_installed", error=str(exc), **blocked_summary)
+        # Sensing does not read the goals store, so it still runs: a lane that
+        # is rate-limited or unpiped stays reported while supervision is held.
+        _sense_governed_panes(config, runtime, goals_by_session={}, bindings=bindings)
         return blocked_summary
     results: list[LanePassResult] = []
     enrolled_goals_by_lane: dict[str, GoalRecord] = {}
@@ -2407,6 +2537,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
     if unsafe_lanes:
         logger.error("monitord_unsafe_lane_names_skipped", lanes=unsafe_lanes)
     observed_lanes = sorted(discovered_lanes - set(unsafe_lanes))
+    _sense_governed_panes(config, runtime, goals_by_session=goals_by_session, bindings=bindings)
     for lane in observed_lanes:
         binding = bindings_by_lane.get(lane)
         loaded_events = load_lane_events(config, lane)
@@ -2869,17 +3000,59 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
     return summary
 
 
+def _start_status_server(
+    config: MonitordConfig,
+    runtime: MonitorRuntime,
+    stop_event: threading.Event,
+) -> ControlServer | None:
+    """Bind the local status socket ``chitra-agent`` talks to.
+
+    A collision or missing parent directory degrades the tool, not the daemon:
+    the monitor keeps running and the next start retries the bind.
+    """
+    if config.socket_path is None:
+        return None
+    api = ApiRuntime(runtime.broker)
+    try:
+        server = ControlServer(config.socket_path, api)
+        server.start()
+    except (OSError, RuntimeError) as exc:
+        logger.error(
+            "monitord_status_socket_unavailable",
+            socket_path=str(config.socket_path),
+            error=str(exc),
+        )
+        return None
+
+    def stop_serving() -> None:
+        stop_event.set()
+        server.shutdown()
+
+    api.set_shutdown_callback(stop_serving)
+    return server
+
+
 def run_forever(config: MonitordConfig, *, stop_event: threading.Event | None = None) -> None:
     """Run the composed monitor passes until a service signal stops the process."""
     active_stop_event = stop_event or threading.Event()
-    logger.info("monitord_started", state_dir=str(config.state_dir), poll_seconds=config.poll_seconds)
+    runtime = MonitorRuntime(
+        broker=AgentStatusBroker(config.state_dir, ManifestRepository(config.manifest_dir))
+    )
+    server = _start_status_server(config, runtime, active_stop_event)
+    logger.info(
+        "monitord_started",
+        state_dir=str(config.state_dir),
+        poll_seconds=config.poll_seconds,
+        socket_path=str(config.socket_path) if config.socket_path is not None else None,
+        socket_bound=server is not None,
+    )
     notify_ready()
     try:
         while not active_stop_event.is_set():
             # A completion landing during the pass still counts: the wake is
             # cleared before the pass so its signal is not consumed early.
             _MONITOR_WAKE.clear()
-            run_once(config)
+            run_once(config, runtime=runtime)
             notify_watchdog()
             # Sleep in short slices so a finished worker wakes the loop for
             # the pass that consumes its record, while the stop event keeps
@@ -2897,6 +3070,8 @@ def run_forever(config: MonitordConfig, *, stop_event: threading.Event | None = 
         for _key, (_context, ingestor) in _INGESTOR_POOL.items():
             ingestor.close()
         _INGESTOR_POOL.clear()
+        if server is not None:
+            server.shutdown()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -2914,6 +3089,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-delay-seconds", type=float, default=60.0)
     parser.add_argument("--findings-path", type=Path, default=None)
     parser.add_argument("--poll-seconds", type=float, default=None)
+    parser.add_argument(
+        "--lanes-file",
+        type=Path,
+        default=None,
+        help="Rendered lane declaration; enables pane sensing for lanes whose state dir this instance owns (default: CHITRA_LANES_FILE).",
+    )
+    parser.add_argument(
+        "--socket-path",
+        type=Path,
+        default=None,
+        help="Local coordination socket for chitra-agent (default: CHITRA_SOCKET_PATH or /run/chitra/chitra.sock).",
+    )
+    parser.add_argument(
+        "--agent-manifest-dir",
+        type=Path,
+        default=None,
+        help="Agent detection manifest directory (default: CHITRA_AGENT_MANIFEST_DIR or the packaged manifests).",
+    )
+    parser.add_argument(
+        "--transcript-stale-seconds",
+        type=int,
+        default=None,
+        help="Silence window before an armed transcript pipe counts as broken.",
+    )
     parser.add_argument("--no-shadow-mode", dest="shadow_mode", action="store_false", help="Record findings outside shadow mode.")
     parser.add_argument("--once", action="store_true", help="Run one pass and exit.")
     return parser
@@ -2933,6 +3132,10 @@ def main(argv: list[str] | None = None) -> int:
         findings_path=args.findings_path,
         poll_seconds=args.poll_seconds,
         shadow_mode=args.shadow_mode,
+        lanes_file=args.lanes_file or _env_lanes_file(),
+        socket_path=args.socket_path,
+        manifest_dir=args.agent_manifest_dir,
+        transcript_stale_seconds=args.transcript_stale_seconds,
     )
     if args.once:
         print(json.dumps(run_once(config), indent=2, sort_keys=True))

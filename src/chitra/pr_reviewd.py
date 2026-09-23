@@ -56,7 +56,7 @@ def _run_gh(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
 def fetch_pull_request(repo: str, number: int, *, runner: GhRunner = _run_gh) -> PullRequestDiff:
     """Fetch one PR's metadata and diff via the ``gh`` CLI.
 
-    ``gh`` is a trusted local tool invoked exactly like ``chitra.watchd``'s ``tmux``
+    ``gh`` is a trusted local tool invoked exactly like monitord's pane-sensing ``tmux``
     calls: its stdout is the source of truth, and a nonzero exit is a hard failure, not
     something this function guesses around.
     """

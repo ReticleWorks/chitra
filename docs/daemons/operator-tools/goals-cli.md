@@ -225,4 +225,3 @@ chitra-goals check --goal "Implement comprehensive user authentication system"  
 ## See Also
 
 - **[Concepts — Goals and Completion Gating](../../concepts/README.md#goals-and-completion-gating)** — How goals work in chitra.
-- **[Watchd](watchd.md)** — Completion review (checks if done_when is satisfied).

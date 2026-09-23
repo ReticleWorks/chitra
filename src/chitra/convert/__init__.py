@@ -1,6 +1,6 @@
 """Topology conversion tooling for Chitra migration receipts."""
 
-from tools.convert.topology import (
+from chitra.convert.topology import (
     ConversionError,
     WriterObservation,
     build_authority_handoff_receipt,

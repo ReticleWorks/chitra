@@ -6,8 +6,7 @@ require an operator to remember to update boardd when a monitor instance is
 added or removed. Instead boardd finds them itself, every time it is asked:
 
 - unit discovery: which chitra systemd template instances are installed
-  (`polyphony-chitra-watchd@<id>`, `polyphony-chitra-triaged@<id>`,
-  `polyphony-chitra-dispatchd@<id>`, `polyphony-chitra-sweepd@<id>`) via
+  (`polyphony-chitra-monitord@<id>`, `polyphony-chitra-dispatchd@<id>`) via
   `systemctl list-units`;
 - root discovery: which `/var/lib/polyphony-chitra*` directories actually
   hold a goals.json.
@@ -32,10 +31,8 @@ from pathlib import Path
 from . import config
 
 UNIT_TEMPLATES = (
-    "polyphony-chitra-watchd@*",
-    "polyphony-chitra-triaged@*",
+    "polyphony-chitra-monitord@*",
     "polyphony-chitra-dispatchd@*",
-    "polyphony-chitra-sweepd@*",
 )
 ROOT_GLOB_BASE = Path("/var/lib")
 ROOT_PREFIX = "polyphony-chitra"
@@ -44,7 +41,7 @@ DEFAULT_MONITOR_ID = "monitor"
 # systemd's ActiveState vocabulary, verbatim (systemd.dbus(5) / `systemctl
 # --state=help`). Matching the ACTIVE column against this closed set is what
 # separates a genuinely failed unit from an instance whose *name* happens to
-# contain the word — `polyphony-chitra-watchd@failed-lane.service` is a
+# contain the word — `polyphony-chitra-monitord@failed-lane.service` is a
 # perfectly ordinary lane.
 ACTIVE_STATES = frozenset(
     {"active", "reloading", "inactive", "failed", "activating", "deactivating", "maintenance", "refreshing"}
@@ -57,7 +54,7 @@ ACTIVE_STATES = frozenset(
 # systemd prefixes a status glyph (●, *, x, and the arrows) to a unit that
 # is not simply loaded+active, and `--plain` does not suppress it. The old
 # pattern anchored the unit name at `^`, so a failed instance —
-# `● polyphony-chitra-watchd@folio.service loaded failed failed …` — matched
+# `● polyphony-chitra-monitord@folio.service loaded failed failed …` — matched
 # nothing and vanished from the picker: exactly the unit an operator most
 # needs to see. The glyph is optional here, the unit name must carry the
 # real deployed prefix and a `.service` suffix, and ACTIVE is captured

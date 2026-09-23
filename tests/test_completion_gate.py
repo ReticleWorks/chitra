@@ -10,13 +10,11 @@ import pytest
 
 import chitra.dispatchd as dispatchd_mod
 from chitra.completion_gate import (
-    CompletionClaimEvent,
     CompletionEvidence,
     TodoItem,
     check_todo_residue,
     completion_receipt_issues,
     evaluate_completion_claim,
-    evaluate_turn_end,
     extract_completion_evidence,
     is_completion_claim,
     scan_deferral_language,
@@ -252,16 +250,6 @@ It is repaired and covered by tests and protected-CI evidence; no human signed."
     assert audit.posture_mismatch is True
 
 
-def test_turn_end_without_completion_claim_is_distinct_and_never_clean() -> None:
-    audit = evaluate_turn_end(
-        "I need the exact deployment target before continuing.",
-        todo_items=[],
-        evidence=[],
-    )
-    assert audit.condition == "turn_end_without_completion_claim"
-    assert audit.completion is None
-
-
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
@@ -277,16 +265,6 @@ def test_turn_end_without_completion_claim_is_distinct_and_never_clean() -> None
 )
 def test_completion_claim_requires_sentence_initial_claim_posture(text: str, expected: bool) -> None:
     assert is_completion_claim(text) is expected
-
-
-# ---------------------------------------------------------------------------
-# CompletionClaimEvent marker
-# ---------------------------------------------------------------------------
-
-
-def test_completion_claim_event_marker_value() -> None:
-    assert CompletionClaimEvent.COMPLETION_CLAIM == "completion_claim"
-    assert CompletionClaimEvent.TURN_END_WITHOUT_CLAIM == "turn_end_without_completion_claim"
 
 
 # ---------------------------------------------------------------------------

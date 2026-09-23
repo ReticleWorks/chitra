@@ -15,11 +15,11 @@ For agent `<agent>`, Chitra resolves status authority in this order:
 
 The default local directory is
 `${XDG_CONFIG_HOME:-~/.config}/chitra/agent-detection`. Set
-`CHITRA_AGENT_MANIFEST_DIR` or pass `watchd --agent-manifest-dir` to use a
+`CHITRA_AGENT_MANIFEST_DIR` or pass `chitra-monitord --agent-manifest-dir` to use a
 different directory.
 
 A local file replaces the bundled file. Chitra loads manifests at observation
-time, so an atomic local-file replacement applies on the next Watchd poll. An
+time, so an atomic local-file replacement applies on the next monitord pass. An
 invalid local file produces idle with `manifest_error_idle_fallback`; it does
 not fall through to bundled rules. Chitra does not fetch remote manifests.
 

@@ -281,7 +281,7 @@ def test_reviewer_reply_packaging_is_removed_before_the_verdict_is_read(packaged
 def test_a_fenced_reviewer_verdict_is_accepted(tmp_path: Path) -> None:
     """A correct verdict must not be lost to a code fence.
 
-    A lost verdict is not harmless: watchd turns an unavailable review into a
+    A lost verdict is not harmless: monitord turns an unavailable review into a
     blocked status and an ask to review the session by hand, so a correct review
     of healthy work became a false blocker.
     """

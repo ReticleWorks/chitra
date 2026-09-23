@@ -143,8 +143,8 @@ _CODEX_TUI_PLACEHOLDER_HINTS: frozenset[str] = frozenset(
 _SGR_RE = re.compile(r"\x1b\[([0-9;]*)m")
 
 # Active-turn chrome: the same "esc to interrupt" spinner text
-# ``chitra.agent_detection``'s codex.toml/claude.toml rules and
-# ``chitra.watchd``'s idle-line filter already key off. Its presence means a
+# ``chitra.agent_detection``'s codex.toml/claude.toml rules and the pane
+# classifier's idle-line rules already key off. Its presence means a
 # turn is currently running; a submit fallback must never fire an ESC-shaped
 # byte sequence into a pane in that state, or it risks cancelling live work
 # instead of submitting a stale, unrelated composer row.
