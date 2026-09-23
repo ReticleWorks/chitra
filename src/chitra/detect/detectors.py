@@ -12,10 +12,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, Sequence, Set
 from pathlib import Path
 from typing import Any
 
+from chitra.completion_gate import scan_deferral_language
 from chitra.journal.models import CanonicalEvent, CanonicalType, ProgressClass, ProgressClassification
 from chitra.validation_receipts import load_receipt_file, receipt_path, verify_receipt
 
@@ -74,12 +75,60 @@ class Finding:
         }
 
 
-def _first_unmet_item(enrolled_items: Sequence[object]) -> str:
+def met_done_items(
+    enrolled_items: Sequence[object],
+    *,
+    receipt_root: Path | None,
+    session_ref: str,
+) -> frozenset[str]:
+    """Return the enrolled item ids whose required receipt verifies right now.
+
+    The same per-item receipt check ``detect_false_done`` applies decides
+    which items are already met; findings then bind the first item that is
+    genuinely unmet instead of the first enrolled row.
+    """
+    met: set[str] = set()
+    if receipt_root is None or not session_ref:
+        return frozenset()
+    for item in enrolled_items:
+        item_id = str(getattr(item, "id", ""))
+        validator = str(getattr(item, "validator", ""))
+        required_receipt = str(getattr(item, "required_receipt", ""))
+        if not item_id or not required_receipt:
+            continue
+        try:
+            verification = verify_receipt(receipt_root, session_ref, required_receipt)
+            receipt, _raw = load_receipt_file(receipt_path(receipt_root, session_ref, required_receipt))
+        except Exception:
+            continue
+        validator_names = {str(receipt.validator.get("name"))} if receipt.validator else set()
+        if verification.completion_eligible and validator in validator_names:
+            met.add(item_id)
+    return frozenset(met)
+
+
+def first_unmet_item[ItemT](
+    enrolled_items: Sequence[ItemT],
+    met_items: Set[str] = frozenset(),
+) -> ItemT | None:
+    """Return the first enrolled item not in ``met_items`` (None when all are met)."""
     for item in enrolled_items:
         item_id = getattr(item, "id", None)
-        if isinstance(item_id, str):
-            return item_id
-    return ""
+        if isinstance(item_id, str) and item_id not in met_items:
+            return item
+    return None
+
+
+def first_unmet_item_id(
+    enrolled_items: Sequence[object],
+    met_items: Set[str] = frozenset(),
+) -> str:
+    """Return the id of the first unmet enrolled item, or "" when none is unmet."""
+    item = first_unmet_item(enrolled_items, met_items)
+    if item is None:
+        return ""
+    item_id = getattr(item, "id", "")
+    return item_id if isinstance(item_id, str) else ""
 
 
 def _joined_results(events: Sequence[CanonicalEvent]) -> dict[str, CanonicalEvent]:
@@ -224,6 +273,7 @@ def detect_drift(
     scope_text: str,
     declared_worktree: str,
     enrolled_items: Sequence[object] = (),
+    met_items: Set[str] = frozenset(),
 ) -> list[Finding]:
     """Flag scoped work events conflicting with the goal's frozen boundaries.
 
@@ -233,7 +283,7 @@ def detect_drift(
     not drift.
     """
     findings: list[Finding] = []
-    unmet = _first_unmet_item(enrolled_items)
+    unmet = first_unmet_item_id(enrolled_items, met_items)
     excluded_clauses = tuple(clause.strip().lower() for clause in re.split(r"[;\n]", scope_text) if len(clause.strip()) > 3)
     for event in events:
         if event.normalized_type is not CanonicalType.TOOL_CALL:
@@ -305,6 +355,7 @@ def detect_unnecessary_steps(
     progress_rows: Sequence[ProgressClassification] = (),
     threshold: int = 2,
     enrolled_items: Sequence[object] = (),
+    met_items: Set[str] = frozenset(),
 ) -> list[Finding]:
     """Flag one normalized tool+target+result signature repeated without progress.
 
@@ -313,7 +364,7 @@ def detect_unnecessary_steps(
     the old one. Two identical outcomes are the first evidence of a loop.
     """
     findings: list[Finding] = []
-    unmet = _first_unmet_item(enrolled_items)
+    unmet = first_unmet_item_id(enrolled_items, met_items)
     results = _joined_results(events)
     positions = {event.event_id: position for position, event in enumerate(events)}
     seen: dict[str, list[tuple[int, str]]] = {}
@@ -359,11 +410,12 @@ def detect_excessive_testing(
     progress_rows: Sequence[ProgressClassification] = (),
     threshold: int = 2,
     enrolled_items: Sequence[object] = (),
+    met_items: Set[str] = frozenset(),
 ) -> list[Finding]:
     """Flag a check suite repeating with no artifact change, new failure
     signature, or newly exercised required surface."""
     findings: list[Finding] = []
-    unmet = _first_unmet_item(enrolled_items)
+    unmet = first_unmet_item_id(enrolled_items, met_items)
     results = _joined_results(events)
     positions = {event.event_id: position for position, event in enumerate(events)}
     runs: list[tuple[int, str, CanonicalEvent]] = []
@@ -424,12 +476,13 @@ def detect_document_dithering(
     goal_is_document: bool,
     minimum_recurrence: int = 3,
     enrolled_items: Sequence[object] = (),
+    met_items: Set[str] = frozenset(),
 ) -> list[Finding]:
     """For a non-document goal, flag recurring document edits while required
     implementation items gain no evidence. Disabled entirely for doc goals."""
     if goal_is_document:
         return []
-    unmet = _first_unmet_item(enrolled_items)
+    unmet = first_unmet_item_id(enrolled_items, met_items)
     doc_events: list[CanonicalEvent] = []
     implementation_evidence = False
     for event in events:
@@ -505,24 +558,7 @@ def detect_false_done(
     monitor pass; the receipt file itself is still read for validator
     binding.
     """
-    from pathlib import Path
-
     findings: list[Finding] = []
-    if final_response is None:
-        item_id = _first_unmet_item(enrolled_items)
-        return [
-            Finding(
-                detector="false_done",
-                fingerprint_seed={"item": item_id, "reason": "exit-before-contract"},
-                event_refs=(),
-                unmet_item=item_id,
-                expected_next_progress="produce a final response that binds the completion contract to current evidence",
-                detail="session exited before a final response could bind the completion contract",
-            )
-        ]
-    final_text = _final_response_text(final_response)
-    if not _makes_completion_claim(final_text):
-        return []
     root: Path | None = None
     root_available = False
     if receipt_roots is not None and session_ref:
@@ -532,6 +568,26 @@ def detect_false_done(
         elif isinstance(candidate, str):
             root = Path(candidate)
         root_available = root is not None and root.exists()
+    unmet = first_unmet_item_id(
+        enrolled_items,
+        met_done_items(enrolled_items, receipt_root=root, session_ref=session_ref)
+        if root_available and root is not None
+        else frozenset(),
+    )
+    if final_response is None:
+        return [
+            Finding(
+                detector="false_done",
+                fingerprint_seed={"item": unmet, "reason": "exit-before-contract"},
+                event_refs=(),
+                unmet_item=unmet,
+                expected_next_progress="produce a final response that binds the completion contract to current evidence",
+                detail="session exited before a final response could bind the completion contract",
+            )
+        ]
+    final_text = _final_response_text(final_response)
+    if not _makes_completion_claim(final_text):
+        return []
     refs: tuple[str, ...] = (final_response.event_id,)
     if target_dirty:
         findings.append(
@@ -539,7 +595,7 @@ def detect_false_done(
                 detector="false_done",
                 fingerprint_seed={"reason": "dirty-target"},
                 event_refs=refs,
-                unmet_item=_first_unmet_item(enrolled_items),
+                unmet_item=unmet,
                 expected_next_progress="cleanly commit or discard target worktree changes before claiming completion",
                 detail="completion claim was made while the target worktree was dirty",
             )
@@ -550,7 +606,7 @@ def detect_false_done(
                 detector="false_done",
                 fingerprint_seed={"reason": "material-questions", "questions": tuple(material_questions)},
                 event_refs=refs,
-                unmet_item=_first_unmet_item(enrolled_items),
+                unmet_item=unmet,
                 expected_next_progress="answer or carry forward material open questions before claiming completion",
                 detail="completion claim was made while material questions remained open",
             )
@@ -561,7 +617,7 @@ def detect_false_done(
                 detector="false_done",
                 fingerprint_seed={"reason": "absent-live-proof"},
                 event_refs=refs,
-                unmet_item=_first_unmet_item(enrolled_items),
+                unmet_item=unmet,
                 expected_next_progress="produce the required live proof before claiming completion",
                 detail="completion claim was made without the required live proof",
             )
@@ -627,6 +683,48 @@ def detect_false_done(
     return findings
 
 
+def detect_deferral_language(
+    events: Sequence[CanonicalEvent],
+    *,
+    enrolled_items: Sequence[object] = (),
+    met_items: Set[str] = frozenset(),
+    phrases: Sequence[str] | None = None,
+) -> list[Finding]:
+    """Flag deferral vocabulary in every assistant turn, not only claims.
+
+    The completion gate already scans claim text for deferral phrases; a lane
+    that defers work in an ordinary turn never reaches that path, so the same
+    deterministic vocabulary runs on every final response and the finding
+    binds the actually-unmet enrolled item.
+    """
+    findings: list[Finding] = []
+    unmet = first_unmet_item_id(enrolled_items, met_items)
+    for event in events:
+        if event.normalized_type is not CanonicalType.FINAL_RESPONSE:
+            continue
+        text = _final_response_text(event)
+        if not text:
+            continue
+        matches = scan_deferral_language(text, phrases=phrases)
+        if not matches:
+            continue
+        matched_phrases = tuple(dict.fromkeys(match["phrase"] for match in matches))
+        findings.append(
+            Finding(
+                detector="deferral",
+                fingerprint_seed={"event_id": event.event_id, "phrases": matched_phrases},
+                event_refs=(event.event_id,),
+                unmet_item=unmet,
+                expected_next_progress=(
+                    "bind the deferred work to the unmet done-when item and produce its evidence now, "
+                    "or carry it forward through an explicit ask"
+                ),
+                detail=f"assistant turn defers work without binding it to evidence: {', '.join(matched_phrases)}",
+            )
+        )
+    return findings
+
+
 def _final_response_text(event: CanonicalEvent) -> str:
     value = event.payload.get("text")
     return value if isinstance(value, str) else ""
@@ -639,9 +737,13 @@ def _makes_completion_claim(text: str) -> bool:
 __all__ = [
     "DETECTOR_VERSION",
     "Finding",
+    "detect_deferral_language",
     "detect_document_dithering",
     "detect_drift",
     "detect_excessive_testing",
     "detect_false_done",
     "detect_unnecessary_steps",
+    "first_unmet_item",
+    "first_unmet_item_id",
+    "met_done_items",
 ]

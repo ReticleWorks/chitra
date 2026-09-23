@@ -35,15 +35,17 @@ one ``monitord`` process per instance instead of the three-daemon chain.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -62,18 +64,24 @@ from chitra.completion_gate import (
 )
 from chitra.decisions import read_decisions
 from chitra.detect import (
+    BlockerClaimStore,
     Finding,
     IncidentRecord,
     IncidentStore,
     LadderDecision,
     ResponseLadder,
     collect_rescue_bundle,
+    detect_blocker_claims,
+    detect_deferral_language,
     detect_document_dithering,
     detect_drift,
     detect_excessive_testing,
     detect_false_done,
     detect_unnecessary_steps,
     find_rescue_bundle,
+    first_unmet_item,
+    first_unmet_item_id,
+    met_done_items,
     rescue_bundle_process_fresh,
     write_checkpoint_receipt,
     write_rescue_bundle,
@@ -90,6 +98,7 @@ from chitra.goal_enforcement import (
     review_watched_session,
 )
 from chitra.goals import (
+    GoalNotFoundError,
     GoalRecord,
     GoalsSchemaNewerError,
     GoalValidationError,
@@ -118,7 +127,12 @@ from chitra.recovery import get_lane_lifecycle, load_worktree_checkpoints
 from chitra.run_pool import RunPool
 from chitra.state_paths import state_dir as default_state_dir
 from chitra.supervision import SupervisionLedger, goal_digest
-from chitra.supervisor import reconcile_corrective_action, reconcile_question_action, record_observing
+from chitra.supervisor import (
+    reconcile_corrective_action,
+    reconcile_question_action,
+    record_observing,
+    record_terminal_pursuit_alert,
+)
 from chitra.systemd_notify import notify_ready, notify_watchdog
 from chitra.transcript_bindings import DEFAULT_FILENAME, TranscriptBinding, load_transcript_bindings
 from chitra.validation_receipts import (
@@ -148,7 +162,20 @@ _DETECTOR_ORDER = (
     "unnecessary_steps",
     "excessive_testing",
     "document_dithering",
+    "deferral",
+    "false_blocker",
+    "changed_excuse",
 )
+# Goal statuses that mean the lane's work is already settled; observability
+# findings only fire while the goal is still unfinished.
+_TERMINAL_GOAL_STATUSES = frozenset({"done-pending-verification", "done-pending-close"})
+_UNFINISHED_OBSERVABLE_STATUSES = frozenset(
+    {"working", "blocked", "turn-finished-unverified", "completion-disputed"}
+)
+# Every durable store (journal, incidents, supervision, blocker claims)
+# rejects lane names outside this shape; an unsafe journal stem or binding
+# lane is logged and skipped rather than crashing the pass for every lane.
+_SAFE_LANE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,7 +336,11 @@ def _event_matches_binding(
     transcript_path: Path,
     native_session_id: str | None,
 ) -> bool:
-    """Accept only events from the complete current transcript binding."""
+    """Accept only events from the complete current transcript binding.
+
+    ``client_version`` is deliberately compared as observed, not gated: a
+    mid-session CLI upgrade must not zero the lane's visible event set.
+    """
     return bool(
         native_session_id
         and event.transcript.path == str(transcript_path)
@@ -317,7 +348,6 @@ def _event_matches_binding(
         and event.lane == binding.lane
         and event.goal_ref == binding.session_ref
         and event.client == binding.client
-        and event.client_version == binding.client_version
         and event.instance == binding.instance
     )
 
@@ -432,17 +462,26 @@ def _idle_pursuit_finding(
     idle_pursuit_passes = goal.autonomy_policy.idle_pursuit_passes
     if count < idle_pursuit_passes:
         return None
-    first_item = goal.enrolled_done_when_items[0]
+    unmet_item = first_unmet_item(
+        goal.enrolled_done_when_items,
+        met_done_items(
+            goal.enrolled_done_when_items,
+            receipt_root=config.state_dir,
+            session_ref=goal.session_ref,
+        ),
+    )
+    if unmet_item is None:
+        return None
     return Finding(
         detector="idle_pursuit",
         fingerprint_seed={
             "anchor_event_id": anchor,
             "session_ref": goal.session_ref,
-            "done_when_item_id": first_item.id,
+            "done_when_item_id": unmet_item.id,
         },
         event_refs=tuple(event.event_id for event in events[-3:]),
-        unmet_item=first_item.id,
-        expected_next_progress=f"take the next reversible in-scope action toward: {first_item.text}",
+        unmet_item=unmet_item.id,
+        expected_next_progress=f"take the next reversible in-scope action toward: {unmet_item.text}",
         detail=f"the enrolled goal produced no new scoped progress for {idle_pursuit_passes} clean monitor passes",
     )
 
@@ -501,6 +540,7 @@ def run_detectors(
     events: tuple[CanonicalEvent, ...],
     *,
     canonical_choices_policy: CanonicalChoicesPolicy | None = None,
+    deferral_phrases: Sequence[str] | None = None,
 ) -> list[Finding]:
     """Run the deterministic detector set over one lane's journal."""
     scope_text = str(getattr(goal, "scope", "") or "")
@@ -508,20 +548,55 @@ def run_detectors(
     goal_text = str(getattr(goal, "goal", "") or "")
     goal_is_document = "documentation" in f"{intent_text}\n{goal_text}".lower()
     enrolled_items = tuple(getattr(goal, "enrolled_done_when_items", ()) or ())
-    policy = canonical_choices_policy or load_policy_config().canonical_choices
+    session_ref = str(getattr(goal, "session_ref", "") or "")
+    met_items = met_done_items(enrolled_items, receipt_root=config.state_dir, session_ref=session_ref)
+    policy_config = load_policy_config()
+    policy = canonical_choices_policy or policy_config.canonical_choices
     findings: list[Finding] = []
-    findings.extend(detect_canonical_choices(events, policy, enrolled_items=enrolled_items))
+    findings.extend(detect_canonical_choices(events, policy, enrolled_items=enrolled_items, met_items=met_items))
     findings.extend(
         detect_drift(
             events,
             scope_text=scope_text,
             declared_worktree=_declared_worktree(config, goal),
             enrolled_items=enrolled_items,
+            met_items=met_items,
         )
     )
-    findings.extend(detect_unnecessary_steps(events, enrolled_items=enrolled_items))
-    findings.extend(detect_excessive_testing(events, enrolled_items=enrolled_items))
-    findings.extend(detect_document_dithering(events, goal_is_document=goal_is_document, enrolled_items=enrolled_items))
+    findings.extend(detect_unnecessary_steps(events, enrolled_items=enrolled_items, met_items=met_items))
+    findings.extend(detect_excessive_testing(events, enrolled_items=enrolled_items, met_items=met_items))
+    findings.extend(
+        detect_document_dithering(
+            events,
+            goal_is_document=goal_is_document,
+            enrolled_items=enrolled_items,
+            met_items=met_items,
+        )
+    )
+    findings.extend(
+        detect_deferral_language(
+            events,
+            enrolled_items=enrolled_items,
+            met_items=met_items,
+            phrases=deferral_phrases if deferral_phrases is not None else policy_config.completion_gate.deferral_phrases,
+        )
+    )
+    try:
+        blocker_store = BlockerClaimStore(config.state_dir, lane)
+    except ValueError:
+        # An unusable lane name must not take the whole pass down; the lane
+        # simply gets no blocker-claim history this pass.
+        blocker_store = None
+    if blocker_store is not None:
+        blocker_findings, blocker_records = detect_blocker_claims(
+            events,
+            enrolled_items=enrolled_items,
+            met_items=met_items,
+            history=blocker_store.load(),
+            goal_digest=goal_digest(goal) if goal is not None else "",
+        )
+        blocker_store.append(blocker_records)
+        findings.extend(blocker_findings)
     return [finding for name in _DETECTOR_ORDER for finding in findings if finding.detector == name]
 
 
@@ -1420,8 +1495,28 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
         logger.error("monitord_goals_schema_newer_than_installed", error=str(exc), **blocked_summary)
         return blocked_summary
     results: list[LanePassResult] = []
-    for lane_path in _lane_roots(config.state_dir):
-        lane = lane_path.stem
+    enrolled_goals_by_lane: dict[str, GoalRecord] = {}
+    for enrolled_goal in goals_by_session.values():
+        if not enrolled_goal.lane_id:
+            continue
+        existing = enrolled_goals_by_lane.get(enrolled_goal.lane_id)
+        if existing is None or (
+            existing.status in _TERMINAL_GOAL_STATUSES and enrolled_goal.status not in _TERMINAL_GOAL_STATUSES
+        ):
+            enrolled_goals_by_lane[enrolled_goal.lane_id] = enrolled_goal
+    # Observation iterates the union of journaled, bound, and enrolled lanes:
+    # a lane whose transcript was never ingested or whose binding no longer
+    # resolves is an explicit observation failure, not an absent lane.
+    discovered_lanes = (
+        {path.stem for path in _lane_roots(config.state_dir)}
+        | set(bindings_by_lane)
+        | set(enrolled_goals_by_lane)
+    )
+    unsafe_lanes = sorted(lane for lane in discovered_lanes if _SAFE_LANE_NAME.fullmatch(lane) is None)
+    if unsafe_lanes:
+        logger.error("monitord_unsafe_lane_names_skipped", lanes=unsafe_lanes)
+    observed_lanes = sorted(discovered_lanes - set(unsafe_lanes))
+    for lane in observed_lanes:
         binding = bindings_by_lane.get(lane)
         loaded_events = load_lane_events(config, lane)
         if binding is not None:
@@ -1437,10 +1532,14 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
             )
         else:
             events = loaded_events
-        if not events:
-            continue
-        session_ref = binding.session_ref if binding is not None else lane
-        goal = goals_by_session.get(binding.session_ref) if binding is not None else None
+        goal = goals_by_session.get(binding.session_ref) if binding is not None else enrolled_goals_by_lane.get(lane)
+        session_ref = (
+            binding.session_ref
+            if binding is not None
+            else goal.session_ref
+            if goal is not None
+            else lane
+        )
         lifecycle = get_lane_lifecycle(config.state_dir, session_ref)
         if lifecycle is not None and not lifecycle.enforcement_enabled:
             results.append(
@@ -1456,6 +1555,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                 )
             )
             continue
+        mismatched_goal: GoalRecord | None = None
         if binding is not None and goal is not None and (not goal.lane_id or goal.lane_id != binding.lane):
             logger.warning(
                 "monitord_goal_binding_mismatch",
@@ -1464,6 +1564,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                 goal_lane_id=goal.lane_id,
                 binding_lane=binding.lane,
             )
+            mismatched_goal = goal
             goal = None
         if binding is not None and goal is None:
             logger.warning(
@@ -1472,6 +1573,125 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                 session_ref=binding.session_ref,
                 binding_lane=binding.lane,
             )
+        observability_findings: list[Finding] = []
+        goal_unfinished = goal is not None and goal.status in _UNFINISHED_OBSERVABLE_STATUSES
+        unmet_for_observation = (
+            first_unmet_item_id(
+                goal.enrolled_done_when_items,
+                met_done_items(
+                    goal.enrolled_done_when_items,
+                    receipt_root=config.state_dir,
+                    session_ref=goal.session_ref,
+                ),
+            )
+            if goal is not None
+            else ""
+        )
+        if binding is not None and goal_unfinished:
+            if binding_native_session_ids.get(lane) is None:
+                observability_findings.append(
+                    Finding(
+                        detector="unobservable_lane",
+                        fingerprint_seed={
+                            "lane": lane,
+                            "session_ref": binding.session_ref,
+                            "reason": "transcript-identity-unresolved",
+                        },
+                        event_refs=(),
+                        unmet_item=unmet_for_observation,
+                        expected_next_progress="restore a readable bound transcript for this lane",
+                        detail=(
+                            f"bound transcript {binding_paths[lane]} yields no native session identity "
+                            "(missing, unreadable, truncated, or foreign); the lane cannot be observed"
+                        ),
+                    )
+                )
+            elif not events:
+                observability_findings.append(
+                    Finding(
+                        detector="binding_unmatched",
+                        fingerprint_seed={
+                            "lane": lane,
+                            "session_ref": binding.session_ref,
+                            "transcript_path": str(binding_paths[lane]),
+                        },
+                        event_refs=(),
+                        unmet_item=unmet_for_observation,
+                        expected_next_progress="re-align the transcript binding so journaled events match it",
+                        detail=(
+                            "bound transcript resolves an identity but no journaled events match the "
+                            "complete binding (lane, session, path, client, instance)"
+                        ),
+                    )
+                )
+        elif binding is None and goal_unfinished and not loaded_events:
+            assert goal is not None
+            observability_findings.append(
+                Finding(
+                    detector="unobservable_lane",
+                    fingerprint_seed={
+                        "lane": lane,
+                        "session_ref": goal.session_ref,
+                        "reason": "enrolled-lane-unbound",
+                    },
+                    event_refs=(),
+                    unmet_item=unmet_for_observation,
+                    expected_next_progress="bind a transcript for this enrolled lane so it can be observed",
+                    detail="enrolled lane has no transcript binding and no journal; its goal is unobservable",
+                )
+            )
+        if binding is not None and goal is None:
+            observability_findings.append(
+                Finding(
+                    detector="unresolved_binding",
+                    fingerprint_seed={
+                        "lane": lane,
+                        "session_ref": binding.session_ref,
+                        "reason": "goal-lane-mismatch" if mismatched_goal is not None else "goal-missing",
+                    },
+                    event_refs=(),
+                    unmet_item="",
+                    expected_next_progress="reconcile the transcript binding or the goal's lane assignment",
+                    detail=(
+                        f"binding for lane {lane!r} resolves to session {binding.session_ref!r} "
+                        + (
+                            f"whose goal is assigned to lane {mismatched_goal.lane_id or '(unassigned)'!r}"
+                            if mismatched_goal is not None
+                            else "which has no goal record"
+                        )
+                    ),
+                )
+            )
+            if not config.shadow_mode:
+                anchor_goal = mismatched_goal or enrolled_goals_by_lane.get(lane)
+                if anchor_goal is not None:
+                    # A goal deleted between the pass snapshot and this write
+                    # drops the alert; the finding record still stands.
+                    with contextlib.suppress(GoalNotFoundError):
+                        add_foreground_task(
+                            config.state_dir,
+                            anchor_goal.session_ref,
+                            kind="investigate",
+                            source="monitord",
+                            text=(
+                                f"transcript binding for lane {lane} resolves to session {binding.session_ref} "
+                                "but no goal on this lane matches it; reconcile the binding manifest or the "
+                                "goal's lane assignment"
+                            ),
+                        )
+        if observability_findings and goal is not None and not config.shadow_mode:
+            with contextlib.suppress(GoalNotFoundError):
+                add_foreground_task(
+                    config.state_dir,
+                    goal.session_ref,
+                    kind="investigate",
+                    source="monitord",
+                    text=(
+                        f"lane {lane} cannot be observed: {observability_findings[0].detail}"
+                    ),
+                )
+        if not events and not observability_findings:
+            continue
         detector_events = events
         supervision = SupervisionLedger(config.state_dir, lane)
         if goal is not None:
@@ -1529,7 +1749,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
             if goal is not None and goal.status in {"held", "done-pending-verification", "done-pending-close"}
             else run_detectors(config, lane, goal, detector_events)
         )
-        findings = detection_findings + [
+        findings = observability_findings + detection_findings + [
             finding for finding in enrollment_findings if finding.detector == "false_done"
         ]
         question_outcome = (
@@ -1592,6 +1812,17 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                 track_id=decision.record.track_id,
                 transcript_path=binding_paths.get(active_lane),
             )
+            if decision.record.stage == "relaunch" and not config.shadow_mode:
+                # The ladder's top rung issues no further orders; without a
+                # surfaced alert the incident would hold forever in silence.
+                record_terminal_pursuit_alert(
+                    config.state_dir,
+                    active_goal,
+                    detail=(
+                        f"Track {decision.record.track_id} is at the relaunch stage; "
+                        "the ladder issues no further corrective orders for it."
+                    ),
+                )
 
         if goal is None:
             # The journal remains observable for diagnosis, but an unresolved

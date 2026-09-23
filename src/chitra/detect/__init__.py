@@ -1,13 +1,24 @@
 """Event-based detectors and the bounded response ladder (DESIGN-v3 §4)."""
 
+from .blockers import (
+    BLOCKER_CLAIM_SCHEMA,
+    BlockerClaimRecord,
+    BlockerClaimStore,
+    detect_blocker_claims,
+    extract_blocker_claims,
+)
 from .detectors import (
     DETECTOR_VERSION,
     Finding,
+    detect_deferral_language,
     detect_document_dithering,
     detect_drift,
     detect_excessive_testing,
     detect_false_done,
     detect_unnecessary_steps,
+    first_unmet_item,
+    first_unmet_item_id,
+    met_done_items,
 )
 from .ladder import (
     INCIDENT_SCHEMA,
@@ -33,11 +44,14 @@ from .rescue import (
 )
 
 __all__ = [
+    "BLOCKER_CLAIM_SCHEMA",
     "BRIEF_SCHEMA",
     "BUNDLE_SCHEMA",
     "DETECTOR_VERSION",
     "INCIDENT_SCHEMA",
     "LADDER_STAGES",
+    "BlockerClaimRecord",
+    "BlockerClaimStore",
     "ConsumptionProof",
     "Finding",
     "IncidentRecord",
@@ -47,13 +61,19 @@ __all__ = [
     "RescueBundle",
     "ResponseLadder",
     "collect_rescue_bundle",
+    "detect_blocker_claims",
+    "detect_deferral_language",
     "detect_document_dithering",
     "detect_drift",
     "detect_excessive_testing",
     "detect_false_done",
     "detect_unnecessary_steps",
+    "extract_blocker_claims",
     "find_rescue_bundle",
+    "first_unmet_item",
+    "first_unmet_item_id",
     "generate_relaunch_brief",
+    "met_done_items",
     "rescue_bundle_process_fresh",
     "track_key",
     "write_checkpoint_receipt",

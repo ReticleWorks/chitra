@@ -185,18 +185,38 @@ def test_unbound_or_mismatched_binding_cannot_fall_back_to_first_goal_or_enroll(
         return ()
 
     monkeypatch.setattr(monitord, "record_enrolled_validator_runs", record_runs)
-    assert _run_monitor(state, bindings_path) == 0
+    # Shadow mode would suppress the board surfacing this test now asserts.
+    run_once(resolve_config(
+        state_dir=state,
+        transcript_bindings_path=bindings_path,
+        dispatch_queue_dir=tmp_path / "queue",
+        shadow_mode=False,
+    ))
     capsys.readouterr()
 
     # Observation is still allowed for diagnosis. What is forbidden is
-    # borrowing alpha's goal for either unresolved lane.
+    # borrowing alpha's goal for either unresolved lane. The unresolved
+    # bindings surface as findings and foreground investigation tasks on
+    # alpha's goal instead of silently skipping the lanes.
     assert EventJournal(state, "not-alpha").load()
     assert EventJournal(state, "unbound").load()
     assert all(event.goal_ref == alpha.session_ref for event in EventJournal(state, "not-alpha").load())
     assert all(event.goal_ref == "host:unbound:0.0" for event in EventJournal(state, "unbound").load())
     assert enrolled_sessions == []
-    assert get_goal(state, alpha.session_ref) == alpha
-    assert not (state / "queue" / "orders").exists()
+    stored_alpha = get_goal(state, alpha.session_ref)
+    assert stored_alpha is not None
+    assert stored_alpha.goal == alpha.goal
+    assert stored_alpha.done_when == alpha.done_when
+    assert stored_alpha.status == alpha.status
+    assert any("transcript binding" in task.text for task in stored_alpha.foreground_tasks)
+    # Only alpha's own enrolled lane may carry corrective orders; the
+    # unresolved bindings create none of their own.
+    orders_dir = state / "queue" / "orders"
+    if orders_dir.exists():
+        assert all(
+            json.loads(order_path.read_text(encoding="utf-8"))["session_ref"] == alpha.session_ref
+            for order_path in orders_dir.glob("*.json")
+        )
 
 
 def test_lane_rebinding_filters_prior_transcript_events(
