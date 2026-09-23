@@ -260,11 +260,25 @@ def _capability_uses(
 
 # Ask gate: a recorded monitor decision answers a lane's question before the
 # question becomes an operator-facing item. The match is a deliberately naive,
-# deterministic word overlap — the earliest decision in append order that
-# shares enough content words wins, so a ruling appended after an answer was
-# queued cannot displace that answer before dispatchd recomputes it. Every
-# auto-answer cites the decision id, which keeps a wrong match contestable.
+# deterministic word overlap — the newest decision in append order that
+# shares enough content words wins, so a later ruling supersedes the one it
+# reverses. dispatchd recomputes the answer before delivery, so a queued
+# answer displaced by a newer ruling is rejected instead of relayed stale.
+# Every auto-answer cites the decision id, which keeps a wrong match
+# contestable.
 _ASK_GATE_MIN_SHARED_WORDS = 3
+
+# Function words long enough to pass the length filter but present in almost
+# every question; counting them lets an unrelated ruling answer.
+_ASK_GATE_STOPWORDS = frozenset(
+    {
+        "about", "also", "been", "before", "could", "does", "done", "each", "from", "have",
+        "here", "into", "just", "like", "more", "much", "must", "need", "only", "other",
+        "over", "same", "should", "some", "such", "than", "that", "their", "them", "then",
+        "there", "these", "they", "this", "those", "want", "were", "what", "when", "where",
+        "which", "while", "will", "with", "would", "your",
+    }
+)  # fmt: skip
 
 # A word-overlap ruling is never authority for these capability classes; a
 # question that needs one keeps the native approval path no matter what the
@@ -280,15 +294,17 @@ _ASK_GATE_UNDELIVERABLE_RE = re.compile(r"\boperator\b|\bthe monitor\b|\bchitra 
 
 
 def _decision_words(text: str) -> frozenset[str]:
-    return frozenset(word for word in re.findall(r"[a-z0-9]+", text.lower()) if len(word) > 3)
+    return frozenset(
+        word for word in re.findall(r"[a-z0-9]+", text.lower()) if len(word) > 3 and word not in _ASK_GATE_STOPWORDS
+    )
 
 
 def _match_decision(question: str, decisions: Sequence[DecisionEntry]) -> DecisionEntry | None:
-    """Return the earliest recorded ruling covering ``question``, or ``None``."""
+    """Return the newest recorded ruling covering ``question``, or ``None``."""
     question_words = _decision_words(question)
     if len(question_words) < _ASK_GATE_MIN_SHARED_WORDS:
         return None
-    for entry in decisions:
+    for entry in reversed(decisions):
         if _ASK_GATE_UNDELIVERABLE_RE.search(entry.decision):
             continue
         if len(question_words & _decision_words(entry.decision)) >= _ASK_GATE_MIN_SHARED_WORDS:
