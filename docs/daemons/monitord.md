@@ -99,6 +99,14 @@ lane's `queue/` directory. The shared `chitra-dispatchd.service` reads the
 same lane roots from `lanes.yaml` and uses the same
 `/etc/chitra/transcript-bindings.json` manifest.
 
+The shipped unit sets `CHITRA_LANES_FILE=/etc/chitra/lanes.yaml`, which turns
+on pane sensing for the lanes whose declared `state_dir` the instance owns:
+semantic status classification into the local status socket that
+`chitra-agent` queries, rate-limit banner alerts, transcript-pipe liveness,
+and the `lane_activity.json` facts the rate-limit guard's quiescence check
+reads. A missing or unusable manifest logs a warning and leaves supervision
+running. `--once` runs do not bind the status socket.
+
 Migration note: this state root moved in `0.19.2` from
 `/var/lib/polyphony-chitra-<lane-id>` (systemd `StateDirectory=polyphony-chitra-%i`)
 to `/var/lib/chitra/lane-<lane-id>` (`StateDirectory=chitra`). Upgrading a
@@ -110,7 +118,8 @@ copies or archives them by hand.
 Flags include `--state-dir`, `--transcript-root`,
 `--transcript-bindings-path`, `--dispatch-queue-dir`, `--ledger-path`,
 `--ledger-key-path`, `--retry-delay-seconds`, `--findings-path`,
-`--poll-seconds`, `--no-shadow-mode`, and `--once`. There is no fixed
+`--poll-seconds`, `--lanes-file`, `--socket-path`, `--agent-manifest-dir`,
+`--transcript-stale-seconds`, `--no-shadow-mode`, and `--once`. There is no fixed
 attempt-count completion or failure cap: the pursuit loop continues until
 completion evidence, an authority gate, or an explicit lifecycle transition
 ends active work.
