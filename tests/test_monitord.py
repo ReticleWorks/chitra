@@ -14,6 +14,7 @@ from _goal_fixtures import enrollment_fields, ingest_passing_receipt, passing_co
 from structlog.testing import capture_logs
 
 import chitra.monitord as monitord_mod
+from chitra.completion_gate import CompletionEvidence
 from chitra.decisions import DecisionEntry, append_decision
 from chitra.goals import EnrolledDoneWhenItem, GoalRecord, GoalsSchemaNewerError, GoalStatus, get_goal, upsert_goal
 from chitra.journal import ByteRange, CanonicalEvent, CanonicalType, Client, TranscriptIdentity
@@ -324,13 +325,16 @@ def _goal(session_ref: str, *, status: GoalStatus = "working") -> GoalRecord:
     )
 
 
-def _write_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _write_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int = 1) -> None:
     import sys
 
     from chitra.validator_registry import VALIDATORS_ENV_VAR
 
     registry = tmp_path / "validators.json"
-    registry.write_text(json.dumps({"stub-check": {"argv": [sys.executable, "-c", "raise SystemExit(1)"]}}), encoding="utf-8")
+    registry.write_text(
+        json.dumps({"stub-check": {"argv": [sys.executable, "-c", f"raise SystemExit({exit_code})"]}}),
+        encoding="utf-8",
+    )
     monkeypatch.setenv(VALIDATORS_ENV_VAR, str(registry))
 
 
@@ -363,6 +367,85 @@ def test_check_enrollment_disputes_when_the_validator_fails(tmp_path: Path, monk
     assert recorded == 1
     assert pending is False
     assert all(finding.detector == "false_done" for finding in findings)
+
+
+def test_check_enrollment_accepts_a_plain_claim_when_the_validator_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_registry(tmp_path, monkeypatch, exit_code=0)
+    upsert_goal(tmp_path, _goal("session-1"))
+    final_response = _event("completion-plain", CanonicalType.FINAL_RESPONSE).model_copy(
+        update={"payload": {"text": "Done. The digest file exists and is verified."}}
+    )
+
+    recorded, disputed, findings, pending = check_enrollment_and_receipts(
+        resolve_config(state_dir=tmp_path, shadow_mode=False),
+        "session-1",
+        final_response,
+        reviewer=_StubReviewer("accept"),
+    )
+
+    assert (recorded, disputed, findings, pending) == (1, False, [], False)
+    stored = get_goal(tmp_path, "session-1")
+    assert stored is not None
+    assert stored.status == "done-pending-close"
+
+
+def test_check_enrollment_disputes_a_plain_claim_when_the_validator_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_registry(tmp_path, monkeypatch)
+    upsert_goal(tmp_path, _goal("session-1"))
+    final_response = _event("completion-plain-fail", CanonicalType.FINAL_RESPONSE).model_copy(
+        update={"payload": {"text": "Done. The digest file exists and is verified."}}
+    )
+
+    recorded, disputed, findings, pending = check_enrollment_and_receipts(
+        resolve_config(state_dir=tmp_path, shadow_mode=False),
+        "session-1",
+        final_response,
+    )
+
+    assert disputed is True
+    assert recorded == 1
+    assert pending is False
+    assert all(finding.detector == "false_done" for finding in findings)
+    assert any("stub-check" in finding.detail for finding in findings)
+    stored = get_goal(tmp_path, "session-1")
+    assert stored is not None
+    assert stored.status == "completion-disputed"
+
+
+def test_check_enrollment_runs_nothing_for_a_negated_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_registry(tmp_path, monkeypatch, exit_code=0)
+    upsert_goal(tmp_path, _goal("session-1"))
+    calls: list[str] = []
+
+    def record_runs(root: Path, session_ref: str, items: object) -> tuple[CompletionEvidence, ...]:
+        del root, items
+        calls.append(session_ref)
+        return ()
+
+    monkeypatch.setattr(monitord_mod, "record_enrolled_validator_runs", record_runs)
+    final_response = _event("completion-negated", CanonicalType.FINAL_RESPONSE).model_copy(
+        update={"payload": {"text": "Not done yet."}}
+    )
+
+    recorded, disputed, findings, pending = check_enrollment_and_receipts(
+        resolve_config(state_dir=tmp_path, shadow_mode=False),
+        "session-1",
+        final_response,
+    )
+
+    assert (recorded, disputed, findings, pending) == (0, False, [], False)
+    assert calls == []
+    assert not (tmp_path / "validation-receipts").exists()
+    stored = get_goal(tmp_path, "session-1")
+    assert stored is not None
+    assert stored.status == "working"
+
 
 def test_check_enrollment_is_silent_for_unenrolled_sessions(tmp_path: Path) -> None:
     assert check_enrollment_and_receipts(_config(tmp_path), "no-such-session") == (0, False, [], False)

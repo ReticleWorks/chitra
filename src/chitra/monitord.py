@@ -795,14 +795,15 @@ def check_enrollment_and_receipts(
 ) -> tuple[int, bool, list[Finding], bool]:
     """Verify an explicit completion claim against its enrolled contract.
 
-    Validators run only when the latest unconsumed final response contains a
-    structured completion line. The lane's claimed result is ignored; Chitra
-    executes and stores each enrolled validator itself. A missing or held
-    goal and a turn without a completion claim are silent. For a lane that
-    runs as another OS user the execution happens on the worker pool and a
-    claim is neither passed nor disputed while that run is in flight; the
-    fourth return value reports that pending state so the pass does not
-    treat a lane under active validation as idle.
+    Validators run on any completion claim in the latest unconsumed final
+    response, whether or not it carries a structured completion line. The
+    lane's claimed result is ignored; Chitra executes and stores each
+    enrolled validator itself. A missing or held goal and a turn without a
+    completion claim are silent. For a lane that runs as another OS user
+    the execution happens on the worker pool and a claim is neither passed
+    nor disputed while that run is in flight; the fourth return value
+    reports that pending state so the pass does not treat a lane under
+    active validation as idle.
     """
     try:
         goal = get_goal(config.state_dir, session_ref)
@@ -854,14 +855,18 @@ def check_enrollment_and_receipts(
         ):
             claim_bindings[item.id] = item.required_receipt
 
-    run_evidence: tuple[CompletionEvidence, ...] = ()
-    if has_structured_completion_line(final_text):
-        claimed = _claimed_run_evidence(config, goal, session_ref, items)
-        if claimed is None:
-            # A worker run is in flight or was just queued: the claim
-            # neither passes nor disputes until the recorded result lands.
-            return 0, False, [], True
-        run_evidence = claimed
+    claimed = _claimed_run_evidence(config, goal, session_ref, items)
+    if claimed is None:
+        # A worker run is in flight or was just queued: the claim
+        # neither passes nor disputes until the recorded result lands.
+        return 0, False, [], True
+    run_evidence = claimed
+    if not has_structured_completion_line(final_text):
+        # A plain-language claim binds no item to a receipt, so bind every
+        # enrolled item to the receipt Chitra just stored and let those
+        # receipts decide the claim.
+        for item in items:
+            claim_bindings[item.id] = item.required_receipt
 
     material_questions = (*goal.open_asks, *((goal.needs,) if goal.needs else ()))
     findings = detect_false_done(
