@@ -54,7 +54,15 @@ def _canonical_digest(value: Any) -> str:
 class Finding:
     """One detector output bound to journal evidence and goal state."""
 
-    __slots__ = ("detector", "fingerprint", "event_refs", "unmet_item", "expected_next_progress", "detail")
+    __slots__ = (
+        "detector",
+        "fingerprint",
+        "fingerprint_seed",
+        "event_refs",
+        "unmet_item",
+        "expected_next_progress",
+        "detail",
+    )
 
     def __init__(
         self,
@@ -67,6 +75,7 @@ class Finding:
         detail: str,
     ) -> None:
         self.detector = detector
+        self.fingerprint_seed = fingerprint_seed
         self.fingerprint = _canonical_digest({"detector": detector, "seed": fingerprint_seed})
         self.event_refs = tuple(event_refs)
         self.unmet_item = unmet_item

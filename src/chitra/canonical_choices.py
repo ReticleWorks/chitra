@@ -84,28 +84,6 @@ def _event_cwd(event: CanonicalEvent, input_value: dict[str, object]) -> str | N
     return payload_cwd if isinstance(payload_cwd, str) else None
 
 
-def _explicit_targets(input_value: object) -> tuple[str, ...]:
-    if not isinstance(input_value, dict):
-        return ()
-    targets: list[str] = []
-    for field_name, value in input_value.items():
-        if field_name not in _TARGET_FIELDS:
-            continue
-        if isinstance(value, str) and value:
-            targets.append(value)
-        elif field_name in {"files", "paths"} and isinstance(value, list):
-            targets.extend(item for item in value if isinstance(item, str) and item)
-    return tuple(targets)
-
-
-def _first_unmet_item(enrolled_items: Sequence[object]) -> str:
-    for item in enrolled_items:
-        item_id = getattr(item, "id", None)
-        if isinstance(item_id, str):
-            return item_id
-    return ""
-
-
 def detect_canonical_choices(
     events: Sequence[CanonicalEvent],
     policy: CanonicalChoicesPolicy,

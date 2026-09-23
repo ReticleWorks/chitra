@@ -271,6 +271,11 @@ class EventJournal:
         self.path = self.directory / f"{lane}.jsonl"
         self.progress_path = self.directory / f"{lane}.progress.jsonl"
         self.lock_path = self.directory / f"{lane}.lock"
+        # Per-file scan watermarks for append dedupe: (inode, offset, mtime_ns, ids).
+        # The journal only grows by appends under this directory's lock, so an
+        # id seen below the watermark cannot reappear above it; an inode swap,
+        # a shrink, or a same-size rewrite (mtime moved) forces a full rescan.
+        self._id_scans: dict[str, tuple[int, int, int, set[str]]] = {}
 
     def load(self) -> list[CanonicalEvent]:
         if not self.path.exists():
@@ -285,6 +290,45 @@ class EventJournal:
                 except ValueError as exc:
                     raise ValueError(f"invalid journal row {self.path}:{line_number}: {exc}") from exc
         return events
+
+    def load_from(
+        self,
+        offset: int,
+        *,
+        inode: int | None = None,
+    ) -> tuple[list[CanonicalEvent], int, int, os.stat_result | None]:
+        """Read rows appended after ``offset`` bytes.
+
+        Returns ``(events, start_offset, end_offset, fd_stat)`` where
+        ``fd_stat`` describes the descriptor actually read. The caller owns
+        the watermark and may pass the inode that watermark belongs to; when
+        the live path has since been replaced, the descriptor's inode differs
+        and the read restarts at byte zero (``start_offset`` is 0) so a cache
+        built on the old file is never mixed with the new one's tail.
+        Journal writes append whole lines under the lane lock, so a stored
+        offset always lands on a line boundary.
+        """
+        if offset < 0:
+            raise ValueError("offset cannot be negative")
+        if not self.path.exists():
+            return [], 0, 0, None
+        events: list[CanonicalEvent] = []
+        with self.path.open("rb") as handle:
+            fd_stat = os.fstat(handle.fileno())
+            if inode is not None and fd_stat.st_ino != inode:
+                offset = 0
+            handle.seek(offset)
+            start = offset
+            position = offset
+            for line in handle:
+                position += len(line)
+                if not line.strip():
+                    continue
+                try:
+                    events.append(CanonicalEvent.model_validate_json(line))
+                except ValueError as exc:
+                    raise ValueError(f"invalid journal row {self.path} after byte {offset}: {exc}") from exc
+        return events, start, position, fd_stat
 
     def load_progress(self) -> list[ProgressClassification]:
         if not self.progress_path.exists():
@@ -312,6 +356,42 @@ class EventJournal:
     def append_progress(self, rows: Iterable[ProgressClassification]) -> tuple[ProgressClassification, ...]:
         return self._append_unique(self.progress_path, tuple(rows), "derivation_id")
 
+    def _scanned_identities(self, path: Path, id_field: str) -> set[str]:
+        """Return every ``id_field`` value already stored, reading only new bytes.
+
+        Append dedupe calls this on every write; keeping a byte watermark per
+        file makes a steady-state append O(new rows) instead of O(file). The
+        caller must hold ``self.lock_path``. A malformed tail raises the same
+        way the previous full-file scan did.
+        """
+        if not path.exists():
+            self._id_scans.pop(str(path), None)
+            return set()
+        stat = path.stat()
+        key = str(path)
+        entry = self._id_scans.get(key)
+        if (
+            entry is None
+            or entry[0] != stat.st_ino
+            or entry[1] > stat.st_size
+            or (stat.st_size == entry[1] and stat.st_mtime_ns != entry[2])
+        ):
+            offset, ids = 0, set()
+        else:
+            offset, ids = entry[1], entry[3]
+        with path.open("rb") as current:
+            current.seek(offset)
+            for line in current:
+                offset += len(line)
+                if not line.strip():
+                    continue
+                value = json.loads(line)
+                identity = value.get(id_field)
+                if isinstance(identity, str):
+                    ids.add(identity)
+        self._id_scans[key] = (stat.st_ino, offset, stat.st_mtime_ns, ids)
+        return ids
+
     def _append_unique[T: CanonicalEvent | ProgressClassification](
         self,
         path: Path,
@@ -323,16 +403,7 @@ class EventJournal:
         self.directory.mkdir(parents=True, exist_ok=True)
         os.chmod(self.directory, 0o700)
         with exclusive_lock(self.lock_path, mode=0o600):
-            existing: set[str] = set()
-            if path.exists():
-                with path.open("r", encoding="utf-8") as current:
-                    for line in current:
-                        if not line.strip():
-                            continue
-                        value = json.loads(line)
-                        identity = value.get(id_field)
-                        if isinstance(identity, str):
-                            existing.add(identity)
+            existing = self._scanned_identities(path, id_field)
             new_rows: list[T] = []
             for candidate in candidates:
                 identity = getattr(candidate, id_field)
@@ -349,6 +420,13 @@ class EventJournal:
                         written = os.write(fd, view)
                         view = view[written:]
                     os.fsync(fd)
+                    final_stat = os.fstat(fd)
                 finally:
                     os.close(fd)
+                self._id_scans[str(path)] = (
+                    final_stat.st_ino,
+                    final_stat.st_size,
+                    final_stat.st_mtime_ns,
+                    existing,
+                )
             return tuple(new_rows)

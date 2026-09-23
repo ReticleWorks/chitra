@@ -890,6 +890,73 @@ def test_discover_consumption_proof_accepts_mid_turn_queued_command_at_next_fina
     assert proof.turn_event_id == "final"  # not the tool call inside the turn
 
 
+def _hooked(text: str) -> dict[str, object]:
+    """A Claude ``hook_success`` attachment whose PostToolUse stdout injects ``text``."""
+    return {
+        "type": "attachment",
+        "attachment": {
+            "type": "hook_success",
+            "hook_name": "PostToolUse:chitra-order",
+            "stdout": json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PostToolUse",
+                        "additionalContext": text,
+                    }
+                }
+            ),
+            "stderr": "",
+            "exitCode": 0,
+        },
+    }
+
+
+def test_discover_consumption_proof_accepts_posttooluse_hook_delivery() -> None:
+    """An order a PostToolUse hook injected mid-turn is delivered input: it
+    binds the signed message hash and the next final response is the
+    consumption boundary, exactly like a queued operator command."""
+    record, entry, key, text = _mid_turn_proof_case()
+    session_ref = entry.session_ref
+    events = (
+        _event("hook", CanonicalType.UNKNOWN, native_type="attachment", raw_record=_hooked(text), session_id=session_ref),
+        _event("call", CanonicalType.TOOL_CALL, session_id=session_ref),
+        _event("final", CanonicalType.FINAL_RESPONSE, payload={"text": "done"}, session_id=session_ref),
+    )
+
+    proof = discover_consumption_proof(record, events, entry, key)
+
+    assert proof is not None
+    assert proof.user_event_id == "hook"
+    assert proof.turn_event_id == "final"
+
+
+def test_discover_consumption_proof_rejects_hook_success_without_exact_context() -> None:
+    """Hook output only counts as delivery when its stdout JSON carries the
+    order text verbatim under hookSpecificOutput.additionalContext."""
+    record, entry, key, text = _mid_turn_proof_case()
+    session_ref = entry.session_ref
+    final = _event("final", CanonicalType.FINAL_RESPONSE, payload={"text": "done"}, session_id=session_ref)
+    spoofs = (
+        # stdout is not JSON at all.
+        {"type": "attachment", "attachment": {"type": "hook_success", "stdout": "hook ran"}},
+        # JSON stdout with no hookSpecificOutput.additionalContext.
+        {"type": "attachment", "attachment": {"type": "hook_success", "stdout": "{}"}},
+        # A non-hook attachment type carrying the same shape.
+        {
+            "type": "attachment",
+            "attachment": {
+                "type": "hook_error",
+                "stdout": json.dumps({"hookSpecificOutput": {"additionalContext": text}}),
+            },
+        },
+        # The marker appears but the signed hash covers different bytes.
+        _hooked(f"{text} — plus trailing commentary"),
+    )
+    for raw in spoofs:
+        spoof = _event("s", CanonicalType.UNKNOWN, native_type="attachment", raw_record=raw, session_id=session_ref)
+        assert discover_consumption_proof(record, (spoof, final), entry, key) is None, raw
+
+
 def test_discover_consumption_proof_rejects_marker_outside_operator_input() -> None:
     record, entry, key, text = _mid_turn_proof_case()
     session_ref = entry.session_ref

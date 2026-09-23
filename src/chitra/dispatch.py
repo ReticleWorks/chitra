@@ -82,7 +82,7 @@ from typing import Protocol
 
 import structlog
 
-from chitra.journal.normalizers import queued_operator_prompt
+from chitra.journal.normalizers import hook_additional_context, queued_operator_prompt
 from chitra.orders import DispatchOrder, DispatchResult, DispatchStatus
 from chitra.policy_config import PolicyConfig
 
@@ -1175,7 +1175,7 @@ def _record_role(payload: object) -> str | None:
     """
     if not isinstance(payload, dict):
         return None
-    if queued_operator_prompt(payload) is not None:
+    if queued_operator_prompt(payload) is not None or hook_additional_context(payload) is not None:
         return "user"
     message = payload.get("message")
     message_role = message.get("role") if isinstance(message, dict) else None
