@@ -225,6 +225,10 @@ class DetectionExplain:
     # A cap with no readable resume time still reports the state; the response
     # protocol then has to source the time from the provider reading instead.
     resume_at: str | None = None
+    # Names a blocker-shaped rule displaced by newer evidence -- a live working
+    # footer, or a bare input row below it -- so the suppressed page stays
+    # auditable instead of vanishing behind the winning rule.
+    suppressed_blocker_rule: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -242,6 +246,7 @@ class DetectionExplain:
             "evaluated_rules": [evaluation.to_dict() for evaluation in self.evaluated_rules],
             "warning": self.warning,
             "resume_at": self.resume_at,
+            "suppressed_blocker_rule": self.suppressed_blocker_rule,
         }
 
 
@@ -451,6 +456,61 @@ class ManifestRepository:
         return manifest
 
 
+def _positive_match_lines(rule: ManifestRule, snapshot: str) -> tuple[int, ...]:
+    """Snapshot line indexes where the rule's positive matchers hit.
+
+    ``all`` and ``any`` matchers both count as evidence. Indexes are absolute
+    to the bounded snapshot so rules evaluated over different region depths
+    can still be ordered by position.
+    """
+    region_text = rule.region_text(snapshot)
+    region_lines = region_text.splitlines()
+    offset = len(snapshot.splitlines()) - len(region_lines)
+    hits: set[int] = set()
+    for matcher in (*rule.all_matchers, *rule.any_matchers):
+        if matcher.kind == "regex":
+            # A multiline matcher can span lines; the evidence sits at the
+            # match's last line so a spanning match still places its depth
+            # correctly.
+            assert matcher.compiled is not None
+            for found in matcher.compiled.finditer(region_text):
+                hits.add(offset + region_text.count("\n", 0, max(found.end() - 1, found.start())))
+            continue
+        if "\n" in matcher.value:
+            # A contains literal spanning lines has no single-line home; mark
+            # the region's last line so its depth is never underestimated.
+            if matcher.matches(region_text):
+                hits.add(offset + len(region_lines) - 1)
+            continue
+        for index, line in enumerate(region_lines):
+            if matcher.matches(line):
+                hits.add(offset + index)
+    return tuple(sorted(hits))
+
+
+def _idle_anchor_below_blocker(idle_rule: ManifestRule, blocker_rule: ManifestRule, snapshot: str) -> bool:
+    """Whether a bare anchored input row sits below the blocker's evidence.
+
+    Answered prompts keep matching blocked rules because the question text is
+    retained on screen. What marks the answer is the composer row returning
+    underneath: the anchor glyph alone on its own line, strictly below every
+    line the blocker matched on. A selector row inside a live prompt
+    (``› 1. Yes``) and an unsubmitted operator draft (``❯ draft text``) both
+    carry payload text, so neither qualifies -- the first is the prompt's own
+    control, and the second is a draft the input contract already treats as
+    not idle.
+    """
+    blocker_lines = _positive_match_lines(blocker_rule, snapshot)
+    if not blocker_lines:
+        return False
+    deepest_blocker = blocker_lines[-1]
+    lines = snapshot.splitlines()
+    return any(
+        index > deepest_blocker and len(lines[index].split()) == 1
+        for index in _positive_match_lines(idle_rule, snapshot)
+    )
+
+
 def classify_snapshot(
     snapshot: str,
     *,
@@ -512,15 +572,29 @@ def classify_snapshot(
     # until the cap lifts the lane is going nowhere, and calling it idle is
     # what made the last one invisible for two days.
     rate_limited = next((rule for rule in matched_rules if rule.state in RATE_LIMITED_STATES), None)
+    suppressed_blocker_rule: str | None = None
     if rate_limited is not None:
         matched_rule = rate_limited
-    elif matched_rule is not None and matched_rule.state == "blocked" and snapshot_live is not False:
-        # A live working footer is newer evidence than blocker-shaped text
-        # retained above it in the bounded capture. Working rules therefore
-        # suppress a simultaneous screen-derived blocker match regardless of
-        # manifest priority. Bundled working rules are anchored to live footer
-        # shapes so ordinary prose cannot trigger this override.
-        matched_rule = next((rule for rule in matched_rules if rule.state == "working"), matched_rule)
+    elif matched_rule is not None and matched_rule.state == "blocked":
+        blocker_rule = matched_rule
+        working_rule = next((rule for rule in matched_rules if rule.state == "working"), None)
+        idle_rule = next((rule for rule in matched_rules if rule.state == "idle"), None)
+        if working_rule is not None and snapshot_live is not False:
+            # A live working footer is newer evidence than blocker-shaped text
+            # retained above it in the bounded capture. Working rules therefore
+            # suppress a simultaneous screen-derived blocker match regardless of
+            # manifest priority. Bundled working rules are anchored to live footer
+            # shapes so ordinary prose cannot trigger this override.
+            matched_rule = working_rule
+            suppressed_blocker_rule = blocker_rule.identifier
+        elif idle_rule is not None and _idle_anchor_below_blocker(idle_rule, blocker_rule, bounded_snapshot):
+            # A bare anchored input row below the blocker's own evidence is
+            # newer still: the prompt was answered and its retained text is
+            # scrollback, not a live control. A selector row inside a live
+            # prompt and an unsubmitted draft both fail the bare-row test, so
+            # neither masks a real page.
+            matched_rule = idle_rule
+            suppressed_blocker_rule = blocker_rule.identifier
     if matched_rule is None:
         return DetectionExplain(
             agent=agent,
@@ -554,4 +628,5 @@ def classify_snapshot(
         screen_detection_skipped=False,
         screen_detection_skip_reason=None,
         evaluated_rules=tuple(evaluations),
+        suppressed_blocker_rule=suppressed_blocker_rule,
     )
