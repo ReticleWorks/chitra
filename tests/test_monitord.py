@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -123,7 +124,7 @@ def test_cli_flag_turns_shadow_mode_off_over_environment(monkeypatch: pytest.Mon
 def test_run_detectors_orders_findings_by_detector_order(tmp_path: Path) -> None:
     config = _config(tmp_path)
     events = (
-        _event("e1", CanonicalType.TOOL_CALL),
+        _event("e1", CanonicalType.TOOL_CALL, lane=SEEDED_LANE),
         _event("e2", CanonicalType.FINAL_RESPONSE),
     )
     findings = run_detectors(config, LANE, None, events)
@@ -449,6 +450,210 @@ def test_check_enrollment_runs_nothing_for_a_negated_claim(
 
 def test_check_enrollment_is_silent_for_unenrolled_sessions(tmp_path: Path) -> None:
     assert check_enrollment_and_receipts(_config(tmp_path), "no-such-session") == (0, False, [], False)
+
+
+def _claim_event(event_id: str) -> CanonicalEvent:
+    return _event(event_id, CanonicalType.FINAL_RESPONSE).model_copy(
+        update={"payload": {"text": "Done. The digest file exists and is verified."}}
+    )
+
+
+def test_check_enrollment_replays_the_stored_outcome_for_an_unchanged_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """proof.md gap 7: a repeated claim must not re-execute its validators.
+
+    The first evaluation runs them and stores a durable outcome marker; the
+    second identical evaluation replays it. Changing the registry bytes
+    reopens the check.
+    """
+    _write_registry(tmp_path, monkeypatch, exit_code=1)
+    upsert_goal(tmp_path, _goal("session-1"))
+    real = monitord_mod.record_enrolled_validator_runs
+    calls: list[str] = []
+
+    def counting(root: Path, session_ref: str, items: object) -> tuple[CompletionEvidence, ...]:
+        calls.append(session_ref)
+        return real(root, session_ref, items)
+
+    monkeypatch.setattr(monitord_mod, "record_enrolled_validator_runs", counting)
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+    claim = _claim_event("claim-1")
+
+    first = check_enrollment_and_receipts(config, "session-1", claim)
+    second = check_enrollment_and_receipts(config, "session-1", claim)
+
+    assert calls == ["session-1"]
+    assert first[0] == 1 and first[1] is True and first[3] is False
+    assert second[0] == first[0] and second[1] == first[1]
+    assert [finding.fingerprint for finding in second[2]] == [finding.fingerprint for finding in first[2]]
+
+    _write_registry(tmp_path, monkeypatch, exit_code=0)
+    third = check_enrollment_and_receipts(
+        config, "session-1", claim, reviewer=_StubReviewer("accept")
+    )
+    assert calls == ["session-1", "session-1"]
+    assert third[1] is False
+    stored = get_goal(tmp_path, "session-1")
+    assert stored is not None
+    assert stored.status == "done-pending-close"
+
+
+def test_check_enrollment_evaluates_every_claim_in_the_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """detect.md gap 9: the newest final response must not erase an earlier one."""
+    _write_registry(tmp_path, monkeypatch, exit_code=1)
+    upsert_goal(tmp_path, _goal("session-1"))
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+    earlier = _claim_event("claim-earlier")
+    latest = _claim_event("claim-latest")
+
+    recorded, disputed, findings, pending = check_enrollment_and_receipts(
+        config,
+        "session-1",
+        latest,
+        final_responses=(earlier, latest),
+    )
+
+    assert (recorded, disputed, pending) == (2, True, False)
+    assert monitord_mod._load_claim_checks(config, "session-1").keys() == {"claim-earlier", "claim-latest"}
+    refs = {ref for finding in findings for ref in finding.event_refs}
+    assert "claim-earlier" in refs
+
+
+def test_check_enrollment_surfaces_a_goal_store_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """proof.md gap 11: a failed get_goal is a finding, not a silent pass."""
+    _write_registry(tmp_path, monkeypatch)
+    upsert_goal(tmp_path, _goal("session-1"))
+
+    def broken(root: Path, session_ref: str, **kwargs: object) -> None:
+        raise OSError("goal store read failed")
+
+    monkeypatch.setattr(monitord_mod, "get_goal", broken)
+
+    with capture_logs() as logs:
+        recorded, disputed, findings, pending = check_enrollment_and_receipts(
+            _config(tmp_path), "session-1", _claim_event("claim-1")
+        )
+
+    assert (recorded, disputed, pending) == (0, True, False)
+    (finding,) = findings
+    assert finding.detector == "monitor-internal-error"
+    assert finding.fingerprint_seed["reason"] == "goal-lookup-failed"
+    assert any(entry["event"] == "monitord_goal_lookup_failed" for entry in logs)
+
+
+def test_check_enrollment_flags_exit_before_contract_when_the_turn_ended(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A turn that ended with no final response fails its enrolled contract."""
+    _write_registry(tmp_path, monkeypatch)
+    upsert_goal(tmp_path, _goal("session-1", status="turn-finished-unverified"))
+    boundary = _event("resume-1", CanonicalType.RESUME)
+
+    recorded, disputed, findings, pending = check_enrollment_and_receipts(
+        _config(tmp_path),
+        "session-1",
+        None,
+        final_responses=(),
+        turn_ended=True,
+        turn_end_event=boundary,
+    )
+
+    assert (recorded, disputed, pending) == (0, True, False)
+    (finding,) = findings
+    assert finding.detector == "false_done"
+    assert finding.fingerprint_seed["reason"] == "exit-before-contract"
+    assert finding.event_refs == ("resume-1",)
+
+
+def test_load_lane_events_parses_only_new_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _config(tmp_path)
+    journal = EventJournal(tmp_path, SEEDED_LANE)
+    journal.append((_event("e1", CanonicalType.TOOL_CALL, lane=SEEDED_LANE),))
+    assert [event.event_id for event in monitord_mod.load_lane_events(config, SEEDED_LANE)] == ["e1"]
+
+    parses: list[object] = []
+    original = CanonicalEvent.model_validate_json
+
+    def counting(cls: type[CanonicalEvent], data: object, *args: object, **kwargs: object) -> CanonicalEvent:
+        parses.append(data)
+        return original(data, *args, **kwargs)
+
+    monkeypatch.setattr(CanonicalEvent, "model_validate_json", classmethod(counting))
+    try:
+        journal.append((_event("e2", CanonicalType.TOOL_CALL, lane=SEEDED_LANE),))
+        assert [event.event_id for event in monitord_mod.load_lane_events(config, SEEDED_LANE)] == ["e1", "e2"]
+        assert len(parses) == 1
+        assert [event.event_id for event in monitord_mod.load_lane_events(config, SEEDED_LANE)] == ["e1", "e2"]
+        assert len(parses) == 1
+    finally:
+        monitord_mod._LANE_JOURNALS.clear()
+
+
+def test_load_lane_events_reloads_after_rewrite_and_truncate(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    journal = EventJournal(tmp_path, SEEDED_LANE)
+    journal.append((_event("e1", CanonicalType.TOOL_CALL, lane=SEEDED_LANE),))
+    assert [event.event_id for event in monitord_mod.load_lane_events(config, SEEDED_LANE)] == ["e1"]
+
+    try:
+        # Same-size rewrite: a different event row of identical serialized length.
+        replacement = _event("e2", CanonicalType.TOOL_CALL, lane=SEEDED_LANE)
+        journal.path.write_text(replacement.model_dump_json() + "\n", encoding="utf-8")
+        stat = journal.path.stat()
+        os.utime(journal.path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+        assert [event.event_id for event in monitord_mod.load_lane_events(config, SEEDED_LANE)] == ["e2"]
+
+        journal.path.write_text("", encoding="utf-8")
+        assert monitord_mod.load_lane_events(config, SEEDED_LANE) == ()
+    finally:
+        monitord_mod._LANE_JOURNALS.clear()
+
+
+def test_ingest_transcript_bindings_pools_the_ingestor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """detect.md gap 15: a second pass must not replay the whole transcript."""
+    fixture = Path(__file__).parent / "fixtures" / "w11" / "claude-2.1.229-synthetic.jsonl"
+    transcript = tmp_path / "pooled.jsonl"
+    transcript.write_bytes(fixture.read_bytes())
+    binding = TranscriptBinding(
+        session_ref="goal-x",
+        lane="lane-x",
+        path=str(transcript),
+        client=Client.CLAUDE,
+        client_version="2.1.229",
+        instance="i",
+    )
+    config = _config(tmp_path)
+    try:
+        first = ingest_transcript_bindings(config, (binding,))
+        key = (str(config.state_dir), str(transcript.resolve()))
+        assert key in monitord_mod._INGESTOR_POOL
+        pooled = monitord_mod._INGESTOR_POOL[key][1]
+
+        assert ingest_transcript_bindings(config, (binding,)) == ()
+        assert monitord_mod._INGESTOR_POOL[key][1] is pooled
+
+        # The pooled normalizer answers the session id without a fresh replay.
+        def never(_path: Path) -> str:
+            raise AssertionError("native_session_identity replayed the transcript")
+
+        monkeypatch.setattr(monitord_mod, "native_session_identity", never)
+        assert monitord_mod._bound_native_session_id(config, transcript.resolve()) == "fixture-claude-session"
+
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps({"type": "brand-new-record", "sessionId": "fixture-claude-session"}) + "\n"
+            )
+        assert len(ingest_transcript_bindings(config, (binding,))) == 1
+        assert len(first) == 10
+    finally:
+        for _key, (_context, ingestor) in monitord_mod._INGESTOR_POOL.items():
+            ingestor.close()
+        monitord_mod._INGESTOR_POOL.clear()
 
 
 class _StubReviewer:

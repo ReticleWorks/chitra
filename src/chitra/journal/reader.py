@@ -42,7 +42,14 @@ class JsonlTailReader:
         self._buffer_start = 0
         self._generation = 0
         self._anchor = b""
-        self._consumed: list[tuple[int, int, str]] = []
+        # Running digest over every consumed byte in [0, _buffer_start):
+        # one hash object replaces a per-line digest list while detecting the
+        # same interior rewrites.
+        self._consumed_digest = hashlib.sha256()
+        # Mtime observed at the last completed read of this file. A poll that
+        # finds size and mtime both untouched proves no byte moved, so the
+        # integrity scan has nothing to re-verify and the poll is O(1).
+        self._last_mtime_ns: int | None = None
 
     @property
     def identity(self) -> TranscriptIdentity | None:
@@ -78,6 +85,15 @@ class JsonlTailReader:
         current_key = (self._identity.device, self._identity.inode)
         path_key = (path_stat.st_dev, path_stat.st_ino)
         replaced = path_key != current_key
+        if (
+            not replaced
+            and path_stat.st_size == self._offset
+            and path_stat.st_mtime_ns == self._last_mtime_ns
+        ):
+            # Same file, no new bytes, mtime unmoved: nothing was appended or
+            # rewritten since the last read, so there is nothing to drain or
+            # re-verify. This is the steady-state poll and it stays O(1).
+            return ReadBatch(())
         rewritten = path_key == current_key and (
             path_stat.st_size < self._offset or not self._anchor_matches() or not self._consumed_intact()
         )
@@ -91,7 +107,7 @@ class JsonlTailReader:
             self._buffer = bytearray()
             self._buffer_start = 0
             self._anchor = b""
-            self._consumed = []
+            self._consumed_digest = hashlib.sha256()
             self._open_current()
             assert self._identity is not None
             rotations.append(Rotation(previous, self._identity, abandoned))
@@ -115,11 +131,13 @@ class JsonlTailReader:
             self._buffer = bytearray()
             self._buffer_start = 0
             self._anchor = b""
-            self._consumed = []
+            self._consumed_digest = hashlib.sha256()
             self._open_current()
             assert self._identity is not None
             rotations.append(Rotation(previous, self._identity, abandoned))
             records.extend(self._drain())
+        if final_stat is not None:
+            self._last_mtime_ns = final_stat.st_mtime_ns
         return ReadBatch(tuple(records), tuple(rotations))
 
     def follow(
@@ -158,6 +176,7 @@ class JsonlTailReader:
             inode=file_stat.st_ino,
             generation=self._generation,
         )
+        self._last_mtime_ns = file_stat.st_mtime_ns
 
     def _anchor_matches(self) -> bool:
         if not self._anchor:
@@ -167,17 +186,25 @@ class JsonlTailReader:
         return os.pread(self._handle.fileno(), len(self._anchor), start) == self._anchor
 
     def _consumed_intact(self) -> bool:
-        """Verify earlier record hashes and buffered bytes still match disk."""
+        """Verify earlier record bytes and the buffered tail still match disk."""
         assert self._handle is not None
         if self._buffer:
             prefix = os.pread(self._handle.fileno(), len(self._buffer), self._buffer_start)
             if prefix != bytes(self._buffer):
                 return False
-        for start, end, digest in self._consumed:
-            found = os.pread(self._handle.fileno(), end - start, start)
-            if hashlib.sha256(found).hexdigest() != digest:
+        hasher = hashlib.sha256()
+        position = 0
+        while position < self._buffer_start:
+            chunk = os.pread(
+                self._handle.fileno(),
+                min(self.chunk_size, self._buffer_start - position),
+                position,
+            )
+            if not chunk:
                 return False
-        return True
+            hasher.update(chunk)
+            position += len(chunk)
+        return hasher.digest() == self._consumed_digest.digest()
 
     def _drain(self) -> list[RawRecord]:
         assert self._handle is not None
@@ -205,9 +232,7 @@ class JsonlTailReader:
                 if raw_line.strip():
                     records.append(self._decode(raw_line, line_start, line_end))
                 else:
-                    self._consumed.append(
-                        (line_start, line_end, hashlib.sha256(raw_line).hexdigest())
-                    )
+                    self._consumed_digest.update(raw_line)
         return records
 
     def _decode(self, raw_line: bytes, start: int, end: int) -> RawRecord:
@@ -223,7 +248,7 @@ class JsonlTailReader:
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             error = str(exc)
         assert self._identity is not None
-        self._consumed.append((start, end, digest))
+        self._consumed_digest.update(raw_line)
         return RawRecord(
             transcript=self._identity,
             byte_range=ByteRange(start=start, end=end),

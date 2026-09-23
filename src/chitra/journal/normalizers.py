@@ -67,6 +67,37 @@ def queued_operator_prompt(record: object) -> str | None:
     return prompt if isinstance(prompt, str) else None
 
 
+def hook_additional_context(record: object) -> str | None:
+    """Return the context text a successful Claude hook injected, else None.
+
+    A PostToolUse hook can deliver an order while a turn is running; Claude
+    Code records it as an ``attachment`` record of type ``hook_success`` whose
+    ``stdout`` is JSON carrying the injected text under
+    ``hookSpecificOutput.additionalContext``. Only that exact shape counts as
+    delivered input -- a malformed stdout payload or a hook result without
+    additional context is ordinary hook output, not an operator message.
+    """
+    if not isinstance(record, dict) or record.get("type") != "attachment":
+        return None
+    attachment = record.get("attachment")
+    if not isinstance(attachment, dict) or attachment.get("type") != "hook_success":
+        return None
+    stdout = attachment.get("stdout")
+    if not isinstance(stdout, str):
+        return None
+    try:
+        payload: object = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    hook_output = payload.get("hookSpecificOutput")
+    if not isinstance(hook_output, dict):
+        return None
+    context = hook_output.get("additionalContext")
+    return context if isinstance(context, str) and context else None
+
+
 def _native_key(record: dict[str, Any], raw_sha256: str) -> str:
     for key in ("uuid", "id"):
         value = record.get(key)

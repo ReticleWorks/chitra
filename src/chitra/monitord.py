@@ -41,7 +41,7 @@ import os
 import signal
 import threading
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -126,8 +126,10 @@ from chitra.validation_receipts import (
     recorded_validator_run_fresh,
     recorded_validator_run_proof,
     run_enrolled_validators_on_worker,
+    validator_runs_root,
     worktree_git_digest,
 )
+from chitra.validator_registry import validators_path
 
 logger = structlog.get_logger(__name__)
 
@@ -240,6 +242,57 @@ def _lane_roots(state_dir: Path) -> list[Path]:
     )
 
 
+# Live ingestors keyed by (state_dir, transcript path). Keeping the reader
+# and normalizer alive between passes makes each pass consume only the bytes
+# appended since the last poll; the reader's own anchor/digest checks still
+# fire on every poll, so a rotated or rewritten transcript replays in full.
+_INGESTOR_POOL: dict[
+    tuple[str, str],
+    tuple[tuple[object, ...], JournalIngestor],
+] = {}
+
+
+def _pooled_ingestor(
+    config: MonitordConfig,
+    transcript_path: Path,
+    context: NormalizationContext,
+) -> JournalIngestor:
+    """Return the live ingestor for this binding, rebuilding on context change."""
+    key = (str(config.state_dir), str(transcript_path))
+    wanted = (context.instance, context.lane, context.client, context.client_version, context.goal_ref)
+    pooled = _INGESTOR_POOL.get(key)
+    if pooled is not None and pooled[0] == wanted:
+        return pooled[1]
+    if pooled is not None:
+        pooled[1].close()
+    ingestor = JournalIngestor(
+        state_root=config.state_dir,
+        transcript_path=transcript_path,
+        context=context,
+    )
+    _INGESTOR_POOL[key] = (wanted, ingestor)
+    return ingestor
+
+
+def _drop_pooled_ingestor(config: MonitordConfig, transcript_path: Path) -> None:
+    pooled = _INGESTOR_POOL.pop((str(config.state_dir), str(transcript_path)), None)
+    if pooled is not None:
+        pooled[1].close()
+
+
+def _bound_native_session_id(config: MonitordConfig, transcript_path: Path) -> str | None:
+    """Return the bound transcript's native session id without a second replay.
+
+    The pooled ingestor's normalizer already tracks the transcript's session
+    id as records flow through it; only a lane whose ingestor is absent (for
+    example after a failed poll evicted it) pays for the full replay.
+    """
+    pooled = _INGESTOR_POOL.get((str(config.state_dir), str(transcript_path)))
+    if pooled is not None:
+        return pooled[1].normalizer.session_id
+    return native_session_identity(transcript_path)
+
+
 def ingest_transcript_bindings(
     config: MonitordConfig,
     bindings: tuple[TranscriptBinding, ...],
@@ -258,16 +311,20 @@ def ingest_transcript_bindings(
             goal_ref=binding.session_ref,
         )
         try:
-            with JournalIngestor(
-                state_root=config.state_dir,
-                transcript_path=transcript_path,
-                context=context,
-            ) as ingestor:
-                result = ingestor.poll()
-        except ValueError as exc:
-            # One malformed transcript skips its own lane this pass, not every lane.
-            logger.error("monitord_binding_ingest_failed", lane=binding.lane, error=str(exc))
-            continue
+            result = _pooled_ingestor(config, transcript_path, context).poll()
+        except ValueError:
+            # A true rotation can hand this path a different session's file:
+            # the pooled normalizer fails on the old session id, so rebuild
+            # the ingestor once and let a fresh stream adopt the new one. A
+            # persistently malformed transcript fails the same way on the
+            # retry, skipping only its own lane this pass.
+            _drop_pooled_ingestor(config, transcript_path)
+            try:
+                result = _pooled_ingestor(config, transcript_path, context).poll()
+            except ValueError as exc:
+                _drop_pooled_ingestor(config, transcript_path)
+                logger.error("monitord_binding_ingest_failed", lane=binding.lane, error=str(exc))
+                continue
         observed.extend(result.observed)
         # Client versions are not gated. Newly appended records the normalizer
         # does not recognize are the drift signal.
@@ -441,9 +498,63 @@ def _idle_pursuit_finding(
     )
 
 
+@dataclass
+class _LaneJournalCache:
+    """Parsed events plus the byte watermark they cover for one journal file."""
+
+    events: list[CanonicalEvent]
+    offset: int
+    inode: int
+    mtime_ns: int
+
+
+_LANE_JOURNALS: dict[tuple[str, str], _LaneJournalCache] = {}
+
+
 def load_lane_events(config: MonitordConfig, lane: str) -> tuple[CanonicalEvent, ...]:
-    """Load one lane's durable canonical journal."""
-    return tuple(EventJournal(config.state_dir, lane).load())
+    """Load one lane's durable canonical journal, parsing only newly appended rows.
+
+    The journal is append-only under its lane lock, so a cached byte offset
+    limits each monitor pass to the delta. An inode change, a shrink, or a
+    same-size rewrite (mtime moved while size stayed put) discards the cache
+    and reloads in full; a malformed tail fails the pass exactly as a full
+    ``load()`` would.
+    """
+    journal = EventJournal(config.state_dir, lane)
+    key = (str(config.state_dir), lane)
+    try:
+        stat = journal.path.stat()
+    except OSError:
+        _LANE_JOURNALS.pop(key, None)
+        return ()
+    cached = _LANE_JOURNALS.get(key)
+    if cached is not None and (
+        cached.inode != stat.st_ino
+        or stat.st_size < cached.offset
+        or (stat.st_size == cached.offset and stat.st_mtime_ns != cached.mtime_ns)
+    ):
+        cached = None
+    if cached is not None and stat.st_size == cached.offset:
+        return tuple(cached.events)
+    parsed, start, end_offset, fd_stat = journal.load_from(
+        cached.offset if cached is not None else 0,
+        inode=cached.inode if cached is not None else None,
+    )
+    if fd_stat is None:
+        _LANE_JOURNALS.pop(key, None)
+        return ()
+    if cached is None:
+        cached = _LaneJournalCache(events=[], offset=0, inode=fd_stat.st_ino, mtime_ns=fd_stat.st_mtime_ns)
+        _LANE_JOURNALS[key] = cached
+    elif start == 0:
+        # The path was replaced between the stat above and the open inside
+        # load_from; the returned events cover the whole current file.
+        cached.events.clear()
+    cached.events.extend(parsed)
+    cached.offset = end_offset
+    cached.inode = fd_stat.st_ino
+    cached.mtime_ns = fd_stat.st_mtime_ns
+    return tuple(cached.events)
 
 
 def _final_response(events: tuple[CanonicalEvent, ...]) -> CanonicalEvent | None:
@@ -861,53 +972,258 @@ def _claimed_run_evidence(
     return None
 
 
-def check_enrollment_and_receipts(
+_ACTIONABLE_GOAL_STATUSES = frozenset(
+    {"working", "blocked", "turn-finished-unverified", "completion-disputed"}
+)
+_CLAIM_CHECK_SCHEMA = "chitra.monitord.claim-check.v1"
+
+
+def _goal_lookup_finding(session_ref: str, exc: Exception) -> Finding:
+    """Surface a failed goal-store read as a finding instead of a silent skip."""
+    return Finding(
+        detector="monitor-internal-error",
+        fingerprint_seed={
+            "session_ref": session_ref,
+            "reason": "goal-lookup-failed",
+            "error_type": type(exc).__name__,
+        },
+        event_refs=(),
+        unmet_item="goal store",
+        expected_next_progress="restore the goal store so this lane's contract can be read",
+        detail=f"goal lookup for session {session_ref!r} failed: {type(exc).__name__}: {exc}",
+    )
+
+
+def _event_text(event: CanonicalEvent) -> str:
+    value = event.payload.get("text")
+    return value if isinstance(value, str) else ""
+
+
+def _claim_check_path(config: MonitordConfig, session_ref: str) -> Path:
+    session_key = hashlib.sha256(session_ref.encode("utf-8")).hexdigest()
+    return validator_runs_root(config.state_dir) / session_key / "claim-check.json"
+
+
+def _registry_file_digest(config: MonitordConfig) -> str | None:
+    """Digest the validator registry bytes; ``None`` when a read fails mid-check."""
+    try:
+        return hashlib.sha256(validators_path(config.state_dir).read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return None
+
+
+def _claim_check_key(
+    config: MonitordConfig,
+    goal: GoalRecord,
+    claim_event: CanonicalEvent,
+    items: tuple[EnrolledDoneWhenItemLike, ...],
+    material_questions: tuple[str, ...],
+    still_running: tuple[str, ...],
+) -> dict[str, Any] | None:
+    """Identify the logical check a claim marker may safely stand in for.
+
+    A stored outcome is reused only while the claim event, goal version,
+    enrolled items, validator registry bytes, open material questions, and
+    in-flight lane work are all unchanged. ``None`` disables reuse entirely
+    when the registry itself cannot be read.
+    """
+    registry_digest = _registry_file_digest(config)
+    if registry_digest is None:
+        return None
+    lane = recorded_result_lane(config.state_dir, goal.session_ref)
+    worktree_digest = worktree_git_digest(lane.workdir) if lane is not None else None
+    if lane is not None and worktree_digest is None:
+        return None
+    return {
+        "claim_event_id": claim_event.event_id,
+        "goal_version": goal.goal_version,
+        "registry_sha256": registry_digest,
+        "items": [[item.id, item.validator, item.required_receipt] for item in items],
+        "material_questions": list(material_questions),
+        "still_running": sorted(still_running),
+        "worktree_digest": worktree_digest,
+    }
+
+
+def _receipt_file_digests(
     config: MonitordConfig,
     session_ref: str,
-    final_response: CanonicalEvent | None = None,
-    *,
-    reviewer: BehaviorReviewer | None = None,
-    still_running: tuple[str, ...] = (),
-) -> tuple[int, bool, list[Finding], bool]:
-    """Verify an explicit completion claim against its enrolled contract.
+    items: tuple[EnrolledDoneWhenItemLike, ...],
+) -> dict[str, str | None]:
+    """Digest each enrolled receipt's stored bytes; ``None`` when unreadable."""
+    digests: dict[str, str | None] = {}
+    for item in items:
+        try:
+            digests[item.required_receipt] = hashlib.sha256(
+                receipt_path(config.state_dir, session_ref, item.required_receipt).read_bytes()
+            ).hexdigest()
+        except (OSError, ValueError):
+            digests[item.required_receipt] = None
+    return digests
 
-    Validators run on any completion claim in the latest unconsumed final
-    response, whether or not it carries a structured completion line. The
-    lane's claimed result is ignored; Chitra executes and stores each
-    enrolled validator itself. A missing or held goal and a turn without a
-    completion claim are silent. For a lane that runs as another OS user
-    the execution happens on the worker pool and a claim is neither passed
-    nor disputed while that run is in flight; the fourth return value
-    reports that pending state so the pass does not treat a lane under
-    active validation as idle. ``still_running`` names lane work still in
-    flight so the isolated reviewer can answer "insufficient", which is
-    reported the same way: pending, neither passed nor disputed.
-    """
+
+def _finding_payload(finding: Finding) -> dict[str, Any]:
+    return {
+        "detector": finding.detector,
+        "fingerprint_seed": finding.fingerprint_seed,
+        "event_refs": list(finding.event_refs),
+        "unmet_item": finding.unmet_item,
+        "expected_next_progress": finding.expected_next_progress,
+        "detail": finding.detail,
+    }
+
+
+def _finding_from_payload(payload: object) -> Finding | None:
+    if not isinstance(payload, dict):
+        return None
+    detector = payload.get("detector")
+    seed = payload.get("fingerprint_seed")
+    refs = payload.get("event_refs")
+    unmet_item = payload.get("unmet_item")
+    expected_next_progress = payload.get("expected_next_progress")
+    detail = payload.get("detail")
+    if not (
+        isinstance(detector, str)
+        and isinstance(seed, dict)
+        and isinstance(refs, list)
+        and all(isinstance(ref, str) for ref in refs)
+        and isinstance(unmet_item, str)
+        and isinstance(expected_next_progress, str)
+        and isinstance(detail, str)
+    ):
+        return None
+    return Finding(
+        detector=detector,
+        fingerprint_seed=seed,
+        event_refs=tuple(refs),
+        unmet_item=unmet_item,
+        expected_next_progress=expected_next_progress,
+        detail=detail,
+    )
+
+
+def _load_claim_checks(config: MonitordConfig, session_ref: str) -> dict[str, Any]:
+    """Read the session's claim-check marker; malformed state reads as absent."""
+    path = _claim_check_path(config, session_ref)
     try:
-        goal = get_goal(config.state_dir, session_ref)
-    except Exception:
-        return 0, False, [], False
-    if goal is None or goal.status not in {
-        "working",
-        "blocked",
-        "turn-finished-unverified",
-        "completion-disputed",
-    }:
-        return 0, False, [], False
-    final_text = ""
-    if final_response is not None:
-        payload_text = final_response.payload.get("text")
-        final_text = payload_text if isinstance(payload_text, str) else ""
-    if not final_text or not is_completion_claim(final_text):
-        return 0, False, [], False
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != _CLAIM_CHECK_SCHEMA
+        or payload.get("session_ref") != session_ref
+    ):
+        return {}
+    checks = payload.get("checks")
+    return dict(checks) if isinstance(checks, dict) else {}
 
+
+def _stored_claim_outcome(
+    entry: object,
+    key: dict[str, Any],
+    receipt_digests: dict[str, str | None],
+) -> tuple[int, bool, list[Finding], bool] | None:
+    """Return the recorded outcome only while it still covers this exact check."""
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("key") != key or entry.get("receipt_digests") != receipt_digests:
+        return None
+    outcome = entry.get("outcome")
+    if not isinstance(outcome, dict):
+        return None
+    receipts = outcome.get("receipts_recorded")
+    disputed = outcome.get("disputed")
+    pending = outcome.get("pending")
+    raw_findings = outcome.get("findings")
+    if not (
+        isinstance(receipts, int)
+        and not isinstance(receipts, bool)
+        and isinstance(disputed, bool)
+        and isinstance(pending, bool)
+        and isinstance(raw_findings, list)
+    ):
+        return None
+    findings = [_finding_from_payload(item) for item in raw_findings]
+    if any(finding is None for finding in findings):
+        return None
+    return receipts, disputed, [finding for finding in findings if finding is not None], pending
+
+
+def _store_claim_check(
+    config: MonitordConfig,
+    session_ref: str,
+    claim_event_id: str,
+    *,
+    key: dict[str, Any],
+    receipt_digests: dict[str, str | None],
+    outcome: tuple[int, bool, list[Finding], bool],
+) -> None:
+    """Record one completion claim's outcome durably.
+
+    The marker is dedupe state, not proof: a write failure only means the
+    next pass re-evaluates, so it is logged and never fatal.
+    """
+    path = _claim_check_path(config, session_ref)
+    entry = {
+        "key": key,
+        "receipt_digests": receipt_digests,
+        "outcome": {
+            "receipts_recorded": outcome[0],
+            "disputed": outcome[1],
+            "pending": outcome[3],
+            "findings": [_finding_payload(finding) for finding in outcome[2]],
+        },
+    }
+    try:
+        with locked_json_store(path):
+            checks = _load_claim_checks(config, session_ref)
+            checks[claim_event_id] = entry
+            write_json_atomic(
+                path,
+                {
+                    "schema": _CLAIM_CHECK_SCHEMA,
+                    "session_ref": session_ref,
+                    "checks": checks,
+                },
+                fsync=True,
+            )
+    except Exception as exc:
+        logger.warning(
+            "monitord_claim_check_store_failed",
+            session_ref=session_ref,
+            error=str(exc),
+        )
+
+
+def _evaluate_completion_claim(
+    config: MonitordConfig,
+    goal: GoalRecord,
+    session_ref: str,
+    claim_event: CanonicalEvent,
+    *,
+    reviewer: BehaviorReviewer | None,
+    still_running: tuple[str, ...],
+) -> tuple[int, bool, list[Finding], bool]:
+    """Evaluate one completion claim event against its enrolled contract.
+
+    The durable claim-check marker under ``validation-runs/`` holds the
+    outcome keyed on the claim event, goal version, enrolled items, registry
+    bytes, open material questions, and in-flight lane work, plus the stored
+    receipt digests produced by the run. While all of those still match, a
+    later pass replays the recorded outcome instead of re-executing the same
+    validators for the same logical check.
+    """
+    final_text = _event_text(claim_event)
     items = tuple(getattr(goal, "enrolled_done_when_items", ()) or ())
     if not items:
         findings = [
             Finding(
                 detector="false_done",
                 fingerprint_seed={"session_ref": session_ref, "reason": "unenrolled-completion"},
-                event_refs=(final_response.event_id,) if final_response is not None else (),
+                event_refs=(claim_event.event_id,),
                 unmet_item="frozen completion contract",
                 expected_next_progress="enroll exact done conditions and their independent validators before claiming completion",
                 detail="completion was claimed without frozen enrolled done items",
@@ -921,6 +1237,25 @@ def check_enrollment_and_receipts(
                 status="completion-disputed",
             )
         return 0, True, findings, False
+
+    material_questions = (*goal.open_asks, *((goal.needs,) if goal.needs else ()))
+    check_key = _claim_check_key(
+        config, goal, claim_event, items, material_questions, still_running
+    )
+    if check_key is not None:
+        stored = _load_claim_checks(config, session_ref).get(claim_event.event_id)
+        outcome = _stored_claim_outcome(
+            stored, check_key, _receipt_file_digests(config, session_ref, items)
+        )
+        if outcome is not None:
+            if outcome[1] and not config.shadow_mode:
+                update_now(
+                    config.state_dir,
+                    session_ref,
+                    now="; ".join(finding.detail for finding in outcome[2]),
+                    status="completion-disputed",
+                )
+            return outcome
 
     claimed_evidence = tuple(extract_completion_evidence(final_text))
     claim_bindings: dict[str, str] = {}
@@ -946,15 +1281,16 @@ def check_enrollment_and_receipts(
         for item in items:
             claim_bindings[item.id] = item.required_receipt
 
-    material_questions = (*goal.open_asks, *((goal.needs,) if goal.needs else ()))
     findings = detect_false_done(
-        final_response=final_response,
+        final_response=claim_event,
         enrolled_items=items,
         receipt_names_by_item=claim_bindings,
         receipt_roots={session_ref: config.state_dir},
         session_ref=session_ref,
         material_questions=material_questions,
     )
+    pending = False
+    cacheable = True
     if not findings and not config.shadow_mode:
         # The same isolated reviewer that gates completion claims under watchd
         # now gates them here: a deterministic pass alone does not release a
@@ -989,11 +1325,12 @@ def check_enrollment_and_receipts(
                     error=str(exc),
                 )
                 signal = None
+                cacheable = False
                 findings = [
                     Finding(
                         detector="false_done",
                         fingerprint_seed={"session_ref": session_ref, "reason": "review-unavailable"},
-                        event_refs=(final_response.event_id,) if final_response is not None else (),
+                        event_refs=(claim_event.event_id,),
                         unmet_item="isolated completion review",
                         expected_next_progress="restore the isolated reviewer and re-claim completion",
                         detail=f"the isolated completion review could not run: {exc}",
@@ -1003,8 +1340,8 @@ def check_enrollment_and_receipts(
             # The reviewers could not decide while lane work is still in
             # flight: like watchd, leave the goal untouched and report the
             # claim as pending rather than disputing it.
-            return len(run_evidence), False, [], True
-        if not findings and signal is not None and signal.verdict != "accept":
+            pending = True
+        elif not findings and signal is not None and signal.verdict != "accept":
             review_detail = "; ".join(f"{item.code}: {item.detail}" for item in signal.findings)
             findings = [
                 Finding(
@@ -1014,7 +1351,7 @@ def check_enrollment_and_receipts(
                         "reason": "review-rejected",
                         "signal_id": signal.signal_id,
                     },
-                    event_refs=(final_response.event_id,) if final_response is not None else (),
+                    event_refs=(claim_event.event_id,),
                     unmet_item="isolated completion review",
                     expected_next_progress="resolve the cited review findings before claiming completion again",
                     detail=(
@@ -1023,13 +1360,13 @@ def check_enrollment_and_receipts(
                     ),
                 )
             ]
-    if not findings and not config.shadow_mode:
+    if not findings and not pending and not config.shadow_mode:
         try:
             mark_completion_gate_passed(
                 config.state_dir,
                 session_ref,
                 now="independent enrolled validators passed for the exact completion claim",
-                last_verified=final_response.event_id if final_response is not None else "",
+                last_verified=claim_event.event_id,
                 completion_evidence=run_evidence,
             )
         except GoalValidationError as exc:
@@ -1037,7 +1374,7 @@ def check_enrollment_and_receipts(
                 Finding(
                     detector="false_done",
                     fingerprint_seed={"session_ref": session_ref, "reason": "completion-store-rejected"},
-                    event_refs=(final_response.event_id,) if final_response is not None else (),
+                    event_refs=(claim_event.event_id,),
                     unmet_item="verified completion receipts",
                     expected_next_progress="produce current verified receipts bound to this exact goal session",
                     detail=f"the completion store rejected the claimed evidence: {exc}",
@@ -1052,7 +1389,152 @@ def check_enrollment_and_receipts(
             now="; ".join(finding.detail for finding in findings),
             status="completion-disputed",
         )
-    return len(run_evidence), disputed, findings, False
+    outcome = (len(run_evidence), disputed, findings, pending)
+    if cacheable and check_key is not None:
+        _store_claim_check(
+            config,
+            session_ref,
+            claim_event.event_id,
+            key=check_key,
+            receipt_digests=_receipt_file_digests(config, session_ref, items),
+            outcome=outcome,
+        )
+    return outcome
+
+
+def check_enrollment_and_receipts(
+    config: MonitordConfig,
+    session_ref: str,
+    final_response: CanonicalEvent | None = None,
+    *,
+    final_responses: Sequence[CanonicalEvent] | None = None,
+    turn_ended: bool = False,
+    turn_end_event: CanonicalEvent | None = None,
+    reviewer: BehaviorReviewer | None = None,
+    still_running: tuple[str, ...] = (),
+) -> tuple[int, bool, list[Finding], bool]:
+    """Verify every completion claim in the unconsumed window against its contract.
+
+    Validators run on any completion claim in an unconsumed final response,
+    whether or not it carries a structured completion line — every claim event
+    in ``final_responses`` is checked, not only the latest, so a claim cannot
+    be erased by a later ordinary response. Each claim's outcome is recorded
+    in a durable claim-check marker keyed on the exact logical check, so a
+    repeated pass replays the recorded outcome instead of re-executing the
+    same validators. A newer claim event, a changed registry or enrollment, a
+    moved receipt, or resolved in-flight work each reopen the check.
+
+    The lane's claimed result is ignored; Chitra executes and stores each
+    enrolled validator itself. A missing or held goal and a turn without a
+    completion claim are silent, while a goal-store failure surfaces as a
+    monitor-internal-error finding rather than reading as a quiet pass. When
+    ``turn_ended`` says the turn finished with no final response at all, the
+    existing exit-before-contract finding fires for an enrolled goal. For a
+    lane that runs as another OS user the execution happens on the worker
+    pool and a claim is neither passed nor disputed while that run is in
+    flight; the fourth return value reports that pending state so the pass
+    does not treat a lane under active validation as idle. ``still_running``
+    names lane work still in flight so the isolated reviewer can answer
+    "insufficient", which is reported the same way: pending, neither passed
+    nor disputed.
+    """
+    try:
+        goal = get_goal(config.state_dir, session_ref)
+    except Exception as exc:
+        # A broken goal store is not an absent goal: surface the failure so an
+        # operator sees this lane is running without its contract check.
+        logger.error(
+            "monitord_goal_lookup_failed",
+            session_ref=session_ref,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        return 0, True, [_goal_lookup_finding(session_ref, exc)], False
+    if goal is None or goal.status not in _ACTIONABLE_GOAL_STATUSES:
+        return 0, False, [], False
+    responses = (
+        tuple(final_responses)
+        if final_responses is not None
+        else (() if final_response is None else (final_response,))
+    )
+    claims = [event for event in responses if is_completion_claim(_event_text(event))]
+    items = tuple(getattr(goal, "enrolled_done_when_items", ()) or ())
+    if not claims:
+        if turn_ended and not responses and items:
+            # The lane's lifecycle says its turn ended with no final response
+            # at all, so no claim can ever bind the contract this turn made.
+            material_questions = (*goal.open_asks, *((goal.needs,) if goal.needs else ()))
+            findings = detect_false_done(
+                final_response=None,
+                enrolled_items=items,
+                receipt_names_by_item={},
+                receipt_roots={session_ref: config.state_dir},
+                session_ref=session_ref,
+                material_questions=material_questions,
+            )
+            if turn_end_event is not None:
+                # Cite the event that ended the turn so a recurrence after a
+                # consumed order reads as new evidence to the ladder, not as
+                # an eternally unprovable condition.
+                findings = [
+                    Finding(
+                        detector=f.detector,
+                        fingerprint_seed=f.fingerprint_seed,
+                        event_refs=(turn_end_event.event_id,),
+                        unmet_item=f.unmet_item,
+                        expected_next_progress=f.expected_next_progress,
+                        detail=f.detail,
+                    )
+                    for f in findings
+                ]
+            if not config.shadow_mode:
+                update_now(
+                    config.state_dir,
+                    session_ref,
+                    now="; ".join(finding.detail for finding in findings),
+                )
+            return 0, True, findings, False
+        return 0, False, [], False
+
+    total_recorded = 0
+    disputed = False
+    all_findings: list[Finding] = []
+    seen_fingerprints: set[str] = set()
+    for claim_event in claims:
+        recorded, claim_disputed, claim_findings, pending = _evaluate_completion_claim(
+            config,
+            goal,
+            session_ref,
+            claim_event,
+            reviewer=reviewer,
+            still_running=still_running,
+        )
+        total_recorded += recorded
+        disputed = disputed or claim_disputed
+        # Two claims can raise the same finding (its seed names the failed
+        # item, not the event): the ladder track is fingerprint-keyed, so a
+        # duplicate must not count as a recurrence in one pass.
+        for finding in claim_findings:
+            if finding.fingerprint not in seen_fingerprints:
+                seen_fingerprints.add(finding.fingerprint)
+                all_findings.append(finding)
+        if pending:
+            return total_recorded, disputed, all_findings, True
+        try:
+            refreshed = get_goal(config.state_dir, session_ref)
+        except Exception as exc:
+            logger.error(
+                "monitord_goal_lookup_failed",
+                session_ref=session_ref,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            all_findings.append(_goal_lookup_finding(session_ref, exc))
+            return total_recorded, True, all_findings, False
+        if refreshed is None or refreshed.status not in _ACTIONABLE_GOAL_STATUSES:
+            break
+        goal = refreshed
+    return total_recorded, disputed, all_findings, False
 
 
 def handle_agent_question(
@@ -1171,7 +1653,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
         for binding in bindings
     }
     binding_native_session_ids = {
-        lane: native_session_identity(path)
+        lane: _bound_native_session_id(config, path)
         for lane, path in binding_paths.items()
     }
     try:
@@ -1262,16 +1744,41 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                 if boundary is not None:
                     detector_events = events[boundary + 1 :]
         if goal is not None:
-            final_response = _final_response(detector_events)
+            # Every unconsumed final response is a claim candidate, not only
+            # the latest one; a turn that ended without any final response is
+            # the exit-before-contract case.
+            final_responses = tuple(
+                event
+                for event in detector_events
+                if event.normalized_type is CanonicalType.FINAL_RESPONSE
+            )
+            final_response = final_responses[-1] if final_responses else None
+            turn_ended = goal.status == "turn-finished-unverified" or bool(
+                detector_events and detector_events[-1].normalized_type is CanonicalType.RESUME
+            )
             receipts_recorded, completion_disputed, enrollment_findings, validator_pending = check_enrollment_and_receipts(
                 config,
                 goal.session_ref,
                 final_response,
+                final_responses=final_responses,
+                turn_ended=turn_ended,
+                turn_end_event=detector_events[-1] if detector_events else None,
                 still_running=_lane_work_in_flight(config, goal.session_ref, events),
             )
-            refreshed_goal = get_goal(config.state_dir, goal.session_ref)
-            if refreshed_goal is not None:
-                goal = refreshed_goal
+            try:
+                refreshed_goal = get_goal(config.state_dir, goal.session_ref)
+            except Exception as exc:
+                logger.error(
+                    "monitord_goal_lookup_failed",
+                    lane=lane,
+                    session_ref=goal.session_ref,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+                enrollment_findings.append(_goal_lookup_finding(goal.session_ref, exc))
+            else:
+                if refreshed_goal is not None:
+                    goal = refreshed_goal
         else:
             # Legacy or unresolved bindings remain observable, but no other
             # goal may be borrowed for detector context or receipt checks.
@@ -1308,6 +1815,12 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
         findings = detection_findings + [
             finding for finding in enrollment_findings if finding.detector == "false_done"
         ]
+        # Monitor-internal errors are surfaced on the findings log and suppress
+        # a clean "observing" record, but they never enter the incident ladder:
+        # no corrective order to the lane can repair the monitor's own store.
+        internal_findings = [
+            finding for finding in enrollment_findings if finding.detector != "false_done"
+        ]
         question_outcome = (
             handle_agent_question(config, goal, final_response, journal_events=events, lane=lane)
             if goal is not None
@@ -1315,15 +1828,26 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
             else "none"
         )
         if question_outcome == "operator_required" and goal is not None and not config.shadow_mode:
-            refreshed_goal = get_goal(config.state_dir, goal.session_ref)
-            if refreshed_goal is not None:
-                goal = refreshed_goal
+            try:
+                refreshed_goal = get_goal(config.state_dir, goal.session_ref)
+            except Exception as exc:
+                logger.error(
+                    "monitord_goal_lookup_failed",
+                    lane=lane,
+                    session_ref=goal.session_ref,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+                internal_findings.append(_goal_lookup_finding(goal.session_ref, exc))
+            else:
+                if refreshed_goal is not None:
+                    goal = refreshed_goal
         idle_finding = _idle_pursuit_finding(
             config,
             lane,
             goal,
             events,
-            findings,
+            findings + internal_findings,
             question_outcome,
             validator_pending=validator_pending,
         )
@@ -1391,14 +1915,14 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                     else None
                 ),
             )
-        if goal is not None and not findings and question_outcome == "none":
+        if goal is not None and not findings and not internal_findings and question_outcome == "none":
             record_observing(
                 state_root=config.state_dir,
                 lane=lane,
                 goal=goal,
                 reason="exact bound goal observed with no corrective finding",
             )
-        append_finding_records(config, lane, findings)
+        append_finding_records(config, lane, findings + internal_findings)
         results.append(
             LanePassResult(
                 lane=lane,
@@ -1463,6 +1987,9 @@ def run_forever(config: MonitordConfig, *, stop_event: threading.Event | None = 
         # Running validators keep their threads; an unfinished run simply
         # never records a result and the next daemon start re-queues it.
         _VALIDATOR_RUN_POOL.shutdown()
+        for _key, (_context, ingestor) in _INGESTOR_POOL.items():
+            ingestor.close()
+        _INGESTOR_POOL.clear()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
