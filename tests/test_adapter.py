@@ -267,6 +267,44 @@ def test_opencode_plug_caps_read_proof_at_accepted(monkeypatch: pytest.MonkeyPat
         plug.events(handle)
 
 
+def test_tmux_plug_events_normalize_claude_jsonl(tmp_path: Path) -> None:
+    # The plug's client ClassVar must reach make_normalizer as a Client enum —
+    # a plain string makes every events() call raise, and the failure must
+    # surface as StreamUnavailable, not the raw ValueError.
+    transcript = tmp_path / "lane-a.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "sessionId": "s-1",
+                "cwd": str(tmp_path),
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "done"}],
+                    "stop_reason": "end_turn",
+                },
+            }
+        )
+        + "\n"
+    )
+    handle = LaneHandle(
+        plug="claude-tmux",
+        lane_id="lane-a",
+        session_ref="localhost:lane-a:0.0",
+        started_at="2026-09-01T00:00:00Z",
+        locator={"tmux_session": "lane-a", "tmux_socket": "/tmp/sock", "host": "localhost"},
+        binding_ref=str(transcript),
+    )
+    batch = ClaudeTmuxPlug().events(handle)
+    assert any(event.payload.get("text") == "done" for event in batch.events)
+
+    class NoNormalizerPlug(ClaudeTmuxPlug):
+        client = "unknown-harness"  # type: ignore[assignment]
+
+    with pytest.raises(StreamUnavailable):
+        NoNormalizerPlug().events(handle)
+
+
 # -- amp orb plug ------------------------------------------------------------
 
 

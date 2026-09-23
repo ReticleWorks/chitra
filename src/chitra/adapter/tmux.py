@@ -220,17 +220,26 @@ class TmuxLanePlug:
             raise StreamUnavailable(f"{self.name} lane {handle.lane_id} has no bound transcript")
         if reader is not None:
             batch = reader.poll()
-            normalizer = make_normalizer(self._context(handle))
+            normalizer = self._normalizer(handle)
             events = [event for record in batch.records for event in normalizer.normalize(record)]
             return EventBatch(events=tuple(events), cursor=str(reader.offset))
         stream = self._streams.get(binding_ref)
         if stream is None:
-            stream = (JsonlTailReader(Path(binding_ref)), make_normalizer(self._context(handle)))
+            stream = (JsonlTailReader(Path(binding_ref)), self._normalizer(handle))
             self._streams[binding_ref] = stream
         tail_reader, normalizer = stream
         batch = tail_reader.poll()
         events = [event for record in batch.records for event in normalizer.normalize(record)]
         return EventBatch(events=tuple(events), cursor=str(tail_reader.offset))
+
+    def _normalizer(self, handle: LaneHandle) -> TranscriptNormalizer:
+        # make_normalizer fails closed with ValueError on a client that has no
+        # JSONL schema; the contract reports that through StreamUnavailable so
+        # callers keep per-lane failure isolation on AdapterError.
+        try:
+            return make_normalizer(self._context(handle))
+        except ValueError as exc:
+            raise StreamUnavailable(str(exc)) from exc
 
     def _context(self, handle: LaneHandle) -> NormalizationContext:
         return NormalizationContext(
