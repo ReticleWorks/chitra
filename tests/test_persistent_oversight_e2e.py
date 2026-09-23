@@ -31,6 +31,7 @@ from chitra.journal import CanonicalEvent
 from chitra.journal.store import EventJournal
 from chitra.monitord import main, resolve_config, run_once
 from chitra.orders import DispatchOrder, DispatchResult, DispatchStatus
+from chitra.review_rubric import ReviewerVerdict
 from chitra.supervision import SupervisionLedger, deterministic_order_id, goal_digest
 
 CLAUDE_VERSION = "2.1.229"
@@ -424,6 +425,18 @@ def _stub_finding(name: str) -> Finding:
         expected_next_progress=f"make progress for {name}",
         detail=f"finding {name}",
     )
+
+
+class _AcceptingReviewer:
+    """Credential-free stand-in for the isolated ``claude -p`` reviewer."""
+
+    def review(self, goal: object, behavior: object, reviewer_id: str) -> ReviewerVerdict:
+        return ReviewerVerdict(
+            reviewer_id=reviewer_id,
+            goal_contract_id=goal.contract_id,  # type: ignore[attr-defined]
+            behavior_sha256=behavior.behavior_sha256,  # type: ignore[attr-defined]
+            verdict="accept",
+        )
 
 
 def test_run_once_evaluates_every_present_finding(
@@ -990,6 +1003,9 @@ def test_passing_validator_and_structured_claim_mark_goal_verified_and_supervisi
         return (passing_completion_evidence(),)
 
     monkeypatch.setattr(monitord_mod, "record_enrolled_validator_runs", passing_run)
+    # The completion path gates on the isolated reviewer now; stub the process
+    # boundary so the acceptance check stays credential-free.
+    monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
     summary = run_once(_live_config(state, bindings_path, queue))
 
     assert summary["completion_disputed"] is False

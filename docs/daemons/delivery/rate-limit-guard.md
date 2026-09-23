@@ -113,10 +113,12 @@ chitra-rate-limit-guard --usage-dir /var/lib/chitra/usage --goals-root /var/lib/
 
 **Run as a systemd timer:**
 
+The Debian package installs `packaging/systemd/chitra-rate-limit-guard.service`
+and `packaging/systemd/chitra-rate-limit-guard.timer` like the other shipped
+daemon units. The service resolves the host name with systemd's `%H` specifier
+and needs no local editing.
+
 ```bash
-sudo cp packaging/systemd/chitra-rate-limit-guard.timer.example /etc/systemd/system/chitra-rate-limit-guard.timer
-sudo cp packaging/systemd/chitra-rate-limit-guard.service.example /etc/systemd/system/chitra-rate-limit-guard.service
-sudoedit /etc/systemd/system/chitra-rate-limit-guard.service  # fill in placeholders
 sudo systemctl daemon-reload
 sudo systemctl enable --now chitra-rate-limit-guard.timer
 ```

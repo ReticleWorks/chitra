@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import contextlib
 import json
+import subprocess
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from _goal_fixtures import enrollment_fields
+from _goal_fixtures import enrollment_fields, ingest_passing_receipt, passing_completion_evidence
 from structlog.testing import capture_logs
 
 import chitra.monitord as monitord_mod
@@ -27,6 +29,8 @@ from chitra.monitord import (
     run_detectors,
     run_once,
 )
+from chitra.recovery import capture_worktree_binding, transition_lane_lifecycle
+from chitra.review_rubric import ReviewerVerdict, ReviewFinding
 from chitra.transcript_bindings import TranscriptBinding
 
 LANE = "lane-a:0.0"
@@ -148,6 +152,54 @@ def test_run_detectors_binds_findings_to_the_goal_enrollment(tmp_path: Path) -> 
     unnecessary = [finding for finding in findings if finding.detector == "unnecessary_steps"]
     assert unnecessary
     assert all(finding.unmet_item == "implementation-complete" for finding in unnecessary)
+
+
+def _git_worktree(tmp_path: Path) -> Path:
+    workdir = tmp_path / "worktree"
+    workdir.mkdir()
+
+    def _run(*args: str) -> None:
+        subprocess.run(["git", "-C", str(workdir), *args], check=True, capture_output=True)
+
+    _run("init")
+    _run("config", "user.email", "chitra-test@example.test")
+    _run("config", "user.name", "Chitra Test")
+    (workdir / "README.md").write_text("initial\n", encoding="utf-8")
+    _run("add", "README.md")
+    _run("commit", "-m", "initial")
+    return workdir
+
+
+def test_run_detectors_flags_only_work_outside_the_checkpointed_worktree(tmp_path: Path) -> None:
+    """The drift boundary check must see the lane's durable worktree path."""
+    workdir = _git_worktree(tmp_path)
+    transition_lane_lifecycle(
+        tmp_path,
+        session_ref="host:lane-a:0.0",
+        target="active",
+        binding=capture_worktree_binding(workdir),
+        resume_note="Begin the enrolled work.",
+    )
+    goal = SimpleNamespace(
+        scope="",
+        intent="",
+        goal="finish the enrolled implementation",
+        session_ref="host:lane-a:0.0",
+        enrolled_done_when_items=(),
+    )
+    events = (
+        _event("e-out", CanonicalType.TOOL_CALL).model_copy(
+            update={"payload": {"tool_name": "Edit", "input": {"file_path": str(tmp_path / "elsewhere" / "x.py")}}}
+        ),
+        _event("e-in", CanonicalType.TOOL_CALL).model_copy(
+            update={"payload": {"tool_name": "Edit", "input": {"file_path": str(workdir / "x.py")}}}
+        ),
+    )
+
+    drift = [finding for finding in run_detectors(_config(tmp_path), LANE, goal, events) if finding.detector == "drift"]
+
+    assert [finding.event_refs for finding in drift] == [("e-out",)]
+
 
 def test_append_finding_records_writes_schema_stamped_jsonl(tmp_path: Path) -> None:
     config = _config(tmp_path)
@@ -314,6 +366,109 @@ def test_check_enrollment_disputes_when_the_validator_fails(tmp_path: Path, monk
 
 def test_check_enrollment_is_silent_for_unenrolled_sessions(tmp_path: Path) -> None:
     assert check_enrollment_and_receipts(_config(tmp_path), "no-such-session") == (0, False, [], False)
+
+
+class _StubReviewer:
+    """Deterministic stand-in for the isolated ``claude -p`` reviewer."""
+
+    def __init__(self, verdict: str) -> None:
+        self._verdict = verdict
+        self.calls: list[str] = []
+
+    def review(self, goal: object, behavior: object, reviewer_id: str) -> ReviewerVerdict:
+        self.calls.append(reviewer_id)
+        findings: tuple[ReviewFinding, ...] = ()
+        if self._verdict == "reject":
+            findings = (
+                ReviewFinding(
+                    code="unsupported_completion",
+                    detail="the turn claims proof it does not contain",
+                    citation="Done.",
+                ),
+            )
+        return ReviewerVerdict(
+            reviewer_id=reviewer_id,
+            goal_contract_id=goal.contract_id,  # type: ignore[attr-defined]
+            behavior_sha256=behavior.behavior_sha256,  # type: ignore[attr-defined]
+            verdict=self._verdict,  # type: ignore[arg-type]
+            findings=findings,
+        )
+
+
+def _verified_claim_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> CanonicalEvent:
+    """Enroll a goal, store its passing receipt, and return a clean claim event."""
+    goal = upsert_goal(tmp_path, replace(_goal("session-1"), **enrollment_fields("The digest file exists and is verified.")))
+    ingest_passing_receipt(tmp_path, goal.session_ref)
+    monkeypatch.setattr(
+        monitord_mod,
+        "record_enrolled_validator_runs",
+        lambda *_args, **_kwargs: (passing_completion_evidence(),),
+    )
+    return _event("completion-1", CanonicalType.FINAL_RESPONSE).model_copy(
+        update={
+            "payload": {
+                "text": "Done.\nCHITRA-COMPLETION: "
+                + json.dumps(
+                    {
+                        "kind": "artifact",
+                        "done_when_item_id": "done-1",
+                        "receipt_name": "tests-green",
+                        "validator": "pytest",
+                        "validator_result": "pass",
+                        "citation": "proof /tmp/daemon-digest.json",
+                    }
+                )
+            }
+        }
+    )
+
+
+def test_completion_claim_reaches_the_isolated_reviewer_and_applies_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_response = _verified_claim_setup(tmp_path, monkeypatch)
+    reviewer = _StubReviewer("reject")
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+
+    _recorded, disputed, findings, _pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=reviewer
+    )
+
+    assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
+    assert disputed is True
+    assert len(findings) == 1
+    assert findings[0].detector == "false_done"
+    assert findings[0].unmet_item == "isolated completion review"
+    assert "rejected the completion claim" in findings[0].detail
+    stored = get_goal(tmp_path, "session-1")
+    assert stored is not None
+    assert stored.status == "completion-disputed"
+
+    # A repeat pass over the unchanged claim reuses the stored signal rather
+    # than paying for another isolated review round.
+    _recorded, disputed_again, _findings, _pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=reviewer
+    )
+    assert disputed_again is True
+    assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
+
+
+def test_completion_claim_the_isolated_reviewer_accepts_is_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_response = _verified_claim_setup(tmp_path, monkeypatch)
+    reviewer = _StubReviewer("accept")
+
+    _recorded, disputed, findings, _pending = check_enrollment_and_receipts(
+        resolve_config(state_dir=tmp_path, shadow_mode=False), "session-1", final_response, reviewer=reviewer
+    )
+
+    assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
+    assert disputed is False
+    assert findings == []
+    stored = get_goal(tmp_path, "session-1")
+    assert stored is not None
+    assert stored.status == "done-pending-close"
 
 
 def test_routine_question_is_queued_as_an_exact_goal_contract_answer(

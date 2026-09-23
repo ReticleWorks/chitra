@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -10,6 +9,8 @@ import re
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
+
+from chitra._fsio import exclusive_lock
 
 from .models import (
     CanonicalEvent,
@@ -162,38 +163,33 @@ class EventJournal:
             return ()
         self.directory.mkdir(parents=True, exist_ok=True)
         os.chmod(self.directory, 0o700)
-        with self.lock_path.open("a", encoding="utf-8") as lock:
-            os.chmod(self.lock_path, 0o600)
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            try:
-                existing: set[str] = set()
-                if path.exists():
-                    with path.open("r", encoding="utf-8") as current:
-                        for line in current:
-                            if not line.strip():
-                                continue
-                            value = json.loads(line)
-                            identity = value.get(id_field)
-                            if isinstance(identity, str):
-                                existing.add(identity)
-                new_rows: list[T] = []
-                for candidate in candidates:
-                    identity = getattr(candidate, id_field)
-                    if identity not in existing:
-                        new_rows.append(candidate)
-                        existing.add(identity)
-                if new_rows:
-                    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-                    try:
-                        os.fchmod(fd, 0o600)
-                        encoded = "".join(row.model_dump_json() + "\n" for row in new_rows).encode()
-                        view = memoryview(encoded)
-                        while view:
-                            written = os.write(fd, view)
-                            view = view[written:]
-                        os.fsync(fd)
-                    finally:
-                        os.close(fd)
-                return tuple(new_rows)
-            finally:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        with exclusive_lock(self.lock_path, mode=0o600):
+            existing: set[str] = set()
+            if path.exists():
+                with path.open("r", encoding="utf-8") as current:
+                    for line in current:
+                        if not line.strip():
+                            continue
+                        value = json.loads(line)
+                        identity = value.get(id_field)
+                        if isinstance(identity, str):
+                            existing.add(identity)
+            new_rows: list[T] = []
+            for candidate in candidates:
+                identity = getattr(candidate, id_field)
+                if identity not in existing:
+                    new_rows.append(candidate)
+                    existing.add(identity)
+            if new_rows:
+                fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+                try:
+                    os.fchmod(fd, 0o600)
+                    encoded = "".join(row.model_dump_json() + "\n" for row in new_rows).encode()
+                    view = memoryview(encoded)
+                    while view:
+                        written = os.write(fd, view)
+                        view = view[written:]
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            return tuple(new_rows)

@@ -93,6 +93,8 @@ def test_systemd_ownership_manifest_is_explicit_and_deterministic() -> None:
     assert shared["parameter_mode"] == "literal"
     assert set(shared["units"]) == {
         "chitra-dispatchd.service",
+        "chitra-rate-limit-guard.service",
+        "chitra-rate-limit-guard.timer",
     }
     for filename, expected_hash in shared["units"].items():
         unit = SYSTEMD_DIR / filename
@@ -205,8 +207,6 @@ def test_shipped_systemd_environment_variables_are_consumed_by_their_entrypoints
         "chitra-monitord@.service": {"CHITRA_MONITORD_SHADOW_MODE", "CHITRA_STATE_DIR"},
         "chitra-ownership-provider.service.example": {"CHITRA_HOST_ID"},
         "chitra-petra.service.example": {"PETRA_HOST_UUID"},
-        "chitra-rate-limit-guard.service.example": set(),
-        "chitra-rate-limit-guard.timer.example": set(),
         # The merge daemon takes its GitHub App token from an EnvironmentFile,
         # never an inline Environment= line, so the credential cannot end up
         # in a unit file that anyone can read.
@@ -262,15 +262,22 @@ def test_shared_daemon_units_are_the_canonical_package_layout() -> None:
     assert not (SYSTEMD_DIR / "chitra-dispatchd.service.example").exists()
     assert not (SYSTEMD_DIR / "chitra-monitord@.service.example").exists()
     assert (SYSTEMD_DIR / "chitra-monitord@.service").is_file()
+    assert not (SYSTEMD_DIR / "chitra-triaged.service.example").exists()
+    assert not (SYSTEMD_DIR / "chitra-rate-limit-guard.service.example").exists()
+    assert not (SYSTEMD_DIR / "chitra-rate-limit-guard.timer.example").exists()
 
     dispatch_docs = (REPO_ROOT / "docs" / "daemons" / "delivery" / "dispatchd.md").read_text(encoding="utf-8")
     triaged_docs = (REPO_ROOT / "docs" / "daemons" / "delivery" / "triaged.md").read_text(encoding="utf-8")
     sweep_docs = (REPO_ROOT / "docs" / "daemons" / "delivery" / "sweepd.md").read_text(encoding="utf-8")
+    guard_docs = (REPO_ROOT / "docs" / "daemons" / "delivery" / "rate-limit-guard.md").read_text(encoding="utf-8")
     configuration_docs = (REPO_ROOT / "docs" / "configuration" / "README.md").read_text(encoding="utf-8")
     assert "packaging/systemd/chitra-dispatchd.service`" in dispatch_docs
     assert "packaging/systemd/chitra-dispatchd.service.example" not in dispatch_docs
     assert "packaging/systemd/chitra-triaged.service" not in triaged_docs
     assert "packaging/systemd/chitra-sweepd.service" not in sweep_docs
+    assert "packaging/systemd/chitra-rate-limit-guard.service`" in guard_docs
+    assert "packaging/systemd/chitra-rate-limit-guard.service.example" not in guard_docs
+    assert "packaging/systemd/chitra-rate-limit-guard.timer.example" not in guard_docs
     assert "ExecStart=/usr/local/bin/dispatchd" not in configuration_docs
     assert "chitra-dispatchd.service" in configuration_docs
     assert "chitra-monitord@.service" in configuration_docs

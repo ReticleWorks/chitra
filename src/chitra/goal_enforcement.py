@@ -8,7 +8,6 @@ is never placed in these prompts. Each reviewer invocation is a separate
 
 from __future__ import annotations
 
-import fcntl
 import json
 import re
 import subprocess
@@ -20,6 +19,7 @@ from typing import Literal, Protocol, Self
 import structlog
 from pydantic import Field, model_validator
 
+from chitra._fsio import exclusive_lock
 from chitra.autonomy import DEFAULT_AUTONOMY_POLICY, AutonomyPolicy
 from chitra.goals import (
     GoalNotFoundError,
@@ -371,22 +371,17 @@ def review_log_path(root: Path) -> Path:
 
 def append_review_signal(path: Path, signal: SessionReviewSignal) -> None:
     """Append one internal review signal, deduplicated by content id."""
-    path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".lock")
-    with lock_path.open("a", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            if path.exists():
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    try:
-                        if json.loads(line).get("signal_id") == signal.signal_id:
-                            return
-                    except (ValueError, AttributeError):
-                        continue
-            with path.open("a", encoding="utf-8") as output:
-                output.write(signal.model_dump_json() + "\n")
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    with exclusive_lock(lock_path):
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    if json.loads(line).get("signal_id") == signal.signal_id:
+                        return
+                except (ValueError, AttributeError):
+                    continue
+        with path.open("a", encoding="utf-8") as output:
+            output.write(signal.model_dump_json() + "\n")
 
 
 def load_latest_review_signal(path: Path, session_ref: str) -> SessionReviewSignal | None:

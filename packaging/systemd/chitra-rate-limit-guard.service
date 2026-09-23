@@ -1,0 +1,20 @@
+[Unit]
+Description=chitra rate-limit and host-load guard sweep
+Documentation=https://github.com/ReticleWorks/chitra
+After=network-online.target
+StartLimitIntervalSec=10min
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+User=chitra
+Group=chitra
+# systemd creates and owns this directory (mode 0750) for the unit's lifetime.
+StateDirectory=chitra
+# %H resolves to the host this sweep runs on; the guard builds each
+# session_ref as <host>:<tmux_session>:0.0 from it.
+ExecStart=/opt/chitra/venv/bin/python -m chitra.rate_limit_guard --usage-dir /var/lib/chitra/usage-snapshots --host %H --goals-root /var/lib/chitra --queue-dir /var/lib/chitra/queue
+Restart=no
+NoNewPrivileges=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/chitra /run/chitra

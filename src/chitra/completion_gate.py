@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import enum
-import fcntl
 import hashlib
 import json
 import re
@@ -14,6 +13,7 @@ from typing import Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from chitra._fsio import exclusive_lock
 from chitra.lexicon import (
     COMPLETION_CLAIM_RE,
     COMPLETION_DEFERRAL_PHRASES,
@@ -393,24 +393,19 @@ def evaluate_turn_end(
 
 def append_completion_review(path: Path, record: CompletionReviewRecord) -> None:
     """Append one deduplicated internal turn-end review record under a lock."""
-    path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".lock")
     key = (record.session_ref, record.behavior_sha256)
-    with lock_path.open("a", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            if path.exists():
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    try:
-                        payload = json.loads(line)
-                    except ValueError:
-                        continue
-                    if (payload.get("session_ref"), payload.get("behavior_sha256")) == key:
-                        return
-            with path.open("a", encoding="utf-8") as output:
-                output.write(record.model_dump_json() + "\n")
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    with exclusive_lock(lock_path):
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    payload = json.loads(line)
+                except ValueError:
+                    continue
+                if (payload.get("session_ref"), payload.get("behavior_sha256")) == key:
+                    return
+        with path.open("a", encoding="utf-8") as output:
+            output.write(record.model_dump_json() + "\n")
 
 
 def behavior_hash(text: str) -> str:

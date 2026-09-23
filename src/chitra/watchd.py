@@ -17,7 +17,6 @@ Review metadata is written only to Chitra-owned ledgers and never to pane text.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import os
 import re
@@ -36,7 +35,7 @@ from typing import Literal
 
 import structlog
 
-from chitra._fsio import parse_iso8601
+from chitra._fsio import exclusive_lock, parse_iso8601
 from chitra.agent_runtime import AgentStatusBroker, PaneStatus, StatusRuntimeError
 from chitra.agent_status import AgentState, ManifestRepository
 from chitra.completion_gate import (
@@ -487,15 +486,11 @@ def append_event(event_log: Path, line: str, *, max_log_bytes: int = DEFAULT_MAX
     """Append under an exclusive lock, rotating the legacy-sized log first."""
     event_log.parent.mkdir(parents=True, exist_ok=True)
     lock_path = event_log.with_name(event_log.name + ".lock")
-    with lock_path.open("a", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            if event_log.exists() and event_log.stat().st_size >= max_log_bytes:
-                event_log.replace(event_log.with_name(event_log.name + ".1"))
-            with event_log.open("a", encoding="utf-8") as output:
-                output.write(line)
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    with exclusive_lock(lock_path):
+        if event_log.exists() and event_log.stat().st_size >= max_log_bytes:
+            event_log.replace(event_log.with_name(event_log.name + ".1"))
+        with event_log.open("a", encoding="utf-8") as output:
+            output.write(line)
 
 
 @dataclass(slots=True)

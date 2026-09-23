@@ -78,6 +78,16 @@ from chitra.detect import (
     write_rescue_bundle,
 )
 from chitra.dispatch import capture, is_local_host, pane_pid, tmux_pane_target
+from chitra.goal_enforcement import (
+    BehaviorReviewer,
+    ClaudeProcessReviewer,
+    GoalReviewError,
+    WatchedSessionBehavior,
+    freeze_goal,
+    load_latest_review_signal,
+    review_log_path,
+    review_watched_session,
+)
 from chitra.goals import (
     GoalRecord,
     GoalsSchemaNewerError,
@@ -442,6 +452,20 @@ def _final_response(events: tuple[CanonicalEvent, ...]) -> CanonicalEvent | None
     return None
 
 
+def _declared_worktree(config: MonitordConfig, goal: object) -> str:
+    """Return the lane's declared worktree realpath from its latest durable checkpoint.
+
+    The checkpoint binding is captured with ``git rev-parse --show-toplevel``
+    when the lane is anchored, so the boundary detector judges file access
+    against the real worktree rather than a placeholder.
+    """
+    session_ref = str(getattr(goal, "session_ref", "") or "")
+    if not session_ref:
+        return ""
+    checkpoints = load_worktree_checkpoints(config.state_dir, session_ref=session_ref)
+    return checkpoints[-1].binding.worktree_realpath if checkpoints else ""
+
+
 def run_detectors(
     config: MonitordConfig,
     lane: str,
@@ -459,7 +483,14 @@ def run_detectors(
     policy = canonical_choices_policy or load_policy_config().canonical_choices
     findings: list[Finding] = []
     findings.extend(detect_canonical_choices(events, policy, enrolled_items=enrolled_items))
-    findings.extend(detect_drift(events, scope_text=scope_text, declared_worktree="", enrolled_items=enrolled_items))
+    findings.extend(
+        detect_drift(
+            events,
+            scope_text=scope_text,
+            declared_worktree=_declared_worktree(config, goal),
+            enrolled_items=enrolled_items,
+        )
+    )
     findings.extend(detect_unnecessary_steps(events, enrolled_items=enrolled_items))
     findings.extend(detect_excessive_testing(events, enrolled_items=enrolled_items))
     findings.extend(detect_document_dithering(events, goal_is_document=goal_is_document, enrolled_items=enrolled_items))
@@ -759,6 +790,8 @@ def check_enrollment_and_receipts(
     config: MonitordConfig,
     session_ref: str,
     final_response: CanonicalEvent | None = None,
+    *,
+    reviewer: BehaviorReviewer | None = None,
 ) -> tuple[int, bool, list[Finding], bool]:
     """Verify an explicit completion claim against its enrolled contract.
 
@@ -839,6 +872,66 @@ def check_enrollment_and_receipts(
         session_ref=session_ref,
         material_questions=material_questions,
     )
+    if not findings and not config.shadow_mode:
+        # The same isolated reviewer that gates completion claims under watchd
+        # now gates them here: a deterministic pass alone does not release a
+        # claimed "done". A stored signal for this exact behavior and contract
+        # is reused so an unchanged disputed claim does not pay for a fresh
+        # review round every pass.
+        behavior = WatchedSessionBehavior.from_turn(session_ref, final_text)
+        signal = load_latest_review_signal(review_log_path(config.state_dir), session_ref)
+        try:
+            contract_id = freeze_goal(goal).contract_id
+        except GoalReviewError:
+            contract_id = ""
+        if (
+            signal is None
+            or signal.behavior_sha256 != behavior.behavior_sha256
+            or signal.goal_contract_id != contract_id
+        ):
+            try:
+                signal = review_watched_session(
+                    config.state_dir,
+                    session_ref,
+                    behavior,
+                    reviewer=reviewer if reviewer is not None else ClaudeProcessReviewer(),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "monitord_completion_review_unavailable",
+                    session_ref=session_ref,
+                    error=str(exc),
+                )
+                signal = None
+                findings = [
+                    Finding(
+                        detector="false_done",
+                        fingerprint_seed={"session_ref": session_ref, "reason": "review-unavailable"},
+                        event_refs=(final_response.event_id,) if final_response is not None else (),
+                        unmet_item="isolated completion review",
+                        expected_next_progress="restore the isolated reviewer and re-claim completion",
+                        detail=f"the isolated completion review could not run: {exc}",
+                    )
+                ]
+        if not findings and signal is not None and signal.verdict != "accept":
+            review_detail = "; ".join(f"{item.code}: {item.detail}" for item in signal.findings)
+            findings = [
+                Finding(
+                    detector="false_done",
+                    fingerprint_seed={
+                        "session_ref": session_ref,
+                        "reason": "review-rejected",
+                        "signal_id": signal.signal_id,
+                    },
+                    event_refs=(final_response.event_id,) if final_response is not None else (),
+                    unmet_item="isolated completion review",
+                    expected_next_progress="resolve the cited review findings before claiming completion again",
+                    detail=(
+                        "isolated reviewers rejected the completion claim"
+                        + (f": {review_detail}" if review_detail else "")
+                    ),
+                )
+            ]
     if not findings and not config.shadow_mode:
         try:
             mark_completion_gate_passed(
