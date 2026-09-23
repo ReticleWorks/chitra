@@ -54,6 +54,8 @@ from typing import Any
 import structlog
 
 from chitra._fsio import locked_json_store, write_json_atomic
+from chitra.adapter.contract import AdapterError
+from chitra.adapter.registry import plug_for_client
 from chitra.canonical_choices import CanonicalChoicesPolicy, detect_canonical_choices
 from chitra.completion_gate import (
     CompletionEvidence,
@@ -139,7 +141,7 @@ from chitra.supervisor import (
     record_terminal_pursuit_alert,
 )
 from chitra.systemd_notify import notify_ready, notify_watchdog
-from chitra.transcript_bindings import DEFAULT_FILENAME, TranscriptBinding, load_transcript_bindings
+from chitra.transcript_bindings import DEFAULT_FILENAME, BoundTranscript, TranscriptBinding, load_transcript_bindings
 from chitra.validation_receipts import (
     lane_worktree_path,
     list_receipts,
@@ -339,15 +341,34 @@ def _bound_native_session_id(config: MonitordConfig, transcript_path: Path) -> s
     return native_session_identity(transcript_path)
 
 
+# Plug event-reader cursors for URI-bound lanes, keyed by
+# (state_dir, locator). They play the same role the ingestor pool plays for
+# file bindings: each pass only pulls events the lane has not already
+# emitted. Journal append dedupe makes a stale cursor safe, never lossy.
+_PLUG_CURSORS: dict[tuple[str, str], str] = {}
+
+
 def ingest_transcript_bindings(
     config: MonitordConfig,
     bindings: tuple[TranscriptBinding, ...],
 ) -> tuple[CanonicalEvent, ...]:
-    """Ingest every explicitly bound JSONL transcript before journal discovery."""
+    """Ingest every explicitly bound transcript before journal discovery.
+
+    File bindings go through the pooled JSONL ingestor; URI locators
+    (``amp-orb:<slug>``) have no local file, so the owning plug's event
+    reader supplies canonical events straight into the lane's journal.
+    """
     observed: list[CanonicalEvent] = []
     unknown: dict[str, Counter[str]] = {}
     manifest_path = config.transcript_bindings_path or config.state_dir / DEFAULT_FILENAME
     for binding in bindings:
+        if binding.is_uri_locator:
+            appended = _ingest_uri_binding(config, binding, manifest_path=manifest_path)
+            observed.extend(appended)
+            for event in appended:
+                if event.normalized_type is CanonicalType.UNKNOWN:
+                    unknown.setdefault(event.lane, Counter())[str(event.payload.get("native_type"))] += 1
+            continue
         transcript_path = _resolved_binding_path(config, binding, manifest_path=manifest_path)
         context = NormalizationContext(
             instance=binding.instance,
@@ -385,6 +406,67 @@ def ingest_transcript_bindings(
     return tuple(observed)
 
 
+def _ingest_uri_binding(
+    config: MonitordConfig,
+    binding: TranscriptBinding,
+    *,
+    manifest_path: Path,
+) -> tuple[CanonicalEvent, ...]:
+    """Pull canonical events for a URI-bound lane through its plug's reader.
+
+    The locator names no local file, so the plug owns the evidence stream
+    (``amp threads export`` for ``amp-orb:<slug>``). Events land in the same
+    lane journal the file path writes to; event ids are stable across
+    replays, so ``EventJournal.append`` dedupe absorbs any overlap the
+    cursor misses. Failures are per-binding, matching the file path: the
+    lane simply contributes no events this pass.
+    """
+    bound = BoundTranscript(
+        binding=binding,
+        path=binding.resolved_ref(manifest_path=manifest_path, transcript_root=config.transcript_root),
+    )
+    try:
+        plug = plug_for_client(binding.client)
+        handle = plug.handle_for_binding(bound, session_ref=binding.session_ref)
+        key = (str(config.state_dir), str(bound.path))
+        batch = plug.events(handle, cursor=_PLUG_CURSORS.get(key))
+        if batch.cursor is not None:
+            _PLUG_CURSORS[key] = batch.cursor
+        return EventJournal(config.state_dir, binding.lane).append(batch.events)
+    except AdapterError as exc:
+        logger.error(
+            "monitord_uri_binding_ingest_failed",
+            lane=binding.lane,
+            client=str(binding.client),
+            error=str(exc),
+        )
+        return ()
+
+
+def _resolved_binding_ref(
+    config: MonitordConfig,
+    binding: TranscriptBinding,
+    *,
+    manifest_path: Path | None = None,
+) -> Path | str:
+    """The binding's resolved evidence ref: a canonical Path or a URI string."""
+    resolved_manifest = manifest_path or config.transcript_bindings_path or config.state_dir / DEFAULT_FILENAME
+    resolved = binding.resolved_ref(manifest_path=resolved_manifest, transcript_root=config.transcript_root)
+    if isinstance(resolved, Path):
+        return resolved.expanduser().resolve(strict=False)
+    return resolved
+
+
+def _uri_bound_native_session_id(binding: TranscriptBinding, ref: str) -> str | None:
+    """Native session id for a URI binding, from the owning plug's lane record."""
+    try:
+        bound = BoundTranscript(binding=binding, path=ref)
+        return plug_for_client(binding.client).handle_for_binding(bound, session_ref=binding.session_ref).native_session_id
+    except AdapterError as exc:
+        logger.error("monitord_uri_binding_native_id_failed", lane=binding.lane, error=str(exc))
+        return None
+
+
 def _resolved_binding_path(
     config: MonitordConfig,
     binding: TranscriptBinding,
@@ -403,7 +485,7 @@ def _event_matches_binding(
     event: CanonicalEvent,
     binding: TranscriptBinding,
     *,
-    transcript_path: Path,
+    transcript_path: Path | str,
     native_session_id: str | None,
 ) -> bool:
     """Accept only events from the complete current transcript binding.
@@ -2132,13 +2214,18 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
     )
     ingest_transcript_bindings(config, bindings)
     bindings_by_lane = {binding.lane: binding for binding in bindings}
-    binding_paths = {
-        binding.lane: _resolved_binding_path(config, binding)
+    binding_refs: dict[str, Path | str] = {
+        binding.lane: _resolved_binding_ref(config, binding)
         for binding in bindings
     }
     binding_native_session_ids = {
-        lane: _bound_native_session_id(config, path)
-        for lane, path in binding_paths.items()
+        binding.lane: (
+            _bound_native_session_id(config, ref)
+            if isinstance(ref, Path)
+            else _uri_bound_native_session_id(binding, ref)
+        )
+        for binding in bindings
+        for ref in (binding_refs[binding.lane],)
     }
     try:
         goals_by_session = {goal.session_ref: goal for goal in list_goals(config.state_dir)}
@@ -2193,7 +2280,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                 if _event_matches_binding(
                     event,
                     binding,
-                    transcript_path=binding_paths[lane],
+                    transcript_path=binding_refs[lane],
                     native_session_id=binding_native_session_ids.get(lane),
                 )
             )
@@ -2268,7 +2355,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                         unmet_item=unmet_for_observation,
                         expected_next_progress="restore a readable bound transcript for this lane",
                         detail=(
-                            f"bound transcript {binding_paths[lane]} yields no native session identity "
+                            f"bound transcript {binding_refs[lane]} yields no native session identity "
                             "(missing, unreadable, truncated, or foreign); the lane cannot be observed"
                         ),
                     )
@@ -2280,7 +2367,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                         fingerprint_seed={
                             "lane": lane,
                             "session_ref": binding.session_ref,
-                            "transcript_path": str(binding_paths[lane]),
+                            "transcript_path": str(binding_refs[lane]),
                         },
                         event_refs=(),
                         unmet_item=unmet_for_observation,
@@ -2549,7 +2636,9 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                 lane=active_lane,
                 goal=active_goal,
                 track_id=decision.record.track_id,
-                transcript_path=binding_paths.get(active_lane),
+                transcript_path=(
+                    ref if isinstance(ref := binding_refs.get(active_lane), Path) else None
+                ),
             )
             if decision.record.stage == "relaunch" and not config.shadow_mode:
                 # The ladder's top rung issues no further orders; without a

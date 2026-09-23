@@ -27,7 +27,11 @@ NORMALIZER_VERSION = "chitra-journal-normalizer.v1"
 class NormalizationContext:
     instance: str
     lane: str
-    client: Client
+    # Known clients are Client members; a plug-owned harness name (e.g. "amp")
+    # is kept as a string so strict bindings stay portable across backends.
+    # Harnesses with no JSONL normalizer are ingested through plug event
+    # readers instead of this path.
+    client: Client | str
     client_version: str
     process_id: str | None = None
     session_id: str | None = None
@@ -200,7 +204,7 @@ class TranscriptNormalizer:
         payload_digest = _canonical_digest(payload)
         event_id = _canonical_digest(
             {
-                "client": self.context.client.value,
+                "client": str(self.context.client),
                 "session_id": receipt.session_id,
                 "receipt_id": receipt.receipt_id,
                 "normalized_type": CanonicalType.RESUME.value,
@@ -251,7 +255,7 @@ class TranscriptNormalizer:
         payload_digest = _canonical_digest(payload)
         event_id = _canonical_digest(
             {
-                "client": self.context.client.value,
+                "client": str(self.context.client),
                 "session_id": self.session_id or "unknown",
                 "native_key": _native_key(record, raw.raw_sha256),
                 "native_occurrence": self._current_occurrence,
@@ -622,9 +626,13 @@ class CodexNormalizer(TranscriptNormalizer):
 
 
 def make_normalizer(context: NormalizationContext) -> TranscriptNormalizer:
+    # Fail closed on a client with no JSONL normalizer: silently defaulting an
+    # unknown harness to Codex normalization would fabricate evidence.
     if context.client is Client.CLAUDE:
         return ClaudeNormalizer(context)
-    return CodexNormalizer(context)
+    if context.client is Client.CODEX:
+        return CodexNormalizer(context)
+    raise ValueError(f"no JSONL transcript normalizer for client {context.client!r}")
 
 
 def native_session_identity(transcript_path: Path | str) -> str | None:
