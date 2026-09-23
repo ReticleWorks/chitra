@@ -4,6 +4,8 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-09-23
+
 ### Added
 
 - `chitra-outcomes` console script prints the per-`task_type` outcomes
@@ -818,7 +820,7 @@ that host, and a capped pane classified as idle.
   regular expression, or an unchanged input row as semantic status. It emits
   `AGENT_STATUS` transitions from lifecycle reports or manifests instead.
   Operators must ship compatible manifest provisioning and lifecycle hooks
-  with the package update; see `docs/watchd-status-migration.md`.
+  with the package update.
 
 ### Fixed
 
