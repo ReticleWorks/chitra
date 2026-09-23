@@ -34,6 +34,7 @@ from chitra.validator_registry import (
     UNRUNNABLE_EXIT_CODE,
     RegisteredValidator,
     load_validators,
+    registered_validator_digest,
     run_registered_validator,
 )
 
@@ -295,6 +296,7 @@ def _migrate_legacy_receipt(root: Path | None, session_ref: str, receipt_name: s
             legacy,
             verify_current_target=False,
             approved_root=root if root is not None else state_dir(),
+            session_ref=session_ref,
         )
         if not source_check.verified:
             raise ReceiptError("legacy receipt evidence verification failed: " + "; ".join(source_check.issues))
@@ -317,6 +319,7 @@ def _migrate_legacy_receipt(root: Path | None, session_ref: str, receipt_name: s
                 staged_receipt,
                 verify_current_target=False,
                 approved_root=root if root is not None else state_dir(),
+                session_ref=session_ref,
             )
             if not staged_check.verified:
                 raise ReceiptError("migrated receipt verification failed: " + "; ".join(staged_check.issues))
@@ -363,6 +366,7 @@ def _migrate_legacy_receipt(root: Path | None, session_ref: str, receipt_name: s
                 destination,
                 verify_current_target=False,
                 approved_root=root if root is not None else state_dir(),
+                session_ref=session_ref,
             )
             if not destination_check.verified:
                 raise ReceiptError(
@@ -537,10 +541,14 @@ def _approved_root_path(root: Path) -> Path:
 def _confined_path(path: Path, approved_root: Path | None, *, label: str) -> Path:
     """Return ``path`` only when it is a real, non-symlink child of ``root``.
 
-    The check is deliberately lexical *and* resolved.  Lexical confinement
-    rejects absolute aliases and ``..`` tricks; walking the components and
-    resolving the complete path rejects symlink escapes (including a symlink
-    that points back inside the workspace).  Callers must pass an explicit
+    The check is deliberately resolved *and* spelled.  Resolving ``path``
+    before the containment compare rejects absolute aliases, ``..`` tricks,
+    and symlink escapes — including a symlink that points back inside the
+    workspace — while still accepting a path spelled through a symlinked
+    prefix of the approved root itself (a symlinked state root component
+    names the same confinement boundary, so it must not blind verification).
+    The spelled components *below* that boundary must still be real, so an
+    in-workspace alias remains rejected.  Callers must pass an explicit
     root.  Without one, running a receipt's validator would turn its claimed
     path into authority, so verification fails closed before subprocess use.
     """
@@ -552,23 +560,34 @@ def _confined_path(path: Path, approved_root: Path | None, *, label: str) -> Pat
     if any(part in ("", ".", "..") for part in path.parts):
         raise ReceiptError(f"{label} path contains traversal components")
     try:
-        relative = path.relative_to(root)
-    except ValueError as exc:
-        raise ReceiptError(f"{label} path is outside the approved workspace: {path}") from exc
-
-    current = root
-    for part in relative.parts:
-        current /= part
-        if current.is_symlink():
-            raise ReceiptError(f"{label} path contains a symlink: {path}")
-    try:
         resolved = path.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise ReceiptError(f"{label} path is unreadable: {exc}") from exc
     try:
         resolved.relative_to(root)
     except ValueError as exc:
-        raise ReceiptError(f"{label} path escapes the approved workspace: {path}") from exc
+        raise ReceiptError(f"{label} path is outside the approved workspace: {path}") from exc
+
+    # The resolved compare alone cannot see a symlink component that resolves
+    # back inside the workspace.  Find where the path as spelled first enters
+    # the approved root — the shallowest prefix that resolves to it — and
+    # require every component below that point to be a real entry.
+    boundary: Path | None = None
+    for index in range(1, len(path.parts) + 1):
+        prefix = Path(*path.parts[:index])
+        try:
+            if prefix.resolve() == root:
+                boundary = prefix
+                break
+        except OSError:
+            continue
+    if boundary is None:
+        raise ReceiptError(f"{label} path is outside the approved workspace: {path}")
+    current = boundary
+    for part in path.parts[len(boundary.parts) :]:
+        current /= part
+        if current.is_symlink():
+            raise ReceiptError(f"{label} path contains a symlink: {path}")
     return path
 
 
@@ -675,10 +694,30 @@ def _validator_identifiers(receipt: ValidationReceipt) -> set[str]:
     return identifiers
 
 
-def _validator_issues(receipt: ValidationReceipt, base: Path, approved_root: Path | None) -> list[str]:
+def _validator_issues(
+    receipt: ValidationReceipt,
+    base: Path,
+    approved_root: Path | None,
+    *,
+    session_ref: str | None = None,
+) -> list[str]:
     name = _text(receipt.validator, "name", parent="validator")
-    if not name.startswith("Polyvalidation Rig"):
-        return _generic_validator_issues(receipt, base, approved_root)
+    registry_root = approved_root if approved_root is not None else _state_root_for_receipt_dir(base)
+    registry = load_validators(registry_root)
+    registered = next(
+        (
+            registry[identifier]
+            for identifier in sorted(_validator_identifiers(receipt))
+            if identifier in registry
+        ),
+        None,
+    )
+    # A receipt whose validator identity is enrolled in the registry always
+    # goes through the generic execution path — only Chitra's own run of the
+    # registered argv can establish its PASS, never the paper a lane filed.
+    # The PVR structural check remains for identities with no registry entry.
+    if not name.startswith("Polyvalidation Rig") or registered is not None:
+        return _generic_validator_issues(receipt, base, approved_root, session_ref=session_ref)
     report_path = receipt.validator.get("report_path")
     status = receipt.result["status"]
     if report_path is None:
@@ -808,7 +847,70 @@ def _pvr_report_accepted(verdict: object) -> bool:
     )
 
 
-def _generic_validator_issues(receipt: ValidationReceipt, base: Path, approved_root: Path | None) -> list[str]:
+def _receipt_worktree_issues(
+    receipt: ValidationReceipt,
+    approved_root: Path | None,
+    session_ref: str | None,
+) -> list[str]:
+    """Refuse a receipt recorded against a different worktree than the lane's.
+
+    Chitra-recorded runs stamp the resolved worktree they executed in.  When
+    the lane has since been re-anchored elsewhere, a receipt bound to the old
+    tree is stale evidence and can never verify.
+    """
+    if approved_root is None or session_ref is None or "artifact" not in receipt.target:
+        return []
+    artifact = receipt.target["artifact"]
+    if not isinstance(artifact, dict):
+        return []
+    recorded = artifact.get("worktree")
+    if not isinstance(recorded, str) or not recorded:
+        return []
+    current = lane_worktree_path(approved_root, session_ref)
+    if current is None:
+        return []
+    if Path(recorded).resolve() != current.resolve():
+        return [
+            f"receipt recorded a validator run in {recorded!r} but the lane is bound to {current}; "
+            "a run in another tree cannot close this lane's claim"
+        ]
+    return []
+
+
+def _enrollment_pin_issues(root: Path | None, session_ref: str, receipt: ValidationReceipt) -> list[str]:
+    """Refuse a receipt whose enrolled validator definition drifted since enrollment."""
+    from chitra.goals import get_goal
+
+    try:
+        goal = get_goal(root, session_ref)
+    except (OSError, ValueError):
+        return []
+    if goal is None:
+        return []
+    item = next(
+        (entry for entry in goal.enrolled_done_when_items if entry.required_receipt == receipt.receipt_name),
+        None,
+    )
+    if item is None or not item.validator_sha256:
+        return []
+    registered = load_validators(root).get(item.validator)
+    if registered is None:
+        return [
+            f"enrolled validator {item.validator!r} is no longer registered; "
+            "the definition pinned at enrollment cannot be honored"
+        ]
+    if registered_validator_digest(registered) != item.validator_sha256:
+        return [f"enrolled validator {item.validator!r} definition drifted since enrollment"]
+    return []
+
+
+def _generic_validator_issues(
+    receipt: ValidationReceipt,
+    base: Path,
+    approved_root: Path | None,
+    *,
+    session_ref: str | None = None,
+) -> list[str]:
     """Fail closed on PASS claims that lack a trusted validator execution.
 
     The frozen validator identity selects Chitra's own trusted verifier; the
@@ -846,7 +948,8 @@ def _generic_validator_issues(receipt: ValidationReceipt, base: Path, approved_r
     if raw_report["command"] != command:
         issues.append("validator report command does not match the receipt exercise")
     issues.extend(_validator_binding_issues(receipt, base, approved_root))
-    actual_exit_code = _trusted_validator_result(receipt, base, approved_root)
+    issues.extend(_receipt_worktree_issues(receipt, approved_root, session_ref))
+    actual_exit_code = _trusted_validator_result(receipt, base, approved_root, session_ref=session_ref)
     if actual_exit_code != exit_code:
         issues.append(
             f"trusted re-execution of the receipt exercise exited {actual_exit_code}; "
@@ -1061,7 +1164,8 @@ def _recorded_validator_result(
         return None
     if record.tree_digest_before is None or record.tree_digest_after is None:
         return None
-    current = worktree_git_digest(lane.workdir)
+    worktree = lane_worktree_path(root, record.session_ref)
+    current = worktree_git_digest(worktree if worktree is not None else lane.workdir)
     if current is None:
         return None
     if record.tree_digest_before != record.tree_digest_after or record.tree_digest_after != current:
@@ -1069,7 +1173,34 @@ def _recorded_validator_result(
     return record.exit_code
 
 
-def _trusted_validator_result(receipt: ValidationReceipt, base: Path, approved_root: Path | None) -> int:
+def lane_worktree_path(root: Path | None, session_ref: str) -> Path | None:
+    """Resolve the worktree a lane's Chitra-run validators execute in.
+
+    The latest durable checkpoint binding is authoritative: it records the
+    realpath the lane was anchored to. When no checkpoint exists, a lane the
+    operator manifest binds to a different OS user falls back to its declared
+    workdir. ``None`` means the lane has no recorded worktree and the caller
+    keeps its own directory.
+    """
+    from chitra.recovery import load_worktree_checkpoints
+
+    try:
+        checkpoints = load_worktree_checkpoints(root, session_ref=session_ref)
+    except (OSError, ValueError):
+        checkpoints = []
+    if checkpoints:
+        return Path(checkpoints[-1].binding.worktree_realpath)
+    lane = recorded_result_lane(root, session_ref)
+    return lane.workdir if lane is not None else None
+
+
+def _trusted_validator_result(
+    receipt: ValidationReceipt,
+    base: Path,
+    approved_root: Path | None,
+    *,
+    session_ref: str | None = None,
+) -> int:
     """Run the frozen identity's trusted verifier against the exact current target.
 
     The enrolled validator name, not the receipt author, selects the program,
@@ -1091,7 +1222,9 @@ def _trusted_validator_result(receipt: ValidationReceipt, base: Path, approved_r
         recorded = _recorded_validator_result(receipt, base, approved_root)
         if recorded is not None:
             return recorded
-        exit_code, output = run_registered_validator(registered)
+        run_root = approved_root if approved_root is not None else _state_root_for_receipt_dir(base)
+        workdir = lane_worktree_path(run_root, session_ref) if session_ref is not None else None
+        exit_code, output = run_registered_validator(registered, cwd=workdir)
         del output
         return exit_code
     try:
@@ -1136,6 +1269,7 @@ def verify_receipt_file(
     *,
     verify_current_target: bool = True,
     approved_root: Path | None = None,
+    session_ref: str | None = None,
 ) -> ReceiptVerification:
     """Verify one stored or source receipt without trusting caller status text."""
     root = approved_root if approved_root is not None else _infer_approved_root(path)
@@ -1144,7 +1278,9 @@ def verify_receipt_file(
     except ReceiptError as exc:
         return ReceiptVerification("", "invalid", False, False, (str(exc),), path)
     issues = _artifact_issues(receipt, path.parent, root)
-    issues.extend(_validator_issues(receipt, path.parent, root))
+    issues.extend(_validator_issues(receipt, path.parent, root, session_ref=session_ref))
+    if session_ref is not None:
+        issues.extend(_enrollment_pin_issues(root, session_ref, receipt))
     if verify_current_target:
         issues.extend(_target_issues(receipt, path.parent, root))
     verified = not issues
@@ -1165,7 +1301,7 @@ def verify_receipt(
         path = _receipt_path_for_read(root, session_ref, receipt_name)
     except ReceiptError as exc:
         return ReceiptVerification("", "invalid", False, False, (str(exc),), path)
-    return verify_receipt_file(path, verify_current_target=verify_current_target, approved_root=root)
+    return verify_receipt_file(path, verify_current_target=verify_current_target, approved_root=root, session_ref=session_ref)
 
 
 def _copy_file_atomic(source: Path, destination: Path) -> None:
@@ -1201,7 +1337,9 @@ def ingest_receipt(root: Path | None, session_ref: str, source: Path) -> Path:
     mismatched = [item.id for item in matching if item.validator not in identifiers]
     if mismatched:
         raise ReceiptError(f"receipt validator does not match enrolled item(s): {mismatched!r}")
-    source_check = verify_receipt_file(source, verify_current_target=False, approved_root=root or state_dir())
+    source_check = verify_receipt_file(
+        source, verify_current_target=False, approved_root=root or state_dir(), session_ref=session_ref
+    )
     if not source_check.verified:
         raise ReceiptError("receipt evidence verification failed: " + "; ".join(source_check.issues))
 
@@ -1211,7 +1349,9 @@ def ingest_receipt(root: Path | None, session_ref: str, source: Path) -> Path:
             existing = _load_raw(destination)
             if existing != raw:
                 raise ReceiptError(f"stored receipt {receipt.receipt_name!r} is immutable and differs from the source")
-            stored_check = verify_receipt_file(destination, verify_current_target=False, approved_root=root or state_dir())
+            stored_check = verify_receipt_file(
+                destination, verify_current_target=False, approved_root=root or state_dir(), session_ref=session_ref
+            )
             if not stored_check.verified:
                 raise ReceiptError("stored receipt verification failed: " + "; ".join(stored_check.issues))
             return destination
@@ -1225,7 +1365,9 @@ def ingest_receipt(root: Path | None, session_ref: str, source: Path) -> Path:
                 _copy_file_atomic(source.parent / relative, stored_artifact)
         write_json_atomic(destination, raw, fsync=True)
         os.chmod(destination, 0o600)
-        stored_check = verify_receipt_file(destination, verify_current_target=False, approved_root=root or state_dir())
+        stored_check = verify_receipt_file(
+            destination, verify_current_target=False, approved_root=root or state_dir(), session_ref=session_ref
+        )
         if not stored_check.verified:
             raise ReceiptError("stored receipt verification failed: " + "; ".join(stored_check.issues))
     return destination
@@ -1273,7 +1415,7 @@ def require_verified_completion_receipts(
             raise ReceiptError(f"done item {item.id!r} receipt is unavailable: {exc}") from exc
         if item.validator not in _validator_identifiers(receipt):
             raise ReceiptError(f"done item {item.id!r} receipt validator does not match {item.validator!r}")
-        verification = verify_receipt_file(path, approved_root=root or state_dir())
+        verification = verify_receipt_file(path, approved_root=root or state_dir(), session_ref=session_ref)
         if not verification.verified:
             raise ReceiptError(f"done item {item.id!r} receipt is not verified: {'; '.join(verification.issues)}")
         if not verification.completion_eligible:
@@ -1312,6 +1454,7 @@ def record_registered_run(
     *,
     produced_at: str | None = None,
     output: str | None = None,
+    workdir: Path | None = None,
 ) -> CompletionEvidence:
     """Run one registered validator, store its receipt, and return its proof.
 
@@ -1321,12 +1464,32 @@ def record_registered_run(
     and the receipt atomically; the newest execution is the proof.
     A missing registry entry (``entry=None``) fails closed as exit 125 so an
     enrolled item whose validator later vanishes still leaves a stored FAIL.
+
+    The run is pinned to the lane's recorded worktree: ``workdir`` wins, else
+    the latest checkpoint binding, else a manifest lane's declared workdir.
+    The resolved tree is stamped on the receipt so verification can prove
+    the run happened in the lane's tree and not beside it. A registry entry
+    whose definition no longer matches the digest pinned at enrollment is
+    refused rather than executed: the pin, not the mutable registry, defines
+    what the item enrolled.
     """
     receipt_name(item.required_receipt)
-    if entry is None:
+    cwd = workdir if workdir is not None else lane_worktree_path(root, session_ref)
+    if cwd is not None:
+        cwd = cwd.resolve()
+    command = list(entry.argv) if entry is not None else [f"<unregistered:{item.validator}>"]
+    pin = getattr(item, "validator_sha256", "")
+    if entry is not None and pin and registered_validator_digest(entry) != pin:
+        exit_code = UNRUNNABLE_EXIT_CODE
+        command = [f"<registry-drifted:{item.validator}>"]
+        output = (
+            f"registered validator {item.validator!r} changed since enrollment "
+            "(the registry digest no longer matches the enrollment pin); refusing to run it"
+        )
+    elif entry is None:
         exit_code, output = UNRUNNABLE_EXIT_CODE, (f"registered validator {item.validator!r} is not in this instance's validators.json")
     else:
-        exit_code, output = run_registered_validator(entry)
+        exit_code, output = run_registered_validator(entry, cwd=cwd)
     destination = receipt_path(root, session_ref, item.required_receipt)
     directory = destination.parent
     directory.mkdir(parents=True, exist_ok=True)
@@ -1335,7 +1498,7 @@ def record_registered_run(
     _write_text_atomic(output_path, output + ("\n" if output else ""))
     report = {
         "schema_version": "chitra-validator-report-v1",
-        "command": list(entry.argv) if entry is not None else [],
+        "command": command,
         "exit_code": exit_code,
     }
     _write_text_atomic(report_path, json.dumps(report, sort_keys=True))
@@ -1351,9 +1514,10 @@ def record_registered_run(
             "artifact": {
                 "path": str(output_path),
                 "sha256": _hash_file(output_path),
+                **({"worktree": str(cwd)} if cwd is not None else {}),
             }
         },
-        "exercise": {"command": list(entry.argv) if entry is not None else [f"<unregistered:{item.validator}>"]},
+        "exercise": {"command": command},
         "result": {"status": status, "validator_acceptance": exit_code == 0},
         "not_exercised": [],
         "artifacts": [
@@ -1520,7 +1684,7 @@ def run_enrolled_validators_on_worker(
         exit_code = UNRUNNABLE_EXIT_CODE
         receipt_digest = ""
         try:
-            record_registered_run(root, session_ref, item, registry.get(item.validator))
+            record_registered_run(root, session_ref, item, registry.get(item.validator), workdir=workdir)
             exit_code = _stored_report_exit_code(root, session_ref, item.required_receipt)
             receipt_digest = _stored_receipt_integrity_digest(root, session_ref, item.required_receipt) or ""
         except Exception:

@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import signal
+import subprocess
 import threading
 from collections import Counter
 from collections.abc import Callable
@@ -119,6 +120,7 @@ from chitra.supervisor import reconcile_corrective_action, reconcile_question_ac
 from chitra.systemd_notify import notify_ready, notify_watchdog
 from chitra.transcript_bindings import DEFAULT_FILENAME, TranscriptBinding, load_transcript_bindings
 from chitra.validation_receipts import (
+    lane_worktree_path,
     list_receipts,
     receipt_path,
     record_enrolled_validator_runs,
@@ -465,6 +467,27 @@ def _declared_worktree(config: MonitordConfig, goal: object) -> str:
         return ""
     checkpoints = load_worktree_checkpoints(config.state_dir, session_ref=session_ref)
     return checkpoints[-1].binding.worktree_realpath if checkpoints else ""
+
+
+def _worktree_dirty(worktree: Path) -> bool:
+    """Live ``git status`` probe: any tracked, staged, or untracked delta is dirty.
+
+    The probe fails closed — a worktree that cannot be examined cannot prove
+    it is clean, so a completion claim on it is disputed rather than passed.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(worktree), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if result.returncode != 0:
+        return True
+    return bool(result.stdout.strip())
 
 
 def run_detectors(
@@ -829,8 +852,9 @@ def _claimed_run_evidence(
     stay synchronous, exactly as before.
     """
     lane = recorded_result_lane(config.state_dir, session_ref)
-    current_digest = worktree_git_digest(lane.workdir) if lane is not None else None
-    if lane is None or current_digest is None:
+    worktree = lane_worktree_path(config.state_dir, session_ref)
+    current_digest = worktree_git_digest(worktree) if worktree is not None else None
+    if lane is None or worktree is None or current_digest is None:
         return record_enrolled_validator_runs(config.state_dir, session_ref, items)
     lane_key = f"{config.state_dir}:{goal.lane_id or session_ref}"
     if _VALIDATOR_RUN_POOL.in_flight(lane_key):
@@ -855,7 +879,7 @@ def _claimed_run_evidence(
             config.state_dir,
             session_ref,
             items,
-            workdir=lane.workdir,
+            workdir=worktree,
         ),
     )
     return None
@@ -922,6 +946,12 @@ def check_enrollment_and_receipts(
             )
         return 0, True, findings, False
 
+    if config.shadow_mode:
+        # Shadow mode is observe-only: it never spawns lane-triggered
+        # validators and never re-executes a stored one, so a claim simply
+        # has nothing to be checked against on this pass.
+        return 0, False, [], False
+
     claimed_evidence = tuple(extract_completion_evidence(final_text))
     claim_bindings: dict[str, str] = {}
     for item in items:
@@ -932,6 +962,12 @@ def check_enrollment_and_receipts(
             for proof in claimed_evidence
         ):
             claim_bindings[item.id] = item.required_receipt
+
+    # Probe the lane's tree before any validator run touches it: a validator
+    # may legitimately write caches into the worktree, and the dirty check
+    # judges the state the claim was made in, not the run's side effects.
+    declared_worktree = _declared_worktree(config, goal)
+    target_dirty = bool(declared_worktree) and _worktree_dirty(Path(declared_worktree))
 
     claimed = _claimed_run_evidence(config, goal, session_ref, items)
     if claimed is None:
@@ -954,6 +990,12 @@ def check_enrollment_and_receipts(
         receipt_roots={session_ref: config.state_dir},
         session_ref=session_ref,
         material_questions=material_questions,
+        target_dirty=target_dirty,
+        # Live proof means a fresh Chitra-executed run for every enrolled
+        # item this pass; a worker in flight returned pending above, so a
+        # claim reaching here has all of them.
+        live_proof_required=True,
+        live_proof_present=len(run_evidence) >= len(items),
     )
     if not findings and not config.shadow_mode:
         # The same isolated reviewer that gates completion claims under watchd

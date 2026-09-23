@@ -359,7 +359,7 @@ def test_check_enrollment_disputes_when_the_validator_fails(tmp_path: Path, monk
         }
     )
     recorded, disputed, findings, pending = check_enrollment_and_receipts(
-        _config(tmp_path),
+        resolve_config(state_dir=tmp_path, shadow_mode=False),
         "session-1",
         final_response,
     )
