@@ -401,9 +401,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
     selectors.add_argument("--index", type=int)
     selectors.add_argument("--all", action="store_true")
     resolve_ask_command.add_argument("--retired-by", choices=("operator", "monitor"), default="operator")
-    resolve_ask_command.add_argument("--basis", default="Operator answered the ask.")
-    resolve_ask_command.add_argument("--citation", default="operator-ruling")
+    resolve_ask_command.add_argument(
+        "--basis",
+        default=None,
+        help="The recorded basis; without one an operator retirement is a dismissal, not an answer.",
+    )
+    resolve_ask_command.add_argument("--citation", default=None)
     resolve_ask_command.add_argument("--authority", default="operator")
+
+    answer_command = commands.add_parser(
+        "answer",
+        help="Record one operator answer as a canonical ruling and relay it to the lane.",
+    )
+    add_root(answer_command)
+    answer_command.add_argument("--session-ref", required=True)
+    answer_command.add_argument("--text", required=True)
+    answer_command.add_argument("--queue-dir", type=Path, default=None)
+
+    resolve_task_command = commands.add_parser(
+        "resolve-task",
+        help="Retire one persisted foreground task, optionally with the answer that closed it.",
+    )
+    add_root(resolve_task_command)
+    resolve_task_command.add_argument("--session-ref", required=True)
+    resolve_task_command.add_argument("--task-id", required=True)
+    resolve_task_command.add_argument("--basis", default=None)
 
     scan_asks_command = commands.add_parser("scan-asks", help="Extract verbatim open asks from a lane transcript.")
     add_root(scan_asks_command)
@@ -580,6 +602,13 @@ def main(argv: list[str] | None = None) -> int:
             _print_record(successor)
         elif args.command == "resume":
             _print_record(goal_store.resume_goal(args.root, args.session_ref))
+            # Orders parked while the lane was held or deferred return to
+            # orders/ so dispatchd can deliver them now that work resumed.
+            from chitra.dispatchd import requeue_deferred_for_session
+
+            queue_dir = (args.root if args.root is not None else state_dir()) / "queue"
+            if (queue_dir / "deferred").is_dir():
+                requeue_deferred_for_session(queue_dir, args.session_ref)
         elif args.command == "redirect":
             redirected_autonomy_policy = _autonomy_policy_from_args(args, default=None)
             _print_record(
@@ -650,6 +679,21 @@ def main(argv: list[str] | None = None) -> int:
                     basis=args.basis,
                     citation=args.citation,
                     authority=args.authority,
+                )
+            )
+        elif args.command == "answer":
+            from chitra.operator_answer import record_operator_answer
+
+            _print_record(
+                record_operator_answer(args.root, args.session_ref, args.text, queue_dir=args.queue_dir)
+            )
+        elif args.command == "resolve-task":
+            _print_record(
+                goal_store.resolve_foreground_task(
+                    args.root,
+                    args.session_ref,
+                    task_id=args.task_id,
+                    basis=args.basis,
                 )
             )
         elif args.command == "scan-asks":

@@ -58,6 +58,9 @@ class QuestionHandlerResult(BaseModel):
     goal_version: int = Field(ge=1)
     goal_digest: str = Field(min_length=1)
     question: str = Field(min_length=1)
+    # The journal event id of the turn that asked; folded into ``request_id``
+    # so a re-ask of the same text is a new, separately delivered request.
+    occurrence: str = ""
     kind: QuestionKind
     disposition: QuestionDisposition
     source: QuestionSource
@@ -299,22 +302,58 @@ def _decision_words(text: str) -> frozenset[str]:
     )
 
 
-def _match_decision(question: str, decisions: Sequence[DecisionEntry]) -> DecisionEntry | None:
+def _decision_is_bound_to(entry: DecisionEntry, *, session_ref: str, goal_version: int, goal_digest_value: str) -> bool:
+    """Return whether a bound ruling still refers to this exact contract.
+
+    Entries carrying no binding fields are historical, unbound rulings and
+    stay eligible.  A bound entry that disagrees with the live contract on
+    any recorded field can no longer answer for it.
+    """
+    if entry.session_ref and entry.session_ref != session_ref:
+        return False
+    if entry.goal_version and entry.goal_version != goal_version:
+        return False
+    return not (entry.goal_digest and entry.goal_digest != goal_digest_value)
+
+
+def _decision_match_text(entry: DecisionEntry) -> str:
+    """Return the text a ruling is matched against: its verbatim ask first."""
+    return entry.question or entry.answer or entry.decision
+
+
+def _decision_deliverable(entry: DecisionEntry) -> str:
+    """Return the text relayed to the lane: its verbatim answer first."""
+    return entry.answer or entry.decision
+
+
+def _match_decision(
+    question: str,
+    decisions: Sequence[DecisionEntry],
+    *,
+    session_ref: str = "",
+    goal_version: int = 0,
+    goal_digest_value: str = "",
+) -> DecisionEntry | None:
     """Return the newest recorded ruling covering ``question``, or ``None``."""
     question_words = _decision_words(question)
     if len(question_words) < _ASK_GATE_MIN_SHARED_WORDS:
         return None
     for entry in reversed(decisions):
-        if _ASK_GATE_UNDELIVERABLE_RE.search(entry.decision):
+        if not _decision_is_bound_to(
+            entry, session_ref=session_ref, goal_version=goal_version, goal_digest_value=goal_digest_value
+        ):
             continue
-        if len(question_words & _decision_words(entry.decision)) >= _ASK_GATE_MIN_SHARED_WORDS:
+        if _ASK_GATE_UNDELIVERABLE_RE.search(_decision_deliverable(entry)):
+            continue
+        if len(question_words & _decision_words(_decision_match_text(entry))) >= _ASK_GATE_MIN_SHARED_WORDS:
             return entry
     return None
 
 
-def _request_id(question: str, digest: str) -> str:
-    payload = json.dumps([digest, question], ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+def _request_id(question: str, digest: str, occurrence: str = "") -> str:
+    payload = [digest, question] if not occurrence else [digest, question, occurrence]
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def _invalid_contract(goal: GoalRecord, *, needs_scope: bool = False) -> bool:
@@ -333,14 +372,16 @@ def _result(
     answer: str | None,
     reason: str,
     gate_reasons: tuple[GateReason, ...] = (),
+    occurrence: str = "",
 ) -> QuestionHandlerResult:
     digest = goal_digest(goal)
     return QuestionHandlerResult(
-        request_id=_request_id(question, digest),
+        request_id=_request_id(question, digest, occurrence),
         session_ref=goal.session_ref,
         goal_version=goal.goal_version,
         goal_digest=digest,
         question=question,
+        occurrence=occurrence,
         kind=kind,
         disposition=disposition,
         source=source,
@@ -350,7 +391,7 @@ def _result(
     )
 
 
-def _decision_answer(goal: GoalRecord, question: str, ruling: DecisionEntry) -> QuestionHandlerResult:
+def _decision_answer(goal: GoalRecord, question: str, ruling: DecisionEntry, *, occurrence: str = "") -> QuestionHandlerResult:
     """Answer from a recorded ruling, citing its decision id for contest."""
     return _result(
         goal,
@@ -358,8 +399,9 @@ def _decision_answer(goal: GoalRecord, question: str, ruling: DecisionEntry) -> 
         kind="unknown",
         disposition="answered",
         source="decisions_log",
-        answer=f"{ruling.decision} (decision {ruling.decision_id})",
+        answer=f"{_decision_deliverable(ruling)} (decision {ruling.decision_id})",
         reason="A recorded decision already settles this question; the decision id is cited so a wrong match can be contested.",
+        occurrence=occurrence,
     )
 
 
@@ -368,6 +410,7 @@ def handle_question(
     question: str,
     *,
     decisions: Sequence[DecisionEntry] = (),
+    occurrence: str = "",
 ) -> QuestionHandlerResult:
     """Answer a frozen-goal question or return a foreground residual.
 
@@ -387,6 +430,7 @@ def handle_question(
             answer=None,
             reason="The question is empty or not text; foreground reasoning must inspect the current lane state.",
             gate_reasons=("unknown_or_ambiguous",),
+            occurrence=occurrence,
         )
     text = question.strip()
     scope_match = _SCOPE_RE.fullmatch(text) or _SCOPE_LISTED_RE.fullmatch(text)
@@ -406,6 +450,7 @@ def handle_question(
                     f"Continue the frozen goal and prove completion with: {done_when_with_delta(goal)}"
                 ),
                 reason="The exact design surface is explicitly excluded by the frozen contract.",
+                occurrence=occurrence,
             )
     capability_uses, changes_frozen_outcome = _capability_uses(
         text,
@@ -420,11 +465,17 @@ def handle_question(
     ruling = (
         None
         if any(use.capability in _ASK_GATE_PROTECTED_CAPABILITIES for use in capability_uses)
-        else _match_decision(text, decisions)
+        else _match_decision(
+            text,
+            decisions,
+            session_ref=goal.session_ref,
+            goal_version=goal.goal_version,
+            goal_digest_value=goal_digest(goal),
+        )
     )
     if authority.disposition == "operator_required":
         if ruling is not None:
-            return _decision_answer(goal, text, ruling)
+            return _decision_answer(goal, text, ruling, occurrence=occurrence)
         reasons = tuple(
             dict.fromkeys(
                 ("strategic_scope_change" if changes_frozen_outcome else _CAPABILITY_GATE_REASON[use.capability]) for use in capability_uses
@@ -441,6 +492,7 @@ def handle_question(
             answer=None,
             reason="The frozen goal policy has no valid grant for this action, exceeds its limit, or the action changes the outcome.",
             gate_reasons=reasons,
+            occurrence=occurrence,
         )
     if authority.disposition == "foreground_residual":
         return _result(
@@ -452,6 +504,7 @@ def handle_question(
             answer=None,
             reason="The grant may cover this action, but its limits cannot be checked from current evidence; investigate and replan.",
             gate_reasons=("unknown_or_ambiguous",),
+            occurrence=occurrence,
         )
 
     if scope_match is not None:
@@ -465,6 +518,7 @@ def handle_question(
                 answer=None,
                 reason="The frozen goal does not contain a valid scope to inspect; foreground reasoning must repair or replan it.",
                 gate_reasons=("invalid_frozen_goal",),
+                occurrence=occurrence,
             )
         item = scope_match.group("item")
         explicit = _scope_match(goal.scope, item)
@@ -481,6 +535,7 @@ def handle_question(
                     "investigate and choose the next in-scope path."
                 ),
                 gate_reasons=("unknown_or_ambiguous",),
+                occurrence=occurrence,
             )
         return _result(
             goal,
@@ -490,6 +545,7 @@ def handle_question(
             source="frozen_goal",
             answer=f"{item.strip()} is {'in' if explicit else 'out of'} the frozen scope.",
             reason="The item is explicitly settled by the frozen scope.",
+            occurrence=occurrence,
         )
 
     if small_delta_match is not None:
@@ -505,6 +561,7 @@ def handle_question(
                     "The frozen goal does not contain a valid scope for this design change; foreground reasoning must repair or replan it."
                 ),
                 gate_reasons=("invalid_frozen_goal",),
+                occurrence=occurrence,
             )
         item = small_delta_match.group("item")
         explicit = _scope_match(goal.scope, item)
@@ -520,6 +577,7 @@ def handle_question(
                     "The frozen scope does not settle that exact design surface; foreground reasoning must investigate before changing it."
                 ),
                 gate_reasons=("unknown_or_ambiguous",),
+                occurrence=occurrence,
             )
         if not explicit:
             answer = (
@@ -540,6 +598,7 @@ def handle_question(
             source="frozen_goal",
             answer=answer,
             reason="The exact design surface and completion proof are settled by the frozen contract.",
+            occurrence=occurrence,
         )
 
     if _DONE_RE.search(text):
@@ -553,6 +612,7 @@ def handle_question(
                 answer=None,
                 reason="The frozen goal does not contain a valid completion condition; foreground reasoning must repair or replan it.",
                 gate_reasons=("invalid_frozen_goal",),
+                occurrence=occurrence,
             )
         return _result(
             goal,
@@ -562,6 +622,7 @@ def handle_question(
             source="frozen_goal",
             answer=f"The completion condition is: {done_when_with_delta(goal)}",
             reason="The completion condition is copied from the frozen goal.",
+            occurrence=occurrence,
         )
 
     if _NEXT_RE.search(text):
@@ -578,6 +639,7 @@ def handle_question(
                     "foreground reasoning must investigate and replan it."
                 ),
                 gate_reasons=("invalid_frozen_goal",),
+                occurrence=occurrence,
             )
         return _result(
             goal,
@@ -590,10 +652,11 @@ def handle_question(
                 f"{done_when_with_delta(goal)}"
             ),
             reason="The next bounded direction is determined by the frozen goal and completion condition.",
+            occurrence=occurrence,
         )
 
     if ruling is not None:
-        return _decision_answer(goal, text, ruling)
+        return _decision_answer(goal, text, ruling, occurrence=occurrence)
     return _result(
         goal,
         text,
@@ -605,7 +668,110 @@ def handle_question(
             "The frozen goal does not deterministically settle this question; foreground reasoning must investigate and continue pursuit."
         ),
         gate_reasons=("unknown_or_ambiguous",),
+        occurrence=occurrence,
     )
+
+
+# --- Turn-text question extraction ---------------------------------------
+#
+# Detection here is deliberately deterministic and conservative: a line only
+# counts as a question when a question mark sits in a natural-language shape
+# or the line declares a human blocker in words. Code punctuation (ternary
+# operators, optional-type markers, URL query strings, regex fragments) never
+# qualifies.
+
+# A question-marked line counts when it opens with an interrogative word or
+# ends with the question mark (quotes and brackets may follow it). ``?`` in
+# the middle of a line that does neither — ``ok ? a : b`` — is code-shaped.
+_QUESTION_OPENER_RE = re.compile(
+    r"^(?:do|does|did|is|are|was|were|am|can|could|should|would|will|won|may|might|must|shall|"
+    r"what|which|who|whom|whose|when|where|why|how|have|has|had)\b",
+    re.IGNORECASE,
+)
+_QUESTION_TAIL_RE = re.compile(r"\?+[\"'”’)\]}>*`]*\s*$")
+_LEADING_MARKUP_RE = re.compile(r"^(?:#{1,6}\s+|>{1,2}\s*|[-*•+]\s+|\d+[.)]\s+)+")
+_INLINE_CODE_RE = re.compile(r"`[^`\n]*`?")
+_URL_RE = re.compile(r"https?://\S+")
+
+# Declarative blocker phrasing — questions that never end in ``?`` but still
+# ask the lane to wait for a human. Each pattern requires a waiting/blocked
+# verb AND a human or authority word so status prose cannot false-positive.
+_DECLARATIVE_BLOCKER_RES: tuple[re.Pattern[str], ...] = (
+    # "waiting for your confirmation/answer/approval/decision/…"
+    re.compile(
+        r"\b(?:waiting|awaiting)\s+(?:for|on)\b[^.!?\n]{0,80}"
+        r"\b(?:your|you|the\s+operator|an?\s+(?:operator|human)|a\s+human)\b[^.!?\n]{0,60}"
+        r"\b(?:answer|repl(?:y|ies)|response|confir\w*|approv\w*|decision|input|sign[\s-]?off|go[\s-]?ahead|green\s*light|ruling|guidance|direction)s?\b",
+        re.IGNORECASE,
+    ),
+    # "I will wait / I'll hold off … until/for you/the operator confirms"
+    re.compile(
+        r"\b(?:i|we)\s*(?:'ll|will|shall|must|need\s+to|have\s+to|'m\s+going\s+to|am\s+going\s+to)\s+"
+        r"(?:wait|hold|pause|stop|stand\s+by|hold\s+off|proceed\s+only|continue\s+only)\b[^.!?\n]{0,60}"
+        r"\b(?:until|for|pending|after|before|without)\b[^.!?\n]{0,60}"
+        r"\b(?:your|you|the\s+operator|operator|confir\w*|approv\w*|decision|answer|input|sign[\s-]?off|go[\s-]?ahead)\b",
+        re.IGNORECASE,
+    ),
+    # "I need your/the operator's/an operator's decision/approval/input"
+    re.compile(
+        r"\b(?:i|we)\s+(?:need|require)\b[^.!?\n]{0,60}"
+        r"\b(?:your|the\s+operator'?s?|an?\s+operator'?s?)\b[^.!?\n]{0,40}"
+        r"\b(?:decision|answer|confir\w*|approv\w*|sign[\s-]?off|input|guidance|ruling|direction)s?\b",
+        re.IGNORECASE,
+    ),
+    # "please confirm/advise/decide/choose/approve" and "let me know which/what/if/…"
+    re.compile(
+        r"\bplease\s+(?:confirm|advise|decide|choose|pick|select|specify|indicate|approve)\b"
+        r"|\blet\s+me\s+know\b[^.!?\n]{0,60}\b(?:which|what|whether|how|when|if|approv|confirm|decid|your\s+preference)\b",
+        re.IGNORECASE,
+    ),
+    # "blocked pending your decision" / "cannot proceed without your approval"
+    re.compile(
+        r"\b(?:blocked|held|paus(?:ed|ing)|stopp?(?:ed|ing)|cannot\s+proceed|can\s+not\s+proceed|"
+        r"won'?t\s+proceed|will\s+not\s+proceed|unable\s+to\s+proceed)\b[^.!?\n]{0,60}"
+        r"\b(?:until|pending|without|waiting\s+for|awaiting|before)\b[^.!?\n]{0,60}"
+        r"\b(?:your|the\s+operator'?s?|an?\s+operator'?s?|operator)\b[^.!?\n]{0,40}"
+        r"\b(?:decision|answer|confir\w*|approv\w*|sign[\s-]?off|input|guidance|ruling|direction|word)s?\b",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _strip_fenced_code(text: str) -> str:
+    """Drop fenced code blocks; an unclosed trailing fence is dropped too."""
+    parts = text.split("```")
+    return "\n".join(part for index, part in enumerate(parts) if index % 2 == 0)
+
+
+def extract_questions(text: str) -> tuple[str, ...]:
+    """Return the lane's verbatim open questions from one response text.
+
+    Fenced code blocks, inline code spans, and URLs are stripped first so
+    code punctuation cannot masquerade as a question. A remaining line
+    qualifies when a question mark sits in a natural-language shape
+    (interrogative opener or question mark at the line's end) or when the
+    line declares a human blocker in words ("waiting for your confirmation",
+    "please confirm", "I need your decision"). Each returned item is the
+    stripped line, deduplicated case-insensitively in first-seen order.
+    """
+    questions: list[str] = []
+    seen: set[str] = set()
+    for raw_line in _strip_fenced_code(text).splitlines():
+        line = _URL_RE.sub(" ", _INLINE_CODE_RE.sub(" ", raw_line))
+        line = _LEADING_MARKUP_RE.sub("", line).strip().strip("\"'“”‘’")
+        if not line or not re.search(r"[a-zA-Z]", line):
+            continue
+        if not any(pattern.search(line) for pattern in _DECLARATIVE_BLOCKER_RES):
+            if "?" not in line:
+                continue
+            if _QUESTION_OPENER_RE.match(line) is None and _QUESTION_TAIL_RE.search(line) is None:
+                continue
+        normalized = " ".join(line.casefold().split())
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        questions.append(line)
+    return tuple(questions)
 
 
 answer_question = handle_question
@@ -617,5 +783,6 @@ __all__ = [
     "QuestionKind",
     "QuestionSource",
     "answer_question",
+    "extract_questions",
     "handle_question",
 ]

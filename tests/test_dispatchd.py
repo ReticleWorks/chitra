@@ -17,7 +17,7 @@ import chitra.dispatchd as dispatchd_mod
 import chitra.ledger as ledger_mod
 from chitra.dispatch import DISPATCH_VERIFY_WAIT_SECONDS, DispatchOrder, DispatchResult, DispatchStatus, LaneLock, LaneLockError
 from chitra.dispatchd import build_arg_parser, main, process_one_order, requeue_deferred_for_session, resolve_session_prefixes, run_once
-from chitra.goals import GOALS_SCHEMA_NEWER_MESSAGE, GoalRecord, hold_goal, redirect_goal, upsert_goal
+from chitra.goals import GOALS_SCHEMA_NEWER_MESSAGE, GoalRecord, hold_goal, redirect_goal, resume_goal, upsert_goal
 from chitra.policy_config import PolicyConfig
 from chitra.question_handler import handle_question
 from chitra.queue_state import LaneLockRetryTracker
@@ -236,8 +236,68 @@ def test_goal_bound_order_is_blocked_when_the_exact_goal_is_held(
     )[0]
 
     assert result.status == DispatchStatus.BLOCKED
-    assert result.reason == "goal-not-actionable"
+    assert result.reason == "goal-held"
     assert calls == []
+
+
+def test_operator_relay_defers_while_goal_is_held_and_delivers_after_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An operator answer queued while its lane is still held parks in
+    deferred/ with no terminal result, then delivers once the goal's hold
+    clears and the deferred backlog is requeued."""
+    calls: list[str] = []
+
+    def fake_dispatch(order: DispatchOrder, **kwargs: Any) -> DispatchResult:
+        calls.append(order.order_id)
+        return DispatchResult(order_id=order.order_id, session_ref=order.session_ref, status=DispatchStatus.SENT)
+
+    monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", fake_dispatch)
+    session_ref = "host-b:feeds-112:0.0"
+    goals_root = tmp_path / "goals"
+    goal = upsert_goal(goals_root, _tracked_goal(session_ref))
+    queue_dir = tmp_path / "queue"
+    _write_order(
+        queue_dir / "orders",
+        DispatchOrder(
+            order_id="ord-held-relay",
+            session_ref=session_ref,
+            nudge="[O] Use the existing cache.",
+            tag="[O]",
+            goal_version=goal.goal_version,
+            goal_digest=goal_digest(goal),
+            message_kind="operator_relay",
+        ),
+    )
+    hold_goal(goals_root, session_ref, reason="operator-required question: pick a cache")
+
+    result = run_once(
+        queue_dir,
+        lock_dir=tmp_path / "locks",
+        ledger_path=tmp_path / "ledger.jsonl",
+        ledger_key_path=tmp_path / "ledger.key",
+        goals_root=goals_root,
+    )[0]
+
+    assert result.status == DispatchStatus.DEFERRED
+    assert "goal-held" in result.reason
+    assert calls == []
+    assert (queue_dir / "deferred" / "ord-held-relay.json").exists()
+    assert not (queue_dir / "results" / "ord-held-relay.json").exists()
+
+    resume_goal(goals_root, session_ref)
+    requeue_deferred_for_session(queue_dir, session_ref)
+
+    delivered = run_once(
+        queue_dir,
+        lock_dir=tmp_path / "locks",
+        ledger_path=tmp_path / "ledger.jsonl",
+        ledger_key_path=tmp_path / "ledger.key",
+        goals_root=goals_root,
+    )[0]
+    assert delivered.status == DispatchStatus.SENT
+    assert calls == ["ord-held-relay"]
+    assert (queue_dir / "results" / "ord-held-relay.json").exists()
 
 
 def test_goal_contract_answer_is_recomputed_before_delivery(

@@ -216,8 +216,10 @@ def test_question_is_processed_even_when_detectors_open_a_finding(
     monkeypatch.setattr(monitord, "run_detectors", lambda *_args, **_kwargs: [finding])
     monkeypatch.setattr(monitord, "evaluate_findings", lambda *_args, **_kwargs: ())
 
-    def record_question(_config, active_goal, response, **_kwargs):
-        calls.append((active_goal.session_ref, response.event_id == final_response.event_id))
+    def record_question(_config, active_goal, responses, **_kwargs):
+        calls.append(
+            (active_goal.session_ref, final_response.event_id in {event.event_id for event in responses})
+        )
         return "answer_queued"
 
     monkeypatch.setattr(monitord, "handle_agent_question", record_question)

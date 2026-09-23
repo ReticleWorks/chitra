@@ -226,12 +226,19 @@ def _goal_contract_rejection(order: DispatchOrder, goals_root: Path | None) -> s
         or goal_digest(current_goal) != order.goal_digest
     ):
         return "stale-goal-contract"
-    if current_goal.status in {"held", "done-pending-verification", "done-pending-close"}:
+    if current_goal.status == "held":
+        return "goal-held"
+    if current_goal.status in {"done-pending-verification", "done-pending-close"}:
         return "goal-not-actionable"
     if order.message_kind == "goal_contract_answer":
         decisions_path = goals_root / "decisions.jsonl" if goals_root is not None else None
         expected_question_result = (
-            handle_question(current_goal, order.question_result.question, decisions=read_decisions(decisions_path))
+            handle_question(
+                current_goal,
+                order.question_result.question,
+                decisions=read_decisions(decisions_path),
+                occurrence=order.question_result.occurrence,
+            )
             if order.question_result is not None
             else None
         )
@@ -524,6 +531,54 @@ def _defer_lifecycle_order(
         session_ref=order.session_ref,
         status=DispatchStatus.DEFERRED,
         reason=f"lane-lifecycle-{state}-deferred",
+        routing_hint=order.routing_hint,
+        task_type=order.task_type,
+        resolved_zdr=resolved_zdr,
+        decision_attestation_id=attestation_id,
+    )
+
+
+def _defer_held_goal_order(
+    claimed_path: Path,
+    *,
+    deferred_dir: Path,
+    retry_tracker: LaneLockRetryTracker,
+    order: DispatchOrder,
+    resolved_zdr: bool,
+    attestation_id: str | None,
+) -> DispatchResult:
+    """Park a goal-bound order whose lane is still held, without killing it.
+
+    An ``operator_relay`` answer is recorded before the hold it resolves is
+    released, so it routinely reaches the queue while the goal still reads
+    ``held``. A terminal ``BLOCKED`` would lose the answer entirely. The
+    order carries no lifecycle marker and no retry sidecar: only
+    ``requeue_deferred_for_session`` -- called by the answer/resume path and
+    by ``chitra-goals resume`` -- returns it to ``orders/``.
+    """
+    deferred_dir.mkdir(parents=True, exist_ok=True)
+    retry_tracker.clear(order.order_id)
+    try:
+        _move_without_replace(claimed_path, deferred_dir / claimed_path.name)
+    except OSError as exc:
+        # Same recoverable shape as the lane-lock deferral: the claim is
+        # released by the outer caller and the next pass reclaims it.
+        logger.error(
+            "dispatchd_goal_held_defer_failed",
+            order_id=order.order_id,
+            session_ref=order.session_ref,
+            error=str(exc),
+        )
+    logger.info(
+        "dispatchd_order_deferred_goal_held",
+        order_id=order.order_id,
+        session_ref=order.session_ref,
+    )
+    return DispatchResult(
+        order_id=order.order_id,
+        session_ref=order.session_ref,
+        status=DispatchStatus.DEFERRED,
+        reason="goal-held-deferred: bound order waits for the lane's hold to clear",
         routing_hint=order.routing_hint,
         task_type=order.task_type,
         resolved_zdr=resolved_zdr,
@@ -1039,6 +1094,15 @@ def _process_claimed_order(
         return None
 
     goal_contract_rejection = _goal_contract_rejection(order, goals_root)
+    if goal_contract_rejection == "goal-held" and order.message_kind == "operator_relay":
+        return _defer_held_goal_order(
+            claimed_path,
+            deferred_dir=deferred_dir,
+            retry_tracker=retry_tracker,
+            order=order,
+            resolved_zdr=resolved_zdr,
+            attestation_id=attestation_id,
+        )
     if goal_contract_rejection is not None:
         result = DispatchResult(
             order_id=order.order_id,
@@ -1233,6 +1297,15 @@ def _process_claimed_order(
         # used for delivery. Completion, hold, redirect, or question-answer
         # changes that land after the queue claim cannot race a stale paste.
         goal_contract_rejection = _goal_contract_rejection(order, goals_root)
+        if goal_contract_rejection == "goal-held" and order.message_kind == "operator_relay":
+            return _defer_held_goal_order(
+                claimed_path,
+                deferred_dir=deferred_dir,
+                retry_tracker=retry_tracker,
+                order=order,
+                resolved_zdr=resolved_zdr,
+                attestation_id=attestation_id,
+            )
         if goal_contract_rejection is not None:
             result = DispatchResult(
                 order_id=order.order_id,

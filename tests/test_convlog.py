@@ -922,6 +922,29 @@ def test_decisionless_only_thread_is_never_pending(tmp_path: Path) -> None:
     assert pending_threads(path) == []
 
 
+def test_ruling_writes_one_bound_canonical_decision(tmp_path: Path) -> None:
+    """An operator ruling lands in decisions.jsonl bound to the thread's
+    session, verbatim, so the question gate reads the same store the log does."""
+    from chitra.decisions import read_decisions
+
+    path = tmp_path / "conversation.jsonl"
+    thread_id = open_thread(path, brief=_brief(), raw_text="raw", evidence_resolver=_AcceptingResolver())
+
+    append_ruling(path, thread_id=thread_id, text="Ship the combined feed.", via="chat")
+    append_ruling(path, thread_id=thread_id, text="Ship the combined feed.", via="chat")
+
+    decisions = read_decisions(tmp_path / "decisions.jsonl")
+    assert len(decisions) == 2
+    first = decisions[0]
+    assert first.kind == "adjudication"
+    assert first.authority == "operator"
+    assert first.answer == "Ship the combined feed."
+    assert first.session_ref == "host-b:feeds:0.0"
+    assert first.decision_id.startswith(f"convlog-{thread_id}-")
+    # Repeats are distinct rulings (distinct seq), not a dedup collision.
+    assert decisions[1].decision_id != first.decision_id
+
+
 def test_malformed_lines_are_skipped_and_sequence_is_monotonic(tmp_path: Path) -> None:
     path = tmp_path / "conversation.jsonl"
     thread_id = "abc123"

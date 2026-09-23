@@ -105,7 +105,7 @@ def mark_for(record: dict[str, Any]) -> str:
     An open ask wins over everything else: it is a live, unanswered request
     to the operator no matter what the lane's status says.
     """
-    if record.get("open_asks"):
+    if record.get("open_asks") or record.get("foreground_tasks"):
         return NEEDS_INPUT
     status = record.get("status", "")
     if status in NEEDS_INPUT_STATUSES:
@@ -118,11 +118,19 @@ def mark_for(record: dict[str, Any]) -> str:
 
 
 def ask_of(record: dict[str, Any]) -> str:
-    """The sentence the operator is being asked. Falls back to the reason
-    the lane is in the queue when it carries no literal ask."""
+    """The sentence the operator is being asked. Falls back to residual
+    questions routed to the foreground queue, then the reason the lane is
+    in the queue when it carries no literal ask."""
     asks = [clean(a) for a in record.get("open_asks", ()) if clean(a)]
     if asks:
         return " ".join(asks)
+    tasks = [
+        clean(task.get("text", ""))
+        for task in (record.get("foreground_tasks", ()) or ())
+        if isinstance(task, dict) and clean(task.get("text", ""))
+    ]
+    if tasks:
+        return " ".join(tasks)
     hold = clean(record.get("hold_reason", ""))
     if hold:
         return hold
@@ -185,7 +193,7 @@ def find_fields(record: dict[str, Any], monitor_id: str) -> dict[str, str]:
         "kind": "chitra",
         "monitor": monitor_id,
         "lane": lane_key(record),
-        "how": "Send to session writes the answer through chitra-goals resolve-ask; the monitor delivers it to the lane.",
+        "how": "Send to session writes the answer through chitra-goals answer; dispatchd delivers it to the lane.",
     }
 
 
