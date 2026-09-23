@@ -18,8 +18,8 @@ enrolled goal until completion evidence verifies:
    new evidence. A transport attempt is evidence, not a terminal failure
    count. A timeout or failed delivery returns control to pursuit so Chitra can
    inspect state, change tactics, and continue.
-4. **Completion and questions** — runs enrolled validators only after a
-   structured completion claim. Receipts are isolated by exact goal session.
+4. **Completion and questions** — runs enrolled validators on any
+   completion claim, structured or plain. Receipts are isolated by exact goal session.
    For a lane the manifest binds to a different OS user, the validators run
    on a bounded worker pool (one run in flight per lane) and the pass
    consumes the recorded result only while the worktree digest it tested

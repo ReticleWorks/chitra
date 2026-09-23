@@ -11,8 +11,8 @@ collapsed out of watchd, triaged, and sweepd:
 3. **Persistent action** -- record corrective intent before publishing a
    goal-bound order, reconcile queue and signed delivery proof after a crash,
    and wait for a completed agent turn before judging recurrence.
-4. **Enrollment and receipts** -- run registered validators only for an exact
-   completion claim, isolate receipts by goal session, and close only after
+4. **Enrollment and receipts** -- run registered validators on any
+   completion claim, structured or plain, isolate receipts by goal session, and close only after
    the stored evidence verifies independently. When the lane provably runs as
    another OS user, validators execute on a bounded worker pool (one run in
    flight per lane) and the pass consumes the recorded result once the
