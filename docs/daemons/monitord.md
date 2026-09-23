@@ -26,7 +26,10 @@ enrolled goal until completion evidence verifies:
    still matches; a lane sharing Chitra's OS user keeps the synchronous run
    and re-execution, since it could write the record itself. A pending run
    leaves the claim untouched — it is neither a pass, a dispute, nor an
-   idle pass.
+   idle pass. After three queued runs that never yield a fresh record, the
+   pass falls back to the synchronous run. The isolated completion reviewer
+   is told which lane work is still in flight. An "insufficient" verdict is
+   pending too, and the claim is reviewed again once nothing is running.
    Routine goal questions and explicit small reversible changes get answers
    derived from the frozen contract. An unresolved routine question becomes a
    foreground Chitra investigation: it may inspect, replan, and direct several

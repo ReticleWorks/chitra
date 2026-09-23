@@ -1259,6 +1259,36 @@ def test_gate_waits_for_an_in_flight_run_even_when_records_look_fresh(
     assert stored.status == "done-pending-close"
 
 
+def test_validator_that_writes_into_its_tree_falls_back_instead_of_requeueing_forever(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every worker record goes stale, so the pool must stop requeueing and resolve the claim."""
+    state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
+    workdir = _init_lane_worktree(tmp_path / "lane-worktree")
+    _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=workdir)
+    registry = tmp_path / "validators.json"
+    writer = f"import pathlib, uuid; pathlib.Path({str(workdir)!r}, 'out-' + uuid.uuid4().hex).write_text('x')"
+    registry.write_text(json.dumps({"pytest": {"argv": [sys.executable, "-c", writer]}}), encoding="utf-8")
+    monkeypatch.setenv("CHITRA_VALIDATORS_FILE", str(registry))
+    monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
+    _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
+    config = _live_config(state, bindings_path, queue)
+
+    for _ in range(monitord_mod._VALIDATOR_RUN_MAX_ATTEMPTS):
+        run_once(config)
+        assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+        stored = get_goal(state, goal.session_ref)
+        assert stored is not None
+        assert stored.status == "working"
+
+    run_once(config)
+
+    stored = get_goal(state, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "done-pending-close"
+
+
 def test_tree_change_after_validation_requeues_instead_of_passing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

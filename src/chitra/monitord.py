@@ -735,9 +735,11 @@ class _ValidatorRunPool:
     run is still executing is not requeued, so validators cannot pile up on
     a tree that is still moving. A worker records its result under
     ``validation-runs/`` and a later pass reads the record instead of
-    waiting on the future. ``attempts`` bounds catastrophic retries so a
-    worker that fails before it can record still surfaces the same loud
-    error the old inline path produced.
+    waiting on the future. ``attempts`` counts runs queued since the gate
+    last consumed a fresh result. It bounds both a worker that fails before
+    it can record and a run whose record is always stale (for example a
+    validator that writes into the tree it tests), so either one falls
+    back to the old synchronous call instead of queueing forever.
     """
 
     def __init__(self, max_workers: int = 4) -> None:
@@ -776,12 +778,16 @@ class _ValidatorRunPool:
         with self._lock:
             if self._in_flight.get(lane_key) is future:
                 self._in_flight.pop(lane_key, None)
-                self._attempts.pop(lane_key, None)
 
     def attempts(self, lane_key: str) -> int:
-        """Return how many queued runs for this lane have not yet succeeded."""
+        """Return how many runs this lane queued since its last consumed result."""
         with self._lock:
             return self._attempts.get(lane_key, 0)
+
+    def reset(self, lane_key: str) -> None:
+        """Clear the attempt count once the gate has consumed a result."""
+        with self._lock:
+            self._attempts.pop(lane_key, None)
 
     def wait_idle(self, timeout: float | None = None) -> bool:
         """Block until no lane has a run in flight; used by tests and shutdown."""
@@ -835,11 +841,13 @@ def _claimed_run_evidence(
         recorded_validator_run_fresh(config.state_dir, session_ref, item, current_digest=current_digest)
         for item in items
     ):
+        _VALIDATOR_RUN_POOL.reset(lane_key)
         return tuple(recorded_validator_run_proof(config.state_dir, session_ref, item) for item in items)
     if _VALIDATOR_RUN_POOL.attempts(lane_key) >= _VALIDATOR_RUN_MAX_ATTEMPTS:
-        # A worker that keeps failing before it can record is surfaced
-        # through the same synchronous call the inline path made instead of
-        # queueing forever.
+        # Worker runs that keep failing, or keep landing stale records, are
+        # surfaced through the same synchronous call the inline path made
+        # instead of queueing forever. The next claim tries the pool again.
+        _VALIDATOR_RUN_POOL.reset(lane_key)
         return record_enrolled_validator_runs(config.state_dir, session_ref, items)
     _VALIDATOR_RUN_POOL.submit(
         lane_key,
