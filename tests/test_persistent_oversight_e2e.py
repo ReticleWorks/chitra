@@ -1179,9 +1179,11 @@ def test_slow_enrolled_validator_does_not_stall_the_monitor_pass(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A five-second validator must finish far outside the monitor pass."""
+    # The registry must precede enrollment: the pin binds the enrolled item to
+    # this exact argv, so a post-enrollment swap would be refused as drift.
+    _slow_validator_registry(tmp_path, monkeypatch, seconds=5)
     state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
     _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=_init_lane_worktree(tmp_path / "lane-worktree"))
-    _slow_validator_registry(tmp_path, monkeypatch, seconds=5)
     _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
 
     started = time.monotonic()
@@ -1265,9 +1267,9 @@ def test_goal_status_stays_unchanged_until_the_worker_result_lands(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """While the worker runs, the claim neither passes nor disputes."""
+    _slow_validator_registry(tmp_path, monkeypatch, seconds=5)
     state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
     _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=_init_lane_worktree(tmp_path / "lane-worktree"))
-    _slow_validator_registry(tmp_path, monkeypatch, seconds=5)
     monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
     _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
 
@@ -1346,13 +1348,15 @@ def test_validator_that_writes_into_its_tree_falls_back_instead_of_requeueing_fo
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Every worker record goes stale, so the pool must stop requeueing and resolve the claim."""
-    state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
     workdir = _init_lane_worktree(tmp_path / "lane-worktree")
-    _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=workdir)
+    # Enroll under the writer registry: a post-enrollment argv swap is drift
+    # and would be refused instead of executed.
     registry = tmp_path / "validators.json"
     writer = f"import pathlib, uuid; pathlib.Path({str(workdir)!r}, 'out-' + uuid.uuid4().hex).write_text('x')"
     registry.write_text(json.dumps({"pytest": {"argv": [sys.executable, "-c", writer]}}), encoding="utf-8")
     monkeypatch.setenv("CHITRA_VALIDATORS_FILE", str(registry))
+    state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
+    _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=workdir)
     monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
     _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
     config = _live_config(state, bindings_path, queue)

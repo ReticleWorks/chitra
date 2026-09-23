@@ -28,7 +28,7 @@ from chitra.plain_english import require_plain_english
 from chitra.state_paths import state_dir
 from chitra.validation_receipts import ReceiptError, require_verified_completion_receipts
 from chitra.validation_receipts import receipt_name as safe_receipt_name
-from chitra.validator_registry import load_validators
+from chitra.validator_registry import load_validators, registered_validator_digest
 
 logger = structlog.get_logger(__name__)
 
@@ -150,12 +150,19 @@ class InterviewReceipt:
 
 @pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True))
 class EnrolledDoneWhenItem:
-    """One immutable completion condition and its exact required proof name."""
+    """One immutable completion condition and its exact required proof name.
+
+    ``validator_sha256`` pins the item to the registered-validator definition
+    present at enrollment so a later registry edit cannot silently redefine
+    the check a frozen item named. Caller-built records leave it empty; the
+    upsert fills it from the instance registry before the item is stored.
+    """
 
     id: str
     text: str
     validator: str
     required_receipt: str
+    validator_sha256: str = ""
 
 
 @pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True))
@@ -441,6 +448,15 @@ def validate_enrollment_contract(rec: GoalRecord, *, root: Path | None = None) -
         seen_receipts.add(item.required_receipt)
         if registered_validators is not None and item.validator not in registered_validators:
             issues.append(f"enrolled done item {item.id!r} validator not registered: {item.validator!r}")
+        elif (
+            registered_validators is not None
+            and item.validator_sha256
+            and registered_validator_digest(registered_validators[item.validator]) != item.validator_sha256
+        ):
+            issues.append(
+                f"enrolled done item {item.id!r} validator {item.validator!r} "
+                "no longer matches the definition pinned at enrollment"
+            )
     rendered = render_done_when_items(rec.enrolled_done_when_items)
     if rec.enrolled_done_when_items and rec.done_when.strip() != rendered:
         issues.append("done_when must be generated from enrolled_done_when_items")
@@ -676,6 +692,52 @@ def upsert_goal(
     return stored
 
 
+def _pin_enrolled_validators(root: Path | None, rec: GoalRecord) -> GoalRecord:
+    """Bind each enrolled item to the registry definition present at enrollment.
+
+    The stored item then carries the digest of the exact argv, timeout, and
+    run-as the operator provisioned, so a later registry edit cannot silently
+    redefine the check a frozen item named.
+    """
+    registry = load_validators(root)
+    return replace(
+        rec,
+        enrolled_done_when_items=tuple(
+            (
+                replace(item, validator_sha256=registered_validator_digest(entry))
+                if (entry := registry.get(item.validator)) is not None
+                else item
+            )
+            for item in rec.enrolled_done_when_items
+        ),
+    )
+
+
+def _enrolled_items_match(
+    incoming: tuple[EnrolledDoneWhenItem, ...],
+    stored: tuple[EnrolledDoneWhenItem, ...],
+) -> bool:
+    """Compare enrolled items while treating an unpinned incoming pin as unspecified.
+
+    Caller-built records never carry the registry pin — the upsert fills it at
+    enrollment — so an empty ``validator_sha256`` matches whatever the stored
+    enrollment pinned. A non-empty pin that differs is a real edit and fails.
+    """
+    if len(incoming) != len(stored):
+        return False
+    for candidate, frozen in zip(incoming, stored, strict=True):
+        if (
+            candidate.id != frozen.id
+            or candidate.text != frozen.text
+            or candidate.validator != frozen.validator
+            or candidate.required_receipt != frozen.required_receipt
+        ):
+            return False
+        if candidate.validator_sha256 and candidate.validator_sha256 != frozen.validator_sha256:
+            return False
+    return True
+
+
 def _upsert_goal_locked(
     root: Path | None,
     rec: GoalRecord,
@@ -711,6 +773,7 @@ def _upsert_goal_locked(
         enrollment_issues = validate_enrollment_contract(rec, root=root)
         if enrollment_issues:
             raise GoalValidationError("; ".join(enrollment_issues))
+        rec = _pin_enrolled_validators(root, rec)
     now = _utc_now() if mutation_time is None else mutation_time
     derived_lane_id = lane_id_from_session_ref(rec.session_ref)
     lane_id = derived_lane_id
@@ -724,7 +787,7 @@ def _upsert_goal_locked(
             raise EnrolledScopeImmutableError("enrolled_at is immutable once a goal is enrolled")
         if rec.interview_receipt != existing.interview_receipt:
             raise EnrolledScopeImmutableError("interview_receipt is immutable once a goal is enrolled")
-        if rec.enrolled_done_when_items != existing.enrolled_done_when_items:
+        if not _enrolled_items_match(rec.enrolled_done_when_items, existing.enrolled_done_when_items):
             raise EnrolledScopeImmutableError("enrolled_done_when_items are immutable once a goal is enrolled")
         if rec.completion_proofs != existing.completion_proofs and not allow_completion_proofs:
             raise GoalValidationError("completion proofs may only be written by the completion gate")
@@ -789,7 +852,11 @@ def _upsert_goal_locked(
         successor_of=rec.successor_of or (existing.successor_of if existing is not None else ""),
         transferred_to=rec.transferred_to or (existing.transferred_to if existing is not None else ""),
         interview_receipt=rec.interview_receipt,
-        enrolled_done_when_items=rec.enrolled_done_when_items,
+        # On update the stored pinned items win: a caller-built record cannot
+        # carry (or clear) the registry pin the enrollment computed.
+        enrolled_done_when_items=(
+            rec.enrolled_done_when_items if existing is None else existing.enrolled_done_when_items
+        ),
         completion_proofs=rec.completion_proofs,
         autonomy_policy=rec.autonomy_policy,
         foreground_tasks=foreground_tasks,
@@ -1012,7 +1079,7 @@ def mark_completion_gate_passed(
         existing = get_goal(root, session_ref)
         if existing is None:
             raise GoalNotFoundError(session_ref)
-        enrollment_issues = validate_enrollment_contract(existing)
+        enrollment_issues = validate_enrollment_contract(existing, root=root)
         if enrollment_issues:
             raise GoalValidationError("completion requires a valid interview enrollment: " + "; ".join(enrollment_issues))
         try:
@@ -1349,7 +1416,7 @@ def close_goal(
                 )
             if closed.status != "done-pending-close":
                 raise GoalValidationError("completion close requires done-pending-close from the completion gate")
-            enrollment_issues = validate_enrollment_contract(closed)
+            enrollment_issues = validate_enrollment_contract(closed, root=root)
             if enrollment_issues:
                 raise GoalValidationError("completion close requires a valid interview enrollment: " + "; ".join(enrollment_issues))
             claimed_proofs = tuple(completion_evidence) or closed.completion_proofs

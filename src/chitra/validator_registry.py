@@ -8,6 +8,7 @@ claim, writes the hash-bound receipt, and the gate reads that disk result.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -20,6 +21,25 @@ from chitra.state_paths import state_dir
 VALIDATORS_ENV_VAR = "CHITRA_VALIDATORS_FILE"
 DEFAULT_VALIDATOR_TIMEOUT_S = 120.0
 UNRUNNABLE_EXIT_CODE = 125
+
+# The only environment a validator child may inherit. Everything else in the
+# daemon's environment — tokens, API keys, session state — stays out of the
+# check process so a validator cannot observe or exfiltrate it.
+_VALIDATOR_ENV_ALLOWLIST = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "TZ",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "SYSTEMROOT",
+)
 
 
 class ValidatorRegistryError(ValueError):
@@ -66,11 +86,35 @@ def load_validators(root: Path | None = None) -> dict[str, RegisteredValidator]:
     return registry
 
 
-def run_registered_validator(entry: RegisteredValidator) -> tuple[int, str]:
+def registered_validator_digest(entry: RegisteredValidator) -> str:
+    """Digest the exact validator definition an enrollment pinned itself to."""
+    canonical = json.dumps(
+        {"argv": list(entry.argv), "timeout_s": entry.timeout_s, "runs_as": entry.runs_as},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _scrubbed_validator_env() -> dict[str, str]:
+    """A minimal environment for validator children, never the daemon's."""
+    return {key: os.environ[key] for key in _VALIDATOR_ENV_ALLOWLIST if os.environ.get(key)}
+
+
+def run_registered_validator(
+    entry: RegisteredValidator,
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[int, str]:
     """Execute one registered argv and return ``(exit_code, output)``.
 
     An unrunnable or timed-out validator returns the fail-closed 125 exit
     code with the reason as output; it can never produce a passing receipt.
+    ``cwd`` pins the run to the lane's recorded worktree; ``None`` keeps the
+    caller's directory for call sites with no lane context. The child always
+    runs with a scrubbed environment unless the caller supplies one.
     """
     try:
         completed = subprocess.run(
@@ -79,6 +123,8 @@ def run_registered_validator(entry: RegisteredValidator) -> tuple[int, str]:
             capture_output=True,
             text=True,
             timeout=entry.timeout_s,
+            cwd=cwd,
+            env=_scrubbed_validator_env() if env is None else dict(env),
         )
     except subprocess.TimeoutExpired:
         return UNRUNNABLE_EXIT_CODE, f"registered validator timed out after {entry.timeout_s}s"
