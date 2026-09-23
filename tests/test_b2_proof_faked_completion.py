@@ -543,7 +543,7 @@ def test_clean_lane_worktree_still_closes(tmp_path: Path, monkeypatch: pytest.Mo
         reviewer=_AcceptReviewer(),
     )
     assert (recorded, disputed, findings, pending) == (1, False, [], True)
-    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+    assert monitord_mod._REVIEW_POOL.wait_idle(timeout=15)
 
     recorded, disputed, findings, pending = check_enrollment_and_receipts(
         config,

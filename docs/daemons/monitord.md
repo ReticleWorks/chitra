@@ -28,8 +28,14 @@ enrolled goal until completion evidence verifies:
    leaves the claim untouched — it is neither a pass, a dispute, nor an
    idle pass. After three queued runs that never yield a fresh record, the
    pass falls back to the synchronous run. The isolated completion reviewer
-   is told which lane work is still in flight. An "insufficient" verdict is
-   pending too, and the claim is reviewed again once nothing is running.
+   runs on its own bounded pool (two `claude -p` rounds at most) behind a
+   per-session `review-runs/` record, and its finish wakes the loop instead
+   of waiting out the poll interval; a `running` record with no live worker
+   counts as lost and is relaunched, while a failed round disputes with the
+   review-unavailable finding and is relaunched only after its recorded
+   backoff expires. The reviewer is told which lane work is still in
+   flight. An "insufficient" verdict is pending too, and the claim is
+   reviewed again once nothing is running.
    Routine goal questions and explicit small reversible changes get answers
    derived from the frozen contract. An unresolved routine question becomes a
    foreground Chitra investigation: it may inspect, replan, and direct several

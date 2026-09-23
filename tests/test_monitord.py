@@ -9,6 +9,7 @@ import subprocess
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from _goal_fixtures import enrollment_fields, ingest_passing_receipt, passing_completion_evidence
@@ -18,6 +19,7 @@ import chitra.monitord as monitord_mod
 import chitra.run_pool as run_pool_mod
 from chitra.completion_gate import CompletionEvidence
 from chitra.decisions import DecisionEntry, append_decision
+from chitra.goal_enforcement import ReviewerProcessError
 from chitra.goals import EnrolledDoneWhenItem, GoalRecord, GoalsSchemaNewerError, GoalStatus, get_goal, upsert_goal
 from chitra.journal import ByteRange, CanonicalEvent, CanonicalType, Client, TranscriptIdentity
 from chitra.journal.store import EventJournal, classify_progress
@@ -387,7 +389,7 @@ def test_check_enrollment_accepts_a_plain_claim_when_the_validator_passes(
         config, "session-1", final_response, reviewer=_StubReviewer("accept")
     )
     assert (recorded, disputed, findings, pending) == (1, False, [], True)
-    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+    assert monitord_mod._REVIEW_POOL.wait_idle(timeout=15)
 
     recorded, disputed, findings, pending = check_enrollment_and_receipts(
         config,
@@ -740,7 +742,7 @@ def test_completion_claim_reaches_the_isolated_reviewer_and_applies_rejection(
         config, "session-1", final_response, reviewer=reviewer
     )
     assert pending is True
-    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+    assert monitord_mod._REVIEW_POOL.wait_idle(timeout=15)
 
     _recorded, disputed, findings, _pending = check_enrollment_and_receipts(
         config, "session-1", final_response, reviewer=reviewer
@@ -776,7 +778,7 @@ def test_completion_claim_the_isolated_reviewer_accepts_is_verified(
         config, "session-1", final_response, reviewer=reviewer
     )
     assert pending is True
-    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+    assert monitord_mod._REVIEW_POOL.wait_idle(timeout=15)
 
     _recorded, disputed, findings, _pending = check_enrollment_and_receipts(
         config, "session-1", final_response, reviewer=reviewer
@@ -814,7 +816,7 @@ def test_insufficient_review_holds_the_claim_until_lane_work_finishes(
         config, "session-1", final_response, reviewer=undecided, still_running=running
     )
     assert result[1:] == (False, [], True)
-    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+    assert monitord_mod._REVIEW_POOL.wait_idle(timeout=15)
 
     result = check_enrollment_and_receipts(
         config, "session-1", final_response, reviewer=undecided, still_running=running
@@ -833,7 +835,7 @@ def test_insufficient_review_holds_the_claim_until_lane_work_finishes(
         config, "session-1", final_response, reviewer=accepting
     )
     assert (disputed, findings, pending) == (False, [], True)
-    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+    assert monitord_mod._REVIEW_POOL.wait_idle(timeout=15)
 
     _recorded, disputed, findings, pending = check_enrollment_and_receipts(
         config, "session-1", final_response, reviewer=accepting
@@ -841,6 +843,173 @@ def test_insufficient_review_holds_the_claim_until_lane_work_finishes(
 
     assert (disputed, findings, pending) == (False, [], False)
     assert accepting.still_running == [(), ()]
+    stored = get_goal(tmp_path, "session-1")
+    assert stored is not None
+    assert stored.status == "done-pending-close"
+
+
+def _review_run_record(config: MonitordConfig, session_ref: str) -> dict[str, Any]:
+    return json.loads(monitord_mod._review_run_path(config, session_ref).read_text(encoding="utf-8"))
+
+
+def test_review_run_record_tracks_the_background_judge_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    final_response = _verified_claim_setup(tmp_path, monkeypatch)
+    release = threading.Event()
+
+    class _BlockedAccepting(_StubReviewer):
+        def review(self, goal: object, behavior: object, reviewer_id: str) -> ReviewerVerdict:
+            release.wait(15)
+            return super().review(goal, behavior, reviewer_id)
+
+    reviewer = _BlockedAccepting("accept")
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+
+    _recorded, _disputed, _findings, pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=reviewer
+    )
+    assert pending is True
+    run = _review_run_record(config, "session-1")
+    assert run["state"] == "running"
+    assert run["attempt"] == 1
+    assert run["op_id"]
+    stored = get_goal(tmp_path, "session-1")
+    assert stored is not None and stored.status == "working"
+
+    release.set()
+    assert monitord_mod._REVIEW_POOL.wait_idle(timeout=15)
+    run = _review_run_record(config, "session-1")
+    assert run["state"] == "done"
+    assert str(run["signal_id"]).startswith("sha256:")
+
+    _recorded, disputed, findings, pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=reviewer
+    )
+    assert (disputed, findings, pending) == (False, [], False)
+    stored = get_goal(tmp_path, "session-1")
+    assert stored is not None
+    assert stored.status == "done-pending-close"
+
+
+class _FailingReviewer:
+    """Reviewer whose ``claude -p`` call always dies."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def review(self, goal: object, behavior: object, reviewer_id: str) -> ReviewerVerdict:
+        self.calls += 1
+        raise ReviewerProcessError("claude -p exited 1")
+
+
+def test_failed_review_disputes_then_relaunches_only_after_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_response = _verified_claim_setup(tmp_path, monkeypatch)
+    reviewer = _FailingReviewer()
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+
+    _recorded, _disputed, _findings, pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=reviewer
+    )
+    assert pending is True
+    assert monitord_mod._REVIEW_POOL.wait_idle(timeout=15)
+
+    # A dead judge disputes with the unchanged review-unavailable finding and
+    # the record carries the error and the earliest retry.
+    _recorded, disputed, findings, pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=reviewer
+    )
+    assert disputed is True
+    assert pending is False
+    assert any("isolated completion review could not run" in finding.detail for finding in findings)
+    run = _review_run_record(config, "session-1")
+    assert run["state"] == "failed"
+    assert run["attempt"] == 1
+    assert run["error"]
+    stored = get_goal(tmp_path, "session-1")
+    assert stored is not None and stored.status == "completion-disputed"
+
+    # The recorded backoff is still in the future: no second round launches.
+    _recorded, disputed, _findings, pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=reviewer
+    )
+    assert disputed is True
+    assert reviewer.calls == 1
+
+    # Once the retry is due, the next pass relaunches with a bumped attempt.
+    monitord_mod._write_review_run(
+        monitord_mod._review_run_path(config, "session-1"),
+        {**run, "next_retry_at": "2000-01-01T00:00:00+00:00"},
+    )
+    _recorded, _disputed, _findings, pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=reviewer
+    )
+    assert pending is True
+    assert _review_run_record(config, "session-1")["attempt"] == 2
+    assert monitord_mod._REVIEW_POOL.wait_idle(timeout=15)
+    assert reviewer.calls == 2
+
+
+def test_running_review_record_with_no_live_worker_is_relaunched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    final_response = _verified_claim_setup(tmp_path, monkeypatch)
+    release = threading.Event()
+
+    class _BlockedAccepting(_StubReviewer):
+        def review(self, goal: object, behavior: object, reviewer_id: str) -> ReviewerVerdict:
+            release.wait(15)
+            return super().review(goal, behavior, reviewer_id)
+
+    reviewer = _BlockedAccepting("accept")
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+
+    _recorded, _disputed, _findings, pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=reviewer
+    )
+    assert pending is True
+    first = _review_run_record(config, "session-1")
+    assert first["state"] == "running"
+    goal = get_goal(tmp_path, "session-1")
+    assert goal is not None
+    review_key = monitord_mod._op_key(config, goal, "session-1", "review")
+    # The judge's own pool holds the round; the shared pool stays free.
+    assert monitord_mod._REVIEW_POOL.in_flight(review_key)
+    assert not monitord_mod._RUN_POOL.in_flight(review_key)
+
+    # A monitor restart replaces the pool: the running record has no live
+    # worker behind it, so the round counts as lost and is relaunched.
+    old_pool = monitord_mod._REVIEW_POOL
+    monkeypatch.setattr(
+        monitord_mod,
+        "_REVIEW_POOL",
+        run_pool_mod.RunPool(max_workers=2, on_complete=monitord_mod._wake_monitor),
+    )
+    try:
+        with capture_logs() as logs:
+            _recorded, _disputed, _findings, pending = check_enrollment_and_receipts(
+                config, "session-1", final_response, reviewer=reviewer
+            )
+        assert pending is True
+        assert any(entry["event"] == "monitord_review_run_lost" for entry in logs)
+        relaunched = _review_run_record(config, "session-1")
+        assert relaunched["attempt"] == 2
+        assert relaunched["op_id"] != first["op_id"]
+    finally:
+        release.set()
+    assert old_pool.wait_idle(timeout=15)
+    assert monitord_mod._REVIEW_POOL.wait_idle(timeout=15)
+
+    _recorded, disputed, findings, pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=reviewer
+    )
+    assert (disputed, findings, pending) == (False, [], False)
     stored = get_goal(tmp_path, "session-1")
     assert stored is not None
     assert stored.status == "done-pending-close"
