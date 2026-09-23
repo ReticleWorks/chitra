@@ -125,11 +125,24 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import structlog
 
 from . import ledger as ledger_mod
 from ._fsio import write_json_atomic
+from .adapter.contract import (
+    AdapterError,
+    LaneDead,
+    LaneHandle,
+    LanePlug,
+    ReadProof,
+    SendReceipt,
+    SendRejected,
+    WireOrder,
+)
+from .adapter.registry import plug_for_client
+from .adapter.tmux import TmuxLanePlug
 from .completion_gate import evaluate_completion_claim, is_completion_claim
 from .decisions import read_decisions
 from .dispatch import (
@@ -166,6 +179,7 @@ from .queue_state import (
     LaneLockRetryTracker,
     QueueLayout,
     QueueSubdir,
+    SendNonce,
     StoredResult,
     TerminalFinalization,
     _move_without_replace,
@@ -181,7 +195,7 @@ from .routing_config import RoutingConfig, load_routing_config, resolve_route, r
 from .run_pool import RunPool
 from .state_paths import default_attestation_ledger_path, default_ledger_key_path, default_ledger_path, default_queue_dir
 from .supervision import goal_digest
-from .transcript_bindings import DEFAULT_FILENAME, load_transcript_bindings
+from .transcript_bindings import DEFAULT_FILENAME, BoundTranscript, load_transcript_bindings
 
 logger = structlog.get_logger(__name__)
 
@@ -379,13 +393,33 @@ def _finalize_claimed_order(
     return result
 
 
+def _bound_native_session_id(bound: BoundTranscript | None, *, session_ref: str) -> str | None:
+    """The bound evidence source's adapter-native session identity.
+
+    File bindings normalize it from the transcript itself. URI bindings ask
+    the owning plug to rebuild the lane handle and report its native id (the
+    orb record's thread id for ``amp-orb:<slug>``). A binding whose source
+    cannot name a native identity returns ``None`` so strict callers fail
+    closed rather than trusting an unbound session.
+    """
+    if bound is None:
+        return None
+    if isinstance(bound.path, Path):
+        return native_session_identity(bound.path)
+    try:
+        return plug_for_client(bound.binding.client).handle_for_binding(bound, session_ref=session_ref).native_session_id
+    except AdapterError:
+        return None
+
+
 def _ensure_delivery_ledger(
     order: DispatchOrder,
     result: DispatchResult,
     *,
     ledger_path: Path | None,
     ledger_key_path: Path | None,
-    expected_transcript_path: Path | None = None,
+    expected_transcript_path: Path | str | None = None,
+    bound_transcript: BoundTranscript | None = None,
     require_native_session_id: bool = False,
 ) -> ledger_mod.LedgerEntry:
     """Return signed proof for a SENT order, appending it when needed.
@@ -401,8 +435,13 @@ def _ensure_delivery_ledger(
     value never comes from ``routing_hint``, which stays opaque audit
     metadata. A transcript that yields no native identity
     still gets a valid v4 row for legacy orders; strict autonomous orders
-    fail closed instead of trusting an unbound session.
+    fail closed instead of trusting an unbound session. A URI binding
+    (``bound_transcript.path`` as a string, e.g. ``amp-orb:<slug>``) takes
+    its native identity from the owning plug's lane record instead of a
+    local JSONL file.
     """
+    if bound_transcript is not None:
+        expected_transcript_path = bound_transcript.path
     resolved_ledger_path = ledger_path or default_ledger_path()
     resolved_key_path = ledger_key_path or (ledger_path.with_name("ledger.key") if ledger_path is not None else default_ledger_key_path())
     key = ledger_mod.load_or_create_signing_key(resolved_key_path)
@@ -410,7 +449,10 @@ def _ensure_delivery_ledger(
     if require_native_session_id:
         if expected_transcript_path is None:
             raise OSError(f"strict delivery has no exact bound transcript for order {order.order_id}")
-        expected_native_session_id = native_session_identity(expected_transcript_path)
+        if isinstance(expected_transcript_path, Path):
+            expected_native_session_id = native_session_identity(expected_transcript_path)
+        else:
+            expected_native_session_id = _bound_native_session_id(bound_transcript, session_ref=order.session_ref)
         if not expected_native_session_id:
             raise OSError(f"strict bound transcript has no native session identity for order {order.order_id}")
     existing = ledger_mod.verify_delivery(
@@ -428,15 +470,21 @@ def _ensure_delivery_ledger(
     if require_native_session_id:
         if expected_transcript_path is None or not result.transcript_path:
             raise OSError(f"strict SENT result has no exact bound transcript for order {order.order_id}")
-        try:
-            expected_path = expected_transcript_path.expanduser().resolve()
-            result_path = Path(result.transcript_path).expanduser().resolve()
-        except (OSError, RuntimeError) as exc:
-            raise OSError(f"strict SENT result transcript path cannot be resolved for order {order.order_id}") from exc
-        if result_path != expected_path:
+        if isinstance(expected_transcript_path, Path):
+            try:
+                expected_path = expected_transcript_path.expanduser().resolve()
+                result_path = Path(result.transcript_path).expanduser().resolve()
+            except (OSError, RuntimeError) as exc:
+                raise OSError(f"strict SENT result transcript path cannot be resolved for order {order.order_id}") from exc
+            path_bound = result_path == expected_path
+        else:
+            path_bound = result.transcript_path == expected_transcript_path
+        if not path_bound:
             raise OSError(f"strict SENT result transcript path is not the bound path for order {order.order_id}")
         result.native_session_id = expected_native_session_id
     elif not result.native_session_id and result.transcript_path:
+        # URI binding refs are not files; native_session_identity returns
+        # None for them, which is exactly the fail-closed outcome.
         result.native_session_id = native_session_identity(Path(result.transcript_path))
     ledger_mod.append_entry(
         resolved_ledger_path,
@@ -691,12 +739,19 @@ def _load_transcript_binding_paths(
     *,
     transcript_root: Path | None,
     default_path: Path,
-) -> dict[str, Path]:
-    """Load one v1 binding manifest and resolve its paths for this pass."""
+) -> dict[str, BoundTranscript]:
+    """Load one v1 binding manifest and resolve its locators for this pass.
+
+    Values carry the binding plus its resolved evidence ref: a ``Path`` for
+    JSONL transcripts, the verbatim URI string for URI locators.
+    """
     manifest_path = bindings_path or (transcript_root / DEFAULT_FILENAME if transcript_root is not None else default_path)
     bindings = load_transcript_bindings(manifest_path, transcript_root=transcript_root)
     return {
-        binding.session_ref: binding.resolved_path(manifest_path=manifest_path, transcript_root=transcript_root)
+        binding.session_ref: BoundTranscript(
+            binding=binding,
+            path=binding.resolved_ref(manifest_path=manifest_path, transcript_root=transcript_root),
+        )
         for binding in bindings
     }
 
@@ -711,7 +766,7 @@ def _complete_existing_result(
     deferred_dir: Path,
     ledger_path: Path | None,
     ledger_key_path: Path | None,
-    transcript_binding_path: Path | None,
+    bound_transcript: BoundTranscript | None,
     strict_autonomous: bool,
 ) -> None:
     """Recover a claimed order whose result was written by an earlier pass.
@@ -755,30 +810,33 @@ def _complete_existing_result(
                 )
                 return
             if strict_autonomous:
-                bound_native_id = (
-                    native_session_identity(transcript_binding_path)
-                    if transcript_binding_path is not None
-                    else None
-                )
-                try:
-                    stored_transcript_path = (
-                        Path(stored_result.transcript_path).expanduser().resolve()
-                        if stored_result.transcript_path
-                        else None
+                bound_native_id = _bound_native_session_id(bound_transcript, session_ref=order.session_ref)
+                if bound_transcript is not None and isinstance(bound_transcript.path, Path):
+                    try:
+                        stored_transcript_path = (
+                            Path(stored_result.transcript_path).expanduser().resolve()
+                            if stored_result.transcript_path
+                            else None
+                        )
+                        bound_transcript_path = bound_transcript.path.expanduser().resolve()
+                    except (OSError, RuntimeError):
+                        stored_transcript_path = None
+                        bound_transcript_path = None
+                    transcript_bound = (
+                        stored_transcript_path is not None and stored_transcript_path == bound_transcript_path
                     )
-                    bound_transcript_path = (
-                        transcript_binding_path.expanduser().resolve()
-                        if transcript_binding_path is not None
-                        else None
+                else:
+                    # A URI binding compares verbatim: the result's evidence
+                    # ref either is the bound locator or it is not.
+                    transcript_bound = (
+                        bound_transcript is not None
+                        and stored_result.transcript_path is not None
+                        and stored_result.transcript_path == str(bound_transcript.path)
                     )
-                except (OSError, RuntimeError):
-                    stored_transcript_path = None
-                    bound_transcript_path = None
                 if (
                     not bound_native_id
                     or existing_ledger.native_session_id != bound_native_id
-                    or stored_transcript_path is None
-                    or stored_transcript_path != bound_transcript_path
+                    or not transcript_bound
                 ):
                     logger.error(
                         "dispatchd_existing_strict_result_without_exact_transcript_proof",
@@ -930,7 +988,7 @@ class _DeliveryCall:
     policy: PolicyConfig
     dispatch_runner: TmuxRunner | None
     projects_root: Path | None
-    transcript_binding_path: Path | None
+    bound_transcript: BoundTranscript | None
     local_extra: set[str] | None
     tmux_socket: Path | None
     ledger_path: Path | None
@@ -938,6 +996,12 @@ class _DeliveryCall:
     strict_autonomous: bool
     resolved_zdr: bool
     attestation_id: str | None
+
+    @property
+    def transcript_binding_path(self) -> Path | None:
+        """The bound JSONL path for file bindings; ``None`` for URI bindings."""
+        bound = self.bound_transcript
+        return bound.path if bound is not None and isinstance(bound.path, Path) else None
 
 
 @dataclass(frozen=True)
@@ -1022,6 +1086,132 @@ def _delivery_runs_dir(queue_dir: Path) -> Path:
 
 def _delivery_record_path(queue_dir: Path, order_id: str) -> Path:
     return _delivery_runs_dir(queue_dir) / f"{order_id}.json"
+
+
+def _plug_send(plug: LanePlug, handle: LaneHandle, wire: WireOrder, call: _DeliveryCall) -> SendReceipt:
+    """Send through the plug, forwarding governed options to tmux-backed plugs.
+
+    A URI binding on a tmux lane (opencode) still delivers through
+    ``dispatch_to_tmux``; the call's injected runner, policy, tuning, and
+    socket must reach it unchanged. Non-tmux plugs own their delivery and
+    take no tmux options.
+    """
+    if isinstance(plug, TmuxLanePlug):
+        return plug.send(
+            handle,
+            wire,
+            runner=call.dispatch_runner,
+            local_extra=call.local_extra,
+            projects_root=call.projects_root,
+            tuning=call.tuning,
+            policy=call.policy,
+            tmux_socket=call.tmux_socket,
+        )
+    return plug.send(handle, wire)
+
+
+def _plug_prove_read(
+    plug: LanePlug,
+    handle: LaneHandle,
+    wire: WireOrder,
+    receipt: SendReceipt | None,
+    call: _DeliveryCall,
+) -> ReadProof:
+    if isinstance(plug, TmuxLanePlug):
+        return plug.prove_read(
+            handle,
+            wire,
+            receipt,
+            deadline_s=call.tuning.transcript_recency_seconds,
+            runner=call.dispatch_runner,
+            projects_root=call.projects_root,
+            local_extra=call.local_extra,
+        )
+    return plug.prove_read(handle, wire, receipt, deadline_s=call.tuning.transcript_recency_seconds)
+
+
+def _deliver_via_plug(call: _DeliveryCall, nonce: SendNonce) -> DispatchResult:
+    """Deliver a URI-bound order through the bound client's lane plug.
+
+    The order's transcript binding names a locator URI instead of a JSONL
+    path, so the tmux paste + transcript-grep path cannot reach or verify the
+    lane. The plug that owns the binding's client performs the send and the
+    read proof; the send nonce keeps the same crash semantics as the tmux
+    path: once minted, a retry only re-proves, it never sends twice.
+    """
+    order = call.order
+    bound = call.bound_transcript
+    if bound is None or not bound.is_uri:
+        return DispatchResult(
+            order_id=order.order_id,
+            session_ref=order.session_ref,
+            status=DispatchStatus.FAILED,
+            reason="delivery-failed: plug delivery requires a URI-bound transcript",
+        )
+    wire = WireOrder.from_order(order)
+
+    def _result(status: DispatchStatus, reason: str, **fields: Any) -> DispatchResult:
+        return DispatchResult(order_id=order.order_id, session_ref=order.session_ref, status=status, reason=reason, **fields)
+
+    try:
+        plug = plug_for_client(bound.binding.client)
+        handle = plug.handle_for_binding(bound, session_ref=order.session_ref)
+    except LaneDead as exc:
+        return _result(DispatchStatus.FAILED, f"lane-dead: {exc}")
+    except AdapterError as exc:
+        return _result(DispatchStatus.FAILED, f"adapter-error: {exc}")
+
+    if nonce.exists():
+        # Reconcile-only: an earlier attempt may already have put the order
+        # on the wire, so this pass proves or disproves, never resends.
+        logger.warning(
+            "dispatchd_order_reconciling_after_possible_crash",
+            order_id=order.order_id,
+            session_ref=order.session_ref,
+        )
+        try:
+            proof = _plug_prove_read(plug, handle, wire, None, call)
+        except AdapterError as exc:
+            proof = ReadProof(order_id=order.order_id, level="none", detail=str(exc))
+        if proof.level == "consumed":
+            return _result(
+                DispatchStatus.SENT,
+                reason="sent: existing nonce reconciled from lane-bound consumption proof",
+                marker=nudge_confirmation_marker(order.nudge),
+                transcript_path=proof.binding_ref or str(bound.path),
+                native_session_id=proof.native_session_id or handle.native_session_id,
+            )
+        return _result(
+            DispatchStatus.DELIVERY_UNCONFIRMED,
+            reason=f"delivery-unconfirmed: existing nonce has no lane-bound consumption proof ({proof.detail})",
+            marker=nudge_confirmation_marker(order.nudge),
+        )
+
+    nonce.mint()
+    try:
+        receipt = _plug_send(plug, handle, wire, call)
+    except SendRejected as exc:
+        return _result(exc.status, reason=f"send-rejected: {exc}")
+    except LaneDead as exc:
+        return _result(DispatchStatus.FAILED, reason=f"lane-dead: {exc}")
+    except AdapterError as exc:
+        return _result(DispatchStatus.FAILED, reason=f"adapter-error: {exc}")
+    try:
+        proof = _plug_prove_read(plug, handle, wire, receipt, call)
+    except AdapterError as exc:
+        # The write was accepted on the wire; only the proof stream failed.
+        proof = ReadProof(order_id=order.order_id, level="accepted", detail=f"read proof unavailable: {exc}")
+    if proof.level == "consumed":
+        return _result(
+            DispatchStatus.SENT,
+            reason=f"sent: {proof.detail}",
+            transcript_path=proof.binding_ref or str(bound.path),
+            native_session_id=proof.native_session_id or handle.native_session_id,
+        )
+    return _result(
+        DispatchStatus.DELIVERY_UNCONFIRMED,
+        reason=f"delivery-unconfirmed: {proof.detail or 'the harness accepted the order but no consumption proof followed'}",
+    )
 
 
 def _compute_delivery_outcome(call: _DeliveryCall) -> _DeliveryOutcome:
@@ -1169,7 +1359,7 @@ def _compute_delivery_outcome(call: _DeliveryCall) -> _DeliveryOutcome:
                     ),
                 )
 
-        if call.strict_autonomous and call.transcript_binding_path is None:
+        if call.strict_autonomous and call.bound_transcript is None:
             return _DeliveryOutcome(
                 order_id=order.order_id,
                 action="result",
@@ -1233,7 +1423,12 @@ def _compute_delivery_outcome(call: _DeliveryCall) -> _DeliveryOutcome:
         # this process/run restarted. Reconcile against the target transcript.
         # The nonce makes this a verify-only state: never paste again.
         nonce = call.layout.send_nonce(order.order_id)
-        if nonce.exists():
+        if call.bound_transcript is not None and call.bound_transcript.is_uri:
+            # A URI-bound lane (``amp-orb:<slug>``, ``opencode-…``) has no
+            # JSONL transcript to paste-verify against; the owning plug owns
+            # the write and the read proof end to end.
+            result = _deliver_via_plug(call, nonce)
+        elif nonce.exists():
             logger.warning("dispatchd_order_reconciling_after_possible_crash", order_id=order.order_id, session_ref=order.session_ref)
             parts = order.session_ref.split(":")
             host = parts[0] if len(parts) == 3 else ""
@@ -1302,7 +1497,7 @@ def _compute_delivery_outcome(call: _DeliveryCall) -> _DeliveryOutcome:
                 result,
                 ledger_path=call.ledger_path,
                 ledger_key_path=call.ledger_key_path,
-                expected_transcript_path=call.transcript_binding_path,
+                bound_transcript=call.bound_transcript,
                 require_native_session_id=call.strict_autonomous,
             )
             result.delivery_ledger_verified = True
@@ -1365,7 +1560,7 @@ def _apply_delivery_outcome(
             deferred_dir=deferred_dir,
             ledger_path=call.ledger_path,
             ledger_key_path=call.ledger_key_path,
-            transcript_binding_path=call.transcript_binding_path,
+            bound_transcript=call.bound_transcript,
             strict_autonomous=call.strict_autonomous,
         )
         return None
@@ -1520,7 +1715,7 @@ def _drain_delivery_results(
     goals_root: Path | None,
     dispatch_runner: TmuxRunner | None,
     projects_root: Path | None,
-    transcript_binding_paths: Mapping[str, Path] | None,
+    transcript_binding_paths: Mapping[str, BoundTranscript] | None,
     local_extra: set[str] | None,
     tmux_socket: Path | None,
     out: list[DispatchResult],
@@ -1567,7 +1762,7 @@ def _drain_delivery_results(
                 policy=policy,
                 dispatch_runner=dispatch_runner,
                 projects_root=projects_root,
-                transcript_binding_path=transcript_binding_paths.get(order.session_ref) if transcript_binding_paths is not None else None,
+                bound_transcript=transcript_binding_paths.get(order.session_ref) if transcript_binding_paths is not None else None,
                 local_extra=local_extra,
                 tmux_socket=tmux_socket,
                 ledger_path=ledger_path,
@@ -1625,7 +1820,7 @@ def process_one_order(
     goals_root: Path | None = None,
     dispatch_runner: TmuxRunner | None = None,
     projects_root: Path | None = None,
-    transcript_binding_paths: Mapping[str, Path] | None = None,
+    transcript_binding_paths: Mapping[str, BoundTranscript] | None = None,
     local_extra: set[str] | None = None,
     tmux_socket: Path | None = None,
     allowed_session_prefixes: tuple[str, ...] = (),
@@ -1763,7 +1958,7 @@ def _process_claimed_order(
     goals_root: Path | None,
     dispatch_runner: TmuxRunner | None,
     projects_root: Path | None,
-    transcript_binding_paths: Mapping[str, Path] | None,
+    transcript_binding_paths: Mapping[str, BoundTranscript] | None,
     local_extra: set[str] | None,
     tmux_socket: Path | None,
     allowed_session_prefixes: tuple[str, ...],
@@ -1816,7 +2011,7 @@ def _process_claimed_order(
                 order.routing_hint = resolved_hint
 
     strict_autonomous = _strict_autonomous_order(order)
-    transcript_binding_path = (
+    bound_transcript = (
         transcript_binding_paths.get(order.session_ref) if transcript_binding_paths is not None else None
     )
     attestation_id = order.decision_attestation.attestation_id if order.decision_attestation is not None else None
@@ -1836,7 +2031,7 @@ def _process_claimed_order(
             deferred_dir=deferred_dir,
             ledger_path=ledger_path,
             ledger_key_path=ledger_key_path,
-            transcript_binding_path=transcript_binding_path,
+            bound_transcript=bound_transcript,
             strict_autonomous=strict_autonomous,
         )
         return None
@@ -1995,7 +2190,7 @@ def _process_claimed_order(
         policy=policy,
         dispatch_runner=dispatch_runner,
         projects_root=projects_root,
-        transcript_binding_path=transcript_binding_path,
+        bound_transcript=bound_transcript,
         local_extra=local_extra,
         tmux_socket=tmux_socket,
         ledger_path=ledger_path,

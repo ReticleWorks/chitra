@@ -8,15 +8,21 @@ the exact enrolled session and durable lane before normalization begins.
 from __future__ import annotations
 
 import json
+import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictStr, field_validator, model_validator
 
 from chitra.journal import Client
 
 SCHEMA = "chitra.transcript-bindings.v1"
 DEFAULT_FILENAME = "transcript-bindings.json"
+
+# A binding ``path`` may be a URI locator (``amp-orb:<slug>``) instead of a
+# filesystem path when the lane's evidence stream is not a local JSONL file.
+_URI_LOCATOR_RE = re.compile(r"\A[A-Za-z][A-Za-z0-9+.-]+:")
 
 
 class TranscriptBinding(BaseModel):
@@ -27,9 +33,19 @@ class TranscriptBinding(BaseModel):
     session_ref: StrictStr = Field(min_length=1)
     lane: StrictStr = Field(min_length=1)
     path: StrictStr = Field(min_length=1)
-    client: Client
+    # Known clients stay enum members; a plug-owned harness name (e.g. "amp")
+    # is kept as a plain string, matching CanonicalEvent.client.
+    client: Client | str
     client_version: StrictStr = Field(min_length=1)
     instance: StrictStr = Field(min_length=1)
+
+    @field_validator("client", mode="before")
+    @classmethod
+    def _known_client(cls, value: Any) -> Any:
+        try:
+            return Client(value)
+        except ValueError:
+            return value
 
     @model_validator(mode="after")
     def validate_binding(self) -> TranscriptBinding:
@@ -37,6 +53,11 @@ class TranscriptBinding(BaseModel):
             if not getattr(self, name).strip():
                 raise ValueError(f"{name} must be a non-empty string")
         return self
+
+    @property
+    def is_uri_locator(self) -> bool:
+        """True when ``path`` is a locator URI, not a transcript file."""
+        return _URI_LOCATOR_RE.match(self.path) is not None
 
     def resolved_path(self, *, manifest_path: Path, transcript_root: Path | None) -> Path:
         """Resolve the path and constrain relative paths to the transcript root."""
@@ -51,6 +72,44 @@ class TranscriptBinding(BaseModel):
                 f"(root {str(root)!r})"
             )
         return resolved
+
+    def resolved_ref(self, *, manifest_path: Path, transcript_root: Path | None) -> Path | str:
+        """The binding's resolved locator: a Path for files, the URI verbatim."""
+        if self.is_uri_locator:
+            return self.path
+        return self.resolved_path(manifest_path=manifest_path, transcript_root=transcript_root)
+
+
+@dataclass(frozen=True, slots=True)
+class BoundTranscript:
+    """A loaded binding with its evidence locator resolved for one pass.
+
+    ``path`` is a ``Path`` for JSONL transcripts and the verbatim URI string
+    for URI locators (``amp-orb:<slug>``), which name no local transcript.
+    """
+
+    binding: TranscriptBinding
+    path: Path | str
+
+    @property
+    def is_uri(self) -> bool:
+        return isinstance(self.path, str)
+
+    @property
+    def client(self) -> str:
+        return str(self.binding.client)
+
+    @property
+    def session_ref(self) -> str:
+        return self.binding.session_ref
+
+    @property
+    def lane(self) -> str:
+        return self.binding.lane
+
+    @property
+    def instance(self) -> str:
+        return self.binding.instance
 
 
 class TranscriptBindingsDocument(BaseModel):
@@ -92,7 +151,7 @@ def load_transcript_bindings(
     seen: dict[str, set[str]] = {"session_ref": set(), "lane": set(), "path": set()}
     bindings: list[TranscriptBinding] = []
     for binding in document.bindings:
-        resolved = binding.resolved_path(manifest_path=manifest_path, transcript_root=transcript_root)
+        resolved = binding.resolved_ref(manifest_path=manifest_path, transcript_root=transcript_root)
         values = {
             "session_ref": binding.session_ref,
             "lane": binding.lane,
@@ -106,4 +165,11 @@ def load_transcript_bindings(
     return tuple(bindings)
 
 
-__all__ = ["DEFAULT_FILENAME", "SCHEMA", "TranscriptBinding", "TranscriptBindingsDocument", "load_transcript_bindings"]
+__all__ = [
+    "DEFAULT_FILENAME",
+    "SCHEMA",
+    "BoundTranscript",
+    "TranscriptBinding",
+    "TranscriptBindingsDocument",
+    "load_transcript_bindings",
+]
