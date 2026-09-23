@@ -113,7 +113,7 @@ def test_goal_hold_while_waiting_on_lane_lock_blocks_delivery(
     result, deliveries = _run_goal_change_race(tmp_path, monkeypatch, hold)
 
     assert result.status is DispatchStatus.BLOCKED
-    assert result.reason == "goal-not-actionable"
+    assert result.reason == "goal-held"
     assert deliveries == []
 
 

@@ -1721,7 +1721,9 @@ def dispatch_to_tmux(
     # Directive-voice guard: reject before anything is pasted. A BLOCKED
     # voice violation must never touch the pane and must never generate a
     # delivery-ledger entry (dispatchd only signs/logs on SENT).
-    bad = directive_voice_violation(order.nudge, patterns=voice_patterns)
+    # ``operator_relay`` carries verbatim operator-typed text; the guard only
+    # exists to catch chitra-authored messages that fake that voice.
+    bad = None if order.message_kind == "operator_relay" else directive_voice_violation(order.nudge, patterns=voice_patterns)
     if bad is not None:
         logger.info("tmux_dispatch_blocked_directive_voice", session_ref=order.session_ref, phrase=bad)
         return _result(DispatchStatus.BLOCKED, f"directive-voice: banned attribution phrase {bad!r}")

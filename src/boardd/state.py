@@ -294,8 +294,15 @@ def build_view(state_dir: Path, tc: TranslationCache, now: datetime | None = Non
         scope = build_scope(g, tc)
         latest = latest_by_lane.get(ref)
         asks = [tc.get(a) for a in g.get("open_asks", [])]
+        # Residual questions the monitor routed to the foreground queue are
+        # operator-visible too: nobody else can answer them from this board.
+        tasks = [
+            tc.get(task.get("text", ""))
+            for task in (g.get("foreground_tasks") or [])
+            if isinstance(task, dict) and task.get("text")
+        ]
         status = g.get("status", "unknown")
-        needs_review = status in REVIEW_STATUSES or bool(asks)
+        needs_review = status in REVIEW_STATUSES or bool(asks) or bool(tasks)
         lane = {
             "session_ref": ref,
             "lane_id": lane_id,
@@ -307,6 +314,7 @@ def build_view(state_dir: Path, tc: TranslationCache, now: datetime | None = Non
             "done_when": done_when,
             "scope": scope,
             "open_asks": asks,
+            "foreground_tasks": tasks,
             "goal_version": g.get("goal_version"),
             "needs_review": needs_review,
             "updated_ts": (latest or {}).get("ts") or g.get("updated_at") or (goals_at.isoformat() if goals_at else None),
@@ -315,7 +323,7 @@ def build_view(state_dir: Path, tc: TranslationCache, now: datetime | None = Non
         if not needs_review:
             continue
         since = g.get("updated_at") or lane["updated_ts"]
-        if asks:
+        if asks or tasks:
             for ask in asks:
                 needs_you.append(
                     {
@@ -325,6 +333,20 @@ def build_view(state_dir: Path, tc: TranslationCache, now: datetime | None = Non
                         "goal": lane["goal"],
                         "question": ask,
                         "context": movement["sentence"],
+                        "kind": "ask",
+                        "since": since,
+                    }
+                )
+            for task in tasks:
+                needs_you.append(
+                    {
+                        "lane_ref": ref,
+                        "lane_id": lane_id,
+                        "lane_title": lane["title"],
+                        "goal": lane["goal"],
+                        "question": task,
+                        "context": movement["sentence"],
+                        "kind": "foreground-task",
                         "since": since,
                     }
                 )
@@ -342,6 +364,7 @@ def build_view(state_dir: Path, tc: TranslationCache, now: datetime | None = Non
                     "goal": lane["goal"],
                     "question": {"text": reason, "raw": reason, "translated": True},
                     "context": movement["sentence"],
+                    "kind": "status-review",
                     "since": since,
                 }
             )

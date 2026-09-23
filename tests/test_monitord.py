@@ -677,7 +677,7 @@ def test_routine_question_is_queued_as_an_exact_goal_contract_answer(
     )
     config = resolve_config(state_dir=tmp_path, shadow_mode=False)
 
-    outcome = handle_agent_question(config, goal, final_response)
+    outcome = handle_agent_question(config, goal, (final_response,))
 
     assert outcome == "answer_queued"
     orders = list((tmp_path / "queue" / "orders").glob("*.json"))
@@ -698,7 +698,7 @@ def test_protected_question_holds_the_goal_without_queueing_an_answer(
     )
     config = resolve_config(state_dir=tmp_path, shadow_mode=False)
 
-    outcome = handle_agent_question(config, goal, final_response)
+    outcome = handle_agent_question(config, goal, (final_response,))
 
     assert outcome == "operator_required"
     stored = get_goal(tmp_path, goal.session_ref)
@@ -730,7 +730,7 @@ def test_decided_question_queues_the_cited_answer_without_an_operator_ask(
     )
     config = resolve_config(state_dir=tmp_path, shadow_mode=False)
 
-    outcome = handle_agent_question(config, goal, final_response)
+    outcome = handle_agent_question(config, goal, (final_response,))
 
     assert outcome == "answer_queued"
     stored = get_goal(tmp_path, goal.session_ref)
@@ -754,7 +754,7 @@ def test_residual_question_stays_active_for_foreground_reasoning(
     )
     config = resolve_config(state_dir=tmp_path, shadow_mode=False)
 
-    outcome = handle_agent_question(config, goal, final_response)
+    outcome = handle_agent_question(config, goal, (final_response,))
 
     assert outcome == "reasoning_required"
     stored = get_goal(tmp_path, goal.session_ref)
@@ -766,6 +766,81 @@ def test_residual_question_stays_active_for_foreground_reasoning(
     assert stored.foreground_tasks[0].source == "monitord"
     assert "Should I redesign the workflow?" in stored.foreground_tasks[0].text
     assert not list((tmp_path / "queue").glob("**/*.json"))
+
+
+def test_operator_ask_text_carries_the_gate_reasons(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gap 8: the persisted ask shows why the question was gated."""
+    _write_registry(tmp_path, monkeypatch)
+    goal = upsert_goal(tmp_path, _goal("session-1"))
+    final_response = _event("question-gated", CanonicalType.FINAL_RESPONSE).model_copy(
+        update={"payload": {"text": "May I use a production API key?"}}
+    )
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+
+    assert handle_agent_question(config, goal, (final_response,)) == "operator_required"
+    stored = get_goal(tmp_path, goal.session_ref)
+    assert stored is not None
+    assert len(stored.open_asks) == 1
+    assert "Gates: credentials" in stored.open_asks[0]
+    assert "May I use a production API key?" in stored.open_asks[0]
+    assert "credentials" in stored.hold_reason
+
+
+def test_two_questions_in_one_turn_are_handled_independently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gap 3/16: every extracted question gets its own durable outcome."""
+    _write_registry(tmp_path, monkeypatch)
+    goal = upsert_goal(tmp_path, _goal("session-1"))
+    final_response = _event("question-pair", CanonicalType.FINAL_RESPONSE).model_copy(
+        update={
+            "payload": {
+                "text": (
+                    "What proves the goal is done?\n"
+                    "Should I redesign the workflow?\n"
+                )
+            }
+        }
+    )
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+
+    outcome = handle_agent_question(config, goal, (final_response,))
+
+    # The routine question queues an answer; the unsettled one becomes a
+    # residual task -- both in one pass over one event.
+    assert outcome == "reasoning_required"
+    stored = get_goal(tmp_path, goal.session_ref)
+    assert stored is not None
+    assert len(stored.foreground_tasks) == 1
+    assert "Should I redesign the workflow?" in stored.foreground_tasks[0].text
+    orders = list((tmp_path / "queue" / "orders").glob("*.json"))
+    assert len(orders) == 1
+    payload = json.loads(orders[0].read_text(encoding="utf-8"))
+    assert payload["message_kind"] == "goal_contract_answer"
+
+
+def test_reasked_question_in_a_later_turn_is_a_new_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gap 16: the same words asked again get a fresh occurrence-bound request."""
+    _write_registry(tmp_path, monkeypatch)
+    goal = upsert_goal(tmp_path, _goal("session-1"))
+    first_turn = _event("question-first", CanonicalType.FINAL_RESPONSE).model_copy(
+        update={"payload": {"text": "What proves the goal is done?"}}
+    )
+    second_turn = _event("question-second", CanonicalType.FINAL_RESPONSE).model_copy(
+        update={"payload": {"text": "What proves the goal is done?"}}
+    )
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+
+    handle_agent_question(config, goal, (first_turn,))
+    handle_agent_question(config, goal, (second_turn,))
+
+    orders = sorted((tmp_path / "queue" / "orders").glob("*.json"))
+    assert len(orders) == 2
+    results = [json.loads(path.read_text())["question_result"] for path in orders]
+    assert results[0]["request_id"] != results[1]["request_id"]
+    assert {result["occurrence"] for result in results} == {"question-first", "question-second"}
 
 
 def test_shadow_questions_neither_queue_answers_nor_mutate_the_goal(
@@ -781,8 +856,8 @@ def test_shadow_questions_neither_queue_answers_nor_mutate_the_goal(
         update={"payload": {"text": "May I use a production API key?"}}
     )
 
-    assert handle_agent_question(config, goal, routine) == "shadow_answer"
-    assert handle_agent_question(config, goal, protected) == "operator_required"
+    assert handle_agent_question(config, goal, (routine,)) == "shadow_answer"
+    assert handle_agent_question(config, goal, (protected,)) == "operator_required"
     stored = get_goal(tmp_path, goal.session_ref)
     assert stored is not None
     assert stored.status == "working"

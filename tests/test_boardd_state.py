@@ -4,10 +4,12 @@ import json
 from pathlib import Path
 
 import pytest
+from _goal_fixtures import enrollment_fields
 
 from boardd import config
 from boardd.state import build_view, split_conditions
 from boardd.translate import TranslationCache
+from chitra.goals import GoalRecord, add_foreground_task, upsert_goal
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "boardd_state"
 
@@ -159,3 +161,37 @@ def test_missing_dir_reports_errors(tmp_path):
     view = build_view(tmp_path, tc)
     assert len(view["source"]["errors"]) == 2
     assert view["lanes"] == []
+
+
+def test_residual_foreground_task_reaches_needs_you(tmp_path):
+    """A question the monitor could not settle becomes a foreground task, not
+    an ask. It must still surface as an operator-visible needs_you item."""
+    goal = upsert_goal(
+        tmp_path,
+        GoalRecord(
+            session_ref="twinridge:residual-lane",
+            lane_id="residual-lane",
+            goal="keep the lane honest through the whole sweep",
+            done_when="reported",
+            source="task",
+            status="working",
+            now="working",
+            **enrollment_fields("reported"),
+        ),
+    )
+    add_foreground_task(
+        tmp_path,
+        goal.session_ref,
+        kind="question",
+        text="no durable ruling covers this. Question: which shard?",
+        source="monitord",
+    )
+    (tmp_path / "sweep-digest.json").write_text(json.dumps({"sweep_at": "2026-01-01T00:05:00+00:00", "events": []}))
+    view = build_view(tmp_path, TranslationCache(None))
+    assert len(view["needs_you"]) == 1
+    item = view["needs_you"][0]
+    assert item["kind"] == "foreground-task"
+    assert item["lane_ref"] == "twinridge:residual-lane"
+    assert "which shard?" in item["question"]["text"]
+    assert view["lanes"][0]["needs_review"] is True
+    assert view["lanes"][0]["foreground_tasks"][0]["text"].endswith("which shard?")

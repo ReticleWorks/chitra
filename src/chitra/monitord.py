@@ -62,7 +62,7 @@ from chitra.completion_gate import (
     has_structured_completion_line,
     is_completion_claim,
 )
-from chitra.decisions import read_decisions
+from chitra.decisions import DecisionEntry, read_decisions
 from chitra.detect import (
     BlockerClaimStore,
     Finding,
@@ -122,7 +122,7 @@ from chitra.lane_config import LaneSpec
 from chitra.orders import DispatchOrder
 from chitra.policy_config import load_policy_config
 from chitra.presence import append_presence
-from chitra.question_handler import handle_question
+from chitra.question_handler import QuestionHandlerResult, extract_questions, handle_question
 from chitra.recovery import get_lane_lifecycle, load_worktree_checkpoints
 from chitra.run_pool import RunPool
 from chitra.state_paths import state_dir as default_state_dir
@@ -1354,69 +1354,90 @@ def check_enrollment_and_receipts(
     return len(run_evidence), disputed, findings, False
 
 
-def handle_agent_question(
+_QUESTION_OUTCOME_PRIORITY: tuple[str, ...] = (
+    "operator_required",
+    "reasoning_required",
+    "answer_queued",
+    "answer_blocked",
+    "blocked",
+    "answer_awaiting_progress",
+    "shadow_answer",
+    "shadow",
+)
+
+
+def _aggregate_question_outcome(outcomes: Sequence[str]) -> str:
+    """Fold per-question outcomes into one deterministic summary token."""
+    for outcome in _QUESTION_OUTCOME_PRIORITY:
+        if outcome in outcomes:
+            return outcome
+    return "none"
+
+
+def _mark_question_boundary(config: MonitordConfig, lane: str, goal: GoalRecord, event_id: str) -> None:
+    """Advance the lane's consumed boundary past a fully handled question turn.
+
+    The row carries forward the in-flight action's fingerprint, retry, and
+    consumption fields; only the turn boundary moves. A lane whose ledger
+    belongs to another session is left alone rather than crashed over.
+    """
+    ledger = SupervisionLedger(config.state_dir, lane)
+    latest = ledger.latest()
+    if latest is not None and (
+        latest.turn_boundary_event_id == event_id or latest.session_ref != goal.session_ref
+    ):
+        return
+    ledger.transition(
+        state=latest.state if latest is not None else "observing",
+        session_ref=goal.session_ref,
+        goal_version=goal.goal_version,
+        goal_digest_value=goal_digest(goal),
+        reason="the question turn is fully handled; its events are accounted for",
+        turn_boundary_event_id=event_id,
+    )
+
+
+def _apply_question_result(
     config: MonitordConfig,
     goal: GoalRecord,
-    final_response: CanonicalEvent | None,
+    result: QuestionHandlerResult,
     *,
-    journal_events: tuple[CanonicalEvent, ...] = (),
-    lane: str | None = None,
-) -> str:
-    """Answer one routine frozen-goal question or record a foreground residual.
+    journal_events: tuple[CanonicalEvent, ...],
+    lane: str,
+) -> tuple[bool, str]:
+    """Persist the durable side of one handled question.
 
-    The answer order is deterministic and dispatchd recomputes it from the
-    current goal before any pane write. Ambiguous questions become a durable
-    foreground-reasoning task. Protected authority classes remain explicit
-    operator gates.
+    Returns ``(handled, outcome)``. ``handled`` is False only while an
+    ``answered`` question's order is still pending delivery or consumption,
+    so the asking event stays in the detection window for a later pass to
+    finish the reconcile.
     """
-    if final_response is None:
-        return "none"
-    payload_text = final_response.payload.get("text")
-    if not isinstance(payload_text, str):
-        return "none"
-    question_lines = tuple(line.strip() for line in payload_text.splitlines() if "?" in line and line.strip())
-    if not question_lines:
-        return "none"
-
-    if len(question_lines) == 1:
-        question = question_lines[0]
-        result = handle_question(goal, question, decisions=read_decisions(config.state_dir / "decisions.jsonl"))
-    else:
-        question = " ".join(question_lines)
-        result = None
-
-    if result is None or result.disposition == "residual":
+    if result.disposition == "residual":
         if not config.shadow_mode:
-            reason = (
-                "the completed turn asked multiple material questions"
-                if result is None
-                else result.reason
-            )
             add_foreground_task(
                 config.state_dir,
                 goal.session_ref,
                 kind="question",
-                text=f"{reason}. Question: {question}",
+                text=f"{result.reason}. Question: {result.question}",
                 source="monitord",
             )
-        return "reasoning_required"
-
+        return True, "reasoning_required"
     if result.disposition == "operator_required":
         if not config.shadow_mode:
-            reason = f"the question requests operator-controlled authority: {result.reason}"
-            add_ask(config.state_dir, goal.session_ref, f"{reason}. Question: {question}")
+            gates = f" Gates: {', '.join(result.gate_reasons)}." if result.gate_reasons else ""
+            reason = f"the question requests operator-controlled authority: {result.reason}{gates}"
+            add_ask(config.state_dir, goal.session_ref, f"{reason}. Question: {result.question}")
             hold_goal(config.state_dir, goal.session_ref, reason=f"operator-required question: {reason}")
-        return "operator_required"
-
+        return True, "operator_required"
     assert result.answer is not None
     if config.shadow_mode:
-        return "shadow_answer"
+        return True, "shadow_answer"
     if config.dispatch_queue_dir is None:
         raise ValueError("dispatch queue is required for autonomous goal answers")
     action = reconcile_question_action(
         state_root=config.state_dir,
         queue_dir=config.dispatch_queue_dir,
-        lane=lane or goal.lane_id or final_response.lane.replace(":", "."),
+        lane=lane,
         goal=goal,
         question_result=result,
         journal_events=journal_events,
@@ -1425,12 +1446,73 @@ def handle_agent_question(
         retry_delay_seconds=config.retry_delay_seconds,
     )
     if action.state == "action_queued":
-        return "answer_queued"
+        return False, "answer_queued"
     if action.state == "awaiting_progress":
-        return "answer_awaiting_progress"
+        latest = SupervisionLedger(config.state_dir / "question-actions", lane).latest_for_action(
+            f"question:{result.request_id}", "question"
+        )
+        consumed = latest is not None and bool(latest.turn_boundary_event_id)
+        return consumed, "answer_awaiting_progress"
     if action.state == "blocked":
-        return "answer_blocked"
-    return action.state
+        return False, "answer_blocked"
+    return False, action.state
+
+
+def handle_agent_question(
+    config: MonitordConfig,
+    goal: GoalRecord,
+    final_responses: Sequence[CanonicalEvent],
+    *,
+    journal_events: tuple[CanonicalEvent, ...] = (),
+    lane: str | None = None,
+) -> str:
+    """Handle every unanswered question in the unconsumed turn window.
+
+    Each final-response event in the window contributes the questions
+    ``extract_questions`` finds in it, and each is classified independently:
+    a deterministic answer is reconciled through the queue, an unsettled one
+    becomes a durable foreground task, and a protected-authority ask holds
+    the lane. An event's turn is marked consumed once every question on it
+    has reached durable state; a still-pending answer keeps its event in the
+    window so the next pass finishes the reconcile, and a re-ask in a later
+    event is a new occurrence-bound request, never a dropped duplicate.
+    """
+    lane_key = lane or goal.lane_id or (final_responses[-1].lane.replace(":", ".") if final_responses else goal.session_ref)
+    decisions: list[DecisionEntry] | None = None
+    outcomes: list[str] = []
+    handled_boundary = ""
+    boundary_complete = True
+    for event in final_responses:
+        payload_text = event.payload.get("text")
+        if not isinstance(payload_text, str):
+            continue
+        questions = extract_questions(payload_text)
+        if not questions:
+            continue
+        if decisions is None:
+            decisions = read_decisions(config.state_dir / "decisions.jsonl")
+        event_handled = True
+        for question in questions:
+            result = handle_question(goal, question, decisions=decisions, occurrence=event.event_id)
+            handled, outcome = _apply_question_result(
+                config,
+                goal,
+                result,
+                journal_events=journal_events,
+                lane=lane_key,
+            )
+            outcomes.append(outcome)
+            event_handled = event_handled and handled
+        # The consumed boundary is a contiguous claim: once one event's
+        # answer is still pending, later events are processed but the
+        # boundary must not jump past the unfinished one.
+        if event_handled and boundary_complete:
+            handled_boundary = event.event_id
+        elif not event_handled:
+            boundary_complete = False
+    if handled_boundary and not config.shadow_mode:
+        _mark_question_boundary(config, lane_key, goal, handled_boundary)
+    return _aggregate_question_outcome(outcomes)
 
 
 def append_finding_records(config: MonitordConfig, lane: str, findings: list[Finding]) -> int:
@@ -1753,7 +1835,15 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
             finding for finding in enrollment_findings if finding.detector == "false_done"
         ]
         question_outcome = (
-            handle_agent_question(config, goal, final_response, journal_events=events, lane=lane)
+            handle_agent_question(
+                config,
+                goal,
+                tuple(
+                    event for event in detector_events if event.normalized_type is CanonicalType.FINAL_RESPONSE
+                ),
+                journal_events=events,
+                lane=lane,
+            )
             if goal is not None
             and goal.status not in {"held", "done-pending-verification", "done-pending-close"}
             else "none"
