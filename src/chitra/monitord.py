@@ -47,6 +47,7 @@ import structlog
 from chitra._fsio import locked_json_store, write_json_atomic
 from chitra.canonical_choices import CanonicalChoicesPolicy, detect_canonical_choices
 from chitra.completion_gate import CompletionEvidence, extract_completion_evidence, has_structured_completion_line, is_completion_claim
+from chitra.decisions import read_decisions
 from chitra.detect import (
     Finding,
     IncidentRecord,
@@ -777,7 +778,7 @@ def handle_agent_question(
 
     if len(question_lines) == 1:
         question = question_lines[0]
-        result = handle_question(goal, question)
+        result = handle_question(goal, question, decisions=read_decisions(config.state_dir / "decisions.jsonl"))
     else:
         question = " ".join(question_lines)
         result = None

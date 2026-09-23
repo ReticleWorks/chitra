@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from chitra.autonomy import AutonomyPolicy, CapabilityGrant
+from chitra.decisions import DecisionEntry
 from chitra.goals import GoalRecord
 from chitra.question_handler import QuestionHandlerResult, handle_question
 
@@ -151,3 +152,51 @@ def test_result_is_typed_and_does_not_claim_review_authority() -> None:
     assert isinstance(result, QuestionHandlerResult)
     assert result.model_config["extra"] == "forbid"
     assert not hasattr(result, "reviewer")
+
+
+def _decision(decision: str, *, decision_id: str = "dec-test-1") -> DecisionEntry:
+    return DecisionEntry(
+        decision_id=decision_id,
+        at="2026-09-22T00:00:00+00:00",
+        kind="adjudication",
+        decision=decision,
+        basis="Recorded test ruling.",
+        citation="test-suite",
+        authority="test authority",
+    )
+
+
+def test_recorded_decision_answers_a_covered_question_with_its_citation() -> None:
+    ruling = _decision("Keep the order queue on plain JSONL files; do not add a database.")
+    result = handle_question(_goal(), "Should the order queue move to a SQLite database?", decisions=[ruling])
+
+    assert result.disposition == "answered"
+    assert result.source == "decisions_log"
+    assert result.answer == f"{ruling.decision} (decision {ruling.decision_id})"
+    assert result.gate_reasons == ()
+
+
+def test_uncovered_goal_change_still_reaches_the_operator() -> None:
+    ruling = _decision("Keep the order queue on plain JSONL files; do not add a database.")
+    result = handle_question(
+        _goal(),
+        "Can we change the goal outcome to include a dashboard?",
+        decisions=[ruling],
+    )
+
+    assert result.disposition == "operator_required"
+    assert result.answer is None
+    assert result.gate_reasons == ("strategic_scope_change",)
+
+
+def test_credential_question_is_never_auto_answered() -> None:
+    ruling = _decision("The stored API key credential file stays inside the vault.")
+    result = handle_question(
+        _goal(),
+        "May I read the stored API key credential file in the vault?",
+        decisions=[ruling],
+    )
+
+    assert result.disposition == "residual"
+    assert result.source == "foreground_reasoning"
+    assert result.answer is None
