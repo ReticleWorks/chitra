@@ -383,13 +383,6 @@ def capture_pane(
     return result.stdout
 
 
-def event_line(lane_id: str, normalized_tail: Sequence[str], *, now: datetime | None = None) -> str:
-    """Format one event exactly as ``triaged.parse_event_line`` consumes it."""
-    timestamp = (now or datetime.now(UTC)).isoformat().replace("+00:00", "Z")
-    text = "CHANGE DETECTED: " + " | ".join(normalized_tail)
-    return f"{timestamp} {lane_id} {text}\n"
-
-
 def status_event_line(status: PaneStatus, *, now: datetime | None = None) -> str:
     """Format one semantic status transition for the legacy triaged log."""
     timestamp = (now or datetime.now(UTC)).isoformat().replace("+00:00", "Z")

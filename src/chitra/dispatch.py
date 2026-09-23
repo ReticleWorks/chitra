@@ -1088,14 +1088,6 @@ def ensure_nudge_submitted(
 # ---------------------------------------------------------------------------
 
 
-def _candidate_transcript_dirs(projects_root: Path | None = None) -> list[Path]:
-    """Return candidate ``~/.claude/projects/*`` transcript directories."""
-    root = projects_root if projects_root is not None else Path(_env("CHITRA_CLAUDE_PROJECTS", str(Path.home() / ".claude" / "projects")))
-    if not root.is_dir():
-        return []
-    return [p for p in root.iterdir() if p.is_dir()]
-
-
 def transcript_glob() -> str:
     """Return the configured relative transcript glob, validating its scope."""
     pattern = _env("CHITRA_TRANSCRIPT_GLOB", _TRANSCRIPT_GLOB_DEFAULT) or _TRANSCRIPT_GLOB_DEFAULT
