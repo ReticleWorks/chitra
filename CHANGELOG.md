@@ -4,6 +4,17 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+### Removed
+
+- Stop shipping the deprecated `chitra-watchd.service`,
+  `chitra-triaged.service`, and `chitra-sweepd.service` units. The Debian
+  package now installs `chitra-monitord@.service` — promoted from the former
+  `.service.example` template — alongside `chitra-dispatchd.service` and
+  `chitra@.service`. The `watchd`, `triaged`, and `sweepd` modules remain
+  installed for existing declarations that invoke them directly (`monitord`
+  and `load_shed` still import from them); only their standalone-daemon
+  systemd surface is gone.
+
 ## [0.21.1] - 2026-09-05
 
 ### Fixed

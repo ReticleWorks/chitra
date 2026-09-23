@@ -16,9 +16,7 @@ trap 'rm -rf "$stage"' EXIT
 install -d "$stage/opt/chitra" "$stage/etc/chitra" "$stage/usr/lib/systemd/system"
 cp -a "$venv_source" "$stage/opt/chitra/venv"
 cp "$repo_root/packaging/systemd/chitra-dispatchd.service" "$stage/usr/lib/systemd/system/"
-cp "$repo_root/packaging/systemd/chitra-watchd.service" "$stage/usr/lib/systemd/system/"
-cp "$repo_root/packaging/systemd/chitra-triaged.service" "$stage/usr/lib/systemd/system/"
-cp "$repo_root/packaging/systemd/chitra-sweepd.service" "$stage/usr/lib/systemd/system/"
+cp "$repo_root/packaging/systemd/chitra-monitord@.service" "$stage/usr/lib/systemd/system/"
 cp "$repo_root/packaging/systemd/chitra@.service" "$stage/usr/lib/systemd/system/"
 
 mkdir -p "$(dirname "$output")"
