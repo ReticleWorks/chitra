@@ -11,9 +11,14 @@ collapsed out of watchd, triaged, and sweepd:
 3. **Persistent action** -- record corrective intent before publishing a
    goal-bound order, reconcile queue and signed delivery proof after a crash,
    and wait for a completed agent turn before judging recurrence.
-4. **Enrollment and receipts** -- run registered validators only for an exact
-   completion claim, isolate receipts by goal session, and close only after
-   the stored evidence verifies independently.
+4. **Enrollment and receipts** -- run registered validators on any
+   completion claim, structured or plain, isolate receipts by goal session, and close only after
+   the stored evidence verifies independently. When the lane provably runs as
+   another OS user, validators execute on a bounded worker pool (one run in
+   flight per lane) and the pass consumes the recorded result once the
+   worktree digest it tested still matches; a lane sharing Chitra's OS user
+   keeps the synchronous run and second-execution check, because it could
+   write the record itself.
 5. **Presence** -- publish one advisory presence record per pass so peers can
    see which instance is observing which lanes.
 
@@ -35,7 +40,9 @@ import json
 import os
 import signal
 import threading
+from collections import Counter
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -45,17 +52,41 @@ import structlog
 
 from chitra._fsio import locked_json_store, write_json_atomic
 from chitra.canonical_choices import CanonicalChoicesPolicy, detect_canonical_choices
-from chitra.completion_gate import CompletionEvidence, extract_completion_evidence, has_structured_completion_line, is_completion_claim
+from chitra.completion_gate import (
+    CompletionEvidence,
+    EnrolledDoneWhenItemLike,
+    extract_completion_evidence,
+    has_structured_completion_line,
+    is_completion_claim,
+)
+from chitra.decisions import read_decisions
 from chitra.detect import (
     Finding,
+    IncidentRecord,
     IncidentStore,
     LadderDecision,
     ResponseLadder,
+    collect_rescue_bundle,
     detect_document_dithering,
     detect_drift,
     detect_excessive_testing,
     detect_false_done,
     detect_unnecessary_steps,
+    find_rescue_bundle,
+    rescue_bundle_process_fresh,
+    write_checkpoint_receipt,
+    write_rescue_bundle,
+)
+from chitra.dispatch import capture, is_local_host, pane_pid, tmux_pane_target
+from chitra.goal_enforcement import (
+    BehaviorReviewer,
+    ClaudeProcessReviewer,
+    GoalReviewError,
+    WatchedSessionBehavior,
+    freeze_goal,
+    load_latest_review_signal,
+    review_log_path,
+    review_watched_session,
 )
 from chitra.goals import (
     GoalRecord,
@@ -77,16 +108,26 @@ from chitra.journal import (
     native_session_identity,
 )
 from chitra.journal.store import EventJournal
+from chitra.orders import DispatchOrder
 from chitra.policy_config import load_policy_config
 from chitra.presence import append_presence
 from chitra.question_handler import handle_question
-from chitra.recovery import get_lane_lifecycle
+from chitra.recovery import get_lane_lifecycle, load_worktree_checkpoints
 from chitra.state_paths import state_dir as default_state_dir
 from chitra.supervision import SupervisionLedger, goal_digest
 from chitra.supervisor import reconcile_corrective_action, reconcile_question_action, record_observing
 from chitra.systemd_notify import notify_ready, notify_watchdog
 from chitra.transcript_bindings import DEFAULT_FILENAME, TranscriptBinding, load_transcript_bindings
-from chitra.validation_receipts import record_enrolled_validator_runs
+from chitra.validation_receipts import (
+    list_receipts,
+    receipt_path,
+    record_enrolled_validator_runs,
+    recorded_result_lane,
+    recorded_validator_run_fresh,
+    recorded_validator_run_proof,
+    run_enrolled_validators_on_worker,
+    worktree_git_digest,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -94,6 +135,7 @@ DEFAULT_POLL_SECONDS = 60.0
 PRESENCE_INSTANCE = "chitra-monitord"
 MONITORD_SCHEMA = "chitra.monitord.pass.v1"
 IDLE_PURSUIT_SCHEMA = "chitra.monitord.idle-pursuit.v1"
+_VALIDATOR_RUN_MAX_ATTEMPTS = 3
 _DETECTOR_ORDER = (
     "canonical_choices.deprecated_path",
     "drift",
@@ -198,30 +240,13 @@ def _lane_roots(state_dir: Path) -> list[Path]:
     )
 
 
-def ingest_lane_transcripts(
-    config: MonitordConfig,
-    lane: str,
-    transcripts: tuple[tuple[Path, NormalizationContext], ...],
-) -> tuple[CanonicalEvent, ...]:
-    """Ingest every declared transcript for one lane into its journal."""
-    observed: list[CanonicalEvent] = []
-    for transcript_path, context in transcripts:
-        with JournalIngestor(
-            state_root=config.state_dir,
-            transcript_path=transcript_path,
-            context=context,
-        ) as ingestor:
-            observed.extend(ingestor.poll().observed)
-    logger.info("monitord_ingested", lane=lane, events=len(observed))
-    return tuple(observed)
-
-
 def ingest_transcript_bindings(
     config: MonitordConfig,
     bindings: tuple[TranscriptBinding, ...],
 ) -> tuple[CanonicalEvent, ...]:
     """Ingest every explicitly bound JSONL transcript before journal discovery."""
     observed: list[CanonicalEvent] = []
+    unknown: dict[str, Counter[str]] = {}
     manifest_path = config.transcript_bindings_path or config.state_dir / DEFAULT_FILENAME
     for binding in bindings:
         transcript_path = _resolved_binding_path(config, binding, manifest_path=manifest_path)
@@ -232,12 +257,26 @@ def ingest_transcript_bindings(
             client_version=binding.client_version,
             goal_ref=binding.session_ref,
         )
-        with JournalIngestor(
-            state_root=config.state_dir,
-            transcript_path=transcript_path,
-            context=context,
-        ) as ingestor:
-            observed.extend(ingestor.poll().observed)
+        try:
+            with JournalIngestor(
+                state_root=config.state_dir,
+                transcript_path=transcript_path,
+                context=context,
+            ) as ingestor:
+                result = ingestor.poll()
+        except ValueError as exc:
+            # One malformed transcript skips its own lane this pass, not every lane.
+            logger.error("monitord_binding_ingest_failed", lane=binding.lane, error=str(exc))
+            continue
+        observed.extend(result.observed)
+        # Client versions are not gated. Newly appended records the normalizer
+        # does not recognize are the drift signal.
+        # Logging the native record types, not just a count, makes a new type stand out.
+        for event in result.appended:
+            if event.normalized_type is CanonicalType.UNKNOWN:
+                unknown.setdefault(event.lane, Counter())[str(event.payload.get("native_type"))] += 1
+    for lane, types in sorted(unknown.items()):
+        logger.info("monitord_unknown_events_ingested", lane=lane, events=sum(types.values()), types=dict(sorted(types.items())))
     if bindings:
         logger.info("monitord_bound_transcripts_ingested", bindings=len(bindings), events=len(observed))
     return tuple(observed)
@@ -300,6 +339,7 @@ def _idle_pursuit_finding(
     events: tuple[CanonicalEvent, ...],
     findings: list[Finding],
     question_outcome: str,
+    validator_pending: bool = False,
 ) -> Finding | None:
     """Persist clean-pass count and emit one deterministic idle finding."""
     path = _idle_pursuit_path(config, lane)
@@ -318,6 +358,7 @@ def _idle_pursuit_finding(
         and not findings
         and question_outcome == "none"
         and not delivery_pending
+        and not validator_pending
         and not goal.open_asks
         and not goal.needs
     )
@@ -338,7 +379,7 @@ def _idle_pursuit_finding(
         "native_session_id": events[0].session_id,
         "lane": events[0].lane,
         "goal_ref": events[0].goal_ref,
-        "client": events[0].client.value,
+        "client": str(events[0].client),
         "client_version": events[0].client_version,
         "instance": events[0].instance,
     }
@@ -412,6 +453,20 @@ def _final_response(events: tuple[CanonicalEvent, ...]) -> CanonicalEvent | None
     return None
 
 
+def _declared_worktree(config: MonitordConfig, goal: object) -> str:
+    """Return the lane's declared worktree realpath from its latest durable checkpoint.
+
+    The checkpoint binding is captured with ``git rev-parse --show-toplevel``
+    when the lane is anchored, so the boundary detector judges file access
+    against the real worktree rather than a placeholder.
+    """
+    session_ref = str(getattr(goal, "session_ref", "") or "")
+    if not session_ref:
+        return ""
+    checkpoints = load_worktree_checkpoints(config.state_dir, session_ref=session_ref)
+    return checkpoints[-1].binding.worktree_realpath if checkpoints else ""
+
+
 def run_detectors(
     config: MonitordConfig,
     lane: str,
@@ -429,7 +484,14 @@ def run_detectors(
     policy = canonical_choices_policy or load_policy_config().canonical_choices
     findings: list[Finding] = []
     findings.extend(detect_canonical_choices(events, policy, enrolled_items=enrolled_items))
-    findings.extend(detect_drift(events, scope_text=scope_text, declared_worktree="", enrolled_items=enrolled_items))
+    findings.extend(
+        detect_drift(
+            events,
+            scope_text=scope_text,
+            declared_worktree=_declared_worktree(config, goal),
+            enrolled_items=enrolled_items,
+        )
+    )
     findings.extend(detect_unnecessary_steps(events, enrolled_items=enrolled_items))
     findings.extend(detect_excessive_testing(events, enrolled_items=enrolled_items))
     findings.extend(detect_document_dithering(events, goal_is_document=goal_is_document, enrolled_items=enrolled_items))
@@ -439,10 +501,11 @@ def run_detectors(
 def _bind_findings_to_goal(findings: list[Finding], goal: GoalRecord) -> list[Finding]:
     """Bind detector identities to the exact frozen goal being observed.
 
-    Incident records remain keyed by their existing finding fingerprint.  The
-    monitor therefore incorporates the current goal version and digest into a
-    fresh fingerprint before a finding reaches the ladder.  A recurrence from
-    an earlier goal revision cannot reuse or advance that revision's incident.
+    Incident pressure tracks are keyed on (goal digest, unmet item); the
+    finding fingerprint is only a detail field on the record.  The monitor
+    still incorporates the current goal version and digest into a fresh
+    fingerprint so the stored detail and order markers stay scoped to the
+    exact goal revision that produced the finding.
     """
     digest = goal_digest(goal)
     return [
@@ -467,6 +530,7 @@ def evaluate_findings(
     lane: str,
     findings: list[Finding],
     *,
+    goal_digest_value: str,
     order_marker: str = "[M] monitord",
     on_decision: Callable[[Finding, LadderDecision], None] | None = None,
     journal_events: tuple[CanonicalEvent, ...] = (),
@@ -481,7 +545,7 @@ def evaluate_findings(
     actions: list[str] = []
     for finding in findings:
         marker = f"{order_marker}:{finding.fingerprint[:16]}"
-        decision = ladder.evaluate(lane=lane, finding=finding, order_marker=marker)
+        decision = ladder.evaluate(lane=lane, finding=finding, order_marker=marker, goal_digest=goal_digest_value)
         actions.append(decision.action)
         if on_decision is not None:
             on_decision(finding, decision)
@@ -497,35 +561,345 @@ def evaluate_findings(
     return actions
 
 
+def _rescue_checkpoint_ref(record: IncidentRecord) -> str:
+    """One deterministic receipt name per rescue-stage instance."""
+    seed = f"{record.track_id}:{record.order_marker}:{record.opened_at}"
+    return f"rescue-{hashlib.sha256(seed.encode()).hexdigest()[:40]}"
+
+
+def _collect_lane_rescue_bundle(
+    config: MonitordConfig,
+    *,
+    lane: str,
+    goal: GoalRecord,
+    store: IncidentStore,
+    transcript_path: Path | None,
+) -> Any | None:
+    """Capture the RESCUE bundle while the lane's pane process is still alive.
+
+    Every failure is a hold, not an exception: a bundle collected against a
+    dead or unobservable process would fail its own identity checks at seal
+    time, so the pass simply tries again while the lane still runs.
+    """
+    parts = goal.session_ref.split(":")
+    if len(parts) != 3 or not is_local_host(parts[0]):
+        # /proc identity is only meaningful for a local pane process.
+        return None
+    host, session, pane_field = parts
+    pane = tmux_pane_target(session, pane_field)
+    pid = pane_pid(pane, host=host)
+    if pid is None:
+        return None
+    checkpoints = load_worktree_checkpoints(config.state_dir, session_ref=goal.session_ref)
+    if not checkpoints:
+        return None
+    worktree = Path(checkpoints[-1].binding.worktree_realpath)
+    try:
+        receipt_paths = [
+            receipt_path(config.state_dir, goal.session_ref, receipt.receipt_name)
+            for receipt in list_receipts(config.state_dir, goal.session_ref)
+        ]
+        pane_lines = capture(host, pane, 200)
+        bundle = collect_rescue_bundle(
+            lane=lane,
+            session_ref=goal.session_ref,
+            worktree=worktree,
+            transcript_path=transcript_path,
+            pane_capture="\n".join(pane_lines),
+            receipt_paths=receipt_paths,
+            contract_text=json.dumps(goal.to_dict(), sort_keys=True, ensure_ascii=False),
+            incidents=store.load(),
+            open_asks=goal.open_asks,
+            process_identity={"target_pid": pid},
+        )
+    except (RuntimeError, OSError, ValueError) as exc:
+        logger.warning("monitord_rescue_capture_failed", lane=lane, error=str(exc))
+        return None
+    write_rescue_bundle(bundle, config.state_dir)
+    logger.info("monitord_rescue_bundle_captured", lane=lane, bundle_sha256=bundle.bundle_sha256)
+    return bundle
+
+
+def reconcile_rescue_checkpoint(
+    config: MonitordConfig,
+    *,
+    lane: str,
+    goal: GoalRecord,
+    track_id: str,
+    transcript_path: Path | None,
+) -> None:
+    """Drive one rescue-stage incident from bundle capture to a sealed checkpoint.
+
+    The bundle is collected while the lane process is still alive — the
+    captured ``target_pid`` identity is re-observed when the checkpoint
+    receipt is written, so a process that already exited can never produce a
+    sealable bundle. Sealing waits for proven consumption of the rescue
+    order; the next recurrence then advances the track to relaunch.
+    """
+    store = IncidentStore(config.state_dir, lane)
+    record = store.latest(track_id)
+    if record is None or record.stage != "rescue" or record.checkpoint_ref:
+        return
+    bundle = find_rescue_bundle(config.state_dir, record, session_ref=goal.session_ref)
+    if bundle is not None and not rescue_bundle_process_fresh(bundle):
+        bundle = None
+    if bundle is None:
+        bundle = _collect_lane_rescue_bundle(
+            config,
+            lane=lane,
+            goal=goal,
+            store=store,
+            transcript_path=transcript_path,
+        )
+        if bundle is None:
+            return
+    if record.consumption is None:
+        # The bundle now sits on disk; the rescue order's consumption is the
+        # only remaining gate before the checkpoint receipt can be sealed.
+        return
+    checkpoint_ref = _rescue_checkpoint_ref(record)
+    receipt_file = config.state_dir / "checkpoints" / f"{checkpoint_ref}.json"
+    if not receipt_file.exists():
+        try:
+            write_checkpoint_receipt(
+                bundle=bundle,
+                record=record,
+                state_root=config.state_dir,
+                checkpoint_ref=checkpoint_ref,
+            )
+        except (RuntimeError, ValueError) as exc:
+            logger.warning("monitord_rescue_checkpoint_receipt_failed", lane=lane, error=str(exc))
+            return
+    try:
+        store.seal_rescue_checkpoint(
+            track_id=track_id,
+            order_marker=record.order_marker,
+            bundle_sha256=bundle.bundle_sha256,
+            checkpoint_ref=checkpoint_ref,
+        )
+    except ValueError as exc:
+        logger.warning("monitord_rescue_checkpoint_seal_failed", lane=lane, error=str(exc))
+        return
+    logger.info("monitord_rescue_checkpoint_sealed", lane=lane, checkpoint_ref=checkpoint_ref)
+
+
+def _lane_work_in_flight(
+    config: MonitordConfig,
+    session_ref: str,
+    events: tuple[CanonicalEvent, ...],
+) -> tuple[str, ...]:
+    """Name this lane's work still in flight, for the completion reviewer.
+
+    Mirrors watchd's turn-end list: a ``run_in_background`` tool call in the
+    journal's latest session with no joined result or error is still
+    running, and an order dispatchd has claimed under ``in_flight/`` for
+    this session is being delivered right now.
+    """
+    running: list[str] = []
+    if events:
+        current_session = events[-1].session_id
+        answered = {
+            event.native_join_id
+            for event in events
+            if event.normalized_type in (CanonicalType.TOOL_RESULT, CanonicalType.TOOL_ERROR)
+        }
+        for event in events:
+            call_input = event.payload.get("input")
+            if (
+                event.normalized_type is CanonicalType.TOOL_CALL
+                and event.native_join_id is not None
+                and event.session_id == current_session
+                and event.native_join_id not in answered
+                and isinstance(call_input, dict)
+                and call_input.get("run_in_background") is True
+            ):
+                tool_name = event.payload.get("tool_name")
+                suffix = f" ({tool_name})" if isinstance(tool_name, str) and tool_name else ""
+                running.append(f"background tool call {event.native_join_id}{suffix} is still running")
+    in_flight_dir = config.dispatch_queue_dir / "in_flight" if config.dispatch_queue_dir is not None else None
+    if in_flight_dir is not None and in_flight_dir.is_dir():
+        for order_path in sorted(in_flight_dir.glob("*.json")):
+            try:
+                order = DispatchOrder.model_validate_json(order_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if order.session_ref == session_ref:
+                running.append(f"dispatch order {order.order_id} is being delivered to the lane")
+    return tuple(running)
+
+
+class _ValidatorRunPool:
+    """Bounded worker pool that keeps validator execution off the monitor loop.
+
+    At most one run is ever in flight per lane key: a lane whose previous
+    run is still executing is not requeued, so validators cannot pile up on
+    a tree that is still moving. A worker records its result under
+    ``validation-runs/`` and a later pass reads the record instead of
+    waiting on the future. ``attempts`` counts runs queued since the gate
+    last consumed a fresh result. It bounds both a worker that fails before
+    it can record and a run whose record is always stale (for example a
+    validator that writes into the tree it tests), so either one falls
+    back to the old synchronous call instead of queueing forever.
+    """
+
+    def __init__(self, max_workers: int = 4) -> None:
+        self._max_workers = max_workers
+        self._executor = self._new_executor()
+        self._lock = threading.Lock()
+        self._in_flight: dict[str, Future[None]] = {}
+        self._attempts: dict[str, int] = {}
+
+    def submit(self, lane_key: str, work: Callable[[], None]) -> None:
+        """Queue ``work`` unless this lane already has a run in flight."""
+        with self._lock:
+            current = self._in_flight.get(lane_key)
+            if current is not None and not current.done():
+                return
+            self._attempts[lane_key] = self._attempts.get(lane_key, 0) + 1
+            future = self._executor.submit(work)
+            self._in_flight[lane_key] = future
+        future.add_done_callback(lambda done: self._completed(lane_key, done))
+
+    def _new_executor(self) -> ThreadPoolExecutor:
+        return ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="chitra-validator-run")
+
+    def in_flight(self, lane_key: str) -> bool:
+        """Return whether this lane has a queued or running validator run."""
+        with self._lock:
+            current = self._in_flight.get(lane_key)
+            return current is not None and not current.done()
+
+    def _completed(self, lane_key: str, future: Future[None]) -> None:
+        try:
+            future.result()
+        except Exception as exc:
+            logger.error("monitord_validator_run_failed", lane=lane_key, error=str(exc))
+            return
+        with self._lock:
+            if self._in_flight.get(lane_key) is future:
+                self._in_flight.pop(lane_key, None)
+
+    def attempts(self, lane_key: str) -> int:
+        """Return how many runs this lane queued since its last consumed result."""
+        with self._lock:
+            return self._attempts.get(lane_key, 0)
+
+    def reset(self, lane_key: str) -> None:
+        """Clear the attempt count once the gate has consumed a result."""
+        with self._lock:
+            self._attempts.pop(lane_key, None)
+
+    def wait_idle(self, timeout: float | None = None) -> bool:
+        """Block until no lane has a run in flight; used by tests and shutdown."""
+        with self._lock:
+            futures = [future for future in self._in_flight.values() if not future.done()]
+        if not futures:
+            return True
+        _finished, pending = wait(futures, timeout=timeout)
+        return not pending
+
+    def shutdown(self) -> None:
+        """Cancel queued runs without blocking exit on running validators.
+
+        The module-level pool outlives one ``run_forever`` call, so a fresh
+        executor replaces the stopped one; a later pass in the same process
+        can still queue work instead of failing on a shut-down executor.
+        """
+        with self._lock:
+            stopped, self._executor = self._executor, self._new_executor()
+        stopped.shutdown(wait=False, cancel_futures=True)
+
+
+_VALIDATOR_RUN_POOL = _ValidatorRunPool()
+
+
+def _claimed_run_evidence(
+    config: MonitordConfig,
+    goal: GoalRecord,
+    session_ref: str,
+    items: tuple[EnrolledDoneWhenItemLike, ...],
+) -> tuple[CompletionEvidence, ...] | None:
+    """Return validator evidence for a structured claim, or None while a run is pending.
+
+    When the lane provably runs as another OS user, the enrolled validators
+    execute on the worker pool — one run in flight per lane — and the
+    recorded result, stamped with the worktree digest it tested, stands in
+    for the gate's re-execution. When the lane shares Chitra's user a record
+    file proves nothing, so both the run and the gate's second execution
+    stay synchronous, exactly as before.
+    """
+    lane = recorded_result_lane(config.state_dir, session_ref)
+    current_digest = worktree_git_digest(lane.workdir) if lane is not None else None
+    if lane is None or current_digest is None:
+        return record_enrolled_validator_runs(config.state_dir, session_ref, items)
+    lane_key = f"{config.state_dir}:{goal.lane_id or session_ref}"
+    if _VALIDATOR_RUN_POOL.in_flight(lane_key):
+        # A running worker may be rewriting these receipts and records right
+        # now: neither read them nor start a second run beside it.
+        return None
+    if all(
+        recorded_validator_run_fresh(config.state_dir, session_ref, item, current_digest=current_digest)
+        for item in items
+    ):
+        _VALIDATOR_RUN_POOL.reset(lane_key)
+        return tuple(recorded_validator_run_proof(config.state_dir, session_ref, item) for item in items)
+    if _VALIDATOR_RUN_POOL.attempts(lane_key) >= _VALIDATOR_RUN_MAX_ATTEMPTS:
+        # Worker runs that keep failing, or keep landing stale records, are
+        # surfaced through the same synchronous call the inline path made
+        # instead of queueing forever. The next claim tries the pool again.
+        _VALIDATOR_RUN_POOL.reset(lane_key)
+        return record_enrolled_validator_runs(config.state_dir, session_ref, items)
+    _VALIDATOR_RUN_POOL.submit(
+        lane_key,
+        lambda: run_enrolled_validators_on_worker(
+            config.state_dir,
+            session_ref,
+            items,
+            workdir=lane.workdir,
+        ),
+    )
+    return None
+
+
 def check_enrollment_and_receipts(
     config: MonitordConfig,
     session_ref: str,
     final_response: CanonicalEvent | None = None,
-) -> tuple[int, bool, list[Finding]]:
+    *,
+    reviewer: BehaviorReviewer | None = None,
+    still_running: tuple[str, ...] = (),
+) -> tuple[int, bool, list[Finding], bool]:
     """Verify an explicit completion claim against its enrolled contract.
 
-    Validators run only when the latest unconsumed final response contains a
-    structured completion line. The lane's claimed result is ignored; Chitra
-    executes and stores each enrolled validator itself. A missing or held
-    goal and a turn without a completion claim are silent.
+    Validators run on any completion claim in the latest unconsumed final
+    response, whether or not it carries a structured completion line. The
+    lane's claimed result is ignored; Chitra executes and stores each
+    enrolled validator itself. A missing or held goal and a turn without a
+    completion claim are silent. For a lane that runs as another OS user
+    the execution happens on the worker pool and a claim is neither passed
+    nor disputed while that run is in flight; the fourth return value
+    reports that pending state so the pass does not treat a lane under
+    active validation as idle. ``still_running`` names lane work still in
+    flight so the isolated reviewer can answer "insufficient", which is
+    reported the same way: pending, neither passed nor disputed.
     """
     try:
         goal = get_goal(config.state_dir, session_ref)
     except Exception:
-        return 0, False, []
+        return 0, False, [], False
     if goal is None or goal.status not in {
         "working",
         "blocked",
         "turn-finished-unverified",
         "completion-disputed",
     }:
-        return 0, False, []
+        return 0, False, [], False
     final_text = ""
     if final_response is not None:
         payload_text = final_response.payload.get("text")
         final_text = payload_text if isinstance(payload_text, str) else ""
     if not final_text or not is_completion_claim(final_text):
-        return 0, False, []
+        return 0, False, [], False
 
     items = tuple(getattr(goal, "enrolled_done_when_items", ()) or ())
     if not items:
@@ -546,7 +920,7 @@ def check_enrollment_and_receipts(
                 now=findings[0].detail,
                 status="completion-disputed",
             )
-        return 0, True, findings
+        return 0, True, findings, False
 
     claimed_evidence = tuple(extract_completion_evidence(final_text))
     claim_bindings: dict[str, str] = {}
@@ -559,9 +933,18 @@ def check_enrollment_and_receipts(
         ):
             claim_bindings[item.id] = item.required_receipt
 
-    run_evidence: tuple[CompletionEvidence, ...] = ()
-    if has_structured_completion_line(final_text):
-        run_evidence = record_enrolled_validator_runs(config.state_dir, session_ref, items)
+    claimed = _claimed_run_evidence(config, goal, session_ref, items)
+    if claimed is None:
+        # A worker run is in flight or was just queued: the claim
+        # neither passes nor disputes until the recorded result lands.
+        return 0, False, [], True
+    run_evidence = claimed
+    if not has_structured_completion_line(final_text):
+        # A plain-language claim binds no item to a receipt, so bind every
+        # enrolled item to the receipt Chitra just stored and let those
+        # receipts decide the claim.
+        for item in items:
+            claim_bindings[item.id] = item.required_receipt
 
     material_questions = (*goal.open_asks, *((goal.needs,) if goal.needs else ()))
     findings = detect_false_done(
@@ -572,6 +955,74 @@ def check_enrollment_and_receipts(
         session_ref=session_ref,
         material_questions=material_questions,
     )
+    if not findings and not config.shadow_mode:
+        # The same isolated reviewer that gates completion claims under watchd
+        # now gates them here: a deterministic pass alone does not release a
+        # claimed "done". A stored signal for this exact behavior and contract
+        # is reused so an unchanged disputed claim does not pay for a fresh
+        # review round every pass.
+        behavior = WatchedSessionBehavior.from_turn(session_ref, final_text, still_running=still_running)
+        signal = load_latest_review_signal(review_log_path(config.state_dir), session_ref)
+        try:
+            contract_id = freeze_goal(goal).contract_id
+        except GoalReviewError:
+            contract_id = ""
+        if (
+            signal is None
+            or signal.behavior_sha256 != behavior.behavior_sha256
+            or signal.goal_contract_id != contract_id
+            # An "insufficient" verdict only holds while lane work is still
+            # in flight; once it finishes, the same claim is judged afresh.
+            or (signal.verdict == "insufficient" and not behavior.still_running)
+        ):
+            try:
+                signal = review_watched_session(
+                    config.state_dir,
+                    session_ref,
+                    behavior,
+                    reviewer=reviewer if reviewer is not None else ClaudeProcessReviewer(),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "monitord_completion_review_unavailable",
+                    session_ref=session_ref,
+                    error=str(exc),
+                )
+                signal = None
+                findings = [
+                    Finding(
+                        detector="false_done",
+                        fingerprint_seed={"session_ref": session_ref, "reason": "review-unavailable"},
+                        event_refs=(final_response.event_id,) if final_response is not None else (),
+                        unmet_item="isolated completion review",
+                        expected_next_progress="restore the isolated reviewer and re-claim completion",
+                        detail=f"the isolated completion review could not run: {exc}",
+                    )
+                ]
+        if not findings and signal is not None and signal.verdict == "insufficient":
+            # The reviewers could not decide while lane work is still in
+            # flight: like watchd, leave the goal untouched and report the
+            # claim as pending rather than disputing it.
+            return len(run_evidence), False, [], True
+        if not findings and signal is not None and signal.verdict != "accept":
+            review_detail = "; ".join(f"{item.code}: {item.detail}" for item in signal.findings)
+            findings = [
+                Finding(
+                    detector="false_done",
+                    fingerprint_seed={
+                        "session_ref": session_ref,
+                        "reason": "review-rejected",
+                        "signal_id": signal.signal_id,
+                    },
+                    event_refs=(final_response.event_id,) if final_response is not None else (),
+                    unmet_item="isolated completion review",
+                    expected_next_progress="resolve the cited review findings before claiming completion again",
+                    detail=(
+                        "isolated reviewers rejected the completion claim"
+                        + (f": {review_detail}" if review_detail else "")
+                    ),
+                )
+            ]
     if not findings and not config.shadow_mode:
         try:
             mark_completion_gate_passed(
@@ -601,7 +1052,7 @@ def check_enrollment_and_receipts(
             now="; ".join(finding.detail for finding in findings),
             status="completion-disputed",
         )
-    return len(run_evidence), disputed, findings
+    return len(run_evidence), disputed, findings, False
 
 
 def handle_agent_question(
@@ -630,7 +1081,7 @@ def handle_agent_question(
 
     if len(question_lines) == 1:
         question = question_lines[0]
-        result = handle_question(goal, question)
+        result = handle_question(goal, question, decisions=read_decisions(config.state_dir / "decisions.jsonl"))
     else:
         question = " ".join(question_lines)
         result = None
@@ -812,10 +1263,11 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                     detector_events = events[boundary + 1 :]
         if goal is not None:
             final_response = _final_response(detector_events)
-            receipts_recorded, completion_disputed, enrollment_findings = check_enrollment_and_receipts(
+            receipts_recorded, completion_disputed, enrollment_findings, validator_pending = check_enrollment_and_receipts(
                 config,
                 goal.session_ref,
                 final_response,
+                still_running=_lane_work_in_flight(config, goal.session_ref, events),
             )
             refreshed_goal = get_goal(config.state_dir, goal.session_ref)
             if refreshed_goal is not None:
@@ -823,7 +1275,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
         else:
             # Legacy or unresolved bindings remain observable, but no other
             # goal may be borrowed for detector context or receipt checks.
-            receipts_recorded, completion_disputed, enrollment_findings = 0, False, []
+            receipts_recorded, completion_disputed, enrollment_findings, validator_pending = 0, False, [], False
             final_response = None
 
         completion_verified = bool(goal is not None and goal.status == "done-pending-close")
@@ -873,6 +1325,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
             events,
             findings,
             question_outcome,
+            validator_pending=validator_pending,
         )
         if idle_finding is not None:
             findings.append(idle_finding)
@@ -904,6 +1357,17 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                 ledger_key_path=config.ledger_key_path,
                 retry_delay_seconds=config.retry_delay_seconds,
             )
+            # RESCUE is evidence work, not another corrective order: capture
+            # the bundle while the lane process is still alive, then seal the
+            # checkpoint once the rescue order's consumption is proven. The
+            # next recurrence on this track can then advance to relaunch.
+            reconcile_rescue_checkpoint(
+                config,
+                lane=active_lane,
+                goal=active_goal,
+                track_id=decision.record.track_id,
+                transcript_path=binding_paths.get(active_lane),
+            )
 
         if goal is None:
             # The journal remains observable for diagnosis, but an unresolved
@@ -918,6 +1382,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                 config,
                 lane,
                 scheduled_findings,
+                goal_digest_value=goal_digest(goal),
                 on_decision=supervise_finding,
                 journal_events=events,
                 ledger_key=(
@@ -989,10 +1454,15 @@ def run_forever(config: MonitordConfig, *, stop_event: threading.Event | None = 
     active_stop_event = stop_event or threading.Event()
     logger.info("monitord_started", state_dir=str(config.state_dir), poll_seconds=config.poll_seconds)
     notify_ready()
-    while not active_stop_event.is_set():
-        run_once(config)
-        notify_watchdog()
-        active_stop_event.wait(config.poll_seconds)
+    try:
+        while not active_stop_event.is_set():
+            run_once(config)
+            notify_watchdog()
+            active_stop_event.wait(config.poll_seconds)
+    finally:
+        # Running validators keep their threads; an unfinished run simply
+        # never records a result and the next daemon start re-queues it.
+        _VALIDATOR_RUN_POOL.shutdown()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

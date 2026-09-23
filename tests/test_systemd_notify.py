@@ -45,22 +45,6 @@ def test_watchdog_for_another_pid_is_disabled() -> None:
     assert watchdog_usec(env={"WATCHDOG_USEC": "6000000", "WATCHDOG_PID": "999"}, pid=1000) is None
 
 
-@pytest.mark.parametrize(
-    ("unit_name", "watchdog_seconds"),
-    [
-        ("chitra-watchd.service", "15"),
-        ("chitra-sweepd.service", "180"),
-        ("chitra-triaged.service", "6"),
-    ],
-)
-def test_daemon_units_enable_systemd_watchdog(unit_name: str, watchdog_seconds: str) -> None:
-    unit = (REPO_ROOT / "packaging" / "systemd" / unit_name).read_text(encoding="utf-8")
-
-    assert "Type=notify" in unit
-    assert "NotifyAccess=main" in unit
-    assert f"WatchdogSec={watchdog_seconds}" in unit
-
-
 @pytest.mark.parametrize("module_name", ["watchd.py", "sweepd.py", "triaged.py"])
 def test_daemon_loops_notify_ready_and_watchdog_without_heartbeat_files(module_name: str) -> None:
     source = (REPO_ROOT / "src" / "chitra" / module_name).read_text(encoding="utf-8")

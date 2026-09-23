@@ -1,10 +1,13 @@
 """Deterministic answers and residuals for questions about one goal.
 
 The handler is intentionally smaller than a conversational agent.  It can
-answer only facts that are present in the enrolled goal contract. Questions
-the contract does not settle become residuals for the foreground Chitra
-reasoning path. Only questions that request protected authority are
-operator-gated.
+answer only facts that are present in the enrolled goal contract or in the
+append-only decisions log: a recorded ruling that shares enough content words
+with the question answers it, always citing the decision id so a wrong match
+stays contestable. Questions neither source settles become residuals for the
+foreground Chitra reasoning path. Only questions that request protected
+authority are operator-gated, and questions about credentials, spend, or
+irreversible actions never take the decisions-log shortcut.
 
 There is no model call and there is no inferred reviewer or approval source in
 this module.  The ``request_id`` binds the result to the exact question and
@@ -17,18 +20,20 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Sequence
 from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from chitra.autonomy import Capability, CapabilityUse, authorize_action, capability_target_from_text
+from chitra.decisions import DecisionEntry
 from chitra.goals import GoalRecord, done_when_with_delta
 from chitra.supervision import goal_digest
 
 QuestionDisposition = Literal["answered", "residual", "operator_required"]
 QuestionKind = Literal["next", "scope", "done_when", "small_delta", "unknown"]
-QuestionSource = Literal["frozen_goal", "foreground_reasoning", "operator_required"]
+QuestionSource = Literal["frozen_goal", "foreground_reasoning", "operator_required", "decisions_log"]
 GateReason = Literal[
     "credentials",
     "spend",
@@ -253,6 +258,60 @@ def _capability_uses(
     return tuple(uses), changes_frozen_outcome
 
 
+# Ask gate: a recorded monitor decision answers a lane's question before the
+# question becomes an operator-facing item. The match is a deliberately naive,
+# deterministic word overlap — the newest decision in append order that
+# shares enough content words wins, so a later ruling supersedes the one it
+# reverses. dispatchd recomputes the answer before delivery, so a queued
+# answer displaced by a newer ruling is rejected instead of relayed stale.
+# Every auto-answer cites the decision id, which keeps a wrong match
+# contestable.
+_ASK_GATE_MIN_SHARED_WORDS = 3
+
+# Function words long enough to pass the length filter but present in almost
+# every question; counting them lets an unrelated ruling answer.
+_ASK_GATE_STOPWORDS = frozenset(
+    {
+        "about", "also", "been", "before", "could", "does", "done", "each", "from", "have",
+        "here", "into", "just", "like", "more", "much", "must", "need", "only", "other",
+        "over", "same", "should", "some", "such", "than", "that", "their", "them", "then",
+        "there", "these", "they", "this", "those", "want", "were", "what", "when", "where",
+        "which", "while", "will", "with", "would", "your",
+    }
+)  # fmt: skip
+
+# A word-overlap ruling is never authority for these capability classes; a
+# question that needs one keeps the native approval path no matter what the
+# decisions log contains.
+_ASK_GATE_PROTECTED_CAPABILITIES: frozenset[Capability] = frozenset(
+    {"credential_use", "authentication", "security_change", "irreversible_action", "spend"}
+)
+
+# Mirror of dispatch._BANNED (kept separate because dispatch imports this
+# module through orders). A ruling whose text cannot be relayed verbatim is
+# skipped rather than queued as an answer build_question_order would reject.
+_ASK_GATE_UNDELIVERABLE_RE = re.compile(r"\boperator\b|\bthe monitor\b|\bchitra (?:wants|says|needs|relays)\b", re.I)
+
+
+def _decision_words(text: str) -> frozenset[str]:
+    return frozenset(
+        word for word in re.findall(r"[a-z0-9]+", text.lower()) if len(word) > 3 and word not in _ASK_GATE_STOPWORDS
+    )
+
+
+def _match_decision(question: str, decisions: Sequence[DecisionEntry]) -> DecisionEntry | None:
+    """Return the newest recorded ruling covering ``question``, or ``None``."""
+    question_words = _decision_words(question)
+    if len(question_words) < _ASK_GATE_MIN_SHARED_WORDS:
+        return None
+    for entry in reversed(decisions):
+        if _ASK_GATE_UNDELIVERABLE_RE.search(entry.decision):
+            continue
+        if len(question_words & _decision_words(entry.decision)) >= _ASK_GATE_MIN_SHARED_WORDS:
+            return entry
+    return None
+
+
 def _request_id(question: str, digest: str) -> str:
     payload = json.dumps([digest, question], ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return f"sha256:{hashlib.sha256(payload).hexdigest()}"
@@ -291,11 +350,32 @@ def _result(
     )
 
 
-def handle_question(goal: GoalRecord, question: str) -> QuestionHandlerResult:
+def _decision_answer(goal: GoalRecord, question: str, ruling: DecisionEntry) -> QuestionHandlerResult:
+    """Answer from a recorded ruling, citing its decision id for contest."""
+    return _result(
+        goal,
+        question,
+        kind="unknown",
+        disposition="answered",
+        source="decisions_log",
+        answer=f"{ruling.decision} (decision {ruling.decision_id})",
+        reason="A recorded decision already settles this question; the decision id is cited so a wrong match can be contested.",
+    )
+
+
+def handle_question(
+    goal: GoalRecord,
+    question: str,
+    *,
+    decisions: Sequence[DecisionEntry] = (),
+) -> QuestionHandlerResult:
     """Answer a frozen-goal question or return a foreground residual.
 
     The function never guesses what an absent scope item means, never uses
     mutable tactical state as authority, and never returns an action approval.
+    When ``decisions`` is supplied, a recorded ruling that clears the ask-gate
+    match answers the question with its decision id cited; questions needing a
+    protected capability never take that shortcut.
     """
     if not isinstance(question, str) or not question.strip():
         return _result(
@@ -337,7 +417,14 @@ def handle_question(goal: GoalRecord, question: str) -> QuestionHandlerResult:
         capability_uses,
         changes_frozen_outcome=changes_frozen_outcome,
     )
+    ruling = (
+        None
+        if any(use.capability in _ASK_GATE_PROTECTED_CAPABILITIES for use in capability_uses)
+        else _match_decision(text, decisions)
+    )
     if authority.disposition == "operator_required":
+        if ruling is not None:
+            return _decision_answer(goal, text, ruling)
         reasons = tuple(
             dict.fromkeys(
                 ("strategic_scope_change" if changes_frozen_outcome else _CAPABILITY_GATE_REASON[use.capability]) for use in capability_uses
@@ -505,6 +592,8 @@ def handle_question(goal: GoalRecord, question: str) -> QuestionHandlerResult:
             reason="The next bounded direction is determined by the frozen goal and completion condition.",
         )
 
+    if ruling is not None:
+        return _decision_answer(goal, text, ruling)
     return _result(
         goal,
         text,

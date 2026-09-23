@@ -26,7 +26,12 @@ that a message was actually received; the transcript is. For a remote
 target, recent candidate paths and their tails are read over ssh against the
 **target host's** filesystem (``find_recent_transcript_remote``), then
 compared locally — the transcript proving a remote delivery lives on the
-remote host, never on the machine chitra runs on.
+remote host, never on the machine chitra runs on. When transcript-grep
+cannot locate a transcript at all, a pane capture showing the submitted
+marker in the lane's scrollback with a cleared, recognized TUI composer is
+still proof the order landed and reports SENT; the same marker with no
+recognized composer (a bare shell echo, an unknown TUI shape) stays
+DELIVERY_UNCONFIRMED for verify-only retry.
 
 Single-writer rule
 -----------------
@@ -77,6 +82,7 @@ from typing import Protocol
 
 import structlog
 
+from chitra.journal.normalizers import queued_operator_prompt
 from chitra.orders import DispatchOrder, DispatchResult, DispatchStatus
 from chitra.policy_config import PolicyConfig
 
@@ -95,6 +101,15 @@ DISPATCH_CAPTURE_LINES: int = 12
 # observed flush delay before declaring a delivery unverified.
 DISPATCH_VERIFY_WAIT_SECONDS: float = 15.0
 PANE_IN_MODE_CANCEL_WAIT_SECONDS: float = 0.3
+# tmux reports ``send-keys Enter`` success when the bytes reach the pane's
+# pty; the lane's TUI consumes the submit and repaints its composer
+# asynchronously. A single capture taken right after Enter therefore races
+# the submit it verifies — a live eval measured a delivered, answered order
+# reported submit-failed in 0.066 s because the composer row still showed
+# the just-pasted draft. Poll the composer over a short grace window before
+# firing a fallback or declaring the submit failed.
+SUBMIT_VERIFY_POLL_SECONDS: float = 0.25
+SUBMIT_VERIFY_MAX_POLLS: int = 8
 DEFAULT_REMOTE_HOSTS: str = ""
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -791,6 +806,36 @@ def ensure_pane_not_in_mode(
     return cancel_copy_mode(pane, host=host, runner=runner, local_extra=local_extra, tmux_socket=tmux_socket)
 
 
+def pane_pid(
+    pane: str,
+    *,
+    host: str = "",
+    runner: TmuxRunner | None = None,
+    local_extra: set[str] | None = None,
+    tmux_socket: Path | None = None,
+) -> int | None:
+    """Return the target pane's root process id, or ``None`` when unavailable.
+
+    The pid is only meaningful on the host whose tmux server answered the
+    query — a caller that reads ``/proc`` must gate remote hosts out itself.
+    """
+    proc = run_on_host(
+        host,
+        ["tmux", "display-message", "-p", "-t", pane, "#{pane_pid}"],
+        runner=runner,
+        local_extra=local_extra,
+        tmux_socket=tmux_socket,
+        timeout=5,
+    )
+    if proc.returncode != 0:
+        return None
+    try:
+        pid = int(proc.stdout.strip())
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
 # ---------------------------------------------------------------------------
 # Paste commands (BUG FIX (a): -p on paste-buffer)
 # ---------------------------------------------------------------------------
@@ -945,6 +990,33 @@ def _send_submit_fallback(
     return enter.returncode == 0
 
 
+def _capture_pane_until_composer_clears(
+    host: str,
+    pane: str,
+    marker: str,
+    *,
+    runner: TmuxRunner,
+    local_extra: set[str] | None,
+    tmux_socket: Path | None,
+    lines: int,
+    sleep: Callable[[float], None],
+) -> list[str]:
+    """Capture the pane, re-polling while the composer still holds ``marker``.
+
+    Returns the last capture, which may still hold the marker once the grace
+    window expires — the caller re-checks. Polling stops early when a turn is
+    already running: composer text then is stale, not this submit waiting to
+    land, and further captures only delay the fallback decision.
+    """
+    captured = capture_dispatch_pane(host, pane, lines=lines, runner=runner, local_extra=local_extra, tmux_socket=tmux_socket)
+    for _ in range(SUBMIT_VERIFY_MAX_POLLS):
+        if not captured or not _composer_holds_marker(captured, marker) or _active_turn_chrome_visible(captured):
+            break
+        sleep(SUBMIT_VERIFY_POLL_SECONDS)
+        captured = capture_dispatch_pane(host, pane, lines=lines, runner=runner, local_extra=local_extra, tmux_socket=tmux_socket)
+    return captured
+
+
 def ensure_nudge_submitted(
     host: str,
     pane: str,
@@ -957,6 +1029,7 @@ def ensure_nudge_submitted(
     local_extra: set[str] | None,
     tmux_socket: Path | None,
     lines: int = DISPATCH_CAPTURE_LINES,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> tuple[bool, str]:
     """Verify a just-pasted nudge actually submitted; fall back once if not.
 
@@ -964,7 +1037,16 @@ def ensure_nudge_submitted(
     nudge after the fallback attempt -- the caller must report FAILED with
     ``detail`` as the reason, never SENT.
     """
-    captured = capture_dispatch_pane(host, pane, lines=lines, runner=runner, local_extra=local_extra, tmux_socket=tmux_socket)
+    captured = _capture_pane_until_composer_clears(
+        host,
+        pane,
+        marker,
+        runner=runner,
+        local_extra=local_extra,
+        tmux_socket=tmux_socket,
+        lines=lines,
+        sleep=sleep,
+    )
     if not captured or not _composer_holds_marker(captured, marker):
         return True, "submitted: composer cleared after Enter"
     if _active_turn_chrome_visible(captured):
@@ -986,7 +1068,16 @@ def ensure_nudge_submitted(
         tmux_socket=tmux_socket,
     ):
         return False, "submit-failed-composer-still-holds-text (fallback command failed)"
-    recaptured = capture_dispatch_pane(host, pane, lines=lines, runner=runner, local_extra=local_extra, tmux_socket=tmux_socket)
+    recaptured = _capture_pane_until_composer_clears(
+        host,
+        pane,
+        marker,
+        runner=runner,
+        local_extra=local_extra,
+        tmux_socket=tmux_socket,
+        lines=lines,
+        sleep=sleep,
+    )
     if recaptured and _composer_holds_marker(recaptured, marker):
         return False, "submit-failed-composer-still-holds-text"
     return True, f"submitted: composer cleared after {backend} submit fallback"
@@ -995,14 +1086,6 @@ def ensure_nudge_submitted(
 # ---------------------------------------------------------------------------
 # Transcript-grep verification (replaces pane-capture confirmation)
 # ---------------------------------------------------------------------------
-
-
-def _candidate_transcript_dirs(projects_root: Path | None = None) -> list[Path]:
-    """Return candidate ``~/.claude/projects/*`` transcript directories."""
-    root = projects_root if projects_root is not None else Path(_env("CHITRA_CLAUDE_PROJECTS", str(Path.home() / ".claude" / "projects")))
-    if not root.is_dir():
-        return []
-    return [p for p in root.iterdir() if p.is_dir()]
 
 
 def transcript_glob() -> str:
@@ -1092,6 +1175,8 @@ def _record_role(payload: object) -> str | None:
     """
     if not isinstance(payload, dict):
         return None
+    if queued_operator_prompt(payload) is not None:
+        return "user"
     message = payload.get("message")
     message_role = message.get("role") if isinstance(message, dict) else None
     nested = payload.get("payload")
@@ -1106,8 +1191,21 @@ def _record_role(payload: object) -> str | None:
         payload.get("type"),
     ):
         if isinstance(candidate, str) and candidate in _TRANSCRIPT_RECORD_ROLES:
-            return candidate
+            return _claude_user_role(payload) if candidate == "user" else candidate
     return None
+
+
+def _claude_user_role(payload: dict[str, object]) -> str:
+    """Keep Claude ``user`` records that are not operator input out of the
+    user role: tool results (a lane can echo any text through a shell
+    command), task notifications, and compaction summaries."""
+    message = payload.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, list) and any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content):
+        return "tool_result"
+    if payload.get("isCompactSummary") is True or "<task-notification>" in "\n".join(_json_string_values(content)):
+        return "system"
+    return "user"
 
 
 def _parse_transcript_records(text: str) -> list[tuple[str | None, str]]:
@@ -1142,7 +1240,9 @@ def _structural_transcript_confirms(text: str, marker_norm: str) -> bool:
     in scrollback with no turn ever having started. Confirmation instead
     requires: (1) the normalized marker appears in a record whose role is
     ``"user"`` -- chitra's tmux paste is persisted by Claude Code/Codex
-    exactly like real operator input, as a user-role record -- AND (2) at
+    exactly like real operator input, as a user-role record, or as an
+    origin-bearing ``queued_command`` attachment when the lane is mid-turn
+    (see ``_record_role``) -- AND (2) at
     least one later agent or tool record showing the turn actually started
     (see ``_CONSUMPTION_EVENT_ROLES``). A user record with the marker but no
     follow-up, or only a generic system/progress record, is not confirmation.
@@ -1363,8 +1463,11 @@ def transcript_confirms_nudge(
     transcript lives on the remote host's filesystem, not the caller's; the
     local-only search this function used to perform would never confirm a
     genuine remote delivery.
+
+    The whole nudge must appear in one input record, not only its marker
+    line, so text that merely quotes the marker cannot confirm delivery.
     """
-    marker = nudge_confirmation_marker(nudge)
+    marker = normalized_dispatch_text(nudge)
     if host and not is_local_host(host, local_extra):
         remote_path = find_recent_transcript_remote(
             host,
@@ -1384,6 +1487,18 @@ def transcript_confirms_nudge(
         now_ts=now_ts,
     )
     return (path is not None, path)
+
+
+def _pane_capture_confirms_marker(captured: list[str], marker: str) -> bool:
+    """The pane-signal check over already-captured lines.
+
+    A marker visible in the active composer is an unsubmitted draft, not
+    delivery evidence — fail closed before considering older scrollback.
+    """
+    if _composer_holds_marker(captured, marker):
+        return False
+    text = normalized_dispatch_text(strip_terminal_controls("\n".join(captured)))
+    return marker in text
 
 
 def pane_capture_confirms_nudge(
@@ -1417,12 +1532,7 @@ def pane_capture_confirms_nudge(
     captured = capture_dispatch_pane(host, pane, lines=lines, runner=runner, local_extra=local_extra, tmux_socket=tmux_socket)
     if not captured:
         return False
-    # A marker visible in the active composer is an unsubmitted draft, not
-    # delivery evidence.  Fail closed before considering older scrollback.
-    if _composer_holds_marker(captured, marker):
-        return False
-    text = normalized_dispatch_text(strip_terminal_controls("\n".join(captured)))
-    return marker in text
+    return _pane_capture_confirms_marker(captured, marker)
 
 
 # ---------------------------------------------------------------------------
@@ -1686,6 +1796,7 @@ def dispatch_to_tmux(
         local_extra=local_extra,
         tmux_socket=tmux_socket,
         lines=tuning.capture_lines,
+        sleep=sleep,
     )
     if not submitted:
         logger.warning(
@@ -1730,20 +1841,33 @@ def dispatch_to_tmux(
     # transcript even when the send succeeded (unresolvable cwd-slug,
     # not-yet-flushed write, transcript outside the searched roots). Before
     # declaring FAILED (a false negative that erodes queue-path trust and
-    # risks a resend), fall back to the weaker-but-real pane signal. Pane
-    # capture cannot tell a genuinely-started turn from a scrollback echo or
-    # an unsubmitted composer row, so it is never authoritative on its own:
-    # this reports DELIVERY_UNCONFIRMED, not SENT. dispatchd keeps the send
-    # nonce and retries transcript verification without pasting again.
-    if pane_capture_confirms_nudge(
-        order.nudge,
-        host=host,
-        pane=pane,
-        lines=tuning.capture_lines,
-        runner=run,
-        local_extra=local_extra,
-        tmux_socket=tmux_socket,
-    ):
+    # risks a resend), check the weaker-but-real pane signal on one capture.
+    # When the submitted marker sits in the lane's scrollback and a
+    # recognized TUI composer row no longer holds it, the order landed:
+    # report SENT (a live eval measured exactly this delivery reported as
+    # delivery_unconfirmed after the full verify window). The same marker
+    # text without a recognized composer — a bare shell echoing the pasted
+    # line, an unknown TUI shape — cannot be told apart from a terminal echo,
+    # so it stays DELIVERY_UNCONFIRMED and dispatchd retries transcript
+    # verification without pasting again. So does a marker that was already
+    # on screen before the paste: a repeated canned nudge leaves the earlier
+    # copy in scrollback, which cannot prove this paste landed.
+    captured = capture_dispatch_pane(
+        host, pane, lines=tuning.capture_lines, runner=run, local_extra=local_extra, tmux_socket=tmux_socket
+    )
+    if captured and _pane_capture_confirms_marker(captured, marker):
+        marker_predates_paste = marker in normalized_dispatch_text(strip_terminal_controls("\n".join(pre_capture)))
+        if not marker_predates_paste and _detect_tui_backend(captured) != "unknown":
+            logger.info(
+                "tmux_dispatch_sent_pane_confirmed",
+                session_ref=order.session_ref,
+                marker=marker,
+            )
+            return _result(
+                DispatchStatus.SENT,
+                "sent: confirmed via pane capture (submitted marker in lane scrollback, composer cleared; transcript-grep found no marker)",
+                marker=marker,
+            )
         logger.info(
             "tmux_dispatch_delivery_unconfirmed_pane_fallback",
             session_ref=order.session_ref,
@@ -1751,7 +1875,7 @@ def dispatch_to_tmux(
         )
         return _result(
             DispatchStatus.DELIVERY_UNCONFIRMED,
-            "delivery-unconfirmed: confirmed only via pane-capture fallback (transcript-grep found no marker)",
+            "delivery-unconfirmed: pane shows marker but no recognized TUI composer (transcript-grep found no marker)",
             marker=marker,
         )
     logger.info(

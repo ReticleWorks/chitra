@@ -150,7 +150,7 @@ def build_reasoned_dispatch(
     corrective dispatch. It is not converted into a simulated operator ruling.
     """
     del review_rejection_confirmed
-    if review_signal.verdict == "accept":
+    if review_signal.verdict != "reject":
         return None
 
     question, judgment = _question_and_judgment(goal, review_signal)

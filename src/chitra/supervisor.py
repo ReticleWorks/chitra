@@ -71,25 +71,30 @@ def order_marker(finding: Finding) -> str:
 
 def build_corrective_order(
     goal: GoalRecord,
-    finding: Finding,
     decision: LadderDecision,
     *,
     retry_attempt: int = 0,
 ) -> DispatchOrder:
-    """Build one deterministic, goal-bound correction for dispatchd."""
+    """Build one deterministic, goal-bound correction for dispatchd.
+
+    The order's queue identity and nudge text come from the incident record —
+    the track id plus the excuse that opened the current stage — so a later
+    finding with a rotated fingerprint rebuilds the same delivered order
+    instead of forking the pressure track.
+    """
     marker = decision.record.order_marker
     stage = decision.stage
     order_id = deterministic_order_id(
         goal.session_ref,
         goal.goal_version,
-        finding.fingerprint,
+        decision.record.track_id,
         stage,
         retry_attempt=retry_attempt,
     )
     nudge = (
         f"{marker} Continue against the frozen goal: {goal.goal} "
-        f"The observed obstacle is: {finding.detail}. "
-        f"Take the next in-scope action that produces this progress: {finding.expected_next_progress}. "
+        f"The observed obstacle is: {decision.record.detail}. "
+        f"Take the next in-scope action that produces this progress: {decision.record.expected_next_progress}. "
         f"The frozen autonomy policy is sha256:{autonomy_policy_sha256(goal.autonomy_policy)} and grants: "
         f"{_autonomy_grant_summary(goal)}. "
         "Continue autonomously when an active grant covers the action target and limits, including credentials, spending, "
@@ -115,19 +120,19 @@ def build_corrective_order(
     )
 
 
-def _same_action(latest: object | None, order: DispatchOrder, finding: Finding, stage: str) -> bool:
+def _same_action(latest: object | None, order: DispatchOrder, action_key: str, stage: str) -> bool:
     return bool(
         latest is not None
         and getattr(latest, "order_id", "") == order.order_id
-        and getattr(latest, "finding_fingerprint", "") == finding.fingerprint
+        and getattr(latest, "finding_fingerprint", "") == action_key
         and getattr(latest, "stage", "") == stage
     )
 
 
-def _same_incident(latest: object | None, finding: Finding, stage: str, digest: str) -> bool:
+def _same_incident(latest: object | None, action_key: str, stage: str, digest: str) -> bool:
     return bool(
         latest is not None
-        and getattr(latest, "finding_fingerprint", "") == finding.fingerprint
+        and getattr(latest, "finding_fingerprint", "") == action_key
         and getattr(latest, "stage", "") == stage
         and getattr(latest, "goal_digest", "") == digest
     )
@@ -230,12 +235,16 @@ def reconcile_corrective_action(
     digest = goal_digest(goal)
     marker = decision.record.order_marker
     stage = decision.stage
-    latest = ledger.latest_for_action(finding.fingerprint, stage)
-    same_incident = _same_incident(latest, finding, stage, digest)
+    # The supervision action key is the pressure-track identity, not the
+    # current finding fingerprint: a rotated excuse shares one retry cursor
+    # and one queue order instead of forking fresh corrective intent. The
+    # finding fingerprint stays evidence on the incident row itself.
+    track_id = decision.record.track_id
+    latest = ledger.latest_for_action(track_id, stage)
+    same_incident = _same_incident(latest, track_id, stage, digest)
     attempt = latest.attempt if same_incident and latest is not None else 0
     order = build_corrective_order(
         goal,
-        finding,
         decision,
         retry_attempt=attempt,
     )
@@ -248,7 +257,7 @@ def reconcile_corrective_action(
                 goal_version=goal.goal_version,
                 goal_digest_value=digest,
                 reason="shadow mode observed a corrective finding without acting",
-                finding_fingerprint=finding.fingerprint,
+                finding_fingerprint=track_id,
                 stage=stage,
                 order_id=order.order_id,
                 order_marker=marker,
@@ -273,7 +282,7 @@ def reconcile_corrective_action(
             goal_version=goal.goal_version,
             goal_digest_value=digest,
             reason="frozen goal changed; stale correction was not reused",
-            finding_fingerprint=finding.fingerprint,
+            finding_fingerprint=track_id,
             stage=stage,
             order_id=order.order_id,
             order_marker=marker,
@@ -284,11 +293,11 @@ def reconcile_corrective_action(
             next_retry_at="",
         )
         attempt = 0
-        order = build_corrective_order(goal, finding, decision, retry_attempt=attempt)
+        order = build_corrective_order(goal, decision, retry_attempt=attempt)
 
     if (
         latest is not None
-        and _same_incident(latest, finding, stage, digest)
+        and _same_incident(latest, track_id, stage, digest)
         and latest.state == "blocked"
         and not _retry_due(latest.next_retry_at)
     ):
@@ -328,7 +337,7 @@ def reconcile_corrective_action(
                 reason = "delivery result lacks valid signed-ledger proof"
                 if not (
                     latest is not None
-                    and _same_action(latest, order, finding, stage)
+                    and _same_action(latest, order, track_id, stage)
                     and latest.state == "action_queued"
                 ):
                     ledger.transition(
@@ -337,7 +346,7 @@ def reconcile_corrective_action(
                         goal_version=goal.goal_version,
                         goal_digest_value=digest,
                         reason=reason,
-                        finding_fingerprint=finding.fingerprint,
+                        finding_fingerprint=track_id,
                         stage=stage,
                         order_id=order.order_id,
                         order_marker=marker,
@@ -360,7 +369,7 @@ def reconcile_corrective_action(
                 reason = "signed delivery is proven; waiting for a bound completed agent turn"
                 if not (
                     latest is not None
-                    and _same_action(latest, order, finding, stage)
+                    and _same_action(latest, order, track_id, stage)
                     and latest.state == "awaiting_progress"
                     and not latest.turn_boundary_event_id
                 ):
@@ -370,7 +379,7 @@ def reconcile_corrective_action(
                         goal_version=goal.goal_version,
                         goal_digest_value=digest,
                         reason=reason,
-                        finding_fingerprint=finding.fingerprint,
+                        finding_fingerprint=track_id,
                         stage=stage,
                         order_id=order.order_id,
                         order_marker=marker,
@@ -384,14 +393,14 @@ def reconcile_corrective_action(
 
             if decision.record.consumption != proof:
                 IncidentStore(state_root, lane).attach_consumption(
-                    fingerprint=finding.fingerprint,
+                    track_id=track_id,
                     order_marker=marker,
                     proof=proof,
                 )
             reason = "signed delivery and the bound completed agent turn are proven"
             if not (
                 latest is not None
-                and _same_action(latest, order, finding, stage)
+                and _same_action(latest, order, track_id, stage)
                 and latest.state == "awaiting_progress"
                 and latest.observed_event_id == proof.user_event_id
                 and latest.turn_boundary_event_id == proof.turn_event_id
@@ -402,7 +411,7 @@ def reconcile_corrective_action(
                     goal_version=goal.goal_version,
                     goal_digest_value=digest,
                     reason=reason,
-                    finding_fingerprint=finding.fingerprint,
+                    finding_fingerprint=track_id,
                     stage=stage,
                     order_id=order.order_id,
                     order_marker=marker,
@@ -425,7 +434,7 @@ def reconcile_corrective_action(
                 )
             if not (
                 latest is not None
-                and _same_action(latest, order, finding, stage)
+                and _same_action(latest, order, track_id, stage)
                 and latest.state == "blocked"
                 and latest.obstacle == failure_disposition
             ):
@@ -435,7 +444,7 @@ def reconcile_corrective_action(
                     goal_version=goal.goal_version,
                     goal_digest_value=digest,
                     reason=reason,
-                    finding_fingerprint=finding.fingerprint,
+                    finding_fingerprint=track_id,
                     stage=stage,
                     order_id=order.order_id,
                     order_marker=marker,
@@ -457,7 +466,7 @@ def reconcile_corrective_action(
             hold_goal(state_root, goal.session_ref, reason=hold_reason)
             if not (
                 latest is not None
-                and _same_action(latest, order, finding, stage)
+                and _same_action(latest, order, track_id, stage)
                 and latest.state == "blocked"
                 and latest.obstacle == "retry_cap_exceeded"
             ):
@@ -467,7 +476,7 @@ def reconcile_corrective_action(
                     goal_version=goal.goal_version,
                     goal_digest_value=digest,
                     reason=reason,
-                    finding_fingerprint=finding.fingerprint,
+                    finding_fingerprint=track_id,
                     stage=stage,
                     order_id=order.order_id,
                     order_marker=marker,
@@ -491,7 +500,7 @@ def reconcile_corrective_action(
         next_retry_at = (datetime.now(UTC) + timedelta(seconds=backoff_seconds)).isoformat()
         if not (
             latest is not None
-            and _same_action(latest, order, finding, stage)
+            and _same_action(latest, order, track_id, stage)
             and latest.state == "blocked"
             and latest.attempt == next_attempt
         ):
@@ -501,7 +510,7 @@ def reconcile_corrective_action(
                 goal_version=goal.goal_version,
                 goal_digest_value=digest,
                 reason=reason,
-                finding_fingerprint=finding.fingerprint,
+                finding_fingerprint=track_id,
                 stage=stage,
                 order_id=order.order_id,
                 order_marker=marker,
@@ -522,7 +531,7 @@ def reconcile_corrective_action(
     if artifacts.order_paths:
         if (
             latest is not None
-            and _same_action(latest, order, finding, stage)
+            and _same_action(latest, order, track_id, stage)
             and latest.state == "awaiting_progress"
         ):
             return CorrectiveActionResult(
@@ -534,7 +543,7 @@ def reconcile_corrective_action(
             )
         if not (
             latest is not None
-            and _same_action(latest, order, finding, stage)
+            and _same_action(latest, order, track_id, stage)
             and latest.state == "action_queued"
         ):
             ledger.transition(
@@ -543,7 +552,7 @@ def reconcile_corrective_action(
                 goal_version=goal.goal_version,
                 goal_digest_value=digest,
                 reason="deterministic corrective order already exists in the dispatch queue",
-                finding_fingerprint=finding.fingerprint,
+                finding_fingerprint=track_id,
                 stage=stage,
                 order_id=order.order_id,
                 order_marker=marker,
@@ -571,7 +580,7 @@ def reconcile_corrective_action(
         )
 
     if decision.action == "hold" and latest is not None:
-        if not _same_incident(latest, finding, stage, digest):
+        if not _same_incident(latest, track_id, stage, digest):
             return CorrectiveActionResult(
                 latest.state,
                 latest.order_id,
@@ -587,7 +596,7 @@ def reconcile_corrective_action(
                     goal_version=goal.goal_version,
                     goal_digest_value=digest,
                     reason="queued corrective action disappeared without a result; refusing an unproven repaste",
-                    finding_fingerprint=finding.fingerprint,
+                    finding_fingerprint=track_id,
                     stage=stage,
                     order_id=order.order_id,
                     order_marker=marker,
@@ -614,7 +623,7 @@ def reconcile_corrective_action(
 
     if not (
         latest is not None
-        and _same_action(latest, order, finding, stage)
+        and _same_action(latest, order, track_id, stage)
         and latest.state == "action_pending"
     ):
         ledger.transition(
@@ -623,7 +632,7 @@ def reconcile_corrective_action(
             goal_version=goal.goal_version,
             goal_digest_value=digest,
             reason="corrective intent persisted before queue publication",
-            finding_fingerprint=finding.fingerprint,
+            finding_fingerprint=track_id,
             stage=stage,
             order_id=order.order_id,
             order_marker=marker,
@@ -640,7 +649,7 @@ def reconcile_corrective_action(
         goal_version=goal.goal_version,
         goal_digest_value=digest,
         reason="corrective order durably published for dispatchd",
-        finding_fingerprint=finding.fingerprint,
+        finding_fingerprint=track_id,
         stage=stage,
         order_id=order.order_id,
         order_marker=marker,

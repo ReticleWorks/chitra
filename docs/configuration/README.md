@@ -158,7 +158,7 @@ Every daemon accepts `--help` to list its flags. Common patterns:
 ```bash
 dispatchd --queue-dir /var/lib/chitra/queue --once
 chitra-monitord --state-dir /var/lib/chitra --once
-rate-limit-guard --policy-config /etc/chitra/policy.yaml
+chitra-rate-limit-guard --usage-dir /var/lib/chitra/usage-snapshots --host "$(hostname)" --policy-config /etc/chitra/policy.yaml
 ```
 
 ## Running with systemd
@@ -167,15 +167,19 @@ The Debian package installs the shared daemon units from
 `packaging/systemd/`. The checked-in units are the canonical service contract:
 
 - `chitra-dispatchd.service`
-- `chitra-monitord@.service.example`
+- `chitra-monitord@.service`
+- `chitra-rate-limit-guard@.service` and `chitra-rate-limit-guard@.timer`, one
+  timer per lane, sweeping the same `/var/lib/chitra/lane-<lane-id>` state root
+  as `chitra-monitord@<lane-id>`
 
 They use the released virtual environment at `/opt/chitra/venv` and the
 declaration at `/etc/chitra/lanes.yaml`. A fleet deployment that uses isolated
 instance templates owns those templates in the fleet repository; do not copy a
 shared unit into an instance-specific service name.
 
-Legacy `watchd`, `triaged`, and `sweepd` units remain shipped for existing
-declarations. New deployments use monitord and dispatchd.
+The deprecated `watchd`, `triaged`, and `sweepd` units are no longer shipped;
+`chitra-monitord@<instance>` replaces them. The daemon modules remain
+installed for existing declarations that invoke them directly.
 
 ## Example policy walkthrough
 

@@ -13,7 +13,6 @@ nobody chose.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import subprocess
@@ -25,6 +24,8 @@ from pathlib import Path
 from typing import Literal
 
 import structlog
+
+from chitra._fsio import exclusive_lock
 
 logger = structlog.get_logger(__name__)
 
@@ -452,16 +453,8 @@ def repo_merge_lock(lock_dir: Path, repo: str, *, timeout_seconds: float = 0.0) 
     """
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_path = lock_dir / f"{repo.replace('/', '_')}.merge.lock"
-    with lock_path.open("a", encoding="utf-8") as handle:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    with exclusive_lock(lock_path, timeout=timeout_seconds) as acquired:
+        yield acquired
 
 
 @dataclass(frozen=True, slots=True)
@@ -511,12 +504,8 @@ class MergeRecord:
 def append_merge_record(path: Path, record: MergeRecord) -> None:
     """Append one ledger line under an exclusive lock."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            handle.write(json.dumps(record.to_dict(), sort_keys=True) + "\n")
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    with exclusive_lock(path.with_name(path.name + ".lock")), path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record.to_dict(), sort_keys=True) + "\n")
 
 
 def merge(

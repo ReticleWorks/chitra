@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import contextlib
 import json
+import subprocess
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from _goal_fixtures import enrollment_fields
+from _goal_fixtures import enrollment_fields, ingest_passing_receipt, passing_completion_evidence
+from structlog.testing import capture_logs
 
 import chitra.monitord as monitord_mod
+from chitra.completion_gate import CompletionEvidence
+from chitra.decisions import DecisionEntry, append_decision
 from chitra.goals import EnrolledDoneWhenItem, GoalRecord, GoalsSchemaNewerError, GoalStatus, get_goal, upsert_goal
 from chitra.journal import ByteRange, CanonicalEvent, CanonicalType, Client, TranscriptIdentity
 from chitra.journal.store import EventJournal, classify_progress
@@ -20,10 +25,14 @@ from chitra.monitord import (
     build_arg_parser,
     check_enrollment_and_receipts,
     handle_agent_question,
+    ingest_transcript_bindings,
     resolve_config,
     run_detectors,
     run_once,
 )
+from chitra.recovery import capture_worktree_binding, transition_lane_lifecycle
+from chitra.review_rubric import ReviewerVerdict, ReviewFinding
+from chitra.transcript_bindings import TranscriptBinding
 
 LANE = "lane-a:0.0"
 SEEDED_LANE = "lane-a.0.0"
@@ -61,6 +70,31 @@ def _event(
         payload={},
         raw_record=None,
     )
+
+def test_unseen_version_ingests_and_logs_unknown_count(tmp_path: Path) -> None:
+    fixture = Path(__file__).parent / "fixtures" / "w11" / "claude-2.1.280-synthetic.jsonl"
+    # A client version no fixture covers, plus a record type the normalizer does not know.
+    transcript = tmp_path / "unseen.jsonl"
+    transcript.write_text(
+        fixture.read_text(encoding="utf-8").replace('"2.1.280"', '"9.9.9"')
+        + json.dumps({"type": "brand-new-record", "sessionId": "fixture-claude-280-session", "version": "9.9.9"})
+        + "\n",
+        encoding="utf-8",
+    )
+    binding = TranscriptBinding(
+        session_ref="goal-x", lane="lane-x", path=str(transcript), client=Client.CLAUDE, client_version="9.9.9", instance="i"
+    )
+
+    with capture_logs() as logs:
+        observed = ingest_transcript_bindings(_config(tmp_path), (binding,))
+
+    assert len(observed) == 13
+    assert len(EventJournal(tmp_path, "lane-x").load()) == 13
+    (drift,) = [entry for entry in logs if entry["event"] == "monitord_unknown_events_ingested"]
+    assert drift["lane"] == "lane-x"
+    assert drift["events"] == 7
+    assert drift["types"]["brand-new-record"] == 1
+
 
 def test_resolve_config_defaults_to_shadow_mode_on() -> None:
     config = resolve_config()
@@ -119,6 +153,54 @@ def test_run_detectors_binds_findings_to_the_goal_enrollment(tmp_path: Path) -> 
     unnecessary = [finding for finding in findings if finding.detector == "unnecessary_steps"]
     assert unnecessary
     assert all(finding.unmet_item == "implementation-complete" for finding in unnecessary)
+
+
+def _git_worktree(tmp_path: Path) -> Path:
+    workdir = tmp_path / "worktree"
+    workdir.mkdir()
+
+    def _run(*args: str) -> None:
+        subprocess.run(["git", "-C", str(workdir), *args], check=True, capture_output=True)
+
+    _run("init")
+    _run("config", "user.email", "chitra-test@example.test")
+    _run("config", "user.name", "Chitra Test")
+    (workdir / "README.md").write_text("initial\n", encoding="utf-8")
+    _run("add", "README.md")
+    _run("commit", "-m", "initial")
+    return workdir
+
+
+def test_run_detectors_flags_only_work_outside_the_checkpointed_worktree(tmp_path: Path) -> None:
+    """The drift boundary check must see the lane's durable worktree path."""
+    workdir = _git_worktree(tmp_path)
+    transition_lane_lifecycle(
+        tmp_path,
+        session_ref="host:lane-a:0.0",
+        target="active",
+        binding=capture_worktree_binding(workdir),
+        resume_note="Begin the enrolled work.",
+    )
+    goal = SimpleNamespace(
+        scope="",
+        intent="",
+        goal="finish the enrolled implementation",
+        session_ref="host:lane-a:0.0",
+        enrolled_done_when_items=(),
+    )
+    events = (
+        _event("e-out", CanonicalType.TOOL_CALL).model_copy(
+            update={"payload": {"tool_name": "Edit", "input": {"file_path": str(tmp_path / "elsewhere" / "x.py")}}}
+        ),
+        _event("e-in", CanonicalType.TOOL_CALL).model_copy(
+            update={"payload": {"tool_name": "Edit", "input": {"file_path": str(workdir / "x.py")}}}
+        ),
+    )
+
+    drift = [finding for finding in run_detectors(_config(tmp_path), LANE, goal, events) if finding.detector == "drift"]
+
+    assert [finding.event_refs for finding in drift] == [("e-out",)]
+
 
 def test_append_finding_records_writes_schema_stamped_jsonl(tmp_path: Path) -> None:
     config = _config(tmp_path)
@@ -243,13 +325,16 @@ def _goal(session_ref: str, *, status: GoalStatus = "working") -> GoalRecord:
     )
 
 
-def _write_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _write_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int = 1) -> None:
     import sys
 
     from chitra.validator_registry import VALIDATORS_ENV_VAR
 
     registry = tmp_path / "validators.json"
-    registry.write_text(json.dumps({"stub-check": {"argv": [sys.executable, "-c", "raise SystemExit(1)"]}}), encoding="utf-8")
+    registry.write_text(
+        json.dumps({"stub-check": {"argv": [sys.executable, "-c", f"raise SystemExit({exit_code})"]}}),
+        encoding="utf-8",
+    )
     monkeypatch.setenv(VALIDATORS_ENV_VAR, str(registry))
 
 
@@ -273,18 +358,276 @@ def test_check_enrollment_disputes_when_the_validator_fails(tmp_path: Path, monk
             }
         }
     )
-    recorded, disputed, findings = check_enrollment_and_receipts(
+    recorded, disputed, findings, pending = check_enrollment_and_receipts(
         _config(tmp_path),
         "session-1",
         final_response,
     )
     assert disputed is True
     assert recorded == 1
+    assert pending is False
     assert all(finding.detector == "false_done" for finding in findings)
 
+
+def test_check_enrollment_accepts_a_plain_claim_when_the_validator_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_registry(tmp_path, monkeypatch, exit_code=0)
+    upsert_goal(tmp_path, _goal("session-1"))
+    final_response = _event("completion-plain", CanonicalType.FINAL_RESPONSE).model_copy(
+        update={"payload": {"text": "Done. The digest file exists and is verified."}}
+    )
+
+    recorded, disputed, findings, pending = check_enrollment_and_receipts(
+        resolve_config(state_dir=tmp_path, shadow_mode=False),
+        "session-1",
+        final_response,
+        reviewer=_StubReviewer("accept"),
+    )
+
+    assert (recorded, disputed, findings, pending) == (1, False, [], False)
+    stored = get_goal(tmp_path, "session-1")
+    assert stored is not None
+    assert stored.status == "done-pending-close"
+
+
+def test_check_enrollment_disputes_a_plain_claim_when_the_validator_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_registry(tmp_path, monkeypatch)
+    upsert_goal(tmp_path, _goal("session-1"))
+    final_response = _event("completion-plain-fail", CanonicalType.FINAL_RESPONSE).model_copy(
+        update={"payload": {"text": "Done. The digest file exists and is verified."}}
+    )
+
+    recorded, disputed, findings, pending = check_enrollment_and_receipts(
+        resolve_config(state_dir=tmp_path, shadow_mode=False),
+        "session-1",
+        final_response,
+    )
+
+    assert disputed is True
+    assert recorded == 1
+    assert pending is False
+    assert all(finding.detector == "false_done" for finding in findings)
+    assert any("stub-check" in finding.detail for finding in findings)
+    stored = get_goal(tmp_path, "session-1")
+    assert stored is not None
+    assert stored.status == "completion-disputed"
+
+
+def test_check_enrollment_runs_nothing_for_a_negated_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_registry(tmp_path, monkeypatch, exit_code=0)
+    upsert_goal(tmp_path, _goal("session-1"))
+    calls: list[str] = []
+
+    def record_runs(root: Path, session_ref: str, items: object) -> tuple[CompletionEvidence, ...]:
+        del root, items
+        calls.append(session_ref)
+        return ()
+
+    monkeypatch.setattr(monitord_mod, "record_enrolled_validator_runs", record_runs)
+    final_response = _event("completion-negated", CanonicalType.FINAL_RESPONSE).model_copy(
+        update={"payload": {"text": "Not done yet."}}
+    )
+
+    recorded, disputed, findings, pending = check_enrollment_and_receipts(
+        resolve_config(state_dir=tmp_path, shadow_mode=False),
+        "session-1",
+        final_response,
+    )
+
+    assert (recorded, disputed, findings, pending) == (0, False, [], False)
+    assert calls == []
+    assert not (tmp_path / "validation-receipts").exists()
+    stored = get_goal(tmp_path, "session-1")
+    assert stored is not None
+    assert stored.status == "working"
+
+
 def test_check_enrollment_is_silent_for_unenrolled_sessions(tmp_path: Path) -> None:
-    recorded, disputed, findings = check_enrollment_and_receipts(_config(tmp_path), "no-such-session")
-    assert (recorded, disputed, findings) == (0, False, [])
+    assert check_enrollment_and_receipts(_config(tmp_path), "no-such-session") == (0, False, [], False)
+
+
+class _StubReviewer:
+    """Deterministic stand-in for the isolated ``claude -p`` reviewer."""
+
+    def __init__(self, verdict: str) -> None:
+        self._verdict = verdict
+        self.calls: list[str] = []
+
+    def review(self, goal: object, behavior: object, reviewer_id: str) -> ReviewerVerdict:
+        self.calls.append(reviewer_id)
+        findings: tuple[ReviewFinding, ...] = ()
+        if self._verdict == "reject":
+            findings = (
+                ReviewFinding(
+                    code="unsupported_completion",
+                    detail="the turn claims proof it does not contain",
+                    citation="Done.",
+                ),
+            )
+        return ReviewerVerdict(
+            reviewer_id=reviewer_id,
+            goal_contract_id=goal.contract_id,  # type: ignore[attr-defined]
+            behavior_sha256=behavior.behavior_sha256,  # type: ignore[attr-defined]
+            verdict=self._verdict,  # type: ignore[arg-type]
+            findings=findings,
+        )
+
+
+def _verified_claim_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> CanonicalEvent:
+    """Enroll a goal, store its passing receipt, and return a clean claim event."""
+    goal = upsert_goal(tmp_path, replace(_goal("session-1"), **enrollment_fields("The digest file exists and is verified.")))
+    ingest_passing_receipt(tmp_path, goal.session_ref)
+    monkeypatch.setattr(
+        monitord_mod,
+        "record_enrolled_validator_runs",
+        lambda *_args, **_kwargs: (passing_completion_evidence(),),
+    )
+    return _event("completion-1", CanonicalType.FINAL_RESPONSE).model_copy(
+        update={
+            "payload": {
+                "text": "Done.\nCHITRA-COMPLETION: "
+                + json.dumps(
+                    {
+                        "kind": "artifact",
+                        "done_when_item_id": "done-1",
+                        "receipt_name": "tests-green",
+                        "validator": "pytest",
+                        "validator_result": "pass",
+                        "citation": "proof /tmp/daemon-digest.json",
+                    }
+                )
+            }
+        }
+    )
+
+
+def test_completion_claim_reaches_the_isolated_reviewer_and_applies_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_response = _verified_claim_setup(tmp_path, monkeypatch)
+    reviewer = _StubReviewer("reject")
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+
+    _recorded, disputed, findings, _pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=reviewer
+    )
+
+    assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
+    assert disputed is True
+    assert len(findings) == 1
+    assert findings[0].detector == "false_done"
+    assert findings[0].unmet_item == "isolated completion review"
+    assert "rejected the completion claim" in findings[0].detail
+    stored = get_goal(tmp_path, "session-1")
+    assert stored is not None
+    assert stored.status == "completion-disputed"
+
+    # A repeat pass over the unchanged claim reuses the stored signal rather
+    # than paying for another isolated review round.
+    _recorded, disputed_again, _findings, _pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=reviewer
+    )
+    assert disputed_again is True
+    assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
+
+
+def test_completion_claim_the_isolated_reviewer_accepts_is_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_response = _verified_claim_setup(tmp_path, monkeypatch)
+    reviewer = _StubReviewer("accept")
+
+    _recorded, disputed, findings, _pending = check_enrollment_and_receipts(
+        resolve_config(state_dir=tmp_path, shadow_mode=False), "session-1", final_response, reviewer=reviewer
+    )
+
+    assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
+    assert disputed is False
+    assert findings == []
+    stored = get_goal(tmp_path, "session-1")
+    assert stored is not None
+    assert stored.status == "done-pending-close"
+
+
+class _RecordingReviewer(_StubReviewer):
+    """Stub reviewer that also records the still-running list it was shown."""
+
+    def __init__(self, verdict: str) -> None:
+        super().__init__(verdict)
+        self.still_running: list[tuple[str, ...]] = []
+
+    def review(self, goal: object, behavior: object, reviewer_id: str) -> ReviewerVerdict:
+        self.still_running.append(behavior.still_running)  # type: ignore[attr-defined]
+        return super().review(goal, behavior, reviewer_id)
+
+
+def test_insufficient_review_holds_the_claim_until_lane_work_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_response = _verified_claim_setup(tmp_path, monkeypatch)
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+    running = ("background tool call t1 (Bash) is still running",)
+    undecided = _RecordingReviewer("insufficient")
+
+    result = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=undecided, still_running=running
+    )
+
+    assert result[1:] == (False, [], True)
+    assert undecided.still_running == [running, running]
+    stored = get_goal(tmp_path, "session-1")
+    assert stored is not None
+    assert stored.status == "working"
+
+    # Once the lane work finishes, the stored "insufficient" signal no longer
+    # holds and the same claim is judged afresh.
+    accepting = _RecordingReviewer("accept")
+    _recorded, disputed, findings, pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=accepting
+    )
+
+    assert (disputed, findings, pending) == (False, [], False)
+    assert accepting.still_running == [(), ()]
+    stored = get_goal(tmp_path, "session-1")
+    assert stored is not None
+    assert stored.status == "done-pending-close"
+
+
+def test_lane_work_in_flight_names_only_unanswered_background_calls(tmp_path: Path) -> None:
+    def call(event_id: str, join_id: str, *, background: bool) -> CanonicalEvent:
+        return _event(event_id, CanonicalType.TOOL_CALL).model_copy(
+            update={
+                "native_join_id": join_id,
+                "payload": {"tool_name": "Bash", "input": {"command": "sleep 60", "run_in_background": background}},
+            }
+        )
+
+    events = (
+        call("c1", "t-open", background=True),
+        call("c2", "t-done", background=True),
+        _event("r2", CanonicalType.TOOL_RESULT).model_copy(update={"native_join_id": "t-done"}),
+        call("c3", "t-foreground", background=False),
+    )
+
+    assert monitord_mod._lane_work_in_flight(_config(tmp_path), "session-1", events) == (
+        "background tool call t-open (Bash) is still running",
+    )
+
+
+def test_validator_pool_accepts_work_after_shutdown() -> None:
+    pool = monitord_mod._ValidatorRunPool(max_workers=1)
+    pool.shutdown()
+    ran: list[str] = []
+
+    pool.submit("lane", lambda: ran.append("ran"))
+
+    assert pool.wait_idle(timeout=5)
+    assert ran == ["ran"]
 
 
 def test_routine_question_is_queued_as_an_exact_goal_contract_answer(
@@ -326,6 +669,42 @@ def test_protected_question_holds_the_goal_without_queueing_an_answer(
     assert stored.status == "held"
     assert stored.open_asks
     assert not list((tmp_path / "queue").glob("**/*.json"))
+
+
+def test_decided_question_queues_the_cited_answer_without_an_operator_ask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_registry(tmp_path, monkeypatch)
+    goal = upsert_goal(tmp_path, _goal("session-1"))
+    append_decision(
+        tmp_path / "decisions.jsonl",
+        DecisionEntry(
+            decision_id="dec-queue-1",
+            at="2026-09-22T00:00:00+00:00",
+            kind="adjudication",
+            decision="Keep the order queue on plain JSONL files; do not add a database.",
+            basis="Recorded test ruling.",
+            citation="test-suite",
+            authority="test authority",
+        ),
+    )
+    final_response = _event("question-decision-1", CanonicalType.FINAL_RESPONSE).model_copy(
+        update={"payload": {"text": "Should the order queue move to a SQLite database?"}}
+    )
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+
+    outcome = handle_agent_question(config, goal, final_response)
+
+    assert outcome == "answer_queued"
+    stored = get_goal(tmp_path, goal.session_ref)
+    assert stored is not None
+    assert stored.open_asks == ()
+    assert stored.foreground_tasks == ()
+    orders = list((tmp_path / "queue" / "orders").glob("*.json"))
+    assert len(orders) == 1
+    payload = json.loads(orders[0].read_text(encoding="utf-8"))
+    assert payload["message_kind"] == "goal_contract_answer"
+    assert "dec-queue-1" in payload["nudge"]
 
 
 def test_residual_question_stays_active_for_foreground_reasoning(
@@ -381,3 +760,25 @@ def test_deprecated_daemon_entrypoints_warn_toward_monitord() -> None:
     for module in (watchd, triaged, sweepd):
         with pytest.warns(DeprecationWarning, match="deprecated by chitra-monitord"), contextlib.suppress(SystemExit):
             module.main(["--help"])
+
+
+def test_bad_binding_skips_its_lane_and_other_lanes_still_ingest(tmp_path: Path) -> None:
+    fixture = Path(__file__).parent / "fixtures" / "w11" / "claude-2.1.280-synthetic.jsonl"
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text(
+        fixture.read_text(encoding="utf-8")
+        + json.dumps({"type": "user", "sessionId": "another-session", "version": "2.1.280"})
+        + "\n",
+        encoding="utf-8",
+    )
+    common = {"client": Client.CLAUDE, "client_version": "2.1.280", "instance": "i"}
+    bindings = (
+        TranscriptBinding(session_ref="g-bad", lane="lane-bad", path=str(bad), **common),
+        TranscriptBinding(session_ref="g-ok", lane="lane-ok", path=str(fixture), **common),
+    )
+
+    with capture_logs() as logs:
+        observed = ingest_transcript_bindings(_config(tmp_path), bindings)
+
+    assert observed and {event.lane for event in observed} == {"lane-ok"}
+    assert any(entry["event"] == "monitord_binding_ingest_failed" and entry["lane"] == "lane-bad" for entry in logs)

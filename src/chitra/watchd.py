@@ -17,7 +17,6 @@ Review metadata is written only to Chitra-owned ledgers and never to pane text.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import os
 import re
@@ -36,7 +35,7 @@ from typing import Literal
 
 import structlog
 
-from chitra._fsio import parse_iso8601
+from chitra._fsio import exclusive_lock, parse_iso8601
 from chitra.agent_runtime import AgentStatusBroker, PaneStatus, StatusRuntimeError
 from chitra.agent_status import AgentState, ManifestRepository
 from chitra.completion_gate import (
@@ -78,7 +77,7 @@ from chitra.journal import CanonicalType, EventJournal
 from chitra.lane_activity import LaneActivity, LaneBackend, load_lane_activity, upsert_lane_activity
 from chitra.lane_config import enabled_lanes
 from chitra.live_handoff import perform_live_handoff
-from chitra.orders import DispatchResult, DispatchStatus
+from chitra.orders import DispatchOrder, DispatchResult, DispatchStatus
 from chitra.policy_config import load_policy_config
 from chitra.reasoned_dispatch import abstaining_oracle, build_reasoned_dispatch
 from chitra.reasoning import Oracle, PrinciplesIndex
@@ -383,13 +382,6 @@ def capture_pane(
     return result.stdout
 
 
-def event_line(lane_id: str, normalized_tail: Sequence[str], *, now: datetime | None = None) -> str:
-    """Format one event exactly as ``triaged.parse_event_line`` consumes it."""
-    timestamp = (now or datetime.now(UTC)).isoformat().replace("+00:00", "Z")
-    text = "CHANGE DETECTED: " + " | ".join(normalized_tail)
-    return f"{timestamp} {lane_id} {text}\n"
-
-
 def status_event_line(status: PaneStatus, *, now: datetime | None = None) -> str:
     """Format one semantic status transition for the legacy triaged log."""
     timestamp = (now or datetime.now(UTC)).isoformat().replace("+00:00", "Z")
@@ -494,15 +486,11 @@ def append_event(event_log: Path, line: str, *, max_log_bytes: int = DEFAULT_MAX
     """Append under an exclusive lock, rotating the legacy-sized log first."""
     event_log.parent.mkdir(parents=True, exist_ok=True)
     lock_path = event_log.with_name(event_log.name + ".lock")
-    with lock_path.open("a", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            if event_log.exists() and event_log.stat().st_size >= max_log_bytes:
-                event_log.replace(event_log.with_name(event_log.name + ".1"))
-            with event_log.open("a", encoding="utf-8") as output:
-                output.write(line)
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    with exclusive_lock(lock_path):
+        if event_log.exists() and event_log.stat().st_size >= max_log_bytes:
+            event_log.replace(event_log.with_name(event_log.name + ".1"))
+        with event_log.open("a", encoding="utf-8") as output:
+            output.write(line)
 
 
 @dataclass(slots=True)
@@ -587,7 +575,7 @@ class Watchd:
             # The turn-end gate decided this shape needs no isolated review.
             status: GoalStatus = "turn-finished-unverified"
             summary = f"{pending.turn_audit.summary}; isolated review was not run for this turn end"
-            review_verdict: Literal["accept", "reject", "unavailable"] = "unavailable"
+            review_verdict: Literal["accept", "reject", "unavailable", "insufficient"] = "unavailable"
         elif review_signal is None:
             status = "blocked"
             summary = f"turn-end review unavailable: {review_error}"
@@ -598,6 +586,14 @@ class Watchd:
             summary = "watched-session direction or completion posture was rejected against the frozen goal"
             ask = "Review the lane's rejected direction or completion posture against its frozen goal."
             review_verdict = "reject"
+        elif review_signal.verdict == "insufficient":
+            # Work is still in flight for this lane, so the claim cannot be
+            # judged yet: no status change, no ask, no escalation. The next
+            # turn end re-reviews under a fresh still-running list.
+            stored = get_goal(root, pending.session_ref)
+            status = stored.status if stored is not None else "turn-finished-unverified"
+            summary = f"{pending.turn_audit.summary}; isolated review deferred: lane work is still in flight"
+            review_verdict = "insufficient"
         elif completion_verdict == "CLEAN":
             status = "done-pending-close"
             summary = pending.turn_audit.summary
@@ -612,7 +608,11 @@ class Watchd:
             summary = f"{pending.turn_audit.summary}; isolated review accepted the turn end with no completion claim"
             review_verdict = "accept"
 
-        if status == "done-pending-close":
+        if review_verdict == "insufficient":
+            # "insufficient" maps to no status change: the stored goal keeps
+            # whatever state it had, including an earlier done-pending-close.
+            pass
+        elif status == "done-pending-close":
             mark_completion_gate_passed(
                 root,
                 pending.session_ref,
@@ -719,6 +719,61 @@ class Watchd:
             if result.session_ref == session_ref and result.status == DispatchStatus.SENT and result.at > since:
                 return True
         return False
+
+    def _lane_work_in_flight(self, session_ref: str) -> tuple[str, ...]:
+        """Name this lane's work still in flight, for the turn-end reviewer.
+
+        Both sources are read-only and already exist. The canonical journal:
+        the Claude normalizer consumes a background launch's "running"
+        placeholder record without emitting it, and only the later terminal
+        task-notification writes a joined result -- so a ``run_in_background``
+        TOOL_CALL whose call id has no joined TOOL_RESULT or TOOL_ERROR is
+        still running. And dispatchd's ``in_flight/`` directory: an order
+        file claimed there for this lane is being delivered right now.
+
+        Open tasks are counted only for the journal's latest session id. The
+        normalizer's own background-task map dies with its transcript, and a
+        lane that respawned under a new session id must not have a dead
+        session's orphaned task hold every later review at "insufficient".
+        """
+        running: list[str] = []
+        journal_root = self.config.journal_root
+        if journal_root is not None:
+            try:
+                events = EventJournal(journal_root, lane_id_from_session_ref(session_ref)).load()
+            except (OSError, ValueError):
+                events = []
+            if events:
+                current_session = events[-1].session_id
+                answered = {
+                    event.native_join_id
+                    for event in events
+                    if event.normalized_type in (CanonicalType.TOOL_RESULT, CanonicalType.TOOL_ERROR)
+                }
+                for event in events:
+                    if (
+                        event.normalized_type is not CanonicalType.TOOL_CALL
+                        or event.native_join_id is None
+                        or event.session_id != current_session
+                        or event.native_join_id in answered
+                    ):
+                        continue
+                    call_input = event.payload.get("input")
+                    if not isinstance(call_input, dict) or call_input.get("run_in_background") is not True:
+                        continue
+                    tool_name = event.payload.get("tool_name")
+                    suffix = f" ({tool_name})" if isinstance(tool_name, str) and tool_name else ""
+                    running.append(f"background tool call {event.native_join_id}{suffix} is still running")
+        in_flight_dir = (self.config.queue_dir or self.config.state_dir / "queue") / "in_flight"
+        if in_flight_dir.is_dir():
+            for order_path in sorted(in_flight_dir.glob("*.json")):
+                try:
+                    order = DispatchOrder.model_validate_json(order_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if order.session_ref == session_ref:
+                    running.append(f"dispatch order {order.order_id} is being delivered to the lane")
+        return tuple(running)
 
     def _turn_made_tool_calls(self, session_ref: str, pane: Pane, *, since: str) -> bool | None:
         """Whether the CURRENT turn made an observable tool call.
@@ -904,7 +959,11 @@ class Watchd:
             )
             return
 
-        behavior = WatchedSessionBehavior.from_turn(session_ref, text)
+        behavior = WatchedSessionBehavior.from_turn(
+            session_ref,
+            text,
+            still_running=self._lane_work_in_flight(session_ref),
+        )
         reviewer = self.reviewer or ClaudeProcessReviewer(
             command=self.config.reviewer_command,
             model=self.config.reviewer_model,

@@ -43,13 +43,12 @@ class DispatchStatus(enum.StrEnum):
     # docs/SOL-ADVERSARIAL-REVIEW finding #1.
     DEFERRED = "deferred"
     # dispatch_to_tmux pasted the nudge and transcript-grep could not confirm
-    # it structurally (see chitra.dispatch.transcript_confirms_nudge), but
-    # the weaker pane-capture fallback saw the marker in the pane's recent
-    # scrollback. Pane capture cannot distinguish a genuinely-started turn
-    # from a scrollback echo or an unsubmitted composer row, so it is never
-    # treated as a terminal SENT result on its own. dispatchd retries
-    # consumption verification using the same durable attempt sidecar the
-    # lane-lock timeout path uses (chitra.dispatchd._process_claimed_order),
+    # it structurally (see chitra.dispatch.transcript_confirms_nudge). The
+    # weaker pane signal saw the marker in the pane's recent scrollback, but
+    # with no recognized TUI composer row it cannot be told apart from a bare
+    # shell echoing the pasted line, so it is not a terminal SENT. dispatchd
+    # retries consumption verification using the same durable attempt sidecar
+    # the lane-lock timeout path uses (chitra.dispatchd._process_claimed_order),
     # without pasting again. A transient failure never becomes terminal merely
     # because it recurred.
     # Like DEFERRED, this status is for in-process visibility only -- it is

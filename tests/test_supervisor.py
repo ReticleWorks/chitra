@@ -67,6 +67,7 @@ def _decision(finding: Finding, *, action: str = "hold", stage: str = "nudge") -
         stage=stage,  # type: ignore[arg-type]
         record=IncidentRecord(
             lane=LANE,
+            goal_digest=goal_digest(_goal()),
             fingerprint=finding.fingerprint,
             detector=finding.detector,
             stage=stage,  # type: ignore[arg-type]
@@ -95,14 +96,14 @@ def _kwargs(tmp_path: Path, goal: GoalRecord, finding: Finding, decision: Ladder
 
 
 def _seed_state(tmp_path: Path, goal: GoalRecord, finding: Finding, decision: LadderDecision, state: str, attempt: int = 0) -> None:
-    order = build_corrective_order(goal, finding, decision, retry_attempt=attempt)
+    order = build_corrective_order(goal, decision, retry_attempt=attempt)
     SupervisionLedger(tmp_path / "state", LANE).transition(
         state=state,  # type: ignore[arg-type]
         session_ref=goal.session_ref,
         goal_version=goal.goal_version,
         goal_digest_value=goal_digest(goal),
         reason="test seed",
-        finding_fingerprint=finding.fingerprint,
+        finding_fingerprint=decision.record.track_id,
         stage=decision.stage,
         order_id=order.order_id,
         order_marker=decision.record.order_marker,
@@ -141,7 +142,7 @@ def test_corrective_order_uses_grants_instead_of_topic_escalation() -> None:
     goal = replace(_goal(), autonomy_policy=policy)
     finding = _finding()
 
-    order = build_corrective_order(goal, finding, _decision(finding, action="open"))
+    order = build_corrective_order(goal, _decision(finding, action="open"))
 
     assert f"sha256:{autonomy_policy_sha256(policy)}" in order.nudge
     assert "spend@goal (amount<=25 USD)" in order.nudge
@@ -161,7 +162,7 @@ def test_action_pending_hold_resumes_with_same_order_id(tmp_path: Path) -> None:
     goal, finding = _goal(), _finding()
     decision = _decision(finding)
     _seed_state(tmp_path, goal, finding, decision, "action_pending")
-    expected = build_corrective_order(goal, finding, decision)
+    expected = build_corrective_order(goal, decision)
     result = reconcile_corrective_action(**_kwargs(tmp_path, goal, finding, decision))  # type: ignore[arg-type]
     assert result.enqueued is True
     assert result.order_id == expected.order_id
@@ -183,7 +184,7 @@ def test_action_queued_missing_queue_or_result_blocks_without_repaste(tmp_path: 
 def test_goal_not_actionable_waits_for_lifecycle_instead_of_retrying_text(tmp_path: Path) -> None:
     goal, finding = _goal(), _finding()
     decision = _decision(finding, action="open")
-    first = build_corrective_order(goal, finding, decision, retry_attempt=0)
+    first = build_corrective_order(goal, decision, retry_attempt=0)
     _seed_state(tmp_path, goal, finding, decision, "action_queued")
     _write_result(tmp_path, first.order_id, reason="goal-not-actionable")
 
@@ -299,7 +300,7 @@ def test_sibling_finding_cannot_reset_an_action_retry_cursor(tmp_path: Path) -> 
     resumed = reconcile_corrective_action(  # type: ignore[arg-type]
         **_kwargs(tmp_path, goal, first_finding, first_decision)
     )
-    retry = build_corrective_order(goal, first_finding, first_decision, retry_attempt=1)
+    retry = build_corrective_order(goal, first_decision, retry_attempt=1)
     assert resumed.enqueued is True
     assert resumed.order_id == retry.order_id
 

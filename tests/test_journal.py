@@ -14,13 +14,14 @@ from chitra.journal import (
     CanonicalEvent,
     CanonicalType,
     Client,
+    EventJournal,
     JournalIngestor,
     JsonlTailReader,
     LifecycleReceipt,
     NormalizationContext,
     ProgressClass,
-    UnsupportedClientVersion,
     classify_progress,
+    native_session_identity,
 )
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "w11"
@@ -76,6 +77,41 @@ CASES = (
         event_digest="ffbf29a762bb3847f761fadef7081f0c74af8983fed653f663fac628bdcea315",
         session_id="fixture-codex-session",
         resume_boundary=8,
+    ),
+    FixtureCase(
+        client=Client.CLAUDE,
+        version="2.1.280",
+        filename="claude-2.1.280-synthetic.jsonl",
+        line_count=12,
+        event_counts={
+            "compaction": 1,
+            "final_response": 1,
+            "tool_call": 2,
+            "tool_error": 1,
+            "tool_result": 1,
+            "unknown": 6,
+        },
+        event_digest="b94e7c2977beca71ba2ef6fdc795942f4bd9f32ab90f0dc875b0339238873bac",
+        session_id="fixture-claude-280-session",
+        resume_boundary=7,
+    ),
+    # Claude Code updated itself mid-session: records switch from 2.1.274 to 2.1.278 at line 8.
+    FixtureCase(
+        client=Client.CLAUDE,
+        version="2.1.274",
+        filename="claude-2.1.274-2.1.278-mixed-synthetic.jsonl",
+        line_count=12,
+        event_counts={
+            "compaction": 1,
+            "final_response": 1,
+            "tool_call": 2,
+            "tool_error": 1,
+            "tool_result": 1,
+            "unknown": 6,
+        },
+        event_digest="895e9d156a71cce994939b6270042470d1292053f506b87b8d9eebf64f2d85ad",
+        session_id="fixture-claude-mixed-session",
+        resume_boundary=7,
     ),
 )
 
@@ -255,21 +291,6 @@ def test_property_reingest_is_idempotent(tmp_path: Path, case: FixtureCase, chun
     assert semantic_projection(second.observed) == semantic_projection(first.observed)
     assert second.appended == ()
     assert len(second_ingestor.journal.load()) == case.line_count
-
-
-def test_version_gate_fails_closed(tmp_path: Path) -> None:
-    case = CASES[0]
-    with pytest.raises(UnsupportedClientVersion, match="fixture-gated versions"):
-        JournalIngestor(
-            state_root=tmp_path,
-            transcript_path=case.path,
-            context=NormalizationContext(
-                instance="test",
-                lane="unsupported",
-                client=case.client,
-                client_version="2.1.230",
-            ),
-        )
 
 
 def test_progress_classification_stays_evidence_bound(tmp_path: Path) -> None:
@@ -524,3 +545,105 @@ def test_same_inode_truncate_to_zero_rotation_preserves_original_event(tmp_path:
     assert restored.appended == ()
     assert len(stored) == 1
     assert stored[0].event_id == original_event_id
+
+
+def _codex_155_subagent_events(tmp_path: Path) -> tuple[CanonicalEvent, ...]:
+    with JournalIngestor(
+        state_root=tmp_path,
+        transcript_path=FIXTURE_DIR / "codex-0.155.1-subagent-synthetic.jsonl",
+        context=NormalizationContext(instance="i", lane="codex", client=Client.CODEX, client_version="0.155.1"),
+    ) as ingestor:
+        return ingestor.poll().observed
+
+
+def test_codex_subagent_rollout_keeps_own_session_despite_parent_meta(tmp_path: Path) -> None:
+    events = _codex_155_subagent_events(tmp_path)
+    assert {event.session_id for event in events} == {"fixture-codex-155-child"}
+
+
+def test_codex_non_spawn_subagent_source_keeps_the_lane_ingesting(tmp_path: Path) -> None:
+    """Codex writes built-in subagents as ``{"subagent": "review"}``, a string, not a thread_spawn dict."""
+    transcript = tmp_path / "review-subagent.jsonl"
+    meta = {"type": "session_meta", "payload": {"id": "review-child", "cli_version": "0.155.1", "source": {"subagent": "review"}}}
+    transcript.write_text(json.dumps(meta) + "\n")
+    with JournalIngestor(
+        state_root=tmp_path / "state",
+        transcript_path=transcript,
+        context=NormalizationContext(instance="i", lane="codex", client=Client.CODEX, client_version="0.155.1"),
+    ) as ingestor:
+        (event,) = ingestor.poll().observed
+    assert event.session_id == "review-child"
+    assert native_session_identity(transcript) == "review-child"
+
+
+def test_event_client_accepts_any_harness_name_through_the_journal(tmp_path: Path) -> None:
+    (claude_event,) = [event for event in ingest(CASES[0], tmp_path) if event.normalized_type is CanonicalType.FINAL_RESPONSE]
+    foreign = CanonicalEvent.model_validate({**claude_event.model_dump(), "event_id": "opencode-1", "client": "opencode"})
+    journal = EventJournal(tmp_path, claude_event.lane)
+    journal.append((foreign,))
+    by_id = {event.event_id: event for event in journal.load()}
+    assert by_id["opencode-1"].client == "opencode"
+    assert by_id[claude_event.event_id].client is Client.CLAUDE
+
+
+def test_codex_function_call_normalizes_as_tool_call_and_result(tmp_path: Path) -> None:
+    events = _codex_155_subagent_events(tmp_path)
+    call = next(event for event in events if event.normalized_type is CanonicalType.TOOL_CALL)
+    result = next(event for event in events if event.normalized_type is CanonicalType.TOOL_RESULT)
+    assert call.payload["tool_name"] == "exec_command"
+    assert call.native_join_id == result.native_join_id == "fixture-call-1"
+
+
+def test_codex_user_message_is_a_user_turn_with_text(tmp_path: Path) -> None:
+    events = _codex_155_subagent_events(tmp_path)
+    (user,) = [event for event in events if event.native_type == "user"]
+    assert user.payload["text"] == "fixture order marker"
+    assert events[-1].normalized_type is CanonicalType.FINAL_RESPONSE
+
+
+def test_claude_background_task_is_in_progress_until_terminal_notification(tmp_path: Path) -> None:
+    """A run_in_background launch's immediate reply is a "running" placeholder,
+    not a result. Only the later terminal task-notification, joined by the
+    task id learned from the placeholder (the tool-use id is frequently
+    absent from real notifications), supplies the TOOL_RESULT. A mid-task
+    <event> tick with no <status> must never be read as completion.
+    """
+    with JournalIngestor(
+        state_root=tmp_path,
+        transcript_path=FIXTURE_DIR / "claude-2.1.229-background-task-synthetic.jsonl",
+        context=NormalizationContext(instance="i", lane="claude", client=Client.CLAUDE, client_version="2.1.229"),
+    ) as ingestor:
+        events = ingestor.poll().observed
+
+    results = [event for event in events if event.normalized_type is CanonicalType.TOOL_RESULT]
+    assert len(results) == 1
+    assert results[0].native_join_id == "fixture-call-bg"
+    assert results[0].payload["status"] == "completed"
+    # Neither the launch placeholder nor the no-status tick produced a result.
+    assert all(event.normalized_type is not CanonicalType.TOOL_ERROR for event in events)
+
+
+def test_claude_honest_run_with_no_stop_hook_emits_final_response_and_no_false_done(tmp_path: Path) -> None:
+    """A real Claude Code 2.1.280 session run without a Stop hook installed
+    (the eval rig's lanes; no operator hook config) never emits a
+    stop_hook_summary/turn_duration pair -- ClaudeNormalizer must still
+    recognize the turn as settled from the API's own stop_reason="end_turn"
+    signal, not from an optional hook. Before this fix, detect_false_done
+    fired "exit-before-contract" on every one of these honest transcripts.
+    """
+    from chitra.detect.detectors import detect_false_done
+
+    with JournalIngestor(
+        state_root=tmp_path,
+        transcript_path=FIXTURE_DIR / "claude-2.1.280-no-stop-hook-synthetic.jsonl",
+        context=NormalizationContext(instance="i", lane="claude", client=Client.CLAUDE, client_version="2.1.280"),
+    ) as ingestor:
+        events = ingestor.poll().observed
+
+    assert "stop_hook_summary" not in {event.native_type for event in events}
+    final_responses = [event for event in events if event.normalized_type is CanonicalType.FINAL_RESPONSE]
+    assert len(final_responses) == 1
+    assert "All tests pass" in final_responses[0].payload["text"]
+
+    findings = detect_false_done(final_response=final_responses[0], enrolled_items=(), receipt_names_by_item={})
+    assert findings == []

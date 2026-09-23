@@ -23,10 +23,7 @@
         "/var/lib/polyphony-chitra-"
       ],
       "units": {
-        "chitra-dispatchd.service": "be17b0bf352b40973e7b109df266c3e5de999855b227379198b92fe18c66a2ab",
-        "chitra-sweepd.service": "745bb62b968ee96595ba8f161abed9fe1d647d392327a2201dd9618a66387857",
-        "chitra-triaged.service": "e9e390dc8acfaf7a559c6f14e2b6bc0a1af9fb3aaf86fb1aa4e0a4731bdf4ca4",
-        "chitra-watchd.service": "40850fcdca1347942b8f5374f31aa4381cd7282cf6cf2b7bf87a3b32f4f040cf"
+        "chitra-dispatchd.service": "be17b0bf352b40973e7b109df266c3e5de999855b227379198b92fe18c66a2ab"
       }
     },
     "package-instance": {
@@ -34,9 +31,12 @@
       "root": "packaging/systemd",
       "parameter_mode": "instance-template",
       "required_tokens": ["%i"],
-      "allowed_tokens": ["%i"],
+      "allowed_tokens": ["%H", "%i", "${CHITRA_STATE_DIR}"],
       "units": {
-        "chitra@.service": "2b3c3333c8a109551d8297d3eb9aad7cade11ef36340809df71257426801f8ca"
+        "chitra@.service": "2b3c3333c8a109551d8297d3eb9aad7cade11ef36340809df71257426801f8ca",
+        "chitra-monitord@.service": "0ec094895022f632465096ec83a0dbf9670968e4ce539728181902b77415da0f",
+        "chitra-rate-limit-guard@.service": "e75fd617537ceb80aac30bea17844d7fa4489ab2a5930b162ec13f89c0348ea7",
+        "chitra-rate-limit-guard@.timer": "d41c9ae55ae849b493aa3e0c4c65e78e5a556b51070a5882867f2dfd24928be4"
       }
     },
     "fleet-host": {

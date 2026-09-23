@@ -1,0 +1,25 @@
+[Unit]
+Description=chitra rate-limit and host-load guard sweep for lane %i
+Documentation=https://github.com/ReticleWorks/chitra
+After=network-online.target
+ConditionPathExists=/etc/chitra/policy.yaml
+StartLimitIntervalSec=10min
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+User=chitra
+Group=chitra
+# systemd creates and owns this directory (mode 0750) for the unit's lifetime.
+StateDirectory=chitra
+# Each %i instance sweeps the lane state root chitra-monitord@%i writes and
+# queues orders where chitra-dispatchd drains that lane. Usage snapshots are
+# per host, so every lane instance reads the same directory.
+Environment=CHITRA_STATE_DIR=/var/lib/chitra/lane-%i
+# %H resolves to the host this sweep runs on; the guard builds each
+# session_ref as <host>:<tmux_session>:0.0 from it.
+ExecStart=/opt/chitra/venv/bin/python -m chitra.rate_limit_guard --usage-dir /var/lib/chitra/usage-snapshots --host %H --goals-root ${CHITRA_STATE_DIR} --queue-dir ${CHITRA_STATE_DIR}/queue --policy-config /etc/chitra/policy.yaml
+Restart=no
+NoNewPrivileges=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/chitra /run/chitra

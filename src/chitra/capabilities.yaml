@@ -126,6 +126,25 @@ capabilities:
         params: []
         mutates: false
 
+  - name: outcomes
+    kind: tool
+    purpose: Compute deterministic per-task_type effectiveness rollups over local Chitra state.
+    when_to_use: Use when an operator wants dispatch, validation, intervention, retry, defect, and cycle-time metrics by task family.
+    authority:
+      level: observe
+      grants:
+        - Read local Chitra state stores and compute per-family outcome metrics.
+      excludes:
+        - Dispatch messages, pause or resume a lane, or invoke an LLM.
+        - Merge, approve, or modify pull requests.
+    default_enabled: true
+    commands:
+      - name: chitra-outcomes
+        description: Print the deterministic per-task_type outcomes rollup as JSON.
+        argv: [chitra-outcomes]
+        params: []
+        mutates: false
+
   - name: goals
     kind: tool
     purpose: Record the monitor-stated goal and explicit status for a lane.

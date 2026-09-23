@@ -4,6 +4,42 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+### Added
+
+- `chitra-outcomes` console script prints the per-`task_type` outcomes
+  rollup as JSON.
+- tmux delivery reports SENT from pane evidence when transcript-grep cannot
+  find the transcript but the submitted marker sits in a recognized TUI's
+  scrollback with a cleared composer.
+- `filelock` runtime dependency; every exclusive state lock goes through
+  one shared helper.
+
+### Removed
+
+- `chitra.board_updater`, which had no callers, and zero-caller helpers
+  across the package.
+- Stop shipping the deprecated `chitra-watchd.service`,
+  `chitra-triaged.service`, and `chitra-sweepd.service` units. The Debian
+  package now installs `chitra-monitord@.service` — promoted from the former
+  `.service.example` template — alongside `chitra-dispatchd.service` and
+  `chitra@.service`. The `watchd`, `triaged`, and `sweepd` modules remain
+  installed for existing declarations that invoke them directly (the
+  `triaged` and `chitra-sweepd` console scripts, `python -m chitra.watchd`);
+  only their standalone-daemon systemd surface is gone.
+
+### Fixed
+
+- The rate-limit guard units ship as per-lane templates,
+  `chitra-rate-limit-guard@.service` and `chitra-rate-limit-guard@.timer`, and
+  the Debian package now installs them. The former literal unit swept
+  `/var/lib/chitra`, which holds no lane goals, and queued orders in
+  `/var/lib/chitra/queue`, which no dispatcher drains. Each instance now
+  sweeps `/var/lib/chitra/lane-<lane-id>` and reads `/etc/chitra/policy.yaml`,
+  the policy file dispatchd uses.
+- tmux pane evidence no longer reports an order SENT when the same marker was
+  already on screen before the paste. A repeated canned nudge stays
+  DELIVERY_UNCONFIRMED until its transcript confirms it.
+
 ## [0.21.1] - 2026-09-05
 
 ### Fixed

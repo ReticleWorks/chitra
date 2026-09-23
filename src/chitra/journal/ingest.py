@@ -1,4 +1,4 @@
-"""Compose tail reading, version-gated normalization, and journal writes."""
+"""Compose tail reading, normalization, and journal writes."""
 
 from __future__ import annotations
 

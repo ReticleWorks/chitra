@@ -671,10 +671,6 @@ class AgentStatusBroker:
                 raise
             self._condition.notify_all()
 
-    def import_handoff_snapshot(self, payload: object) -> None:
-        """Validate, then atomically replace empty replacement-server state."""
-        self.import_validated_handoff_snapshot(self.validate_handoff_snapshot(payload))
-
     def _ensure_mutable(self) -> None:
         if self._frozen:
             raise StatusRuntimeError("status authority is frozen for live handoff")

@@ -127,6 +127,7 @@ import structlog
 
 from . import ledger as ledger_mod
 from .completion_gate import evaluate_completion_claim, is_completion_claim
+from .decisions import read_decisions
 from .dispatch import (
     DISPATCH_VERIFY_WAIT_SECONDS,
     DispatchTuning,
@@ -228,8 +229,11 @@ def _goal_contract_rejection(order: DispatchOrder, goals_root: Path | None) -> s
     if current_goal.status in {"held", "done-pending-verification", "done-pending-close"}:
         return "goal-not-actionable"
     if order.message_kind == "goal_contract_answer":
+        decisions_path = goals_root / "decisions.jsonl" if goals_root is not None else None
         expected_question_result = (
-            handle_question(current_goal, order.question_result.question) if order.question_result is not None else None
+            handle_question(current_goal, order.question_result.question, decisions=read_decisions(decisions_path))
+            if order.question_result is not None
+            else None
         )
         if (
             expected_question_result is None
@@ -379,10 +383,10 @@ def _ensure_delivery_ledger(
     returned without making the proof durable.
 
     When the confirmed result names a lane transcript, its adapter-native
-    session identity is normalized with the journal's own version-gated
+    session identity is normalized with the journal's own
     normalizers and bound into the signed row (signature version 5). The
     value never comes from ``routing_hint``, which stays opaque audit
-    metadata. A transcript that yields no fixture-gated native identity
+    metadata. A transcript that yields no native identity
     still gets a valid v4 row for legacy orders; strict autonomous orders
     fail closed instead of trusting an unbound session.
     """
@@ -395,7 +399,7 @@ def _ensure_delivery_ledger(
             raise OSError(f"strict delivery has no exact bound transcript for order {order.order_id}")
         expected_native_session_id = native_session_identity(expected_transcript_path)
         if not expected_native_session_id:
-            raise OSError(f"strict bound transcript has no fixture-gated native session identity for order {order.order_id}")
+            raise OSError(f"strict bound transcript has no native session identity for order {order.order_id}")
     existing = ledger_mod.verify_delivery(
         resolved_ledger_path,
         key=key,
@@ -793,26 +797,6 @@ def requeue_deferred_for_session(queue_dir: Path, session_ref: str) -> list[str]
     if requeued:
         logger.info("dispatchd_deferred_requeued", session_ref=session_ref, order_ids=requeued)
     return requeued
-
-
-def _lane_lock_retry_state_path(deferred_dir: Path, order_id: str) -> Path:
-    """Return the durable lane-lock retry sidecar path (see ``chitra.queue_state.LaneLockRetryTracker``)."""
-    return LaneLockRetryTracker(deferred_dir).state_path(order_id)
-
-
-def _read_lane_lock_retry_attempts(deferred_dir: Path, order_id: str) -> int:
-    """Read the durable diagnostic retry count."""
-    return LaneLockRetryTracker(deferred_dir).attempts(order_id)
-
-
-def _record_lane_lock_retry_attempt(deferred_dir: Path, order_id: str) -> int:
-    """Atomically increment and persist one lane-lock timeout count."""
-    return LaneLockRetryTracker(deferred_dir).record_attempt(order_id)
-
-
-def _remove_lane_lock_retry_attempts(deferred_dir: Path, order_id: str) -> None:
-    """Best-effort cleanup after a terminal result has made retry state moot."""
-    LaneLockRetryTracker(deferred_dir).clear(order_id)
 
 
 def _requeue_lane_lock_deferred(queue_dir: Path, orders_dir: Path) -> list[Path]:

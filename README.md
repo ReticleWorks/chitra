@@ -24,14 +24,15 @@ independently checked the evidence.
 
 ## Components
 
-**The daemon set.** Four daemons run as templated systemd instances, one
-instance per monitor (for example a monitor named `monitor` or one named
-`boomtown`), each with its own state root under `/var/lib/polyphony-chitra*`:
-`watchd` (semantic pane status), `triaged` (deduplicated state-change
-events), `dispatchd` (the sole process allowed to write into a session), and
-`sweepd` (a compact fleet-state digest). `watchd`, `triaged`, and `sweepd`
-are deprecated in favor of the supervisor below; `dispatchd` stays the sole
-terminal writer for both the older set and the newer one.
+**The daemon set.** The package ships one `chitra-monitord@` systemd
+instance template — one instance per monitor (for example a monitor named
+`monitor` or one named `boomtown`), each with its own state root under
+`/var/lib/chitra/lane-<id>` — and a shared `chitra-dispatchd.service`, the
+sole process allowed to write into a session. The older `watchd`, `triaged`,
+and `sweepd` daemons are deprecated in favor of `monitord`; their modules
+remain installed for existing declarations, but their systemd units no
+longer ship. A per-lane `chitra-rate-limit-guard@` timer sweeps the same lane
+state root for usage and host-load holds.
 
 **The supervisor.** Added in 0.19.2, `monitord` is the persistent-goal-pursuit
 engine: it binds a transcript to one frozen goal, runs deterministic

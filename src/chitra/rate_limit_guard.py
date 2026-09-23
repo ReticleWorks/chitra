@@ -83,7 +83,7 @@ an external timer (systemd timer / cron), exactly like ``chitra.draft_
 scanner``'s periodic-scan shape -- re-running it every few minutes is what
 lets the transaction state machine make forward progress and is what makes
 "resume it automatically after reset" work, with no long-lived process of
-its own. Example two-minute systemd units ship under ``packaging/systemd``.
+its own. Two-minute systemd units ship under ``packaging/systemd``.
 
 The same sweep also samples local MemAvailable and Linux memory/CPU PSI. Its
 per-host two-sweep anti-flap state and last-shed-first stack live beside the

@@ -8,7 +8,6 @@ is never placed in these prompts. Each reviewer invocation is a separate
 
 from __future__ import annotations
 
-import fcntl
 import json
 import re
 import subprocess
@@ -20,6 +19,7 @@ from typing import Literal, Protocol, Self
 import structlog
 from pydantic import Field, model_validator
 
+from chitra._fsio import exclusive_lock
 from chitra.autonomy import DEFAULT_AUTONOMY_POLICY, AutonomyPolicy
 from chitra.goals import (
     GoalNotFoundError,
@@ -163,7 +163,7 @@ class SessionReviewSignal(_FrozenModel):
     session_ref: str
     goal_contract_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     behavior_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    verdict: Literal["accept", "reject"]
+    verdict: Literal["accept", "reject", "insufficient"]
     reviewer_ids: tuple[str, ...] = Field(min_length=1)
     findings: tuple[ReviewFinding, ...] = ()
     restarted_after_redirect: bool = False
@@ -187,7 +187,7 @@ class SessionReviewSignal(_FrozenModel):
         session_ref: str,
         goal_contract_id: str,
         behavior_sha256: str,
-        verdict: Literal["accept", "reject"],
+        verdict: Literal["accept", "reject", "insufficient"],
         reviewer_ids: Sequence[str],
         findings: Sequence[ReviewFinding] = (),
         restarted_after_redirect: bool = False,
@@ -344,7 +344,16 @@ def _signal(
     restarted_after_redirect: bool,
 ) -> SessionReviewSignal:
     findings = tuple(finding for review in reviews for finding in review.findings)
-    verdict: Literal["accept", "reject"] = "accept" if all(review.verdict == "accept" for review in reviews) else "reject"
+    # "insufficient" is the middle verdict: it never yields an accept, and it
+    # never softens a reject -- a dissenting reviewer that still found a
+    # grounded adverse finding keeps its force.
+    verdict: Literal["accept", "reject", "insufficient"] = (
+        "accept"
+        if all(review.verdict == "accept" for review in reviews)
+        else "reject"
+        if any(review.verdict == "reject" for review in reviews)
+        else "insufficient"
+    )
     return SessionReviewSignal.create(
         session_ref=behavior.session_ref,
         goal_contract_id=goal.contract_id,
@@ -362,22 +371,17 @@ def review_log_path(root: Path) -> Path:
 
 def append_review_signal(path: Path, signal: SessionReviewSignal) -> None:
     """Append one internal review signal, deduplicated by content id."""
-    path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".lock")
-    with lock_path.open("a", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            if path.exists():
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    try:
-                        if json.loads(line).get("signal_id") == signal.signal_id:
-                            return
-                    except (ValueError, AttributeError):
-                        continue
-            with path.open("a", encoding="utf-8") as output:
-                output.write(signal.model_dump_json() + "\n")
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    with exclusive_lock(lock_path):
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    if json.loads(line).get("signal_id") == signal.signal_id:
+                        return
+                except (ValueError, AttributeError):
+                    continue
+        with path.open("a", encoding="utf-8") as output:
+            output.write(signal.model_dump_json() + "\n")
 
 
 def load_latest_review_signal(path: Path, session_ref: str) -> SessionReviewSignal | None:

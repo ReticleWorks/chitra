@@ -162,6 +162,75 @@ def test_any_rejection_blocks_unanimous_release(tmp_path: Path) -> None:
     assert signal.findings[0].code == "hedged_completion"
 
 
+def test_an_insufficient_round_is_neither_accepted_nor_rejected(tmp_path: Path) -> None:
+    """Work still in flight yields "insufficient": no accept, no reject."""
+    goal = _goal(tmp_path)
+    behavior = WatchedSessionBehavior.from_turn(
+        goal.session_ref,
+        "Done; the verification suite is still running in the background.",
+        still_running=("background tool call call-1 (Bash) is still running",),
+    )
+
+    class InsufficientReviewer:
+        def review(self, frozen, watched, reviewer_id: str) -> ReviewerVerdict:
+            return ReviewerVerdict(
+                reviewer_id=reviewer_id,
+                goal_contract_id=frozen.contract_id,
+                behavior_sha256=watched.behavior_sha256,
+                verdict="insufficient",
+            )
+
+    signal = review_watched_session(tmp_path, goal.session_ref, behavior, reviewer=InsufficientReviewer())
+
+    assert signal.verdict == "insufficient"
+    assert signal.findings == ()
+
+
+def test_an_insufficient_verdict_breaks_unanimous_acceptance(tmp_path: Path) -> None:
+    """One insufficient reviewer defeats the accept without becoming a reject."""
+    goal = _goal(tmp_path)
+    behavior = WatchedSessionBehavior.from_turn(goal.session_ref, "Done, pending a running check.")
+
+    class MixedReviewer(AcceptingReviewer):
+        def review(self, frozen, watched, reviewer_id: str) -> ReviewerVerdict:
+            if reviewer_id.endswith("2"):
+                return ReviewerVerdict(
+                    reviewer_id=reviewer_id,
+                    goal_contract_id=frozen.contract_id,
+                    behavior_sha256=watched.behavior_sha256,
+                    verdict="insufficient",
+                )
+            return super().review(frozen, watched, reviewer_id)
+
+    signal = review_watched_session(tmp_path, goal.session_ref, behavior, reviewer=MixedReviewer())
+
+    assert signal.verdict == "insufficient"
+
+
+def test_the_reviewer_input_lists_work_still_running(tmp_path: Path) -> None:
+    """The INPUT payload carries the lane's in-flight work next to the rule."""
+    goal = freeze_goal(_goal(tmp_path))
+    behavior = WatchedSessionBehavior.from_turn(
+        goal.session_ref,
+        "Continuing against the recorded goal.",
+        still_running=("background tool call call-1 (Bash) is still running",),
+    )
+    captured: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(command)
+        return subprocess.CompletedProcess(command, 0, _verdict_json(command), "")
+
+    ClaudeProcessReviewer(runner=runner).review(goal, behavior, "reviewer-a")
+
+    request = _request_from_prompt(captured[0][2])
+    assert request["watched_session_behavior"]["still_running"] == [
+        "background tool call call-1 (Bash) is still running"
+    ]
+    assert "still_running" in captured[0][2]
+    assert '"insufficient"' in captured[0][2]
+
+
 def test_redirect_restarts_automatically_with_exactly_one_reviewer_and_logs_history(tmp_path: Path) -> None:
     goal = _goal(tmp_path)
     behavior = WatchedSessionBehavior.from_turn(goal.session_ref, "The lane asks whether it may change the release strategy.")

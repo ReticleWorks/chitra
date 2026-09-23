@@ -1,9 +1,10 @@
-"""Version-gated normalizers for observed Claude Code and Codex JSONL."""
+"""Normalizers for observed Claude Code and Codex JSONL."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,14 +21,6 @@ from .models import (
 from .reader import JsonlTailReader
 
 NORMALIZER_VERSION = "chitra-journal-normalizer.v1"
-SUPPORTED_VERSIONS: dict[Client, frozenset[str]] = {
-    Client.CLAUDE: frozenset({"2.1.229"}),
-    Client.CODEX: frozenset({"0.149.0"}),
-}
-
-
-class UnsupportedClientVersion(ValueError):
-    """The transcript has not passed the fixture gate for this client version."""
 
 
 @dataclass(frozen=True)
@@ -55,6 +48,25 @@ def _blocks(value: Any) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)]
 
 
+def queued_operator_prompt(record: object) -> str | None:
+    """Return the text of input typed into a busy Claude session, else None.
+
+    Claude Code records such input as an ``attachment`` record of type
+    ``queued_command``, not a ``user`` record. Task notifications use the same
+    shape without ``origin``, and their text can be written by the lane's own
+    subagents, so only an origin-bearing attachment counts as input.
+    """
+    if not isinstance(record, dict) or record.get("type") != "attachment":
+        return None
+    attachment = record.get("attachment")
+    if not isinstance(attachment, dict) or attachment.get("type") != "queued_command":
+        return None
+    if not isinstance(attachment.get("origin"), dict):
+        return None
+    prompt = attachment.get("prompt")
+    return prompt if isinstance(prompt, str) else None
+
+
 def _native_key(record: dict[str, Any], raw_sha256: str) -> str:
     for key in ("uuid", "id"):
         value = record.get(key)
@@ -68,6 +80,35 @@ def _native_key(record: dict[str, Any], raw_sha256: str) -> str:
                 return f"payload.{key}:{value}:sha256:{raw_sha256}"
     timestamp = record.get("timestamp")
     return f"timestamp:{timestamp!s}:sha256:{raw_sha256}"
+
+
+_TASK_NOTIFICATION_TASK_ID_RE = re.compile(r"<task-id>(.*?)</task-id>", re.S)
+_TASK_NOTIFICATION_STATUS_RE = re.compile(r"<status>(.*?)</status>", re.S)
+_TASK_NOTIFICATION_SUMMARY_RE = re.compile(r"<summary>(.*?)</summary>", re.S)
+
+
+def _parse_task_notification(content: str) -> dict[str, str | None] | None:
+    """Parse a background-task notification's task id and terminal status.
+
+    A launched background command's tool-use id is absent from roughly a
+    third of real notifications (measured), so the caller must join back to
+    the originating tool call by ``task-id``, learned from the launch
+    placeholder -- never by tool-use id alone. A notification with no
+    ``<status>`` is a mid-task ``<event>`` tick, not a completion; callers
+    must not treat it as one.
+    """
+    if "<task-notification>" not in content:
+        return None
+    task_id_match = _TASK_NOTIFICATION_TASK_ID_RE.search(content)
+    if task_id_match is None:
+        return None
+    status_match = _TASK_NOTIFICATION_STATUS_RE.search(content)
+    summary_match = _TASK_NOTIFICATION_SUMMARY_RE.search(content)
+    return {
+        "task_id": task_id_match.group(1).strip(),
+        "status": status_match.group(1).strip() if status_match else None,
+        "summary": summary_match.group(1).strip() if summary_match else None,
+    }
 
 
 def _nested_exit_code(output: Any) -> int | None:
@@ -90,12 +131,6 @@ class TranscriptNormalizer:
     """Stateful normalizer for one transcript stream."""
 
     def __init__(self, context: NormalizationContext) -> None:
-        supported = SUPPORTED_VERSIONS[context.client]
-        if context.client_version not in supported:
-            raise UnsupportedClientVersion(
-                f"unsupported {context.client.value} version {context.client_version!r}; "
-                f"fixture-gated versions: {', '.join(sorted(supported))}"
-            )
         self.context = context
         self.session_id = context.session_id
         self.resume_id = context.resume_id
@@ -174,12 +209,14 @@ class TranscriptNormalizer:
         slot: str,
         payload: dict[str, Any],
         native_join_id: str | None = None,
+        native_type: str | None = None,
     ) -> CanonicalEvent:
         record = raw.record or {}
         native_time_value = record.get("timestamp")
         native_time = native_time_value if isinstance(native_time_value, str) else None
-        native_type_value = record.get("type")
-        native_type = native_type_value if isinstance(native_type_value, str) else "invalid_json"
+        if native_type is None:
+            native_type_value = record.get("type")
+            native_type = native_type_value if isinstance(native_type_value, str) else "invalid_json"
         payload_digest = _canonical_digest(payload)
         event_id = _canonical_digest(
             {
@@ -239,20 +276,19 @@ class ClaudeNormalizer(TranscriptNormalizer):
         super().__init__(context)
         self._pending_text: tuple[str, str | None] | None = None
         self._stop_hook_seen = False
+        self._background_tasks: dict[str, str] = {}
 
     def begin_replay(self) -> None:
         super().begin_replay()
         self._pending_text = None
         self._stop_hook_seen = False
+        self._background_tasks = {}
 
     def normalize(self, raw: RawRecord) -> tuple[CanonicalEvent, ...]:
         self._begin_record(raw)
         if raw.record is None:
             return (self._unknown(raw),)
         record = raw.record
-        version = record.get("version")
-        if isinstance(version, str) and version != self.context.client_version:
-            raise UnsupportedClientVersion(f"Claude record version changed to {version!r}")
         session_id = record.get("sessionId")
         if isinstance(session_id, str):
             if self.session_id is not None and self.session_id != session_id:
@@ -283,33 +319,88 @@ class ClaudeNormalizer(TranscriptNormalizer):
                         )
                 elif block.get("type") == "text" and isinstance(block.get("text"), str):
                     message_id = message.get("id")
-                    self._pending_text = (
-                        block["text"],
-                        message_id if isinstance(message_id, str) else None,
-                    )
-                    self._stop_hook_seen = False
+                    if message.get("stop_reason") == "end_turn":
+                        # The API's own turn-boundary signal: this message ends
+                        # the turn (no further tool_use will follow it), so the
+                        # text is the final response now. Older transcripts
+                        # (and any client that omits stop_reason) fall through
+                        # to the stop_hook_summary/turn_duration path below,
+                        # which a Stop hook may or may not ever produce.
+                        events.append(
+                            self._event(
+                                raw,
+                                CanonicalType.FINAL_RESPONSE,
+                                slot="turn_boundary",
+                                native_join_id=message_id if isinstance(message_id, str) else None,
+                                payload={"text": block["text"], "message_id": message_id},
+                            )
+                        )
+                        self._pending_text = None
+                        self._stop_hook_seen = False
+                    else:
+                        self._pending_text = (
+                            block["text"],
+                            message_id if isinstance(message_id, str) else None,
+                        )
+                        self._stop_hook_seen = False
         elif record_type == "user" and isinstance(message, dict):
-            for index, block in enumerate(_blocks(message.get("content"))):
-                if block.get("type") != "tool_result":
-                    continue
-                call_id = block.get("tool_use_id")
-                if not isinstance(call_id, str):
-                    continue
-                is_error = block.get("is_error") is True
-                events.append(
-                    self._event(
-                        raw,
-                        CanonicalType.TOOL_ERROR if is_error else CanonicalType.TOOL_RESULT,
-                        slot=f"tool_result:{index}",
-                        native_join_id=call_id,
-                        payload={
-                            "call_id": call_id,
-                            "content": block.get("content"),
-                            "is_error": is_error,
-                            "tool_use_result": record.get("toolUseResult"),
-                        },
+            content = message.get("content")
+            if isinstance(content, str):
+                notification = _parse_task_notification(content)
+                if notification is not None and notification["status"] is not None:
+                    call_id = self._background_tasks.pop(notification["task_id"] or "", None)
+                    if call_id is not None:
+                        is_error = notification["status"] != "completed"
+                        events.append(
+                            self._event(
+                                raw,
+                                CanonicalType.TOOL_ERROR if is_error else CanonicalType.TOOL_RESULT,
+                                slot="task_notification",
+                                native_join_id=call_id,
+                                payload={
+                                    "call_id": call_id,
+                                    "task_id": notification["task_id"],
+                                    "status": notification["status"],
+                                    "summary": notification["summary"],
+                                    "is_error": is_error,
+                                },
+                            )
+                        )
+                # A notification with no <status> is a mid-task <event> tick,
+                # never a completion; an unmapped task id is left unknown.
+            else:
+                for index, block in enumerate(_blocks(content)):
+                    if block.get("type") != "tool_result":
+                        continue
+                    call_id = block.get("tool_use_id")
+                    if not isinstance(call_id, str):
+                        continue
+                    tool_use_result = record.get("toolUseResult")
+                    background_task_id = (
+                        tool_use_result.get("backgroundTaskId") if isinstance(tool_use_result, dict) else None
                     )
-                )
+                    if isinstance(background_task_id, str):
+                        # A background launch's immediate result is a
+                        # "running" placeholder, not the tool's outcome. Track
+                        # it as in progress; only the later terminal
+                        # task-notification supplies the real result.
+                        self._background_tasks[background_task_id] = call_id
+                        continue
+                    is_error = block.get("is_error") is True
+                    events.append(
+                        self._event(
+                            raw,
+                            CanonicalType.TOOL_ERROR if is_error else CanonicalType.TOOL_RESULT,
+                            slot=f"tool_result:{index}",
+                            native_join_id=call_id,
+                            payload={
+                                "call_id": call_id,
+                                "content": block.get("content"),
+                                "is_error": is_error,
+                                "tool_use_result": record.get("toolUseResult"),
+                            },
+                        )
+                    )
         elif record_type == "system" and record.get("subtype") == "stop_hook_summary":
             if self._pending_text is not None:
                 self._stop_hook_seen = True
@@ -347,6 +438,7 @@ class CodexNormalizer(TranscriptNormalizer):
             raise ValueError("CodexNormalizer requires the codex client")
         super().__init__(context)
         self._pending_text: tuple[str, str | None] | None = None
+        self._parent_thread_id: str | None = None
 
     def begin_replay(self) -> None:
         super().begin_replay()
@@ -360,18 +452,64 @@ class CodexNormalizer(TranscriptNormalizer):
         record_type = record.get("type")
         payload = record.get("payload")
         if record_type == "session_meta" and isinstance(payload, dict):
-            version = payload.get("cli_version")
-            if version != self.context.client_version:
-                raise UnsupportedClientVersion(f"Codex session version changed to {version!r}")
             candidate = payload.get("id")
-            if isinstance(candidate, str):
+            # A subagent rollout replays its parent's session_meta after its own.
+            if isinstance(candidate, str) and candidate != self._parent_thread_id:
+                source = payload.get("source")
+                # Built-in subagents write a bare string, e.g. {"subagent": "review"}.
+                subagent = source.get("subagent") if isinstance(source, dict) else None
+                spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+                if isinstance(spawn, dict) and isinstance(spawn.get("parent_thread_id"), str):
+                    self._parent_thread_id = spawn["parent_thread_id"]
                 if self.session_id is not None and self.session_id != candidate:
                     raise ValueError("Codex session id changed within one transcript")
                 self.session_id = candidate
             return (self._unknown(raw),)
         if record_type == "response_item" and isinstance(payload, dict):
             payload_type = payload.get("type")
-            if payload_type == "custom_tool_call":
+            if payload_type == "function_call":
+                call_id = payload.get("call_id")
+                if isinstance(call_id, str):
+                    return (
+                        self._event(
+                            raw,
+                            CanonicalType.TOOL_CALL,
+                            slot="function_call",
+                            native_join_id=call_id,
+                            payload={
+                                "call_id": call_id,
+                                "tool_name": payload.get("name"),
+                                "namespace": payload.get("namespace"),
+                                "input": payload.get("arguments"),
+                            },
+                        ),
+                    )
+            elif payload_type == "function_call_output":
+                call_id = payload.get("call_id")
+                if isinstance(call_id, str):
+                    return (
+                        self._event(
+                            raw,
+                            CanonicalType.TOOL_RESULT,
+                            slot="function_call_output",
+                            native_join_id=call_id,
+                            payload={"call_id": call_id, "output": payload.get("output")},
+                        ),
+                    )
+            elif payload_type == "message" and payload.get("role") == "user":
+                # Claude's user turns carry native_type "user". The ladder's
+                # consumption proof keys on that and on payload text.
+                texts = [block["text"] for block in _blocks(payload.get("content")) if isinstance(block.get("text"), str)]
+                return (
+                    self._event(
+                        raw,
+                        CanonicalType.UNKNOWN,
+                        slot="user_message",
+                        native_type="user",
+                        payload={"native_type": "user", "text": "\n".join(texts)},
+                    ),
+                )
+            elif payload_type == "custom_tool_call":
                 call_id = payload.get("call_id")
                 if isinstance(call_id, str):
                     return (
@@ -461,12 +599,12 @@ def make_normalizer(context: NormalizationContext) -> TranscriptNormalizer:
 def native_session_identity(transcript_path: Path | str) -> str | None:
     """Derive one transcript's adapter-native session identity.
 
-    The transcript is replayed through the same version-gated normalizers the
-    durable journal uses, so the returned value is exactly the ``session_id``
+    The transcript is replayed through the same normalizers the durable
+    journal uses, so the returned value is exactly the ``session_id``
     canonical events for that transcript carry. Any transcript that does not
-    identify a fixture-gated Claude/Codex session -- unreadable, foreign
-    schema, unsupported client version, or inconsistent native identity --
-    yields ``None`` so callers can fail closed instead of binding a guess.
+    identify a Claude/Codex session -- unreadable, foreign schema, no client
+    version, or inconsistent native identity -- yields ``None`` so callers
+    can fail closed instead of binding a guess.
     """
     path = Path(transcript_path)
     try:
@@ -491,7 +629,7 @@ def native_session_identity(transcript_path: Path | str) -> str | None:
             client_version = candidate
         if client is not None and client_version is not None:
             break
-    if client is None or client_version is None or client_version not in SUPPORTED_VERSIONS[client]:
+    if client is None or client_version is None:
         return None
     context = NormalizationContext(
         instance="native-session-identity",
@@ -503,6 +641,6 @@ def native_session_identity(transcript_path: Path | str) -> str | None:
     try:
         for raw in records:
             normalizer.normalize(raw)
-    except (UnsupportedClientVersion, ValueError):
+    except ValueError:
         return None
     return normalizer.session_id

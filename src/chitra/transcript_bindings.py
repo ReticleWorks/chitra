@@ -13,7 +13,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, model_validator
 
-from chitra.journal import SUPPORTED_VERSIONS, Client
+from chitra.journal import Client
 
 SCHEMA = "chitra.transcript-bindings.v1"
 DEFAULT_FILENAME = "transcript-bindings.json"
@@ -36,12 +36,6 @@ class TranscriptBinding(BaseModel):
         for name in ("session_ref", "lane", "path", "client_version", "instance"):
             if not getattr(self, name).strip():
                 raise ValueError(f"{name} must be a non-empty string")
-        if self.client_version not in SUPPORTED_VERSIONS[self.client]:
-            supported = ", ".join(sorted(SUPPORTED_VERSIONS[self.client]))
-            raise ValueError(
-                f"unsupported {self.client.value} version {self.client_version!r}; "
-                f"fixture-gated versions: {supported}"
-            )
         return self
 
     def resolved_path(self, *, manifest_path: Path, transcript_root: Path | None) -> Path:

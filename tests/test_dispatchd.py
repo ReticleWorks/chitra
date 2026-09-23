@@ -20,6 +20,7 @@ from chitra.dispatchd import build_arg_parser, main, process_one_order, requeue_
 from chitra.goals import GOALS_SCHEMA_NEWER_MESSAGE, GoalRecord, hold_goal, redirect_goal, upsert_goal
 from chitra.policy_config import PolicyConfig
 from chitra.question_handler import handle_question
+from chitra.queue_state import LaneLockRetryTracker
 from chitra.reasoning import DecisionAttestation, DelegatedAuthority
 from chitra.routing_config import ROUTING_CONFIG_ENV_VAR, RoutingConfig
 from chitra.supervision import goal_digest
@@ -898,7 +899,7 @@ def test_lane_lock_timeout_is_retried_then_succeeds(tmp_path: Path, monkeypatch:
 
     first = run_once(queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl")
 
-    retry_state = dispatchd_mod._lane_lock_retry_state_path(queue_dir / "deferred", order.order_id)
+    retry_state = LaneLockRetryTracker(queue_dir / "deferred").state_path(order.order_id)
     assert [result.status for result in first] == [DispatchStatus.BLOCKED]
     assert (queue_dir / "deferred" / "retry-then-send.json").exists()
     assert not (queue_dir / "results" / "retry-then-send.json").exists()
@@ -960,7 +961,7 @@ def test_delivery_unconfirmed_is_deferred_not_terminal(tmp_path: Path, monkeypat
     assert not (queue_dir / "results" / "unconfirmed-1.json").exists()
     assert not (queue_dir / "processed" / "unconfirmed-1.json").exists()
     assert (queue_dir / "deferred" / "unconfirmed-1.json").exists()
-    assert dispatchd_mod._lane_lock_retry_state_path(queue_dir / "deferred", order.order_id).exists()
+    assert LaneLockRetryTracker(queue_dir / "deferred").state_path(order.order_id).exists()
 
 
 def test_delivery_unconfirmed_keeps_retrying_without_a_terminal_result(
@@ -1000,7 +1001,7 @@ def test_delivery_unconfirmed_keeps_retrying_without_a_terminal_result(
     assert not (queue_dir / "results" / "unconfirmed-2.json").exists()
     assert not (queue_dir / "processed" / "unconfirmed-2.json").exists()
     assert (queue_dir / "deferred" / "unconfirmed-2.json").exists()
-    assert dispatchd_mod._read_lane_lock_retry_attempts(queue_dir / "deferred", order.order_id) == 2
+    assert LaneLockRetryTracker(queue_dir / "deferred").attempts(order.order_id) == 2
 
 
 def test_lane_lock_timeout_keeps_retrying_without_a_terminal_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1025,13 +1026,13 @@ def test_lane_lock_timeout_keeps_retrying_without_a_terminal_result(tmp_path: Pa
         ledger_path=tmp_path / "ledger.jsonl",
     )
 
-    retry_state = dispatchd_mod._lane_lock_retry_state_path(queue_dir / "deferred", order.order_id)
+    retry_state = LaneLockRetryTracker(queue_dir / "deferred").state_path(order.order_id)
     assert [result.status for result in second] == [DispatchStatus.BLOCKED]
     assert not (queue_dir / "results" / "retry-exhausted.json").exists()
     assert not (queue_dir / "processed" / "retry-exhausted.json").exists()
     assert (queue_dir / "deferred" / "retry-exhausted.json").exists()
     assert retry_state.exists()
-    assert dispatchd_mod._read_lane_lock_retry_attempts(queue_dir / "deferred", order.order_id) == 2
+    assert LaneLockRetryTracker(queue_dir / "deferred").attempts(order.order_id) == 2
 
 
 def test_lane_lock_deferred_requeue_is_atomic_and_runs_after_pending_orders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1046,7 +1047,7 @@ def test_lane_lock_deferred_requeue_is_atomic_and_runs_after_pending_orders(tmp_
     pending_order = DispatchOrder(order_id="already-pending", session_ref="localhost:s:0.1", nudge="pending")
     _write_order(queue_dir / "deferred", deferred_order)
     _write_order(queue_dir / "orders", pending_order)
-    dispatchd_mod._record_lane_lock_retry_attempt(queue_dir / "deferred", deferred_order.order_id)
+    LaneLockRetryTracker(queue_dir / "deferred").record_attempt(deferred_order.order_id)
 
     seen: list[str] = []
 
@@ -1061,7 +1062,7 @@ def test_lane_lock_deferred_requeue_is_atomic_and_runs_after_pending_orders(tmp_
     with pytest.raises(RuntimeError, match="simulated crash after deferred requeue"):
         run_once(queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl")
 
-    retry_state = dispatchd_mod._lane_lock_retry_state_path(queue_dir / "deferred", deferred_order.order_id)
+    retry_state = LaneLockRetryTracker(queue_dir / "deferred").state_path(deferred_order.order_id)
     assert seen == [pending_order.order_id, deferred_order.order_id]
     assert (queue_dir / "orders" / "retry-after-crash.json").exists()
     assert not (queue_dir / "deferred" / "retry-after-crash.json").exists()

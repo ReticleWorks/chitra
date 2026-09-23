@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import fcntl
 import hashlib
 import json
 import os
@@ -26,6 +25,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final
 
+from chitra._fsio import exclusive_lock
 from chitra.goals import GOAL_STATUSES, GOALS_SCHEMA_RE, _schema_version
 from chitra.goals import SCHEMA as CURRENT_GOALS_SCHEMA
 from chitra.state_paths import state_dir as default_state_dir
@@ -501,74 +501,64 @@ def _enforce_generation_fence(
     boot identity is independently mandatory on every ownership query.
     """
 
-    descriptor: int | None = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(path.with_suffix(path.suffix + ".lock"), lock_flags, 0o600)
-        os.chmod(path.with_suffix(path.suffix + ".lock"), 0o600)
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        previous: dict[str, object] | None = None
-        try:
-            raw = _read_bounded_regular_file(
-                path,
-                label="generation_fence",
-                maximum_bytes=MAX_GENERATION_FENCE_BYTES,
-                expected_owner_uid=os.geteuid(),
-            )
-        except StateReadError as exc:
-            if exc.reason != "generation_fence_missing":
-                return False
-        else:
-            decoded = _load_json_bytes(raw, description="generation fence")
-            if not isinstance(decoded, dict) or set(decoded) != _GENERATION_FENCE_FIELDS:
-                return False
-            previous = decoded
-        if previous is not None:
+        with exclusive_lock(path.with_suffix(path.suffix + ".lock"), mode=0o600):
+            previous: dict[str, object] | None = None
             try:
-                previous_host = _nonempty_string(previous, "host_id")
-                previous_boot = _nonempty_string(previous, "boot_id")
-                previous_generation = previous["generation"]
-                previous_digest = previous["goals_sha256"]
-            except (KeyError, ValueError):
-                return False
-            if (
-                previous.get("schema") != GENERATION_FENCE_SCHEMA
-                or isinstance(previous_generation, bool)
-                or not isinstance(previous_generation, int)
-                or not 1 <= previous_generation <= MAX_GENERATION
-                or not isinstance(previous_digest, str)
-                or len(previous_digest) != 64
-                or previous_host != host_id
-            ):
-                return False
-            if previous_boot == boot_id:
-                if generation < previous_generation:
+                raw = _read_bounded_regular_file(
+                    path,
+                    label="generation_fence",
+                    maximum_bytes=MAX_GENERATION_FENCE_BYTES,
+                    expected_owner_uid=os.geteuid(),
+                )
+            except StateReadError as exc:
+                if exc.reason != "generation_fence_missing":
                     return False
-                if generation == previous_generation and goals_sha256 != previous_digest:
+            else:
+                decoded = _load_json_bytes(raw, description="generation fence")
+                if not isinstance(decoded, dict) or set(decoded) != _GENERATION_FENCE_FIELDS:
                     return False
-                if generation == previous_generation:
-                    return True
-        write_json_atomic(
-            path,
-            {
-                "schema": GENERATION_FENCE_SCHEMA,
-                "host_id": host_id,
-                "boot_id": boot_id,
-                "generation": generation,
-                "goals_sha256": goals_sha256,
-            },
-            mode=0o600,
-        )
-        return True
+                previous = decoded
+            if previous is not None:
+                try:
+                    previous_host = _nonempty_string(previous, "host_id")
+                    previous_boot = _nonempty_string(previous, "boot_id")
+                    previous_generation = previous["generation"]
+                    previous_digest = previous["goals_sha256"]
+                except (KeyError, ValueError):
+                    return False
+                if (
+                    previous.get("schema") != GENERATION_FENCE_SCHEMA
+                    or isinstance(previous_generation, bool)
+                    or not isinstance(previous_generation, int)
+                    or not 1 <= previous_generation <= MAX_GENERATION
+                    or not isinstance(previous_digest, str)
+                    or len(previous_digest) != 64
+                    or previous_host != host_id
+                ):
+                    return False
+                if previous_boot == boot_id:
+                    if generation < previous_generation:
+                        return False
+                    if generation == previous_generation and goals_sha256 != previous_digest:
+                        return False
+                    if generation == previous_generation:
+                        return True
+            write_json_atomic(
+                path,
+                {
+                    "schema": GENERATION_FENCE_SCHEMA,
+                    "host_id": host_id,
+                    "boot_id": boot_id,
+                    "generation": generation,
+                    "goals_sha256": goals_sha256,
+                },
+                mode=0o600,
+            )
+            return True
     except (OSError, ValueError, json.JSONDecodeError):
         return False
-    finally:
-        if descriptor is not None:
-            with contextlib.suppress(OSError):
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            with contextlib.suppress(OSError):
-                os.close(descriptor)
 
 
 def validate_query(payload: object) -> dict[str, str]:

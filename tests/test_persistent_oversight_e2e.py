@@ -9,6 +9,11 @@ inconsistent binding must never be guessed from another goal.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -21,12 +26,13 @@ import chitra.ledger as ledger_mod
 import chitra.monitord as monitord_mod
 from chitra.autonomy import AutonomyPolicy
 from chitra.completion_gate import CompletionEvidence
-from chitra.detect import Finding, IncidentStore
+from chitra.detect import Finding, IncidentStore, track_key
 from chitra.goals import GoalRecord, add_ask, get_goal, redirect_goal, update_now, upsert_goal
 from chitra.journal import CanonicalEvent
 from chitra.journal.store import EventJournal
 from chitra.monitord import main, resolve_config, run_once
 from chitra.orders import DispatchOrder, DispatchResult, DispatchStatus
+from chitra.review_rubric import ReviewerVerdict
 from chitra.supervision import SupervisionLedger, deterministic_order_id, goal_digest
 
 CLAUDE_VERSION = "2.1.229"
@@ -416,10 +422,22 @@ def _stub_finding(name: str) -> Finding:
         detector=f"test-{name}",
         fingerprint_seed={"name": name},
         event_refs=(),
-        unmet_item="done-1",
+        unmet_item=f"done-{name}",
         expected_next_progress=f"make progress for {name}",
         detail=f"finding {name}",
     )
+
+
+class _AcceptingReviewer:
+    """Credential-free stand-in for the isolated ``claude -p`` reviewer."""
+
+    def review(self, goal: object, behavior: object, reviewer_id: str) -> ReviewerVerdict:
+        return ReviewerVerdict(
+            reviewer_id=reviewer_id,
+            goal_contract_id=goal.contract_id,  # type: ignore[attr-defined]
+            behavior_sha256=behavior.behavior_sha256,  # type: ignore[attr-defined]
+            verdict="accept",
+        )
 
 
 def test_run_once_evaluates_every_present_finding(
@@ -498,7 +516,8 @@ def _expected_nudge_order(state: Path, goal: GoalRecord, queue: Path) -> tuple[s
     findings_path = state / "monitord-findings.jsonl"
     records = [json.loads(line) for line in findings_path.read_text(encoding="utf-8").splitlines()]
     repeated = next(record for record in records if record["detector"] == "unnecessary_steps")
-    order_id = deterministic_order_id(goal.session_ref, goal.goal_version, repeated["fingerprint"], "nudge")
+    track_id = track_key(goal_digest(goal), repeated["unmet_item"])
+    order_id = deterministic_order_id(goal.session_ref, goal.goal_version, track_id, "nudge")
     order_path = queue / "orders" / f"{order_id}.json"
     return order_id, DispatchOrder.model_validate_json(order_path.read_text(encoding="utf-8"))
 
@@ -595,16 +614,31 @@ def test_action_queued_transition_restarts_after_order_enqueue_without_duplicate
     assert len(list((queue / "orders").glob("*.json"))) == 1
 
 
-def _append_nudge_and_final_response(transcript: Path, nudge: str, *, session_id: str) -> None:
-    """Append a real Claude user turn and its later final response."""
+def _append_nudge_and_final_response(transcript: Path, nudge: str, *, session_id: str, mid_turn: bool = False) -> None:
+    """Append a real Claude user turn and its later final response.
+
+    ``mid_turn`` records the nudge the way Claude Code does when it arrives
+    while a turn is running: an ``attachment`` record of type
+    ``queued_command`` that carries ``origin``, not a ``user`` record.
+    """
+    delivered: dict[str, Any] = {"type": "user", "message": {"role": "user", "content": nudge}}
+    if mid_turn:
+        delivered = {
+            "type": "attachment",
+            "attachment": {
+                "type": "queued_command",
+                "prompt": nudge,
+                "commandMode": "prompt",
+                "origin": {"kind": "human"},
+            },
+        }
     rows = [
         {
             "parentUuid": "fixture-assistant",
             "sessionId": session_id,
             "uuid": "oversight-user",
             "version": CLAUDE_VERSION,
-            "type": "user",
-            "message": {"role": "user", "content": nudge},
+            **delivered,
         },
         {
             "parentUuid": "oversight-user",
@@ -691,9 +725,11 @@ def _append_repeated_post_consumption_calls(transcript: Path, *, session_id: str
         handle.write("".join(json.dumps(row) + "\n" for row in rows))
 
 
+@pytest.mark.parametrize("mid_turn", [False, True], ids=["idle-user-record", "mid-turn-queued-command"])
 def test_monitor_dispatchd_monitor_reconciles_signed_delivery_and_advances_only_after_consumption(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    mid_turn: bool,
 ) -> None:
     """A signed delivery plus a later assistant turn is the only ladder proof."""
     state, bindings_path, queue, goal = _prepare_repeated_action_case(tmp_path)
@@ -711,7 +747,7 @@ def test_monitor_dispatchd_monitor_reconciles_signed_delivery_and_advances_only_
         )
         if record["detector"] == "unnecessary_steps"
     )
-    initial_incident = IncidentStore(state, goal.lane_id).latest(
+    initial_incident = IncidentStore(state, goal.lane_id).latest_by_fingerprint(
         finding_fingerprint
     )
     assert initial_incident is not None
@@ -723,7 +759,7 @@ def test_monitor_dispatchd_monitor_reconciles_signed_delivery_and_advances_only_
     def fake_dispatch(dispatch_order: DispatchOrder, **kwargs: Any) -> DispatchResult:
         assert dispatch_order.order_id == order_id
         assert dispatch_order.nudge == order.nudge
-        _append_nudge_and_final_response(transcript, dispatch_order.nudge, session_id=native_session_id)
+        _append_nudge_and_final_response(transcript, dispatch_order.nudge, session_id=native_session_id, mid_turn=mid_turn)
         return DispatchResult(
             order_id=dispatch_order.order_id,
             session_ref=dispatch_order.session_ref,
@@ -762,25 +798,26 @@ def test_monitor_dispatchd_monitor_reconciles_signed_delivery_and_advances_only_
     supervised = SupervisionLedger(state, goal.lane_id).latest()
     assert supervised is not None
     assert supervised.state == "awaiting_progress"
-    consumed = IncidentStore(state, goal.lane_id).latest(initial_incident.fingerprint)
+    consumed = IncidentStore(state, goal.lane_id).latest(initial_incident.track_id)
     assert consumed is not None
     assert consumed.stage == "nudge"
     assert consumed.consumption is not None
     assert consumed.consumption.user_event_id
     assert consumed.consumption.turn_event_id
+    assert not list((queue / "orders").glob("*.json"))  # no second order
 
     # The historical finding alone cannot advance after consumption.
     third = run_once(_live_config(state, bindings_path, queue))
     assert third["lanes_observed"] == 1
     assert third["findings_opened"] == 0
     assert SupervisionLedger(state, goal.lane_id).latest().state == "observing"  # type: ignore[union-attr]
-    assert IncidentStore(state, goal.lane_id).latest(initial_incident.fingerprint).stage == "nudge"  # type: ignore[union-attr]
+    assert IncidentStore(state, goal.lane_id).latest(initial_incident.track_id).stage == "nudge"  # type: ignore[union-attr]
 
     # Only a genuine post-consumption recurrence may issue the next stage.
     _append_repeated_post_consumption_calls(transcript, session_id=native_session_id)
     fourth = run_once(_live_config(state, bindings_path, queue))
     assert fourth["lanes_observed"] == 1
-    advanced = IncidentStore(state, goal.lane_id).latest(initial_incident.fingerprint)
+    advanced = IncidentStore(state, goal.lane_id).latest(initial_incident.track_id)
     assert advanced is not None
     assert advanced.stage == "redirect"
     assert advanced.consumption is None
@@ -825,7 +862,7 @@ def test_sent_result_without_valid_signed_ledger_proof_cannot_count_as_consumed(
         for record in map(json.loads, (state / "monitord-findings.jsonl").read_text(encoding="utf-8").splitlines())
         if record["detector"] == "unnecessary_steps"
     )
-    incident = IncidentStore(state, goal.lane_id).latest(fingerprint)
+    incident = IncidentStore(state, goal.lane_id).latest_by_fingerprint(fingerprint)
     assert incident is not None
     assert incident.consumption is None
     pending = list((queue / "orders").glob("*.json"))
@@ -967,6 +1004,9 @@ def test_passing_validator_and_structured_claim_mark_goal_verified_and_supervisi
         return (passing_completion_evidence(),)
 
     monkeypatch.setattr(monitord_mod, "record_enrolled_validator_runs", passing_run)
+    # The completion path gates on the isolated reviewer now; stub the process
+    # boundary so the acceptance check stays credential-free.
+    monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
     summary = run_once(_live_config(state, bindings_path, queue))
 
     assert summary["completion_disputed"] is False
@@ -978,6 +1018,38 @@ def test_passing_validator_and_structured_claim_mark_goal_verified_and_supervisi
     assert supervision is not None
     assert supervision.state == "completion_verified"
     assert supervision.session_ref == goal.session_ref
+
+
+def test_passing_validator_and_plain_claim_mark_goal_verified_and_supervision_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
+    ingest_passing_receipt(state, goal.session_ref)
+    _append_completion_response(
+        transcript,
+        session_id="native-alpha",
+        claim="Done. The enrolled check passes.",
+    )
+
+    def passing_run(root: Path, session_ref: str, items: object) -> tuple[CompletionEvidence, ...]:
+        del root, session_ref, items
+        return (passing_completion_evidence(),)
+
+    monkeypatch.setattr(monitord_mod, "record_enrolled_validator_runs", passing_run)
+    # The completion path gates on the isolated reviewer now; stub the process
+    # boundary so the acceptance check stays credential-free.
+    monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
+    summary = run_once(_live_config(state, bindings_path, queue))
+
+    assert summary["completion_disputed"] is False
+    assert summary["validator_receipts_recorded"] == 1
+    stored = get_goal(state, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "done-pending-close"
+    supervision = SupervisionLedger(state, goal.lane_id).latest()
+    assert supervision is not None
+    assert supervision.state == "completion_verified"
 
 
 def test_fabricated_or_cross_goal_receipt_cannot_mark_claiming_goal_verified(
@@ -1014,3 +1086,233 @@ def test_fabricated_or_cross_goal_receipt_cannot_mark_claiming_goal_verified(
     assert not claiming_goal.completion_proofs
     supervision = SupervisionLedger(state, goal.lane_id).latest()
     assert supervision is None or supervision.state != "completion_verified"
+
+
+def _init_lane_worktree(path: Path) -> Path:
+    """Create a real git worktree so the lane digest is computable."""
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
+    (path / "tracked.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(path), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "-c", "user.email=lane@chitra.test", "-c", "user.name=lane", "commit", "-qm", "init"],
+        check=True,
+    )
+    return path
+
+
+def _separate_user_lane_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    workdir: Path,
+) -> Path:
+    """Declare lane ``alpha`` as a different OS user so recorded results count."""
+    manifest = tmp_path / "lanes.yaml"
+    manifest.write_text(
+        json.dumps(
+            {
+                "lanes": [
+                    {
+                        "id": "alpha",
+                        "account": "alpha",
+                        "uid": os.geteuid() + 1,
+                        "home": str(tmp_path / "lane-home"),
+                        "workdir": str(workdir),
+                        "config_dir": str(tmp_path / "lane-config"),
+                        "state_dir": str(tmp_path / "lane-state"),
+                        "tmux_socket": str(tmp_path / "lane-tmux.sock"),
+                        "tmux_session": "alpha",
+                        "credentials": {
+                            "claude_credentials": str(tmp_path / "lane-creds" / "claude.json"),
+                            "ssh_dispatch_key": str(tmp_path / "lane-creds" / "ssh_key"),
+                        },
+                        "enabled": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CHITRA_LANES_FILE", str(manifest))
+    return manifest
+
+
+def _slow_validator_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, seconds: float) -> Path:
+    """Register the enrolled ``pytest`` validator as a command that sleeps."""
+    registry = tmp_path / "validators.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "pytest": {
+                    "argv": [sys.executable, "-c", f"import time; time.sleep({seconds})"],
+                    "timeout_s": max(seconds * 3, 15),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CHITRA_VALIDATORS_FILE", str(registry))
+    return registry
+
+
+def test_slow_enrolled_validator_does_not_stall_the_monitor_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A five-second validator must finish far outside the monitor pass."""
+    state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
+    _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=_init_lane_worktree(tmp_path / "lane-worktree"))
+    _slow_validator_registry(tmp_path, monkeypatch, seconds=5)
+    _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
+
+    started = time.monotonic()
+    run_once(_live_config(state, bindings_path, queue))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+
+
+def test_goal_status_stays_unchanged_until_the_worker_result_lands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While the worker runs, the claim neither passes nor disputes."""
+    state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
+    _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=_init_lane_worktree(tmp_path / "lane-worktree"))
+    _slow_validator_registry(tmp_path, monkeypatch, seconds=5)
+    monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
+    _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
+
+    run_once(_live_config(state, bindings_path, queue))
+
+    stored = get_goal(state, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "working"
+
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+    run_once(_live_config(state, bindings_path, queue))
+
+    stored = get_goal(state, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "done-pending-close"
+
+
+def test_same_user_lane_keeps_the_synchronous_second_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lane sharing Chitra's OS user could forge a record, so it stays inline."""
+    state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
+    workdir = _init_lane_worktree(tmp_path / "lane-worktree")
+    manifest = _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=workdir)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    lanes = payload["lanes"]
+    assert isinstance(lanes, list)
+    lanes[0]["uid"] = os.geteuid()
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
+    _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
+
+    summary = run_once(_live_config(state, bindings_path, queue))
+
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=0)
+    assert summary["validator_receipts_recorded"] == 1
+    stored = get_goal(state, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "done-pending-close"
+
+
+def test_gate_waits_for_an_in_flight_run_even_when_records_look_fresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A running worker may be rewriting the records; the gate must not read them."""
+    state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
+    _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=_init_lane_worktree(tmp_path / "lane-worktree"))
+    monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
+    _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
+    config = _live_config(state, bindings_path, queue)
+
+    run_once(config)
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+
+    release = threading.Event()
+
+    def still_running() -> None:
+        release.wait(15)
+
+    monitord_mod._VALIDATOR_RUN_POOL.submit(f"{state}:{goal.lane_id}", still_running)
+    try:
+        run_once(config)
+        stored = get_goal(state, goal.session_ref)
+        assert stored is not None
+        assert stored.status == "working"
+    finally:
+        release.set()
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+
+    run_once(config)
+    stored = get_goal(state, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "done-pending-close"
+
+
+def test_validator_that_writes_into_its_tree_falls_back_instead_of_requeueing_forever(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every worker record goes stale, so the pool must stop requeueing and resolve the claim."""
+    state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
+    workdir = _init_lane_worktree(tmp_path / "lane-worktree")
+    _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=workdir)
+    registry = tmp_path / "validators.json"
+    writer = f"import pathlib, uuid; pathlib.Path({str(workdir)!r}, 'out-' + uuid.uuid4().hex).write_text('x')"
+    registry.write_text(json.dumps({"pytest": {"argv": [sys.executable, "-c", writer]}}), encoding="utf-8")
+    monkeypatch.setenv("CHITRA_VALIDATORS_FILE", str(registry))
+    monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
+    _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
+    config = _live_config(state, bindings_path, queue)
+
+    for _ in range(monitord_mod._VALIDATOR_RUN_MAX_ATTEMPTS):
+        run_once(config)
+        assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+        stored = get_goal(state, goal.session_ref)
+        assert stored is not None
+        assert stored.status == "working"
+
+    run_once(config)
+
+    stored = get_goal(state, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "done-pending-close"
+
+
+def test_tree_change_after_validation_requeues_instead_of_passing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worktree that moved since the worker ran can never pass on its record."""
+    state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
+    workdir = _init_lane_worktree(tmp_path / "lane-worktree")
+    _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=workdir)
+    monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
+    _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
+
+    run_once(_live_config(state, bindings_path, queue))
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+
+    (workdir / "lane-edit.txt").write_text("edited after the validator ran\n", encoding="utf-8")
+    run_once(_live_config(state, bindings_path, queue))
+
+    stored = get_goal(state, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "working"
+
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+    run_once(_live_config(state, bindings_path, queue))
+
+    stored = get_goal(state, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "done-pending-close"

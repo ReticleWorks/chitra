@@ -4,36 +4,25 @@ from __future__ import annotations
 
 import re
 
-# Incident scar tissue lives in chitra.policy_config (see
-# INCIDENT_COMPLETION_DEFERRAL_PHRASES), not here: these are cue-derived,
-# reviewer-judged phrases, and the lexicon stays free of one-off findings.
-COMPLETION_DEFERRAL_PHRASES: tuple[str, ...] = (
-    "you'll need to",
-    "you will need to",
-    "todo",
-    "not implemented",
-    "notimplemented",
-    "out of scope",
-    "leaving for",
-    "leave for",
-    "deferred",
-    "deferring",
-    "close follow-up",
-    "close follow-ups",
-    "follow-up items",
-    "left as an exercise",
-    "in a future pr",
-    "future work",
-    "conditionally healthy",
-    "parse-only",
-    "not publication-ready",
-)
+from chitra.taxonomy import cue_phrases
+
+# The shipped deferral vocabulary lives in the packaged evasion taxonomy
+# (taxonomy.json, DEFERRAL_STUB entry), the single source for the completion
+# gate's cue phrases; this re-exports it for lexicon callers. Incident scar
+# tissue lives in chitra.policy_config (see
+# INCIDENT_COMPLETION_DEFERRAL_PHRASES), not in the taxonomy: those are
+# one-off findings named verbatim, not cue-derived reviewer phrases.
+COMPLETION_DEFERRAL_PHRASES: tuple[str, ...] = cue_phrases("DEFERRAL_STUB")
 
 COMPLETION_CLAIM_RE = re.compile(
     r"^\s*(?:"
     r"(?:(?:I|we|it|this|task|work|lane)|the\s+[^\n.!?]{1,80}?)"
     r"\s+(?:am|is|was|are|were|now|has|have)\s+"
     r")?"
+    # A markdown emphasis marker (e.g. "**DONE**") may sit between the
+    # optional subject clause and the claim word without breaking the
+    # sentence-initial anchor.
+    r"(?:[*_`]{1,3}\s*)?"
     r"(done|complete(?:d)?|finished|fixed|repaired|shipped|deployed|publication-ready|ready for (?:merge|release))\b",
     re.I | re.M,
 )

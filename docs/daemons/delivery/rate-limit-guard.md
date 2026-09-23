@@ -24,27 +24,27 @@ All nudges are fixed canned templates (e.g., "Pausing due to rate limit"). Chitr
 
 ```bash
 chitra-rate-limit-guard \
-  --usage-dir /var/lib/chitra/usage \
-  --goals-root /var/lib/chitra/goals \
-  --queue-dir /var/lib/chitra/queue \
+  --usage-dir /var/lib/chitra/usage-snapshots \
+  --host "$(hostname)" \
+  --goals-root /var/lib/chitra/lane-<lane-id> \
+  --queue-dir /var/lib/chitra/lane-<lane-id>/queue \
   --policy-config /etc/chitra/policy.yaml
 ```
 
-Typical systemd timer: run every 3-5 minutes.
+Each run is one sweep. The shipped systemd timer runs it every two minutes.
 
 ## Key flags
 
 | Flag | Default | Notes |
 |------|---------|-------|
-| `--usage-dir` | Unset | Directory for usage snapshots. |
-| `--host` | localhost | Host to read usage and load for. |
+| `--usage-dir` | Required | Directory for usage snapshots. |
+| `--host` | Required | Host the sessions run on; used to build each `session_ref`. |
 | `--staleness-seconds` | 1200 (20 min) | How old a usage snapshot can be. |
-| `--goals-root` | Unset | Root directory for goals.json. |
+| `--goals-root` | `$CHITRA_STATE_DIR` | Lane state root holding goals and transactions. |
 | `--queue-dir` | `$CHITRA_STATE_DIR/queue` | Dispatchd order queue. |
-| `--policy-config` | Unset | Policy config (YAML) with pause thresholds. |
-| `--codex` | false | Use Codex thresholds instead of Claude. |
+| `--policy-config` | `$CHITRA_POLICY_CONFIG`, else shipped defaults | Policy config (YAML) with pause thresholds. |
+| `--codex` | false | Also read this host's local Codex account usage. |
 | `--codex-bin` | `codex` | Codex CLI binary path. |
-| `--once` | False | Run once and exit. |
 
 ## Environment variables
 
@@ -95,7 +95,7 @@ Each phase transition consumes a dispatchd result (proof the nudge was delivered
 **View pause/resume history:**
 
 ```bash
-cat /var/lib/chitra/rate-limit-ledger.json | jq '.[] | select(.lane_id == "my-session")'
+jq . /var/lib/chitra/lane-<lane-id>/rate_limit_state.json
 ```
 
 **Never pause certain sessions:**
@@ -108,17 +108,22 @@ chitra-rate-limit-guard
 **Check current hold status:**
 
 ```bash
-chitra-rate-limit-guard --usage-dir /var/lib/chitra/usage --goals-root /var/lib/chitra/goals
+chitra-rate-limit-guard --usage-dir /var/lib/chitra/usage-snapshots --host "$(hostname)" --goals-root /var/lib/chitra/lane-<lane-id>
 ```
 
 **Run as a systemd timer:**
 
+The Debian package installs `packaging/systemd/chitra-rate-limit-guard@.service`
+and `packaging/systemd/chitra-rate-limit-guard@.timer`. They are per-lane
+templates like `chitra-monitord@.service`: instance `<lane-id>` sweeps
+`/var/lib/chitra/lane-<lane-id>`, the state root that monitor writes, and queues
+orders where `chitra-dispatchd` drains that lane. The service reads
+`/etc/chitra/policy.yaml`, the file dispatchd uses, and resolves the host name
+with systemd's `%H` specifier. Enable one timer per lane:
+
 ```bash
-sudo cp packaging/systemd/chitra-rate-limit-guard.timer.example /etc/systemd/system/chitra-rate-limit-guard.timer
-sudo cp packaging/systemd/chitra-rate-limit-guard.service.example /etc/systemd/system/chitra-rate-limit-guard.service
-sudoedit /etc/systemd/system/chitra-rate-limit-guard.service  # fill in placeholders
 sudo systemctl daemon-reload
-sudo systemctl enable --now chitra-rate-limit-guard.timer
+sudo systemctl enable --now chitra-rate-limit-guard@<lane-id>.timer
 ```
 
 ## Load shedding strategy
