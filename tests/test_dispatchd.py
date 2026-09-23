@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -97,6 +98,93 @@ def test_run_once_processes_pending_orders_and_moves_them(tmp_path: Path, monkey
     assert (queue_dir / "results" / "ord-1.json").exists()
     # A successful send is signed and logged automatically, no extra step.
     assert (tmp_path / "ledger.jsonl").exists()
+
+
+def test_deferred_delivery_keeps_run_once_fast_and_lands_on_a_later_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lane-lock wait, tmux paste, and confirmation poll run on the pool."""
+
+    def slow_dispatch(order: DispatchOrder, **kwargs: Any) -> DispatchResult:
+        time.sleep(5)
+        return DispatchResult(order_id=order.order_id, session_ref=order.session_ref, status=DispatchStatus.SENT, reason="sent: test")
+
+    monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", slow_dispatch)
+
+    queue_dir = tmp_path / "queue"
+    order = DispatchOrder(order_id="ord-slow", session_ref="localhost:s:0.0", nudge="hi")
+    _write_order(queue_dir / "orders", order)
+    kwargs = {
+        "lock_dir": tmp_path / "locks",
+        "ledger_path": tmp_path / "ledger.jsonl",
+        "ledger_key_path": tmp_path / "ledger.key",
+        "_defer_delivery": True,
+    }
+
+    started = time.monotonic()
+    results = run_once(queue_dir, **kwargs)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert results == []
+    # The claim is held in in_flight/ while the worker delivers.
+    assert (queue_dir / "in_flight" / "ord-slow.json").exists()
+
+    assert dispatchd_mod._DELIVERY_POOL.wait_idle(timeout=15)
+    results = run_once(queue_dir, **kwargs)
+
+    assert len(results) == 1
+    assert results[0].status == DispatchStatus.SENT
+    assert (queue_dir / "processed" / "ord-slow.json").exists()
+
+
+def test_deferred_delivery_survives_a_worker_that_dies_before_recording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker that dies without writing its record must not lose the claim.
+
+    The dead attempt minted the send nonce and touched the pane (transcript
+    written) before dying, so the retried pass reconciles by transcript —
+    it never pastes a second time.
+    """
+    projects_root = tmp_path / "projects"
+    pasted = {"count": 0}
+
+    def dying_dispatch(order: DispatchOrder, **kwargs: Any) -> DispatchResult:
+        pasted["count"] += 1
+        session_dir = projects_root / "some-project"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "abc123.jsonl").write_text(user_turn_jsonl(order.nudge), encoding="utf-8")
+        raise RuntimeError("simulated worker death")
+
+    monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", dying_dispatch)
+
+    queue_dir = tmp_path / "queue"
+    order = DispatchOrder(order_id="ord-dead", session_ref="localhost:s:0.0", nudge="hi")
+    _write_order(queue_dir / "orders", order)
+    kwargs = {
+        "lock_dir": tmp_path / "locks",
+        "ledger_path": tmp_path / "ledger.jsonl",
+        "ledger_key_path": tmp_path / "ledger.key",
+        "projects_root": projects_root,
+        "_defer_delivery": True,
+    }
+
+    assert run_once(queue_dir, **kwargs) == []
+    assert dispatchd_mod._DELIVERY_POOL.wait_idle(timeout=15)
+
+    # The claim survived the dead worker: still held in in_flight/ with its
+    # nonce, so the next pass recovers it for a verify-only retry.
+    assert (queue_dir / "in_flight" / "ord-dead.json").exists()
+    recovered = run_once(queue_dir, **kwargs)
+    assert recovered == []
+    assert dispatchd_mod._DELIVERY_POOL.wait_idle(timeout=15)
+
+    settled = run_once(queue_dir, **kwargs)
+
+    assert pasted["count"] == 1  # never pasted a second time
+    assert any(result.status == DispatchStatus.SENT for result in settled)
+    assert (queue_dir / "processed" / "ord-dead.json").exists()
 
 
 def test_goal_bound_order_reaches_delivery_only_for_current_goal_contract(
@@ -2643,3 +2731,34 @@ def test_daemon_runs_read_only_against_a_newer_goals_schema(tmp_path: Path, caps
     notices = [line for line in capsys.readouterr().out.splitlines() if GOALS_SCHEMA_NEWER_MESSAGE in line]
     assert len(notices) == 1
     assert json.loads((tmp_path / "goals.json").read_text(encoding="utf-8"))["schema"] == "chitra.goals.v4"
+
+
+def test_run_forever_wakes_when_a_delivery_worker_completes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import time
+
+    passes = 0
+
+    class StopDaemonLoop(Exception):
+        pass
+
+    def capture_run_once(*args: Any, **kwargs: Any) -> list[DispatchResult]:
+        nonlocal passes
+        passes += 1
+        if passes == 1:
+            # A worker landing during the sleep must wake the loop for the
+            # pass that drains its record, not wait out the poll interval.
+            dispatchd_mod._DELIVERY_POOL.submit(f"{tmp_path}:wake-test", lambda: None)
+        else:
+            raise StopDaemonLoop
+        return []
+
+    monkeypatch.setattr(dispatchd_mod, "load_routing_config", lambda *a, **k: RoutingConfig())
+    monkeypatch.setattr(dispatchd_mod, "load_policy_config", lambda *a, **k: PolicyConfig())
+    monkeypatch.setattr(dispatchd_mod, "run_once", capture_run_once)
+
+    started = time.monotonic()
+    with pytest.raises(StopDaemonLoop):
+        dispatchd_mod.run_forever(tmp_path / "queue", poll_seconds=30.0)
+
+    assert passes == 2
+    assert time.monotonic() - started < 10.0

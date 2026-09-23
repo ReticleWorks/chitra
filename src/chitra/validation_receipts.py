@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -592,11 +593,24 @@ def _artifact_root(base: Path, approved_root: Path | None) -> Path:
     return approved_root
 
 
-def _hash_file(path: Path) -> str:
+_HASH_READ_DEADLINE_SECONDS = 60.0
+
+
+def _hash_file(path: Path, *, deadline_seconds: float = _HASH_READ_DEADLINE_SECONDS) -> str:
+    """Hash one file with a read deadline.
+
+    A stalled filesystem read cannot be interrupted, so the deadline is
+    checked between chunks and trips on slow-trickle reads; a fully stuck
+    read parks the calling worker, never the monitor pass that queued it.
+    Either way the caller sees a failure, never a silently absent file.
+    """
     digest = hashlib.sha256()
+    deadline = time.monotonic() + deadline_seconds
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
+            if time.monotonic() > deadline:
+                raise ReceiptError(f"file read exceeded its {deadline_seconds}s deadline: {path}")
     return digest.hexdigest()
 
 
@@ -645,12 +659,18 @@ def _target_issues(receipt: ValidationReceipt, base: Path, approved_root: Path |
         repository = _confined_path(repository, approved_root, label="target.commit repository")
     except ReceiptError as exc:
         return [f"current target commit is not readable: {exc}"]
-    result = subprocess.run(
-        ["git", "-C", str(repository), "rev-parse", "HEAD"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60.0,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        # A timeout lands here as SubprocessError: the target state is
+        # UNKNOWN, which must never read as a missing or matching commit.
+        return [f"current target commit is unreadable: {exc}"]
     if result.returncode != 0:
         issues.append(f"current target commit is unreadable: {result.stderr.strip() or result.stdout.strip()}")
     elif result.stdout.strip() != expected:
@@ -956,7 +976,7 @@ def _trusted_validator_target_issues(receipt: ValidationReceipt, approved_root: 
     return []
 
 
-def worktree_git_digest(workdir: Path) -> str | None:
+def worktree_git_digest(workdir: Path, *, deadline_seconds: float = 90.0) -> str | None:
     """Digest the exact worktree content a validator could observe.
 
     HEAD, the full ``git diff HEAD`` patch, and a blob hash of every
@@ -964,16 +984,23 @@ def worktree_git_digest(workdir: Path) -> str | None:
     the digest tracks file content, not modification flags, so a lane that
     edits a file it already touched still changes the digest. ``None`` means
     the directory cannot be digested (not a worktree, or git failed) and
-    every caller fails closed on it.
+    every caller fails closed on it. ``deadline_seconds`` bounds the whole
+    sequence of git calls so a stalled tree reports UNKNOWN instead of
+    pinning the worker.
     """
 
+    deadline = time.monotonic() + deadline_seconds
+
     def _git(*args: str) -> str | None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
         try:
             result = subprocess.run(
                 ["git", "-C", str(workdir), *args],
                 check=False,
                 capture_output=True,
-                timeout=30.0,
+                timeout=min(30.0, remaining),
             )
         except (OSError, subprocess.SubprocessError):
             return None
@@ -1488,7 +1515,12 @@ def _stored_report_exit_code(root: Path | None, session_ref: str, receipt_name: 
     return exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else UNRUNNABLE_EXIT_CODE
 
 
-def _stored_receipt_integrity_digest(root: Path | None, session_ref: str, receipt_name: str) -> str | None:
+def validator_run_record(root: Path | None, session_ref: str, receipt_name: str) -> ValidatorRunRecord | None:
+    """Return the worker run record for one receipt, or ``None`` if absent/malformed."""
+    return _load_run_record(validator_run_record_path(root, session_ref, receipt_name))
+
+
+def stored_receipt_integrity_digest(root: Path | None, session_ref: str, receipt_name: str) -> str | None:
     """Return the stored receipt's integrity digest, or ``None`` when unreadable."""
     try:
         stored, _raw = load_receipt_file(receipt_path(root, session_ref, receipt_name))
@@ -1522,7 +1554,7 @@ def run_enrolled_validators_on_worker(
         try:
             record_registered_run(root, session_ref, item, registry.get(item.validator))
             exit_code = _stored_report_exit_code(root, session_ref, item.required_receipt)
-            receipt_digest = _stored_receipt_integrity_digest(root, session_ref, item.required_receipt) or ""
+            receipt_digest = stored_receipt_integrity_digest(root, session_ref, item.required_receipt) or ""
         except Exception:
             # A run that cannot record its receipt still needs a landed
             # record: the gate treats it as a completed non-passing result
@@ -1537,6 +1569,100 @@ def run_enrolled_validators_on_worker(
             digest_before=digest_before,
             digest_after=worktree_git_digest(workdir),
         )
+
+
+_VERIFICATION_RUN_SCHEMA = "chitra.verification-run.v1"
+
+
+@dataclass(frozen=True, slots=True)
+class ReceiptVerificationRecord:
+    """A worker's stored receipt verdicts and the exact tree it sampled.
+
+    ``tree_digest`` is the worktree digest taken when verification finished;
+    the monitor consumes the record only while every validator run record's
+    post-run digest still equals it, so a tree that moved after the recorded
+    runs requeues validation instead of passing on stale proof.
+    ``receipt_digests`` binds each verdict to the receipt file the worker
+    read, so a receipt rewritten after verification requeues verification.
+    """
+
+    session_ref: str
+    tree_digest: str | None
+    results: dict[str, str]
+    receipt_digests: dict[str, str]
+    recorded_at: str
+
+
+def verification_runs_root(root: Path | None = None) -> Path:
+    """Return the instance directory for worker-recorded receipt verifications."""
+    return (state_dir() if root is None else root) / "verification-runs"
+
+
+def verification_record_path(root: Path | None, session_ref: str) -> Path:
+    """Return the verification-record path bound to one exact session."""
+    if not session_ref.strip():
+        raise ReceiptError("session_ref must be non-empty")
+    session_key = hashlib.sha256(session_ref.encode("utf-8")).hexdigest()
+    return verification_runs_root(root) / session_key / "verification.json"
+
+
+def load_verification_record(root: Path | None, session_ref: str) -> ReceiptVerificationRecord | None:
+    """Return the recorded verification for a session, or ``None`` if absent/malformed."""
+    path = verification_record_path(root, session_ref)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict) or raw.get("schema") != _VERIFICATION_RUN_SCHEMA:
+        return None
+    results = raw.get("results")
+    receipt_digests = raw.get("receipt_digests")
+    session = raw.get("session_ref")
+    tree_digest = raw.get("tree_digest")
+    if not isinstance(session, str) or not isinstance(results, dict) or not isinstance(receipt_digests, dict):
+        return None
+    return ReceiptVerificationRecord(
+        session_ref=session,
+        tree_digest=tree_digest if isinstance(tree_digest, str) else None,
+        results={str(key): str(value) for key, value in results.items()},
+        receipt_digests={str(key): str(value) for key, value in receipt_digests.items()},
+        recorded_at=str(raw.get("recorded_at") or ""),
+    )
+
+
+def run_receipt_verification_on_worker(
+    root: Path | None,
+    session_ref: str,
+    items: Sequence[EnrolledDoneWhenItemLike],
+    *,
+    workdir: Path,
+) -> None:
+    """Verify every stored receipt and durably record the verdicts.
+
+    This is the verification stage of the worker pipeline: it runs the same
+    ``verified_disk_results`` checks the monitor pass used to run inline —
+    including the git digests and target hashing those verifications imply —
+    and lands one record the pass consumes on a later iteration. The digest
+    is sampled after the verdicts so a tree that moved mid-verify no longer
+    matches the validator run records and the evidence requeues.
+    """
+    results = verified_disk_results(root, session_ref, items)
+    digest = worktree_git_digest(workdir)
+    receipt_digests = {
+        item.required_receipt: stored_receipt_integrity_digest(root, session_ref, item.required_receipt) or ""
+        for item in items
+    }
+    path = verification_record_path(root, session_ref)
+    payload = {
+        "schema": _VERIFICATION_RUN_SCHEMA,
+        "session_ref": session_ref,
+        "tree_digest": digest,
+        "results": results,
+        "receipt_digests": receipt_digests,
+        "recorded_at": datetime.now(UTC).isoformat(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(path, payload)
 
 
 def recorded_validator_run_fresh(

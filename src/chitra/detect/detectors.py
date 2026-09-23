@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -493,12 +493,17 @@ def detect_false_done(
     material_questions: Sequence[str] = (),
     live_proof_required: bool = False,
     live_proof_present: bool = True,
+    verified_results: Mapping[str, str] | None = None,
 ) -> list[Finding]:
     """Reject a completion claim that conflicts with goal state.
 
     Every open item, missing/stale/failed receipt, or absent claim binding
     yields one finding naming the blocking condition. Only exact current
-    bindings of every item pass silently.
+    bindings of every item pass silently. When ``verified_results`` is
+    supplied (receipt name → ``pass``/``fail``), it is a worker-recorded
+    verification map and stands in for re-running ``verify_receipt`` on the
+    monitor pass; the receipt file itself is still read for validator
+    binding.
     """
     from pathlib import Path
 
@@ -590,8 +595,11 @@ def detect_false_done(
             )
             continue
         try:
-            verification = verify_receipt(root, session_ref, required_receipt)
             receipt, _raw = load_receipt_file(receipt_path(root, session_ref, required_receipt))
+            if verified_results is None:
+                eligible = verify_receipt(root, session_ref, required_receipt).completion_eligible
+            else:
+                eligible = verified_results.get(required_receipt) == "pass"
         except Exception:
             findings.append(
                 Finding(
@@ -605,7 +613,7 @@ def detect_false_done(
             )
             continue
         validator_names = {str(receipt.validator.get("name"))} if receipt.validator else set()
-        if not verification.completion_eligible or validator not in validator_names:
+        if not eligible or validator not in validator_names:
             findings.append(
                 Finding(
                     detector="false_done",

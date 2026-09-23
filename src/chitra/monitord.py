@@ -40,9 +40,9 @@ import json
 import os
 import signal
 import threading
+import time
 from collections import Counter
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -108,11 +108,13 @@ from chitra.journal import (
     native_session_identity,
 )
 from chitra.journal.store import EventJournal
+from chitra.lane_config import LaneSpec
 from chitra.orders import DispatchOrder
 from chitra.policy_config import load_policy_config
 from chitra.presence import append_presence
 from chitra.question_handler import handle_question
 from chitra.recovery import get_lane_lifecycle, load_worktree_checkpoints
+from chitra.run_pool import RunPool
 from chitra.state_paths import state_dir as default_state_dir
 from chitra.supervision import SupervisionLedger, goal_digest
 from chitra.supervisor import reconcile_corrective_action, reconcile_question_action, record_observing
@@ -120,13 +122,15 @@ from chitra.systemd_notify import notify_ready, notify_watchdog
 from chitra.transcript_bindings import DEFAULT_FILENAME, TranscriptBinding, load_transcript_bindings
 from chitra.validation_receipts import (
     list_receipts,
+    load_verification_record,
     receipt_path,
     record_enrolled_validator_runs,
     recorded_result_lane,
-    recorded_validator_run_fresh,
     recorded_validator_run_proof,
     run_enrolled_validators_on_worker,
-    worktree_git_digest,
+    run_receipt_verification_on_worker,
+    stored_receipt_integrity_digest,
+    validator_run_record,
 )
 
 logger = structlog.get_logger(__name__)
@@ -644,15 +648,24 @@ def reconcile_rescue_checkpoint(
     if bundle is not None and not rescue_bundle_process_fresh(bundle):
         bundle = None
     if bundle is None:
-        bundle = _collect_lane_rescue_bundle(
-            config,
-            lane=lane,
-            goal=goal,
-            store=store,
-            transcript_path=transcript_path,
-        )
-        if bundle is None:
+        # Bundle capture runs tmux pane_pid/capture plus the worktree git
+        # reads inside collect_rescue_bundle — slow calls that must not block
+        # the pass. The worker's durable record is the bundle file itself:
+        # a later pass finds it and continues to sealing.
+        rescue_key = f"{config.state_dir}:{lane}:{track_id}:rescue"
+        if _RUN_POOL.in_flight(rescue_key):
             return
+        _RUN_POOL.submit(
+            rescue_key,
+            lambda: _collect_lane_rescue_bundle(
+                config,
+                lane=lane,
+                goal=goal,
+                store=store,
+                transcript_path=transcript_path,
+            ),
+        )
+        return
     if record.consumption is None:
         # The bundle now sits on disk; the rescue order's consumption is the
         # only remaining gate before the checkpoint receipt can be sealed.
@@ -728,89 +741,88 @@ def _lane_work_in_flight(
     return tuple(running)
 
 
-class _ValidatorRunPool:
-    """Bounded worker pool that keeps validator execution off the monitor loop.
+_MONITOR_WAKE = threading.Event()
 
-    At most one run is ever in flight per lane key: a lane whose previous
-    run is still executing is not requeued, so validators cannot pile up on
-    a tree that is still moving. A worker records its result under
-    ``validation-runs/`` and a later pass reads the record instead of
-    waiting on the future. ``attempts`` counts runs queued since the gate
-    last consumed a fresh result. It bounds both a worker that fails before
-    it can record and a run whose record is always stale (for example a
-    validator that writes into the tree it tests), so either one falls
-    back to the old synchronous call instead of queueing forever.
+
+def _wake_monitor() -> None:
+    """Wake the monitor loop when any worker finishes so its record is read now."""
+    _MONITOR_WAKE.set()
+
+
+# One bounded pool carries every slow call the pass must not wait on: the
+# enrolled validators, the receipt re-verification (git digests and target
+# hashing), the isolated ``claude -p`` completion review, and the gate close
+# that re-verifies inside the goal lock. Kind-suffixed lane keys keep one
+# operation in flight per lane per kind; each worker lands a durable record
+# (``validation-runs/``, ``verification-runs/``, the review log, the goal
+# store itself) that a later pass consumes instead of waiting.
+_RUN_POOL = RunPool(
+    max_workers=4,
+    thread_name_prefix="chitra-monitor-run",
+    on_complete=_wake_monitor,
+)
+# Kept under the historical name: tests and operators already know the
+# validator pool by it, and it is the same shared pool now.
+_VALIDATOR_RUN_POOL = _RUN_POOL
+
+
+def _op_key(config: MonitordConfig, goal: GoalRecord, session_ref: str, kind: str) -> str:
+    """Return the one-in-flight key for one lane and one slow-operation kind."""
+    return f"{config.state_dir}:{goal.lane_id or session_ref}:{kind}"
+
+
+def _run_completion_review(
+    state_dir: Path,
+    session_ref: str,
+    behavior: WatchedSessionBehavior,
+    reviewer: BehaviorReviewer,
+) -> None:
+    """Run the isolated review on the pool; the appended signal is the record."""
+    review_watched_session(state_dir, session_ref, behavior, reviewer=reviewer)
+
+
+def _verify_evidence_state(
+    root: Path,
+    session_ref: str,
+    items: tuple[EnrolledDoneWhenItemLike, ...],
+) -> str:
+    """Classify worker evidence as ``runs``, ``verify``, or ``fresh``.
+
+    ``runs`` means the validator run records are missing, bound to another
+    session/validator, or straddle a worktree move — the lane must be
+    re-validated. ``verify`` means the run records are self-consistent but
+    the recorded verification is missing or no longer describes the stored
+    receipts. ``fresh`` means the pass can consume the recorded verdicts
+    without running git or re-executing anything itself.
     """
-
-    def __init__(self, max_workers: int = 4) -> None:
-        self._max_workers = max_workers
-        self._executor = self._new_executor()
-        self._lock = threading.Lock()
-        self._in_flight: dict[str, Future[None]] = {}
-        self._attempts: dict[str, int] = {}
-
-    def submit(self, lane_key: str, work: Callable[[], None]) -> None:
-        """Queue ``work`` unless this lane already has a run in flight."""
-        with self._lock:
-            current = self._in_flight.get(lane_key)
-            if current is not None and not current.done():
-                return
-            self._attempts[lane_key] = self._attempts.get(lane_key, 0) + 1
-            future = self._executor.submit(work)
-            self._in_flight[lane_key] = future
-        future.add_done_callback(lambda done: self._completed(lane_key, done))
-
-    def _new_executor(self) -> ThreadPoolExecutor:
-        return ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="chitra-validator-run")
-
-    def in_flight(self, lane_key: str) -> bool:
-        """Return whether this lane has a queued or running validator run."""
-        with self._lock:
-            current = self._in_flight.get(lane_key)
-            return current is not None and not current.done()
-
-    def _completed(self, lane_key: str, future: Future[None]) -> None:
-        try:
-            future.result()
-        except Exception as exc:
-            logger.error("monitord_validator_run_failed", lane=lane_key, error=str(exc))
-            return
-        with self._lock:
-            if self._in_flight.get(lane_key) is future:
-                self._in_flight.pop(lane_key, None)
-
-    def attempts(self, lane_key: str) -> int:
-        """Return how many runs this lane queued since its last consumed result."""
-        with self._lock:
-            return self._attempts.get(lane_key, 0)
-
-    def reset(self, lane_key: str) -> None:
-        """Clear the attempt count once the gate has consumed a result."""
-        with self._lock:
-            self._attempts.pop(lane_key, None)
-
-    def wait_idle(self, timeout: float | None = None) -> bool:
-        """Block until no lane has a run in flight; used by tests and shutdown."""
-        with self._lock:
-            futures = [future for future in self._in_flight.values() if not future.done()]
-        if not futures:
-            return True
-        _finished, pending = wait(futures, timeout=timeout)
-        return not pending
-
-    def shutdown(self) -> None:
-        """Cancel queued runs without blocking exit on running validators.
-
-        The module-level pool outlives one ``run_forever`` call, so a fresh
-        executor replaces the stopped one; a later pass in the same process
-        can still queue work instead of failing on a shut-down executor.
-        """
-        with self._lock:
-            stopped, self._executor = self._executor, self._new_executor()
-        stopped.shutdown(wait=False, cancel_futures=True)
-
-
-_VALIDATOR_RUN_POOL = _ValidatorRunPool()
+    afters: set[str] = set()
+    for item in items:
+        run = validator_run_record(root, session_ref, item.required_receipt)
+        if run is None or run.session_ref != session_ref or run.validator != item.validator:
+            return "runs"
+        if run.tree_digest_before is None or run.tree_digest_before != run.tree_digest_after:
+            return "runs"
+        afters.add(run.tree_digest_after)
+    if len(afters) != 1:
+        # The recorded runs straddle a worktree move: they never described a
+        # single tree, so the whole evidence set re-queues.
+        return "runs"
+    digest = afters.pop()
+    verify = load_verification_record(root, session_ref)
+    if verify is None or verify.session_ref != session_ref:
+        return "verify"
+    if verify.tree_digest != digest:
+        # The tree moved between the recorded runs and the verification
+        # sample: the run evidence is stale, not merely unverified.
+        return "runs"
+    for item in items:
+        name = item.required_receipt
+        if verify.results.get(name) is None:
+            return "verify"
+        current = stored_receipt_integrity_digest(root, session_ref, name) or ""
+        if verify.receipt_digests.get(name, "") != current:
+            return "verify"
+    return "fresh"
 
 
 def _claimed_run_evidence(
@@ -818,47 +830,138 @@ def _claimed_run_evidence(
     goal: GoalRecord,
     session_ref: str,
     items: tuple[EnrolledDoneWhenItemLike, ...],
-) -> tuple[CompletionEvidence, ...] | None:
-    """Return validator evidence for a structured claim, or None while a run is pending.
+    *,
+    lane: LaneSpec | None,
+) -> tuple[tuple[CompletionEvidence, ...], dict[str, str] | None] | None:
+    """Return validator evidence for a claim, or None while worker runs settle.
 
     When the lane provably runs as another OS user, the enrolled validators
-    execute on the worker pool — one run in flight per lane — and the
-    recorded result, stamped with the worktree digest it tested, stands in
-    for the gate's re-execution. When the lane shares Chitra's user a record
-    file proves nothing, so both the run and the gate's second execution
+    and the receipt re-verification execute on the worker pool — one run in
+    flight per lane per kind — and their durable records stand in for the
+    pass's own git digests and re-executions. When the lane shares Chitra's
+    user a record file proves nothing, so both the run and the verification
     stay synchronous, exactly as before.
     """
-    lane = recorded_result_lane(config.state_dir, session_ref)
-    current_digest = worktree_git_digest(lane.workdir) if lane is not None else None
-    if lane is None or current_digest is None:
-        return record_enrolled_validator_runs(config.state_dir, session_ref, items)
-    lane_key = f"{config.state_dir}:{goal.lane_id or session_ref}"
-    if _VALIDATOR_RUN_POOL.in_flight(lane_key):
+    if lane is None:
+        return record_enrolled_validator_runs(config.state_dir, session_ref, items), None
+    run_key = _op_key(config, goal, session_ref, "validators")
+    verify_key = _op_key(config, goal, session_ref, "verify")
+    if _RUN_POOL.in_flight(run_key) or _RUN_POOL.in_flight(verify_key):
         # A running worker may be rewriting these receipts and records right
         # now: neither read them nor start a second run beside it.
         return None
-    if all(
-        recorded_validator_run_fresh(config.state_dir, session_ref, item, current_digest=current_digest)
-        for item in items
-    ):
-        _VALIDATOR_RUN_POOL.reset(lane_key)
-        return tuple(recorded_validator_run_proof(config.state_dir, session_ref, item) for item in items)
-    if _VALIDATOR_RUN_POOL.attempts(lane_key) >= _VALIDATOR_RUN_MAX_ATTEMPTS:
+    state = _verify_evidence_state(config.state_dir, session_ref, items)
+    if state == "fresh":
+        _RUN_POOL.reset(run_key)
+        _RUN_POOL.reset(verify_key)
+        verify = load_verification_record(config.state_dir, session_ref)
+        assert verify is not None  # _verify_evidence_state just proved it
+        return (
+            tuple(recorded_validator_run_proof(config.state_dir, session_ref, item) for item in items),
+            dict(verify.results),
+        )
+    if _RUN_POOL.attempts(run_key) + _RUN_POOL.attempts(verify_key) >= _VALIDATOR_RUN_MAX_ATTEMPTS:
         # Worker runs that keep failing, or keep landing stale records, are
         # surfaced through the same synchronous call the inline path made
         # instead of queueing forever. The next claim tries the pool again.
-        _VALIDATOR_RUN_POOL.reset(lane_key)
-        return record_enrolled_validator_runs(config.state_dir, session_ref, items)
-    _VALIDATOR_RUN_POOL.submit(
-        lane_key,
-        lambda: run_enrolled_validators_on_worker(
+        _RUN_POOL.reset(run_key)
+        _RUN_POOL.reset(verify_key)
+        return record_enrolled_validator_runs(config.state_dir, session_ref, items), None
+    if state == "verify":
+        _RUN_POOL.submit(
+            verify_key,
+            lambda: run_receipt_verification_on_worker(
+                config.state_dir,
+                session_ref,
+                items,
+                workdir=lane.workdir,
+            ),
+        )
+    else:
+        _RUN_POOL.submit(
+            run_key,
+            lambda: run_enrolled_validators_on_worker(
+                config.state_dir,
+                session_ref,
+                items,
+                workdir=lane.workdir,
+            ),
+        )
+    return None
+
+
+_GATE_CLOSE_RUN_SCHEMA = "chitra.gate-close-run.v1"
+
+
+def _close_record_path(root: Path, session_ref: str) -> Path:
+    """Return the rejection-record path for one session's async gate close."""
+    session_key = hashlib.sha256(session_ref.encode("utf-8")).hexdigest()
+    return root / "gate-close-runs" / session_key / "rejection.json"
+
+
+def _close_rejection_detail(
+    root: Path,
+    session_ref: str,
+    *,
+    behavior_sha256: str,
+    goal_contract_id: str,
+) -> str | None:
+    """Return a worker's recorded close rejection for this exact claim, if any.
+
+    The record binds to the reviewed behavior and goal contract, so a stale
+    rejection from an earlier claim can never dispute a fresh one.
+    """
+    try:
+        raw = json.loads(_close_record_path(root, session_ref).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict) or raw.get("schema") != _GATE_CLOSE_RUN_SCHEMA:
+        return None
+    if raw.get("session_ref") != session_ref:
+        return None
+    if raw.get("behavior_sha256") != behavior_sha256 or raw.get("goal_contract_id") != goal_contract_id:
+        return None
+    detail = raw.get("detail")
+    return detail if isinstance(detail, str) else "gate close rejected"
+
+
+def _close_completion_on_worker(
+    config: MonitordConfig,
+    session_ref: str,
+    *,
+    run_evidence: tuple[CompletionEvidence, ...],
+    last_verified: str,
+    behavior_sha256: str,
+    goal_contract_id: str,
+) -> None:
+    """Close the completion gate from a worker and record only a rejection.
+
+    Success needs no record: the goal's own ``done-pending-close`` status is
+    the durable result the next pass observes. A ``GoalValidationError`` is
+    the claim-level rejection the pass turns into a dispute; anything else
+    propagates to the pool log and is retried within the attempt bound, then
+    falls back to the inline call.
+    """
+    try:
+        mark_completion_gate_passed(
             config.state_dir,
             session_ref,
-            items,
-            workdir=lane.workdir,
-        ),
-    )
-    return None
+            now="independent enrolled validators passed for the exact completion claim",
+            last_verified=last_verified,
+            completion_evidence=run_evidence,
+        )
+    except GoalValidationError as exc:
+        write_json_atomic(
+            _close_record_path(config.state_dir, session_ref),
+            {
+                "schema": _GATE_CLOSE_RUN_SCHEMA,
+                "session_ref": session_ref,
+                "behavior_sha256": behavior_sha256,
+                "goal_contract_id": goal_contract_id,
+                "detail": str(exc),
+                "recorded_at": datetime.now(UTC).isoformat(),
+            },
+        )
 
 
 def check_enrollment_and_receipts(
@@ -933,12 +1036,13 @@ def check_enrollment_and_receipts(
         ):
             claim_bindings[item.id] = item.required_receipt
 
-    claimed = _claimed_run_evidence(config, goal, session_ref, items)
+    lane = recorded_result_lane(config.state_dir, session_ref)
+    claimed = _claimed_run_evidence(config, goal, session_ref, items, lane=lane)
     if claimed is None:
         # A worker run is in flight or was just queued: the claim
         # neither passes nor disputes until the recorded result lands.
         return 0, False, [], True
-    run_evidence = claimed
+    run_evidence, verified_results = claimed
     if not has_structured_completion_line(final_text):
         # A plain-language claim binds no item to a receipt, so bind every
         # enrolled item to the receipt Chitra just stored and let those
@@ -954,51 +1058,74 @@ def check_enrollment_and_receipts(
         receipt_roots={session_ref: config.state_dir},
         session_ref=session_ref,
         material_questions=material_questions,
+        verified_results=verified_results,
     )
     if not findings and not config.shadow_mode:
         # The same isolated reviewer that gates completion claims under watchd
         # now gates them here: a deterministic pass alone does not release a
         # claimed "done". A stored signal for this exact behavior and contract
         # is reused so an unchanged disputed claim does not pay for a fresh
-        # review round every pass.
+        # review round every pass. The review runs on the worker pool — its
+        # durable record is the review-log signal this pass already reads —
+        # so ``claude -p`` never blocks the loop; a queued or running review
+        # reports the claim as pending, like the validator stages.
         behavior = WatchedSessionBehavior.from_turn(session_ref, final_text, still_running=still_running)
         signal = load_latest_review_signal(review_log_path(config.state_dir), session_ref)
         try:
             contract_id = freeze_goal(goal).contract_id
         except GoalReviewError:
             contract_id = ""
-        if (
+        review_key = _op_key(config, goal, session_ref, "review")
+        signal_stale = (
             signal is None
             or signal.behavior_sha256 != behavior.behavior_sha256
             or signal.goal_contract_id != contract_id
             # An "insufficient" verdict only holds while lane work is still
             # in flight; once it finishes, the same claim is judged afresh.
             or (signal.verdict == "insufficient" and not behavior.still_running)
-        ):
-            try:
-                signal = review_watched_session(
-                    config.state_dir,
-                    session_ref,
-                    behavior,
-                    reviewer=reviewer if reviewer is not None else ClaudeProcessReviewer(),
-                )
-            except Exception as exc:
-                logger.warning(
-                    "monitord_completion_review_unavailable",
-                    session_ref=session_ref,
-                    error=str(exc),
-                )
-                signal = None
-                findings = [
-                    Finding(
-                        detector="false_done",
-                        fingerprint_seed={"session_ref": session_ref, "reason": "review-unavailable"},
-                        event_refs=(final_response.event_id,) if final_response is not None else (),
-                        unmet_item="isolated completion review",
-                        expected_next_progress="restore the isolated reviewer and re-claim completion",
-                        detail=f"the isolated completion review could not run: {exc}",
+        )
+        if signal_stale:
+            if _RUN_POOL.in_flight(review_key):
+                return len(run_evidence), False, [], True
+            if _RUN_POOL.attempts(review_key) >= _VALIDATOR_RUN_MAX_ATTEMPTS:
+                _RUN_POOL.reset(review_key)
+                try:
+                    signal = review_watched_session(
+                        config.state_dir,
+                        session_ref,
+                        behavior,
+                        reviewer=reviewer if reviewer is not None else ClaudeProcessReviewer(),
                     )
-                ]
+                except Exception as exc:
+                    logger.warning(
+                        "monitord_completion_review_unavailable",
+                        session_ref=session_ref,
+                        error=str(exc),
+                    )
+                    signal = None
+                    findings = [
+                        Finding(
+                            detector="false_done",
+                            fingerprint_seed={"session_ref": session_ref, "reason": "review-unavailable"},
+                            event_refs=(final_response.event_id,) if final_response is not None else (),
+                            unmet_item="isolated completion review",
+                            expected_next_progress="restore the isolated reviewer and re-claim completion",
+                            detail=f"the isolated completion review could not run: {exc}",
+                        )
+                    ]
+            else:
+                _RUN_POOL.submit(
+                    review_key,
+                    lambda: _run_completion_review(
+                        config.state_dir,
+                        session_ref,
+                        behavior,
+                        reviewer if reviewer is not None else ClaudeProcessReviewer(),
+                    ),
+                )
+                return len(run_evidence), False, [], True
+        else:
+            _RUN_POOL.reset(review_key)
         if not findings and signal is not None and signal.verdict == "insufficient":
             # The reviewers could not decide while lane work is still in
             # flight: like watchd, leave the goal untouched and report the
@@ -1024,25 +1151,75 @@ def check_enrollment_and_receipts(
                 )
             ]
     if not findings and not config.shadow_mode:
-        try:
-            mark_completion_gate_passed(
+        # The close key carries the claim's behavior hash so the attempt
+        # bound counts retries of THIS claim — a later, different claim
+        # starts at zero instead of inheriting exhausted attempts.
+        close_key = _op_key(config, goal, session_ref, f"close:{behavior.behavior_sha256[:16]}")
+        rejected: str | None = None
+        if lane is not None:
+            # The gate close re-verifies every receipt inside the goal lock —
+            # git digests and trusted-validator re-execution included — so for
+            # a lane whose records are trustworthy it runs on the worker pool.
+            # A success is observable as the goal's own status change; a
+            # rejection lands as a durable record this pass consumes.
+            rejected = _close_rejection_detail(
                 config.state_dir,
                 session_ref,
-                now="independent enrolled validators passed for the exact completion claim",
-                last_verified=final_response.event_id if final_response is not None else "",
-                completion_evidence=run_evidence,
+                behavior_sha256=behavior.behavior_sha256,
+                goal_contract_id=contract_id,
             )
-        except GoalValidationError as exc:
-            findings = [
-                Finding(
-                    detector="false_done",
-                    fingerprint_seed={"session_ref": session_ref, "reason": "completion-store-rejected"},
-                    event_refs=(final_response.event_id,) if final_response is not None else (),
-                    unmet_item="verified completion receipts",
-                    expected_next_progress="produce current verified receipts bound to this exact goal session",
-                    detail=f"the completion store rejected the claimed evidence: {exc}",
+            if rejected is None and not _RUN_POOL.in_flight(close_key):
+                if _RUN_POOL.attempts(close_key) >= _VALIDATOR_RUN_MAX_ATTEMPTS:
+                    _RUN_POOL.reset(close_key)
+                else:
+                    _RUN_POOL.submit(
+                        close_key,
+                        lambda: _close_completion_on_worker(
+                            config,
+                            session_ref,
+                            run_evidence=run_evidence,
+                            last_verified=final_response.event_id if final_response is not None else "",
+                            behavior_sha256=behavior.behavior_sha256,
+                            goal_contract_id=contract_id,
+                        ),
+                    )
+                    return len(run_evidence), False, [], True
+            if rejected is None and _RUN_POOL.in_flight(close_key):
+                return len(run_evidence), False, [], True
+            if rejected is not None:
+                findings = [
+                    Finding(
+                        detector="false_done",
+                        fingerprint_seed={"session_ref": session_ref, "reason": "completion-store-rejected"},
+                        event_refs=(final_response.event_id,) if final_response is not None else (),
+                        unmet_item="verified completion receipts",
+                        expected_next_progress="produce current verified receipts bound to this exact goal session",
+                        detail=f"the completion store rejected the claimed evidence: {rejected}",
+                    )
+                ]
+        if lane is None or (rejected is None and not _RUN_POOL.in_flight(close_key) and not findings):
+            # Same-OS-user lanes keep the synchronous close — a worker record
+            # they could write proves nothing — and the attempts-exhausted
+            # fallback lands here too.
+            try:
+                mark_completion_gate_passed(
+                    config.state_dir,
+                    session_ref,
+                    now="independent enrolled validators passed for the exact completion claim",
+                    last_verified=final_response.event_id if final_response is not None else "",
+                    completion_evidence=run_evidence,
                 )
-            ]
+            except GoalValidationError as exc:
+                findings = [
+                    Finding(
+                        detector="false_done",
+                        fingerprint_seed={"session_ref": session_ref, "reason": "completion-store-rejected"},
+                        event_refs=(final_response.event_id,) if final_response is not None else (),
+                        unmet_item="verified completion receipts",
+                        expected_next_progress="produce current verified receipts bound to this exact goal session",
+                        detail=f"the completion store rejected the claimed evidence: {exc}",
+                    )
+                ]
 
     disputed = bool(findings)
     if disputed and not config.shadow_mode:
@@ -1456,13 +1633,23 @@ def run_forever(config: MonitordConfig, *, stop_event: threading.Event | None = 
     notify_ready()
     try:
         while not active_stop_event.is_set():
+            # A completion landing during the pass still counts: the wake is
+            # cleared before the pass so its signal is not consumed early.
+            _MONITOR_WAKE.clear()
             run_once(config)
             notify_watchdog()
-            active_stop_event.wait(config.poll_seconds)
+            # Sleep in short slices so a finished worker wakes the loop for
+            # the pass that consumes its record, while the stop event keeps
+            # its prompt shutdown response.
+            deadline = time.monotonic() + config.poll_seconds
+            while not _MONITOR_WAKE.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or active_stop_event.wait(min(remaining, 0.25)):
+                    break
     finally:
-        # Running validators keep their threads; an unfinished run simply
-        # never records a result and the next daemon start re-queues it.
-        _VALIDATOR_RUN_POOL.shutdown()
+        # Running workers keep their threads; an unfinished run simply never
+        # records a result and the next daemon start re-queues it.
+        _RUN_POOL.shutdown()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
