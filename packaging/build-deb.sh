@@ -18,6 +18,8 @@ cp -a "$venv_source" "$stage/opt/chitra/venv"
 cp "$repo_root/packaging/systemd/chitra-dispatchd.service" "$stage/usr/lib/systemd/system/"
 cp "$repo_root/packaging/systemd/chitra-monitord@.service" "$stage/usr/lib/systemd/system/"
 cp "$repo_root/packaging/systemd/chitra@.service" "$stage/usr/lib/systemd/system/"
+cp "$repo_root/packaging/systemd/chitra-rate-limit-guard@.service" "$stage/usr/lib/systemd/system/"
+cp "$repo_root/packaging/systemd/chitra-rate-limit-guard@.timer" "$stage/usr/lib/systemd/system/"
 
 mkdir -p "$(dirname "$output")"
 fpm \

@@ -91,17 +91,28 @@ def test_systemd_ownership_manifest_is_explicit_and_deterministic() -> None:
 
     shared = classes["shared-package"]
     assert shared["parameter_mode"] == "literal"
-    assert set(shared["units"]) == {
-        "chitra-dispatchd.service",
-        "chitra-rate-limit-guard.service",
-        "chitra-rate-limit-guard.timer",
-    }
+    assert set(shared["units"]) == {"chitra-dispatchd.service"}
     for filename, expected_hash in shared["units"].items():
         unit = SYSTEMD_DIR / filename
         assert unit.is_file(), filename
         assert _sha256(unit) == expected_hash, filename
         text = unit.read_text(encoding="utf-8")
         assert not any(token in text for token in shared["forbidden_tokens"]), filename
+
+    instance = classes["package-instance"]
+    assert set(instance["units"]) == {
+        "chitra@.service",
+        "chitra-monitord@.service",
+        "chitra-rate-limit-guard@.service",
+        "chitra-rate-limit-guard@.timer",
+    }
+    for filename, expected_hash in instance["units"].items():
+        unit = SYSTEMD_DIR / filename
+        assert unit.is_file(), filename
+        assert _sha256(unit) == expected_hash, filename
+        text = unit.read_text(encoding="utf-8")
+        assert "%i" in text, filename
+        assert set(_SYSTEMD_TOKEN.findall(text)) <= set(instance["allowed_tokens"]), filename
 
     mirrored = classes["shared-mirror"]["units"]
     assert set(mirrored) == {
@@ -275,7 +286,7 @@ def test_shared_daemon_units_are_the_canonical_package_layout() -> None:
     assert "packaging/systemd/chitra-dispatchd.service.example" not in dispatch_docs
     assert "packaging/systemd/chitra-triaged.service" not in triaged_docs
     assert "packaging/systemd/chitra-sweepd.service" not in sweep_docs
-    assert "packaging/systemd/chitra-rate-limit-guard.service`" in guard_docs
+    assert "packaging/systemd/chitra-rate-limit-guard@.service`" in guard_docs
     assert "packaging/systemd/chitra-rate-limit-guard.service.example" not in guard_docs
     assert "packaging/systemd/chitra-rate-limit-guard.timer.example" not in guard_docs
     assert "ExecStart=/usr/local/bin/dispatchd" not in configuration_docs
@@ -301,6 +312,37 @@ def test_persistent_supervision_units_share_lane_queue_and_binding_topology() ->
     monitor_docs = (REPO_ROOT / "docs" / "daemons" / "monitord.md").read_text(encoding="utf-8")
     assert "/var/lib/chitra/lane-<lane-id>" in monitor_docs
     assert "/etc/chitra/transcript-bindings.json" in monitor_docs
+
+
+def test_rate_limit_guard_sweeps_the_lane_the_monitor_and_dispatcher_share() -> None:
+    """The guard must read the goals monitord writes and queue orders where
+    dispatchd drains them, and use the policy file dispatchd uses. A shared
+    root such as /var/lib/chitra holds no lane goals and no drained queue."""
+    monitor = (SYSTEMD_DIR / "chitra-monitord@.service").read_text(encoding="utf-8")
+    guard = (SYSTEMD_DIR / "chitra-rate-limit-guard@.service").read_text(encoding="utf-8")
+    timer = (SYSTEMD_DIR / "chitra-rate-limit-guard@.timer").read_text(encoding="utf-8")
+    dispatch = (SYSTEMD_DIR / "chitra-dispatchd.service").read_text(encoding="utf-8")
+
+    lane_root = "Environment=CHITRA_STATE_DIR=/var/lib/chitra/lane-%i"
+    assert lane_root in monitor and lane_root in guard
+    assert "--goals-root ${CHITRA_STATE_DIR} --queue-dir ${CHITRA_STATE_DIR}/queue" in guard
+    assert "--policy-config-path /etc/chitra/policy.yaml" in dispatch
+    assert "--policy-config /etc/chitra/policy.yaml" in guard
+    assert "Unit=chitra-rate-limit-guard@%i.service" in timer
+
+
+def test_debian_package_installs_every_chitra_owned_unit() -> None:
+    """Each unit Chitra owns in the manifest must be copied by build-deb.sh."""
+    manifest = json.loads(OWNERSHIP_MANIFEST.read_text(encoding="utf-8"))
+    owned = {
+        filename
+        for entry in manifest["classes"].values()
+        if entry["owner"] == "ReticleWorks/chitra" and entry.get("root") == "packaging/systemd"
+        for filename in entry["units"]
+    }
+    build = (REPO_ROOT / "packaging" / "build-deb.sh").read_text(encoding="utf-8")
+    copied = set(re.findall(r'cp "\$repo_root/packaging/systemd/([^"]+)" "\$stage/usr/lib/systemd/system/"', build))
+    assert copied == owned
 
 
 def test_the_merge_daemon_unit_fails_rather_than_starting_without_its_token() -> None:

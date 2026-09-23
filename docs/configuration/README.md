@@ -158,7 +158,7 @@ Every daemon accepts `--help` to list its flags. Common patterns:
 ```bash
 dispatchd --queue-dir /var/lib/chitra/queue --once
 chitra-monitord --state-dir /var/lib/chitra --once
-rate-limit-guard --policy-config /etc/chitra/policy.yaml
+chitra-rate-limit-guard --usage-dir /var/lib/chitra/usage-snapshots --host "$(hostname)" --policy-config /etc/chitra/policy.yaml
 ```
 
 ## Running with systemd
@@ -168,6 +168,9 @@ The Debian package installs the shared daemon units from
 
 - `chitra-dispatchd.service`
 - `chitra-monitord@.service`
+- `chitra-rate-limit-guard@.service` and `chitra-rate-limit-guard@.timer`, one
+  timer per lane, sweeping the same `/var/lib/chitra/lane-<lane-id>` state root
+  as `chitra-monitord@<lane-id>`
 
 They use the released virtual environment at `/opt/chitra/venv` and the
 declaration at `/etc/chitra/lanes.yaml`. A fleet deployment that uses isolated

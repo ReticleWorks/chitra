@@ -1,11 +1,11 @@
 [Unit]
-Description=Run the chitra capacity and load-shed sweep every two minutes
+Description=Run the chitra capacity and load-shed sweep for lane %i every two minutes
 Documentation=https://github.com/ReticleWorks/chitra
 
 [Timer]
 OnBootSec=2min
 OnUnitActiveSec=2min
-Unit=chitra-rate-limit-guard.service
+Unit=chitra-rate-limit-guard@%i.service
 Persistent=true
 
 [Install]

@@ -15,6 +15,19 @@ All notable changes to this project are documented here, in the [Keep a Changelo
   and `load_shed` still import from them); only their standalone-daemon
   systemd surface is gone.
 
+### Fixed
+
+- The rate-limit guard units ship as per-lane templates,
+  `chitra-rate-limit-guard@.service` and `chitra-rate-limit-guard@.timer`, and
+  the Debian package now installs them. The former literal unit swept
+  `/var/lib/chitra`, which holds no lane goals, and queued orders in
+  `/var/lib/chitra/queue`, which no dispatcher drains. Each instance now
+  sweeps `/var/lib/chitra/lane-<lane-id>` and reads `/etc/chitra/policy.yaml`,
+  the policy file dispatchd uses.
+- tmux pane evidence no longer reports an order SENT when the same marker was
+  already on screen before the paste. A repeated canned nudge stays
+  DELIVERY_UNCONFIRMED until its transcript confirms it.
+
 ## [0.21.1] - 2026-09-05
 
 ### Fixed
