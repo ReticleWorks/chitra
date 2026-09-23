@@ -58,4 +58,4 @@ No reconciliation or drift-detection path exists in chitra. If one is added, it 
 
 ## Extensibility without coupling
 
-chitra exposes plain, documented file and queue formats: JSON orders and results (`chitra.dispatch`'s `DispatchOrder`/`DispatchResult` models), the `<ISO8601> <LANE_ID> <TEXT>` events-log line format documented in `chitra.triaged`'s module docstring, and the JSON triage log it emits. Any read-only consumer — a dashboard, a learning loop, another project — can be built against these formats without chitra needing to know it exists. For such a consumer, the module docstrings are the complete contract.
+chitra exposes plain, documented file and queue formats: JSON orders and results (`chitra.dispatch`'s `DispatchOrder`/`DispatchResult` models), the signed delivery ledger, and the canonical per-lane journal. Any read-only consumer — a dashboard, a learning loop, another project — can be built against these formats without chitra needing to know it exists. For such a consumer, the module docstrings are the complete contract.

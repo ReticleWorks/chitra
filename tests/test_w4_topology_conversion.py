@@ -13,8 +13,8 @@ from typing import Any, cast
 import pytest
 import yaml
 
-import tools.convert.topology as topology
-from tools.convert import (
+import chitra.convert.topology as topology
+from chitra.convert import (
     ConversionError,
     WriterObservation,
     build_authority_handoff_receipt,
@@ -923,5 +923,7 @@ def test_rollback_validates_snapshot_before_touching_destination_and_refuses_v2_
 
 def test_converter_is_packaged_and_exposed_as_entrypoint() -> None:
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
-    assert "tools" in pyproject["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"]
-    assert pyproject["project"]["scripts"]["chitra-convert"] == "tools.convert.topology:main"
+    packages = pyproject["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"]
+    assert "src/chitra" in packages
+    assert "tools" not in packages
+    assert pyproject["project"]["scripts"]["chitra-convert"] == "chitra.convert.topology:main"

@@ -330,20 +330,6 @@ class EventJournal:
                     raise ValueError(f"invalid journal row {self.path} after byte {offset}: {exc}") from exc
         return events, start, position, fd_stat
 
-    def load_progress(self) -> list[ProgressClassification]:
-        if not self.progress_path.exists():
-            return []
-        rows: list[ProgressClassification] = []
-        with self.progress_path.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, 1):
-                if not line.strip():
-                    continue
-                try:
-                    rows.append(ProgressClassification.model_validate_json(line))
-                except ValueError as exc:
-                    raise ValueError(f"invalid progress row {self.progress_path}:{line_number}: {exc}") from exc
-        return rows
-
     def append(self, events: Iterable[CanonicalEvent]) -> tuple[CanonicalEvent, ...]:
         candidates = tuple(events)
         if not candidates:

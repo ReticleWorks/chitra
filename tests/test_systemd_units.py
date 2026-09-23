@@ -278,14 +278,10 @@ def test_shared_daemon_units_are_the_canonical_package_layout() -> None:
     assert not (SYSTEMD_DIR / "chitra-rate-limit-guard.timer.example").exists()
 
     dispatch_docs = (REPO_ROOT / "docs" / "daemons" / "delivery" / "dispatchd.md").read_text(encoding="utf-8")
-    triaged_docs = (REPO_ROOT / "docs" / "daemons" / "delivery" / "triaged.md").read_text(encoding="utf-8")
-    sweep_docs = (REPO_ROOT / "docs" / "daemons" / "delivery" / "sweepd.md").read_text(encoding="utf-8")
     guard_docs = (REPO_ROOT / "docs" / "daemons" / "delivery" / "rate-limit-guard.md").read_text(encoding="utf-8")
     configuration_docs = (REPO_ROOT / "docs" / "configuration" / "README.md").read_text(encoding="utf-8")
     assert "packaging/systemd/chitra-dispatchd.service`" in dispatch_docs
     assert "packaging/systemd/chitra-dispatchd.service.example" not in dispatch_docs
-    assert "packaging/systemd/chitra-triaged.service" not in triaged_docs
-    assert "packaging/systemd/chitra-sweepd.service" not in sweep_docs
     assert "packaging/systemd/chitra-rate-limit-guard@.service`" in guard_docs
     assert "packaging/systemd/chitra-rate-limit-guard.service.example" not in guard_docs
     assert "packaging/systemd/chitra-rate-limit-guard.timer.example" not in guard_docs

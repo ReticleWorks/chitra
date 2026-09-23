@@ -44,9 +44,9 @@ from chitra.supervision import goal_digest
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 SANCTIONED_HOST = "tophand"
 SANCTIONED_HOSTS = frozenset({"tophand", "trinity", "twinridge"})
-# The name chitra.watchd's transcript-pipe liveness check looks for. The two
-# must agree: the watcher reads this file to decide whether a governed lane is
-# still being recorded.
+# The name monitord's pane-sensing transcript-pipe liveness check looks
+# for. The two must agree: the monitor reads this file to decide whether a
+# governed lane is still being recorded.
 TRANSCRIPT_NAME = "tmux-transcript.log"
 CLAUDE_MODELS = ("sonnet", "opus")
 BACKENDS = ("claude", "codex", "opencode")
@@ -515,7 +515,7 @@ def _write_launch_receipt(
             PANE_TARGET_ENV_VAR: f"{lane.tmux_session}:0.0",
             SOCKET_PATH_ENV_VAR: str(socket_path),
         },
-        "lifecycle": ["dispatchd", "watchd", "completion_gate", "goal_enforcement", "draft_scanner", "rate_limit_guard"],
+        "lifecycle": ["dispatchd", "monitord", "completion_gate", "goal_enforcement", "draft_scanner", "rate_limit_guard"],
         # What the launch proved about this lane's permissions, so a reader
         # weeks later can tell a lane that was tested from one that was not.
         "permission_self_test": (self_test.as_dict() if self_test else {"live": False, "passed": False, "detail": "not run"}),

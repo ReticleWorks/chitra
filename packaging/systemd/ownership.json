@@ -34,7 +34,7 @@
       "allowed_tokens": ["%H", "%i", "${CHITRA_STATE_DIR}"],
       "units": {
         "chitra@.service": "2b3c3333c8a109551d8297d3eb9aad7cade11ef36340809df71257426801f8ca",
-        "chitra-monitord@.service": "0ec094895022f632465096ec83a0dbf9670968e4ce539728181902b77415da0f",
+        "chitra-monitord@.service": "f1e9daa27e47e5ebf8dd89e7f7482a7963a28851116d1244e385f34abc749e76",
         "chitra-rate-limit-guard@.service": "e75fd617537ceb80aac30bea17844d7fa4489ab2a5930b162ec13f89c0348ea7",
         "chitra-rate-limit-guard@.timer": "d41c9ae55ae849b493aa3e0c4c65e78e5a556b51070a5882867f2dfd24928be4"
       }
@@ -47,8 +47,7 @@
       "units": {
         "chitra-dispatchd.service": "093166f3b72da759866c60efe91850d2ad61eddc9cf1b6d1e262b3cd1f87201a",
         "chitra-rate-limit-guard.service": "eae32b02e40e7c627b2e4e5b79347ac5d434ebef029b52f91efa84b929831815",
-        "chitra-rate-limit-guard.timer": "8d5dde03b333269e8910e61723bcf5050243f61b1f2968418846b0d9149eac39",
-        "chitra-triaged.service": "2c9c72f9e38e7b3bfaa66c676d4cf022aa700489f9b5bb04bf99313cf40091b4"
+        "chitra-rate-limit-guard.timer": "8d5dde03b333269e8910e61723bcf5050243f61b1f2968418846b0d9149eac39"
       }
     },
     "fleet-instance": {
@@ -58,10 +57,7 @@
       "required_tokens": ["%i"],
       "allowed_tokens": ["%H", "%i", "%n", "${CHITRA_SOCKET_PATH}", "${CHITRA_STATE_DIR}"],
       "units": {
-        "polyphony-chitra-dispatchd@.service": "ccfaa9430824cc9a44124c18cb8218ba3c6de8e2138d35abfdea15f240617d31",
-        "polyphony-chitra-sweepd@.service": "5a5d777ddd1492448ddf06808e22d7fe4ad771fcc06a4a42a4db1950eb219316",
-        "polyphony-chitra-triaged@.service": "4c6d1d345f10bb5562f5316f2e5dc95aab1a3d426f09356f081145c1bccd47ee",
-        "polyphony-chitra-watchd@.service": "bc9f3e17c63492afa24d642c66487657adabd3f85a7abd0057ab219fa43ffae0"
+        "polyphony-chitra-dispatchd@.service": "ccfaa9430824cc9a44124c18cb8218ba3c6de8e2138d35abfdea15f240617d31"
       }
     },
     "polyphony-instance": {
@@ -71,20 +67,7 @@
       "required_tokens": ["%i"],
       "allowed_tokens": ["%H", "%i", "%n", "${CHITRA_SOCKET_PATH}", "${CHITRA_STATE_DIR}"],
       "units": {
-        "polyphony-chitra-dispatchd@.service": "5ff26f3f2d1ee1b534b14281ade59baa39c10f392425ae19bb36fe22e42d69b8",
-        "polyphony-chitra-sweepd@.service": "49fd5bdbae0a77e08bd74c03f2909f1e5710868ed76a591038e43f4e54f18e9d",
-        "polyphony-chitra-triaged@.service": "6bc04049db46d8df6379e9259f9bffefa45349c78eaf0b8e256f6ecf181ae91d",
-        "polyphony-chitra-watchd@.service": "b5e9845df05336bc854cfb2eff79542e07121714e9204da9c102072fbfcdc8fe"
-      }
-    },
-    "polyphony-host": {
-      "owner": "ReticleWorks/polyphony",
-      "root": "infra/systemd",
-      "parameter_mode": "literal",
-      "intent": "concrete-monitor-daemons-retained-for-compatibility-and-board-publish",
-      "units": {
-        "polyphony-chitra-sweepd.service": "05963490a119838d31c7479d64b8e1e37cf9bafffba418eb6e8891a4bda0de2b",
-        "polyphony-chitra-watchd.service": "9ad5204a4e3d8838b5af6680e5c1e50e27f54e6df71f73cc5d82e099168c9401"
+        "polyphony-chitra-dispatchd@.service": "5ff26f3f2d1ee1b534b14281ade59baa39c10f392425ae19bb36fe22e42d69b8"
       }
     },
     "polyphony-source-host": {
@@ -93,8 +76,7 @@
       "parameter_mode": "literal",
       "intent": "legacy-extracted-phase-0-and-phase-1-daemons",
       "units": {
-        "polyphony-chitra-dispatchd.service": "9a4d4e9f45fe456a5b3d26e8333eee84186639d167d5c528ecb6d3f7e42a2d15",
-        "polyphony-chitra-triaged.service": "0549fdc043a0f2faf089f0004c7f9574003fb1f451364990f3cbdd8dcbefd71a"
+        "polyphony-chitra-dispatchd.service": "9a4d4e9f45fe456a5b3d26e8333eee84186639d167d5c528ecb6d3f7e42a2d15"
       }
     },
     "shared-mirror": {

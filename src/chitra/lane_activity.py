@@ -1,8 +1,9 @@
-"""Durable backend-neutral pane activity facts emitted by ``chitra.watchd``.
+"""Durable backend-neutral pane activity facts emitted by monitord's pane sensing.
 
-The load-shed selector is a one-shot process, while watchd is the component
-that already observes pane changes.  This small state file bridges those two
-lifetimes without teaching the load ladder to inspect conversation content.
+The rate-limit guard's quiescence check is a one-shot process, while monitord
+is the component that already observes pane changes. This small state file
+bridges those two lifetimes without teaching the guard to inspect
+conversation content.
 """
 
 from __future__ import annotations
@@ -62,7 +63,7 @@ class LaneActivity:
 
 
 def activity_path(root: Path | None = None) -> Path:
-    """Return the watchd activity-state path beneath ``root``."""
+    """Return the pane-activity state path beneath ``root``."""
     return (state_dir() if root is None else root) / "lane_activity.json"
 
 
@@ -95,7 +96,7 @@ def _write_activity(root: Path | None, records: list[LaneActivity]) -> None:
 
 
 def upsert_lane_activity(root: Path | None, records: Iterable[LaneActivity]) -> None:
-    """Atomically merge a watchd poll's activity facts by session reference."""
+    """Atomically merge one sensing pass's activity facts by session reference."""
     incoming = list(records)
     if not incoming:
         return

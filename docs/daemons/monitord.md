@@ -60,20 +60,17 @@ ladder decisions, supervision state, and presence, but queues no answers or
 corrective orders and does not mutate a disputed or completed goal. Turn
 shadow mode off only after the bound lanes and recorded decisions are checked.
 
-## Deprecated predecessors
+## Retired predecessors
 
-`watchd`, `triaged`, and `sweepd` remain installed and documented because
-existing declarations still reference them, but they are deprecated by this
-entrypoint:
+`watchd`, `triaged`, and `sweepd` are retired and no longer ship. monitord
+absorbed the behaviors that were still live:
 
-- `watchd` (semantic status + completion review) — superseded by monitord's
-  detector and enrollment passes.
+- `watchd` (semantic status, pane sensing, and completion review) — absorbed
+  by monitord's detector, sensing, and enrollment passes.
 - `triaged` (events-log tailing and dedup) — superseded by the canonical
   journal.
 - `sweepd` (fleet-state digest) — superseded by monitord's per-pass summary.
 
-No new deployment should declare them; no new daemon beyond `monitord` and
-`dispatchd` will be added. Their packaged systemd units are retired —
 `chitra-monitord@<instance>` is the only shipped supervisor unit.
 
 ## Running

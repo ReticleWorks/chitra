@@ -22,8 +22,6 @@ from chitra.agent_status import (
     classify_snapshot,
     parse_resume_at,
 )
-from chitra.triaged import critical_hits, parse_event_line
-from chitra.watchd import status_event_line
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 HARD_CAP = (FIXTURES / "codex_weekly_hard_cap_20260814.txt").read_text(encoding="utf-8")
@@ -124,11 +122,11 @@ def test_an_unreadable_resume_time_is_absent_rather_than_invented(text: str, lan
     assert parse_resume_at(text) is None
 
 
-def test_the_cap_reaches_triaged_as_a_critical_event(tmp_path: Path, lane_timezone: None) -> None:
-    """End to end: capped pane in, CRIT with a resume time out.
+def test_the_cap_reaches_the_status_broker_with_its_resume_time(tmp_path: Path, lane_timezone: None) -> None:
+    """End to end at the live boundary: capped pane in, status + resume out.
 
     The banner scrolls away, so if the resume time does not survive onto the
-    event line the response protocol has nothing to hold the lane against.
+    published status the alert has nothing to hold the lane against.
     """
     broker = AgentStatusBroker(tmp_path, ManifestRepository(tmp_path / "no-local-overrides"))
     event = broker.observe(
@@ -142,33 +140,4 @@ def test_the_cap_reaches_triaged_as_a_critical_event(tmp_path: Path, lane_timezo
     )
     assert event is not None
     assert event.pane.state == "rate_limited_hard"
-
-    parsed = parse_event_line(status_event_line(event.pane))
-    assert parsed is not None
-    _timestamp, lane_id, text = parsed
-
-    assert lane_id == "%12"
-    assert "state=rate_limited_hard" in text
-    assert "resume_at=2026-08-20T03:37:00Z" in text
-    assert [rule for rule, _ in critical_hits(text)] == ["rate_limited_hard"]
-
-
-def test_triaged_classifies_a_hard_cap_as_critical() -> None:
-    line = (
-        "AGENT_STATUS state=rate_limited_hard resume_at=2026-08-20T03:37:00Z pane_id=%12 "
-        "target=gct-secret-broker:0.0 agent=codex authority=manifest source=package:codex.toml "
-        "rule=rate_limit_hard_cap fallback=none"
-    )
-
-    hits = critical_hits(line)
-
-    assert [rule for rule, _ in hits] == ["rate_limited_hard"]
-
-
-def test_triaged_leaves_a_warning_at_normal_priority() -> None:
-    line = (
-        "AGENT_STATUS state=rate_limited_warn pane_id=%12 target=gct-secret-broker:0.0 "
-        "agent=codex authority=manifest source=package:codex.toml rule=rate_limit_warning fallback=none"
-    )
-
-    assert critical_hits(line) == []
+    assert event.pane.explain.resume_at == "2026-08-20T03:37:00Z"

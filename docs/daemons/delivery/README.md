@@ -5,11 +5,9 @@ The deterministic core handles message queuing, delivery verification, state tra
 ## Always-On Daemons
 
 - **[dispatchd](dispatchd.md)** — Drains the message queue, delivers to tmux sessions, verifies delivery by grepping transcripts, and writes a signed ledger.
-- **[triaged](triaged.md)** — Deprecated. Tails the events log, deduplicates pane changes, and emits alerts on critical conditions (crash, merge, rate limit). Superseded by [monitord](../monitord.md); no systemd unit ships.
 
 ## Periodic Services
 
-- **[sweepd](sweepd.md)** — Deprecated. Reads canonical goals and rate-limit state, publishes delta-only updates for downstream dashboards. Superseded by [monitord](../monitord.md); no systemd unit ships.
 - **[rate-limit-guard](rate-limit-guard.md)** — Pauses and resumes sessions via a durable transaction ledger based on account usage and host pressure.
 
 ## See Also

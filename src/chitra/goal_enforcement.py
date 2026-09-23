@@ -75,8 +75,8 @@ logger = structlog.get_logger(__name__)
 #: prompt and the same flags return either a valid verdict or a degenerate
 #: ``{"ok": ...}`` object, and the production reviewer wrapper's own header
 #: records that same shape as observed. Without a retry the intermittency
-#: reaches a person, because watchd turns one unusable reply into a blocked
-#: session and an ask to review the work by hand.
+#: reaches a person, because monitord turns one unusable reply into a
+#: blocked session and an ask to review the work by hand.
 #:
 #: Five, not three, and the difference is measured rather than chosen. Fifteen
 #: runs of the real review path on tophand, 2026-08-17, needed 21 attempts in
@@ -105,7 +105,7 @@ def unwrap_json_object(text: str) -> str:
 
     A reviewer that answers correctly but wraps the object in a fenced code
     block used to fail the strict parse, and a failed parse is not harmless
-    here: ``watchd`` turns an unavailable review into a ``blocked`` status and
+    here: ``monitord`` turns an unavailable review into a ``blocked`` status and
     an ask for someone to review the session by hand. A correct review of
     healthy work became a false blocker.
 
@@ -269,7 +269,7 @@ class ClaudeProcessReviewer:
             # answer in narrated prose, so it returned commentary ABOUT the
             # verdict instead of the verdict. Every review then failed
             # validation and fell back to the fail-closed "unavailable" verdict,
-            # which watchd turns into a blocked session and a manual-review ask.
+            # which monitord turns into a blocked session and a manual-review ask.
             # A replacement system prompt makes the reviewer indifferent to
             # whatever memory or output style a host happens to carry.
             "--system-prompt",

@@ -13,9 +13,8 @@ vocabulary.
 | `DEFERRAL_STUB` | leaves placeholders/TODO/NotImplemented/empty body/"you'll need to..." where a working artifact was asked for |
 | `FAKE_DONE` | pass/complete/high-score/verdict claim with no preceding tool execution in the window, or output contradicting its own verdict |
 
-`watchd` calls `evaluate_turn_end` whenever a pane finishes a turn. A turn
-with no completion claim is recorded as finished but unverified. A completion
-claim is audited for these concrete behaviors:
+When a pane turn ends in a completion claim, `evaluate_completion_claim`
+audits it for these concrete behaviors:
 
 1. An open or in-progress todo item survives under a done claim.
 2. Fixed deferral language such as `TODO`, `you'll need to`, `parse-only`, or

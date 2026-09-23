@@ -34,16 +34,6 @@ ROSTER_MAX_TERM_WIDTH = 160
 # Both render_roster()'s default fmt= and chitra-goals roster's --format
 # default read this one constant, so the operator ruling stays centralized.
 ROSTER_DEFAULT_FORMAT: Literal["cards", "box", "markdown"] = "markdown"
-ROSTER_MARKERS: dict[GoalStatus, str] = {
-    "blocked": "🔴",
-    "held": "🟡",
-    "idle": "🟡",
-    "working": "🟢",
-    "turn-finished-unverified": "🟡",
-    "completion-disputed": "🔴",
-    "done-pending-verification": "🟡",
-    "done-pending-close": "🟢",
-}
 
 
 class RosterRecord(Protocol):
@@ -85,14 +75,6 @@ class ArtifactRosterRecord(Protocol):
 
     @property
     def review_status(self) -> Literal["unreviewed", "reviewed"]: ...
-
-
-def marker_for(status: GoalStatus) -> str:
-    """Return the status-only marker, rejecting status outside the known states."""
-    try:
-        return ROSTER_MARKERS[status]
-    except KeyError as exc:
-        raise ValueError(f"unknown goal status: {status}") from exc
 
 
 def compute_marker(record: RosterRecord) -> str:

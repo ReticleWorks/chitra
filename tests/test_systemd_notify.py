@@ -8,17 +8,17 @@ from pathlib import Path
 
 import pytest
 
+from chitra.dispatch import run_cmd
 from chitra.systemd_notify import notify_ready, notify_watchdog, watchdog_usec
-from chitra.watchd import _run_command
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_run_command_timeout_is_a_loud_failed_result() -> None:
-    result = _run_command(["sleep", "2"], timeout=0.05)
+    result = run_cmd(["sleep", "2"], timeout=1)
 
     assert result.returncode == 124
-    assert result.stderr == "timed out after 0.05s"
+    assert result.stderr == "timed out after 1s"
 
 
 def test_ready_and_watchdog_datagrams_reach_systemd_socket(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -45,7 +45,7 @@ def test_watchdog_for_another_pid_is_disabled() -> None:
     assert watchdog_usec(env={"WATCHDOG_USEC": "6000000", "WATCHDOG_PID": "999"}, pid=1000) is None
 
 
-@pytest.mark.parametrize("module_name", ["watchd.py", "sweepd.py", "triaged.py"])
+@pytest.mark.parametrize("module_name", ["monitord.py"])
 def test_daemon_loops_notify_ready_and_watchdog_without_heartbeat_files(module_name: str) -> None:
     source = (REPO_ROOT / "src" / "chitra" / module_name).read_text(encoding="utf-8")
 

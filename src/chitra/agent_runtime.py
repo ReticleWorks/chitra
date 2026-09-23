@@ -1,4 +1,4 @@
-"""Thread-safe semantic agent state shared by watchd and its socket API."""
+"""Thread-safe semantic agent state shared by monitord and its socket API."""
 
 from __future__ import annotations
 

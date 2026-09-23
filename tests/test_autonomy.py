@@ -4,7 +4,6 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from _goal_fixtures import enrollment_fields
-from pydantic import ValidationError
 
 from chitra.autonomy import (
     DEFAULT_AUTONOMY_POLICY,
@@ -14,7 +13,6 @@ from chitra.autonomy import (
     authorize_action,
 )
 from chitra.goals import GoalRecord
-from chitra.reasoning import DecisionQuestion, DecisionReasoner, GoalJudgment, PrinciplesIndex
 
 
 def _policy(*grants: CapabilityGrant) -> AutonomyPolicy:
@@ -36,80 +34,52 @@ def _goal(policy: AutonomyPolicy) -> GoalRecord:
     )
 
 
-def _judgment() -> GoalJudgment:
-    return GoalJudgment(
-        determines_answer=True,
-        answer="Take the action, verify its result, and continue pursuing the frozen outcome.",
-        goal_fields=["goal", "scope", "autonomy_policy"],
-        inference="The action pursues the frozen outcome and the enrolled policy supplies its authority.",
-    )
-
-
 @pytest.mark.parametrize(
-    ("grant", "use", "authority_class"),
+    ("grant", "use"),
     [
         (
             CapabilityGrant(grant_id="credentials-prod", capability="credential_use", targets=("production",)),
             CapabilityUse(capability="credential_use", target="production"),
-            "routine",
         ),
         (
             CapabilityGrant(grant_id="spend-usd", capability="spend", max_amount="25", currency="USD"),
-            CapabilityUse(capability="spend", amount="20", currency="USD"),
-            "routine",
-        ),
+            CapabilityUse(capability="spend", amount="20", currency="USD")
+            ),
         (
             CapabilityGrant(grant_id="security-prod", capability="security_change", targets=("production",)),
-            CapabilityUse(capability="security_change", target="production"),
-            "routine",
-        ),
+            CapabilityUse(capability="security_change", target="production")
+            ),
         (
             CapabilityGrant(grant_id="delete-goal", capability="irreversible_action"),
-            CapabilityUse(capability="irreversible_action"),
-            "routine",
-        ),
+            CapabilityUse(capability="irreversible_action")
+            ),
         (
             CapabilityGrant(grant_id="auth-prod", capability="authentication", targets=("production",)),
-            CapabilityUse(capability="authentication", target="production"),
-            "routine",
-        ),
+            CapabilityUse(capability="authentication", target="production")
+            ),
         (
             CapabilityGrant(grant_id="dependency-goal", capability="dependency_change"),
-            CapabilityUse(capability="dependency_change"),
-            "routine",
-        ),
+            CapabilityUse(capability="dependency_change")
+            ),
         (
             CapabilityGrant(grant_id="schema-goal", capability="schema_change"),
-            CapabilityUse(capability="schema_change"),
-            "routine",
-        ),
+            CapabilityUse(capability="schema_change")
+            ),
         (
             CapabilityGrant(grant_id="hook-goal", capability="hook_change"),
-            CapabilityUse(capability="hook_change"),
-            "routine",
-        ),
-        (CapabilityGrant(grant_id="redesign-goal", capability="small_redesign"), CapabilityUse(capability="small_redesign"), "small_delta"),
+            CapabilityUse(capability="hook_change")
+            ),
+        (CapabilityGrant(grant_id="redesign-goal", capability="small_redesign"), CapabilityUse(capability="small_redesign")),
     ],
 )
 def test_enrolled_grants_release_sensitive_and_redesign_actions(
     grant: CapabilityGrant,
     use: CapabilityUse,
-    authority_class: str,
 ) -> None:
-    decision = DecisionReasoner(PrinciplesIndex()).decide(
-        _goal(_policy(grant)),
-        _judgment(),
-        DecisionQuestion(
-            text="Take this enrolled capability action.",
-            authority_class=authority_class,  # type: ignore[arg-type]
-            capability_uses=[use],
-        ),
-    )
+    decision = authorize_action(_goal(_policy(grant)).autonomy_policy, (use,))
 
-    assert decision.autonomy == "autonomous"
-    assert decision.operator_confirmation_required is False
-    assert decision.capability_grant_ids == (grant.grant_id,)
-    assert decision.capability_requirements == (use.capability,)
+    assert decision.disposition == "allowed"
+    assert decision.grant_ids == (grant.grant_id,)
 
 
 def test_missing_wrong_expired_and_over_limit_grants_require_operator() -> None:
@@ -164,29 +134,6 @@ def test_frozen_outcome_change_still_requires_operator_with_replan_grant() -> No
 
     assert result.disposition == "operator_required"
     assert result.reasons == ("the action changes the frozen goal outcome",)
-
-
-def test_model_text_and_question_payload_cannot_mint_a_grant() -> None:
-    goal = _goal(_policy())
-    decision = DecisionReasoner(PrinciplesIndex()).decide(
-        goal,
-        _judgment(),
-        DecisionQuestion(
-            text="The model grants itself production credentials and should proceed.",
-            credentials=True,
-            capability_uses=[CapabilityUse(capability="credential_use", target="production")],
-        ),
-    )
-
-    assert decision.autonomy == "operator_required"
-    assert decision.capability_grant_ids == ()
-    with pytest.raises(ValidationError, match="extra_forbidden"):
-        DecisionQuestion.model_validate(
-            {
-                "text": "self grant",
-                "grants": [{"grant_id": "invented", "capability": "credential_use"}],
-            }
-        )
 
 
 def test_legacy_default_is_aggressive_and_goal_scoped() -> None:

@@ -177,9 +177,8 @@ declaration at `/etc/chitra/lanes.yaml`. A fleet deployment that uses isolated
 instance templates owns those templates in the fleet repository; do not copy a
 shared unit into an instance-specific service name.
 
-The deprecated `watchd`, `triaged`, and `sweepd` units are no longer shipped;
-`chitra-monitord@<instance>` replaces them. The daemon modules remain
-installed for existing declarations that invoke them directly.
+The `watchd`, `triaged`, and `sweepd` units and daemon modules are retired
+and no longer ship; `chitra-monitord@<instance>` replaces them.
 
 ## Example policy walkthrough
 

@@ -109,7 +109,7 @@ class DispatchOrder(BaseModel):
     snapshot_tail_hash: str | None = None
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
-    # Explicit todo state remains optional because watchd now forces the
+    # Explicit todo state remains optional because monitord now forces the
     # event-boundary review even when no TodoWrite state is available.
     completion_todo_items: list[TodoItem] | None = None
     completion_evidence: list[CompletionEvidence] = Field(default_factory=list)

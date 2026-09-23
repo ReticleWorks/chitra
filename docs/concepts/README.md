@@ -76,8 +76,8 @@ Monitord never:
 - Treat an untyped or unverified capability as authorized outside the frozen
   per-goal `AutonomyPolicy`.
 
-Legacy `watchd` deployments may still use isolated completion reviewers. Those
-reviewers remain advisory and cannot change the frozen goal or its policy.
+monitord's isolated completion reviewers remain advisory and cannot change
+the frozen goal or its policy.
 
 ### Goals and Completion Gating
 

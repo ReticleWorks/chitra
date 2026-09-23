@@ -255,7 +255,7 @@ def test_three_w12_golden_envelopes_round_trip_exactly() -> None:
 
 
 # ---------------------------------------------------------------------------
-# registered validators: watchd executes and stores the result itself
+# registered validators: monitord executes and stores the result itself
 # ---------------------------------------------------------------------------
 
 

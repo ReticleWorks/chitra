@@ -3,7 +3,6 @@
 ## Agent coordination and status
 
 - [Semantic agent status, coordination API, and live handoff](agent-status-design.md)
-- [Migration from Watchd screen-change inference](watchd-status-migration.md)
 - [Agent detection manifest format](agent-detection-manifests.md)
 
 Chitra delivers messages to long-running LLM agent sessions in tmux and persistently supervises each explicitly bound transcript against its frozen goal. `monitord` detects drift and stalls, persists corrective intent and retries across restarts, answers contract-settled questions, and records unresolved routine questions for foreground investigation. It executes enrolled completion validators. `dispatchd` remains the sole terminal writer. Each goal freezes an aggressive, goal-scoped `AutonomyPolicy` with typed grants and limits; only a verified policy boundary or frozen-outcome change reaches the user.

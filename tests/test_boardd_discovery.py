@@ -38,10 +38,9 @@ def test_discover_units_matches_deployed_names(monkeypatch):
     packaging/systemd/ownership.json (polyphony-chitra-<role>@), not a bare
     <role>@ pattern that never appears on a deployed host."""
     fake_stdout = (
-        "polyphony-chitra-watchd@folio.service     loaded active   running Chitra watchd (folio)\n"
-        "polyphony-chitra-triaged@folio.service    loaded active   running Chitra triaged (folio)\n"
+        "polyphony-chitra-monitord@folio.service   loaded active   running Chitra monitord (folio)\n"
         "polyphony-chitra-dispatchd@folio.service  loaded inactive dead    Chitra dispatchd (folio)\n"
-        "polyphony-chitra-sweepd@boomtown.service  loaded active   running Chitra sweepd (boomtown)\n"
+        "polyphony-chitra-monitord@boomtown.service loaded active   running Chitra monitord (boomtown)\n"
     )
 
     def fake_run(*args, **kwargs):
@@ -64,10 +63,10 @@ def test_discover_units_reads_the_active_column_not_the_line(monkeypatch):
     ordinary running lane.
     """
     fake_stdout = (
-        "● polyphony-chitra-watchd@folio.service        loaded failed     failed      Chitra watchd (folio)\n"
-        "polyphony-chitra-watchd@failed-lane.service    loaded active     running     Chitra watchd (failed-lane)\n"
-        "polyphony-chitra-sweepd@boomtown.service       loaded activating auto-restart Chitra sweepd (boomtown)\n"
-        "polyphony-chitra-triaged@ghost.service         not-found inactive dead        Chitra triaged (ghost)\n"
+        "● polyphony-chitra-monitord@folio.service      loaded failed     failed      Chitra monitord (folio)\n"
+        "polyphony-chitra-monitord@failed-lane.service  loaded active     running     Chitra monitord (failed-lane)\n"
+        "polyphony-chitra-monitord@boomtown.service     loaded activating auto-restart Chitra monitord (boomtown)\n"
+        "polyphony-chitra-monitord@ghost.service        not-found inactive dead        Chitra monitord (ghost)\n"
         "Loaded units listed. Pass --all to see loaded but inactive units, too.\n"
     )
 

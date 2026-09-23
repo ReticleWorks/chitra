@@ -2,12 +2,13 @@
 
 Chitra provides command-line tools and daemons organized by function. New
 deployments run `monitord` for persistent supervision and `dispatchd` as the
-sole terminal writer. `watchd`, `triaged`, and `sweepd` remain for existing
-deployments. The rest are periodic, ad-hoc, or observation-only services.
+sole terminal writer. The retired `watchd`, `triaged`, and `sweepd` daemons
+are no longer shipped. The rest are periodic, ad-hoc, or observation-only
+services.
 
 ## The Composed Monitor
 
-- **[monitord](monitord.md)** — Persistent, exact goal-bound supervision: transcript ingestion, deterministic detectors, crash-safe corrective orders, completion receipts, foreground investigation, and presence. `watchd`, `triaged`, and `sweepd` are deprecated by it.
+- **[monitord](monitord.md)** — Persistent, exact goal-bound supervision: transcript ingestion, deterministic detectors, crash-safe corrective orders, completion receipts, pane sensing, foreground investigation, and presence. It replaces the retired `watchd`, `triaged`, and `sweepd` daemons.
 
 ## Delivery Systems
 

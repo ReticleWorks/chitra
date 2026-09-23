@@ -721,7 +721,7 @@ def _advance_quiescence(txn: Transaction, *, pause_policy: PausePolicy, activity
                 deadline_seconds=pause_policy.quiescence_timeout_seconds,
                 max_attempts=pause_policy.max_retry_attempts,
                 now=now,
-                waiting_for="Codex turn-stopped verification (watchd has no pane activity fact for this lane)",
+                waiting_for="Codex turn-stopped verification (monitord has no pane activity fact for this lane)",
             )
         token = activity.last_change_at
         if not txn.last_activity_token or token != txn.last_activity_token:

@@ -21,6 +21,9 @@ ExecStartPre=/usr/bin/install -d -o chitra -g chitra -m 0750 ${CHITRA_STATE_DIR}
 # publishing answer or corrective orders. Keep it on until this instance's
 # exact transcript bindings and decisions have been checked.
 Environment=CHITRA_MONITORD_SHADOW_MODE=1
+# The rendered lane declaration enables pane sensing for the lanes this
+# instance owns. A missing or unusable manifest degrades to supervision only.
+Environment=CHITRA_LANES_FILE=/etc/chitra/lanes.yaml
 # Install one chitra.transcript-bindings.v1 manifest containing every lane at
 # the conditioned path. Each instance writes its own state root and queues
 # actions only for goals found in that root.

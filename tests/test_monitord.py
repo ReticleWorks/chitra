@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import subprocess
@@ -1244,16 +1243,6 @@ def test_shadow_questions_neither_queue_answers_nor_mutate_the_goal(
     assert stored.open_asks == ()
     assert not list((tmp_path / "queue").glob("**/*.json"))
 
-def test_deprecated_daemon_entrypoints_warn_toward_monitord() -> None:
-    import chitra.sweepd as sweepd
-    import chitra.triaged as triaged
-    import chitra.watchd as watchd
-
-    for module in (watchd, triaged, sweepd):
-        with pytest.warns(DeprecationWarning, match="deprecated by chitra-monitord"), contextlib.suppress(SystemExit):
-            module.main(["--help"])
-
-
 def test_bad_binding_skips_its_lane_and_other_lanes_still_ingest(tmp_path: Path) -> None:
     fixture = Path(__file__).parent / "fixtures" / "w11" / "claude-2.1.280-synthetic.jsonl"
     bad = tmp_path / "bad.jsonl"
@@ -1282,7 +1271,7 @@ def test_run_forever_wakes_when_a_worker_completes(monkeypatch: pytest.MonkeyPat
 
     passes = 0
 
-    def _counting_pass(_config: MonitordConfig) -> dict[str, int]:
+    def _counting_pass(_config: MonitordConfig, *, runtime: object = None) -> dict[str, int]:
         nonlocal passes
         passes += 1
         if passes == 1:

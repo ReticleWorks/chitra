@@ -20,7 +20,7 @@ from chitra.state_paths import state_dir as default_state_dir
 
 
 class TrackedLane(Protocol):
-    """The small portion of ``sweepd.LaneState`` needed by this query."""
+    """The small portion of a tracked-lane record needed by this query."""
 
     @property
     def session_ref(self) -> str: ...
