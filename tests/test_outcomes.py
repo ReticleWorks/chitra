@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
 
-from chitra.outcomes import compute_outcomes
+import pytest
+
+from chitra.outcomes import compute_outcomes, main
 
 NOW = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
 
@@ -150,3 +153,14 @@ def test_compute_outcomes_treats_missing_state_as_empty(tmp_path: Path) -> None:
     assert rollup.totals.retry_count == 0
     assert rollup.totals.escaped_defects == 0
     assert rollup.totals.cycle_time_seconds is None
+
+
+def test_main_prints_the_rollup_as_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--root", str(tmp_path)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["totals"]["dispatch_count"] == 0
+
+
+def test_main_is_registered_as_the_chitra_outcomes_console_script() -> None:
+    pyproject = tomllib.loads((Path(__file__).resolve().parent.parent / "pyproject.toml").read_text(encoding="utf-8"))
+    assert pyproject["project"]["scripts"]["chitra-outcomes"] == "chitra.outcomes:main"

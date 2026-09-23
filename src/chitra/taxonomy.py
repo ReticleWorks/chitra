@@ -1,6 +1,9 @@
 """Typed loader for chitra's operational completion-evasion codes.
 
 The broader documentation-only taxonomy lives in ``docs/evasion-taxonomy.md``.
+Each entry's ``phrases`` are that code's shipped cue vocabulary: the
+completion gate's deferral scan reads its phrase list from the
+``DEFERRAL_STUB`` entry here.
 
 No LLM calls. Deterministic JSON loading + Pydantic validation only.
 """
@@ -20,6 +23,7 @@ class TaxonomyEntry(BaseModel):
 
     code: str
     cue: str
+    phrases: tuple[str, ...] = ()
 
 
 @lru_cache(maxsize=1)
@@ -35,3 +39,8 @@ def load_taxonomy(path: str | Path | None = None) -> tuple[TaxonomyEntry, ...]:
         return _load_packaged_taxonomy()
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     return tuple(TaxonomyEntry.model_validate(item) for item in raw["entries"])
+
+
+def cue_phrases(code: str, path: str | Path | None = None) -> tuple[str, ...]:
+    """Return the cue phrases declared for one operationalized code."""
+    return tuple(phrase for entry in load_taxonomy(path) if entry.code == code for phrase in entry.phrases)

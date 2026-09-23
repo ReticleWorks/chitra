@@ -23,8 +23,9 @@ from chitra.completion_gate import (
 )
 from chitra.dispatch import DispatchOrder, DispatchStatus
 from chitra.dispatchd import process_one_order
+from chitra.lexicon import COMPLETION_DEFERRAL_PHRASES
 from chitra.policy_config import GatePolicy
-from chitra.taxonomy import TaxonomyEntry, load_taxonomy
+from chitra.taxonomy import TaxonomyEntry, cue_phrases, load_taxonomy
 
 # ---------------------------------------------------------------------------
 # taxonomy loading
@@ -60,6 +61,22 @@ def test_load_taxonomy_can_validate_a_configured_replacement(tmp_path: Path) -> 
     path.write_text(json.dumps({"entries": [{"code": "DEFERRAL_STUB", "cue": "custom"}]}), encoding="utf-8")
     taxonomy = load_taxonomy(path)
     assert taxonomy[0].cue == "custom"
+
+
+def test_shipped_deferral_phrases_are_sourced_from_the_taxonomy() -> None:
+    """The lexicon's deferral vocabulary is the packaged DEFERRAL_STUB cue list."""
+    assert cue_phrases("DEFERRAL_STUB") == COMPLETION_DEFERRAL_PHRASES
+    assert COMPLETION_DEFERRAL_PHRASES
+
+
+def test_cue_phrases_reads_a_configured_taxonomy_replacement(tmp_path: Path) -> None:
+    path = tmp_path / "taxonomy.json"
+    path.write_text(
+        json.dumps({"entries": [{"code": "DEFERRAL_STUB", "cue": "custom", "phrases": ["zzz stub phrase"]}]}),
+        encoding="utf-8",
+    )
+    assert cue_phrases("DEFERRAL_STUB", path) == ("zzz stub phrase",)
+    assert cue_phrases("FAKE_DONE", path) == ()
 
 
 # ---------------------------------------------------------------------------
