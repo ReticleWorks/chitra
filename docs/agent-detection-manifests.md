@@ -58,7 +58,11 @@ matchers.
 Chitra evaluates every rule for explain output. The first matched rule in
 descending priority order authors status, except that an anchored live
 working rule suppresses a simultaneous blocked match from older text above
-the working footer.
+the working footer, and — when no working rule matched — a bare anchored
+input row (`›` or `❯` alone on its line) strictly below the blocker's own
+matched lines suppresses it as retained text from an already-answered
+prompt. A selector row inside a live prompt and an unsubmitted operator
+draft both carry text after the anchor, so neither performs this override.
 
 ## Matcher fields
 
@@ -91,7 +95,12 @@ anchored approval, question, or permission control, including exact answer
 tokens where the interface supplies them. Broad matches on prompt prose,
 scrollback, an error word, a status sentence, or silence are invalid uses of
 the contract. A simultaneous anchored working footer wins over older blocker
-text in the capture.
+text in the capture. The broker treats that footer as stale after the same
+snapshot is observed twice for the same pane and session, allowing the
+blocker to win. When no working footer matches, a bare anchored input row
+below the blocker text wins instead, since a consumed prompt leaves its text
+behind while the composer returns. Explain output names any displaced
+blocker in `suppressed_blocker_rule`.
 
 When no rule matches a known agent, Chitra returns idle with
 `default_known_agent_idle_fallback`. This is a safety bias, not evidence that
@@ -140,5 +149,6 @@ CHITRA_AGENT_MANIFEST_DIR=/path/to/overrides \
 ```
 
 Explain output includes the final state, authority, source kind, manifest
-version, matched rule, blocker kind, every evaluated rule result, warning, and
-fallback or screen-skip reason.
+version, matched rule, blocker kind, every evaluated rule result, warning, the
+suppressed blocker rule when an override displaced one, and fallback or
+screen-skip reason.
