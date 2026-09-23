@@ -77,6 +77,7 @@ from chitra.detect import (
     detect_drift,
     detect_excessive_testing,
     detect_false_done,
+    detect_stall,
     detect_unnecessary_steps,
     find_rescue_bundle,
     first_unmet_item,
@@ -115,6 +116,9 @@ from chitra.journal import (
     CanonicalType,
     JournalIngestor,
     NormalizationContext,
+    ProgressClass,
+    ProgressClassification,
+    derive_progress_rows,
     native_session_identity,
 )
 from chitra.journal.store import EventJournal
@@ -123,6 +127,7 @@ from chitra.orders import DispatchOrder
 from chitra.policy_config import load_policy_config
 from chitra.presence import append_presence
 from chitra.question_handler import QuestionHandlerResult, extract_questions, handle_question
+from chitra.queue_state import QueueSubdir
 from chitra.recovery import get_lane_lifecycle, load_worktree_checkpoints
 from chitra.run_pool import RunPool
 from chitra.state_paths import state_dir as default_state_dir
@@ -147,6 +152,8 @@ from chitra.validation_receipts import (
     run_receipt_verification_on_worker,
     stored_receipt_integrity_digest,
     validator_run_record,
+    worktree_changed_files,
+    worktree_git_digest,
 )
 
 logger = structlog.get_logger(__name__)
@@ -156,12 +163,18 @@ PRESENCE_INSTANCE = "chitra-monitord"
 MONITORD_SCHEMA = "chitra.monitord.pass.v1"
 IDLE_PURSUIT_SCHEMA = "chitra.monitord.idle-pursuit.v1"
 _VALIDATOR_RUN_MAX_ATTEMPTS = 3
+# A pending corrective order suppresses idle pursuit only for a bounded
+# lease: long enough for dispatchd to claim and deliver it, short enough
+# that a lane ignoring a consumed order — or an order the transport never
+# delivers — falls back to the lane's own progress evidence.
+_DELIVERY_PENDING_LEASE_PASSES = 3
 _DETECTOR_ORDER = (
     "canonical_choices.deprecated_path",
     "drift",
     "unnecessary_steps",
     "excessive_testing",
     "document_dithering",
+    "stall",
     "deferral",
     "false_blocker",
     "changed_excuse",
@@ -356,16 +369,39 @@ def _idle_pursuit_path(config: MonitordConfig, lane: str) -> Path:
     return config.state_dir / "idle-pursuit" / f"{lane}.json"
 
 
-def _progress_digest(events: tuple[CanonicalEvent, ...]) -> str:
-    """Digest only explicit scoped-progress evidence in the current journal."""
-    progress_ids = [
-        event.event_id
-        for event in events
-        if isinstance(event.payload.get("progress_evidence"), dict)
-        and any(value is True for value in event.payload["progress_evidence"].values())
-    ]
-    encoded = json.dumps(progress_ids, separators=(",", ":"), ensure_ascii=False).encode()
+def _progress_digest(
+    events: tuple[CanonicalEvent, ...],
+    *,
+    progress_rows: Sequence[ProgressClassification] = (),
+    worktree_digest: str | None = None,
+) -> str:
+    """Digest the lane's real progress evidence: classified progress rows plus
+    the declared worktree's content digest, so a diff change or new file
+    counts even when no journal event carried it."""
+    progress_ids = sorted(
+        {
+            source
+            for row in progress_rows
+            if row.classification is ProgressClass.PROGRESS
+            for source in row.source_event_ids
+        }
+    )
+    encoded = json.dumps(
+        {"events": progress_ids, "worktree": worktree_digest},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _pending_order_state(config: MonitordConfig, order_id: str) -> str:
+    """Where a corrective order sits in the durable dispatch queue, if anywhere."""
+    if not order_id or config.dispatch_queue_dir is None:
+        return ""
+    for subdir in QueueSubdir:
+        if (config.dispatch_queue_dir / subdir.value / f"{order_id}.json").is_file():
+            return subdir.value
+    return "gone"
 
 
 def _idle_pursuit_finding(
@@ -376,6 +412,8 @@ def _idle_pursuit_finding(
     findings: list[Finding],
     question_outcome: str,
     validator_pending: bool = False,
+    *,
+    progress_rows: Sequence[ProgressClassification] = (),
 ) -> Finding | None:
     """Persist clean-pass count and emit one deterministic idle finding."""
     path = _idle_pursuit_path(config, lane)
@@ -393,7 +431,6 @@ def _idle_pursuit_finding(
         and bool(events)
         and not findings
         and question_outcome == "none"
-        and not delivery_pending
         and not validator_pending
         and not goal.open_asks
         and not goal.needs
@@ -409,7 +446,9 @@ def _idle_pursuit_finding(
 
     assert goal is not None
     digest = goal_digest_value
-    progress_digest = _progress_digest(events)
+    declared = _declared_worktree(config, goal)
+    worktree_digest = worktree_git_digest(Path(declared)) if declared else None
+    progress_digest = _progress_digest(events, progress_rows=progress_rows, worktree_digest=worktree_digest)
     source = {
         "path": events[0].transcript.path,
         "native_session_id": events[0].session_id,
@@ -436,14 +475,51 @@ def _idle_pursuit_finding(
             and payload.get("goal_digest") == digest
             and payload.get("source") == source
         )
+        anchor = payload.get("anchor_event_id") if same_identity else None
+        if not isinstance(anchor, str) or not anchor:
+            anchor = events[0].event_id
+        suppressed_passes = 0
+        if delivery_pending:
+            # Bounded delivery lease: the supervision ledger says a corrective
+            # order is owed to the lane, so give dispatchd and the lane a few
+            # passes before the lane's own progress evidence judges it. Once
+            # the lease lapses, normal counting resumes and the finding names
+            # where the owed order actually sits.
+            suppressed = payload.get("suppressed_passes") if same_identity else 0
+            suppressed_passes = suppressed + 1 if isinstance(suppressed, int) else 1
+            if suppressed_passes <= _DELIVERY_PENDING_LEASE_PASSES:
+                write_json_atomic(
+                    path,
+                    {
+                        "schema": IDLE_PURSUIT_SCHEMA,
+                        "lane": lane,
+                        "session_ref": goal.session_ref,
+                        "goal_version": goal.goal_version,
+                        "goal_digest": digest,
+                        "source": source,
+                        "progress_digest": progress_digest,
+                        "anchor_event_id": anchor,
+                        "count": payload.get("count") if isinstance(payload.get("count"), int) else 0,
+                        "suppressed_passes": suppressed_passes,
+                    },
+                    fsync=True,
+                )
+                return None
+            order_state = _pending_order_state(config, str(getattr(latest_supervision, "order_id", "") or ""))
+            logger.warning(
+                "monitord_delivery_pending_lease_expired",
+                lane=lane,
+                order_id=getattr(latest_supervision, "order_id", ""),
+                order_state=order_state,
+                suppressed_passes=suppressed_passes,
+            )
+        else:
+            order_state = ""
         previous_progress_digest = payload.get("progress_digest") if same_identity else None
         previous_count = payload.get("count") if same_identity else 0
         count = previous_count + 1 if previous_progress_digest == progress_digest and isinstance(previous_count, int) else 1
         if previous_progress_digest is not None and previous_progress_digest != progress_digest:
             count = 0
-        anchor = payload.get("anchor_event_id") if same_identity else None
-        if not isinstance(anchor, str) or not anchor:
-            anchor = events[0].event_id
         write_json_atomic(
             path,
             {
@@ -456,6 +532,7 @@ def _idle_pursuit_finding(
                 "progress_digest": progress_digest,
                 "anchor_event_id": anchor,
                 "count": count,
+                "suppressed_passes": suppressed_passes,
             },
             fsync=True,
         )
@@ -472,6 +549,9 @@ def _idle_pursuit_finding(
     )
     if unmet_item is None:
         return None
+    detail = f"the enrolled goal produced no new scoped progress for {idle_pursuit_passes} clean monitor passes"
+    if order_state:
+        detail += f"; the corrective order still sits in the {order_state} queue state"
     return Finding(
         detector="idle_pursuit",
         fingerprint_seed={
@@ -482,7 +562,7 @@ def _idle_pursuit_finding(
         event_refs=tuple(event.event_id for event in events[-3:]),
         unmet_item=unmet_item.id,
         expected_next_progress=f"take the next reversible in-scope action toward: {unmet_item.text}",
-        detail=f"the enrolled goal produced no new scoped progress for {idle_pursuit_passes} clean monitor passes",
+        detail=detail,
     )
 
 
@@ -541,6 +621,7 @@ def run_detectors(
     *,
     canonical_choices_policy: CanonicalChoicesPolicy | None = None,
     deferral_phrases: Sequence[str] | None = None,
+    progress_rows: Sequence[ProgressClassification] = (),
 ) -> list[Finding]:
     """Run the deterministic detector set over one lane's journal."""
     scope_text = str(getattr(goal, "scope", "") or "")
@@ -552,19 +633,40 @@ def run_detectors(
     met_items = met_done_items(enrolled_items, receipt_root=config.state_dir, session_ref=session_ref)
     policy_config = load_policy_config()
     policy = canonical_choices_policy or policy_config.canonical_choices
+    declared_worktree = _declared_worktree(config, goal)
+    changed_files: tuple[str, ...] = ()
+    if declared_worktree:
+        real_changed = worktree_changed_files(Path(declared_worktree))
+        if real_changed is not None:
+            changed_files = real_changed
     findings: list[Finding] = []
     findings.extend(detect_canonical_choices(events, policy, enrolled_items=enrolled_items, met_items=met_items))
     findings.extend(
         detect_drift(
             events,
             scope_text=scope_text,
-            declared_worktree=_declared_worktree(config, goal),
+            declared_worktree=declared_worktree,
+            enrolled_items=enrolled_items,
+            met_items=met_items,
+            changed_files=changed_files,
+        )
+    )
+    findings.extend(
+        detect_unnecessary_steps(
+            events,
+            progress_rows=progress_rows,
             enrolled_items=enrolled_items,
             met_items=met_items,
         )
     )
-    findings.extend(detect_unnecessary_steps(events, enrolled_items=enrolled_items, met_items=met_items))
-    findings.extend(detect_excessive_testing(events, enrolled_items=enrolled_items, met_items=met_items))
+    findings.extend(
+        detect_excessive_testing(
+            events,
+            progress_rows=progress_rows,
+            enrolled_items=enrolled_items,
+            met_items=met_items,
+        )
+    )
     findings.extend(
         detect_document_dithering(
             events,
@@ -573,6 +675,7 @@ def run_detectors(
             met_items=met_items,
         )
     )
+    findings.extend(detect_stall(events, enrolled_items=enrolled_items))
     findings.extend(
         detect_deferral_language(
             events,
@@ -1787,6 +1890,15 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                 boundary = positions.get(latest_supervision.turn_boundary_event_id)
                 if boundary is not None:
                     detector_events = events[boundary + 1 :]
+        # Derive progress evidence from the whole journal — writes, new check
+        # results, and worktree-visible changes — then persist the new rows so
+        # detectors and idle pursuit judge the lane on real signals, not
+        # narration.
+        progress_rows = derive_progress_rows(
+            events,
+            goal_version=str(goal.goal_version) if goal is not None else "",
+        )
+        EventJournal(config.state_dir, lane).append_progress(progress_rows)
         if goal is not None:
             final_response = _final_response(detector_events)
             receipts_recorded, completion_disputed, enrollment_findings, validator_pending = check_enrollment_and_receipts(
@@ -1829,8 +1941,20 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
         detection_findings = (
             []
             if goal is not None and goal.status in {"held", "done-pending-verification", "done-pending-close"}
-            else run_detectors(config, lane, goal, detector_events)
+            else run_detectors(config, lane, goal, detector_events, progress_rows=progress_rows)
         )
+        if detection_findings and goal is not None:
+            # While a corrective order is owed or freshly consumed, the ladder
+            # already owns the escalation cadence for a narrating lane; stall
+            # only flags lanes with no pending corrective window.
+            latest_supervision_state = supervision.latest()
+            if (
+                latest_supervision_state is not None
+                and latest_supervision_state.goal_digest == goal_digest(goal)
+                and latest_supervision_state.state
+                in {"action_pending", "action_queued", "awaiting_progress"}
+            ):
+                detection_findings = [f for f in detection_findings if f.detector != "stall"]
         findings = observability_findings + detection_findings + [
             finding for finding in enrollment_findings if finding.detector == "false_done"
         ]
@@ -1860,6 +1984,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
             findings,
             question_outcome,
             validator_pending=validator_pending,
+            progress_rows=progress_rows,
         )
         if idle_finding is not None:
             findings.append(idle_finding)

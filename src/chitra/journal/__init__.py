@@ -19,7 +19,7 @@ from .normalizers import (
     native_session_identity,
 )
 from .reader import JsonlTailReader, ReadBatch, Rotation
-from .store import CLASSIFIER_VERSION, EventJournal, classify_progress
+from .store import CLASSIFIER_VERSION, EventJournal, classify_progress, derive_progress_rows
 
 __all__ = [
     "CLASSIFIER_VERSION",
@@ -41,6 +41,7 @@ __all__ = [
     "Rotation",
     "TranscriptIdentity",
     "classify_progress",
+    "derive_progress_rows",
     "make_normalizer",
     "native_session_identity",
 ]

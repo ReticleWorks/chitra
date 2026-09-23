@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Literal, Self
 from pydantic import BaseModel, Field, model_validator
 
 from chitra.journal.models import CanonicalEvent, CanonicalType
+from chitra.journal.tools import coerce_tool_input, target_paths, tool_class
 
 if TYPE_CHECKING:
     from chitra.detect.detectors import Finding
@@ -23,8 +24,6 @@ CanonicalChoiceKind = Literal[
 ]
 
 _REGISTRY_KEY_RE = re.compile(r"[a-z][a-z0-9_.-]{0,63}\Z")
-_WRITE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
-_TARGET_FIELDS = frozenset({"file_path", "path", "target", "target_path", "files", "paths"})
 
 
 class CanonicalChoice(BaseModel):
@@ -99,6 +98,14 @@ def _explicit_targets(input_value: object) -> tuple[str, ...]:
     return tuple(targets)
 
 
+def _first_unmet_item(enrolled_items: Sequence[object]) -> str:
+    for item in enrolled_items:
+        item_id = getattr(item, "id", None)
+        if isinstance(item_id, str):
+            return item_id
+    return ""
+
+
 def detect_canonical_choices(
     events: Sequence[CanonicalEvent],
     policy: CanonicalChoicesPolicy,
@@ -121,15 +128,13 @@ def detect_canonical_choices(
         if event.normalized_type is not CanonicalType.TOOL_CALL:
             continue
         tool_name = event.payload.get("tool_name")
-        if not isinstance(tool_name, str) or tool_name not in _WRITE_TOOLS:
+        if not isinstance(tool_name, str) or tool_class(tool_name) != "write":
             continue
-        input_value = event.payload.get("input")
-        if not isinstance(input_value, dict):
-            continue
-        cwd = _event_cwd(event, input_value)
+        coerced = coerce_tool_input(event.payload.get("input"))
+        cwd = _event_cwd(event, coerced if isinstance(coerced, dict) else {})
         targets = tuple(
             normalized
-            for raw_target in _explicit_targets(input_value)
+            for raw_target in target_paths(event)
             if (normalized := _lexical_path(raw_target, cwd=cwd)) is not None
         )
         if not targets:
