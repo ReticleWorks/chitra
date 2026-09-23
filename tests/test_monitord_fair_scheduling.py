@@ -13,7 +13,7 @@ def _finding(name: str) -> Finding:
         detector="test",
         fingerprint_seed={"name": name},
         event_refs=(f"event-{name}",),
-        unmet_item="done-1",
+        unmet_item=f"done-{name}",
         expected_next_progress=f"make progress for {name}",
         detail=f"finding {name}",
     )
@@ -31,6 +31,7 @@ def test_monitor_pursues_more_than_five_findings_in_one_pass(tmp_path: Path) -> 
         config,
         "lane",
         findings,
+        goal_digest_value="g" * 64,
         on_decision=serve,  # type: ignore[arg-type]
     )
 

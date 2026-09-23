@@ -10,12 +10,16 @@ from .detectors import (
     detect_unnecessary_steps,
 )
 from .ladder import (
+    INCIDENT_SCHEMA,
     LADDER_STAGES,
     ConsumptionProof,
     IncidentRecord,
     IncidentStore,
     LadderDecision,
+    LegacyIncidentRecord,
     ResponseLadder,
+    find_rescue_bundle,
+    track_key,
 )
 from .rescue import (
     BRIEF_SCHEMA,
@@ -23,6 +27,7 @@ from .rescue import (
     RescueBundle,
     collect_rescue_bundle,
     generate_relaunch_brief,
+    rescue_bundle_process_fresh,
     write_checkpoint_receipt,
     write_rescue_bundle,
 )
@@ -31,12 +36,14 @@ __all__ = [
     "BRIEF_SCHEMA",
     "BUNDLE_SCHEMA",
     "DETECTOR_VERSION",
+    "INCIDENT_SCHEMA",
     "LADDER_STAGES",
     "ConsumptionProof",
     "Finding",
     "IncidentRecord",
     "IncidentStore",
     "LadderDecision",
+    "LegacyIncidentRecord",
     "RescueBundle",
     "ResponseLadder",
     "collect_rescue_bundle",
@@ -45,7 +52,10 @@ __all__ = [
     "detect_excessive_testing",
     "detect_false_done",
     "detect_unnecessary_steps",
+    "find_rescue_bundle",
     "generate_relaunch_brief",
+    "rescue_bundle_process_fresh",
+    "track_key",
     "write_checkpoint_receipt",
     "write_rescue_bundle",
 ]

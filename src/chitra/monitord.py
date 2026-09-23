@@ -49,15 +49,22 @@ from chitra.canonical_choices import CanonicalChoicesPolicy, detect_canonical_ch
 from chitra.completion_gate import CompletionEvidence, extract_completion_evidence, has_structured_completion_line, is_completion_claim
 from chitra.detect import (
     Finding,
+    IncidentRecord,
     IncidentStore,
     LadderDecision,
     ResponseLadder,
+    collect_rescue_bundle,
     detect_document_dithering,
     detect_drift,
     detect_excessive_testing,
     detect_false_done,
     detect_unnecessary_steps,
+    find_rescue_bundle,
+    rescue_bundle_process_fresh,
+    write_checkpoint_receipt,
+    write_rescue_bundle,
 )
+from chitra.dispatch import capture, is_local_host, pane_pid, tmux_pane_target
 from chitra.goals import (
     GoalRecord,
     GoalsSchemaNewerError,
@@ -81,13 +88,13 @@ from chitra.journal.store import EventJournal
 from chitra.policy_config import load_policy_config
 from chitra.presence import append_presence
 from chitra.question_handler import handle_question
-from chitra.recovery import get_lane_lifecycle
+from chitra.recovery import get_lane_lifecycle, load_worktree_checkpoints
 from chitra.state_paths import state_dir as default_state_dir
 from chitra.supervision import SupervisionLedger, goal_digest
 from chitra.supervisor import reconcile_corrective_action, reconcile_question_action, record_observing
 from chitra.systemd_notify import notify_ready, notify_watchdog
 from chitra.transcript_bindings import DEFAULT_FILENAME, TranscriptBinding, load_transcript_bindings
-from chitra.validation_receipts import record_enrolled_validator_runs
+from chitra.validation_receipts import list_receipts, receipt_path, record_enrolled_validator_runs
 
 logger = structlog.get_logger(__name__)
 
@@ -455,10 +462,11 @@ def run_detectors(
 def _bind_findings_to_goal(findings: list[Finding], goal: GoalRecord) -> list[Finding]:
     """Bind detector identities to the exact frozen goal being observed.
 
-    Incident records remain keyed by their existing finding fingerprint.  The
-    monitor therefore incorporates the current goal version and digest into a
-    fresh fingerprint before a finding reaches the ladder.  A recurrence from
-    an earlier goal revision cannot reuse or advance that revision's incident.
+    Incident pressure tracks are keyed on (goal digest, unmet item); the
+    finding fingerprint is only a detail field on the record.  The monitor
+    still incorporates the current goal version and digest into a fresh
+    fingerprint so the stored detail and order markers stay scoped to the
+    exact goal revision that produced the finding.
     """
     digest = goal_digest(goal)
     return [
@@ -483,6 +491,7 @@ def evaluate_findings(
     lane: str,
     findings: list[Finding],
     *,
+    goal_digest_value: str,
     order_marker: str = "[M] monitord",
     on_decision: Callable[[Finding, LadderDecision], None] | None = None,
     journal_events: tuple[CanonicalEvent, ...] = (),
@@ -497,7 +506,7 @@ def evaluate_findings(
     actions: list[str] = []
     for finding in findings:
         marker = f"{order_marker}:{finding.fingerprint[:16]}"
-        decision = ladder.evaluate(lane=lane, finding=finding, order_marker=marker)
+        decision = ladder.evaluate(lane=lane, finding=finding, order_marker=marker, goal_digest=goal_digest_value)
         actions.append(decision.action)
         if on_decision is not None:
             on_decision(finding, decision)
@@ -511,6 +520,128 @@ def evaluate_findings(
             shadow_mode=config.shadow_mode,
         )
     return actions
+
+
+def _rescue_checkpoint_ref(record: IncidentRecord) -> str:
+    """One deterministic receipt name per rescue-stage instance."""
+    seed = f"{record.track_id}:{record.order_marker}:{record.opened_at}"
+    return f"rescue-{hashlib.sha256(seed.encode()).hexdigest()[:40]}"
+
+
+def _collect_lane_rescue_bundle(
+    config: MonitordConfig,
+    *,
+    lane: str,
+    goal: GoalRecord,
+    store: IncidentStore,
+    transcript_path: Path | None,
+) -> Any | None:
+    """Capture the RESCUE bundle while the lane's pane process is still alive.
+
+    Every failure is a hold, not an exception: a bundle collected against a
+    dead or unobservable process would fail its own identity checks at seal
+    time, so the pass simply tries again while the lane still runs.
+    """
+    parts = goal.session_ref.split(":")
+    if len(parts) != 3 or not is_local_host(parts[0]):
+        # /proc identity is only meaningful for a local pane process.
+        return None
+    host, session, pane_field = parts
+    pane = tmux_pane_target(session, pane_field)
+    pid = pane_pid(pane, host=host)
+    if pid is None:
+        return None
+    checkpoints = load_worktree_checkpoints(config.state_dir, session_ref=goal.session_ref)
+    if not checkpoints:
+        return None
+    worktree = Path(checkpoints[-1].binding.worktree_realpath)
+    try:
+        receipt_paths = [
+            receipt_path(config.state_dir, goal.session_ref, receipt.receipt_name)
+            for receipt in list_receipts(config.state_dir, goal.session_ref)
+        ]
+        pane_lines = capture(host, pane, 200)
+        bundle = collect_rescue_bundle(
+            lane=lane,
+            session_ref=goal.session_ref,
+            worktree=worktree,
+            transcript_path=transcript_path,
+            pane_capture="\n".join(pane_lines),
+            receipt_paths=receipt_paths,
+            contract_text=json.dumps(goal.to_dict(), sort_keys=True, ensure_ascii=False),
+            incidents=store.load(),
+            open_asks=goal.open_asks,
+            process_identity={"target_pid": pid},
+        )
+    except (RuntimeError, OSError, ValueError) as exc:
+        logger.warning("monitord_rescue_capture_failed", lane=lane, error=str(exc))
+        return None
+    write_rescue_bundle(bundle, config.state_dir)
+    logger.info("monitord_rescue_bundle_captured", lane=lane, bundle_sha256=bundle.bundle_sha256)
+    return bundle
+
+
+def reconcile_rescue_checkpoint(
+    config: MonitordConfig,
+    *,
+    lane: str,
+    goal: GoalRecord,
+    track_id: str,
+    transcript_path: Path | None,
+) -> None:
+    """Drive one rescue-stage incident from bundle capture to a sealed checkpoint.
+
+    The bundle is collected while the lane process is still alive — the
+    captured ``target_pid`` identity is re-observed when the checkpoint
+    receipt is written, so a process that already exited can never produce a
+    sealable bundle. Sealing waits for proven consumption of the rescue
+    order; the next recurrence then advances the track to relaunch.
+    """
+    store = IncidentStore(config.state_dir, lane)
+    record = store.latest(track_id)
+    if record is None or record.stage != "rescue" or record.checkpoint_ref:
+        return
+    bundle = find_rescue_bundle(config.state_dir, record, session_ref=goal.session_ref)
+    if bundle is not None and not rescue_bundle_process_fresh(bundle):
+        bundle = None
+    if bundle is None:
+        bundle = _collect_lane_rescue_bundle(
+            config,
+            lane=lane,
+            goal=goal,
+            store=store,
+            transcript_path=transcript_path,
+        )
+        if bundle is None:
+            return
+    if record.consumption is None:
+        # The bundle now sits on disk; the rescue order's consumption is the
+        # only remaining gate before the checkpoint receipt can be sealed.
+        return
+    checkpoint_ref = _rescue_checkpoint_ref(record)
+    receipt_file = config.state_dir / "checkpoints" / f"{checkpoint_ref}.json"
+    if not receipt_file.exists():
+        try:
+            write_checkpoint_receipt(
+                bundle=bundle,
+                record=record,
+                state_root=config.state_dir,
+                checkpoint_ref=checkpoint_ref,
+            )
+        except (RuntimeError, ValueError) as exc:
+            logger.warning("monitord_rescue_checkpoint_receipt_failed", lane=lane, error=str(exc))
+            return
+    try:
+        store.seal_rescue_checkpoint(
+            track_id=track_id,
+            order_marker=record.order_marker,
+            bundle_sha256=bundle.bundle_sha256,
+            checkpoint_ref=checkpoint_ref,
+        )
+    except ValueError as exc:
+        logger.warning("monitord_rescue_checkpoint_seal_failed", lane=lane, error=str(exc))
+        return
+    logger.info("monitord_rescue_checkpoint_sealed", lane=lane, checkpoint_ref=checkpoint_ref)
 
 
 def check_enrollment_and_receipts(
@@ -920,6 +1051,17 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                 ledger_key_path=config.ledger_key_path,
                 retry_delay_seconds=config.retry_delay_seconds,
             )
+            # RESCUE is evidence work, not another corrective order: capture
+            # the bundle while the lane process is still alive, then seal the
+            # checkpoint once the rescue order's consumption is proven. The
+            # next recurrence on this track can then advance to relaunch.
+            reconcile_rescue_checkpoint(
+                config,
+                lane=active_lane,
+                goal=active_goal,
+                track_id=decision.record.track_id,
+                transcript_path=binding_paths.get(active_lane),
+            )
 
         if goal is None:
             # The journal remains observable for diagnosis, but an unresolved
@@ -934,6 +1076,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                 config,
                 lane,
                 scheduled_findings,
+                goal_digest_value=goal_digest(goal),
                 on_decision=supervise_finding,
                 journal_events=events,
                 ledger_key=(
