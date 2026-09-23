@@ -1712,6 +1712,39 @@ def test_dispatch_to_tmux_reports_sent_when_pane_shows_the_order_landed(tmp_path
     assert "pane capture" in result.reason
 
 
+def test_dispatch_to_tmux_pane_evidence_ignores_a_marker_already_on_screen(tmp_path: Path) -> None:
+    """A repeated canned nudge leaves its earlier copy in scrollback. When
+    that copy was visible before the paste, the same pane after the paste
+    cannot prove the new order landed, so it must not report SENT."""
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    pane_text = (
+        "❯ diagnose the failing build\n"
+        "✻ Cogitated for 0s\n"
+        "Done.\n"
+        "──────────────────────\n"
+        "❯ \n"
+        "──────────────────────\n"
+        "⏵⏵ accept edits on (shift+tab to cycle)\n"
+    )
+
+    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+        if cmd[:2] == ["tmux", "capture-pane"]:
+            return fake_completed(0, pane_text, "")
+        return fake_completed(0, "", "")
+
+    order = DispatchOrder(order_id="o2", session_ref="localhost:f3:0.0", nudge="diagnose the failing build")
+    result = dispatch_to_tmux(
+        order,
+        runner=runner,
+        input_runner=FakeInputRunner(),
+        local_extra={"localhost"},
+        projects_root=projects_root,
+        sleep=lambda _seconds: None,
+    )
+    assert result.status == DispatchStatus.DELIVERY_UNCONFIRMED
+
+
 def test_dispatch_to_tmux_reports_failed_when_composer_never_clears(tmp_path: Path) -> None:
     """End-to-end: a Codex pane that is idle at pre-dispatch time (so the new
     nudge is genuinely pasted), but whose composer still holds the pasted
