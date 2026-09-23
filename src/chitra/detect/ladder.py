@@ -558,8 +558,11 @@ class ResponseLadder:
         if turn_position < 0:
             return False
         # A historical finding must not advance the ladder. The detector must
-        # report at least one event strictly after the consumed turn boundary.
-        return any(_position_of(self._events, event_id) > turn_position for event_id in finding.event_refs)
+        # report at least one event at or after the consumed turn boundary:
+        # that boundary is the lane's own reply to the order, so a gate
+        # finding on it (another bare "done") or an idle finding ending at it
+        # is a recurrence, not history.
+        return any(_position_of(self._events, event_id) >= turn_position for event_id in finding.event_refs)
 
 
 def _iter_rescue_bundles(state_root: Path) -> Iterator[Any]:

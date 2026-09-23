@@ -200,3 +200,20 @@ def test_credential_question_is_never_auto_answered() -> None:
     assert result.disposition == "residual"
     assert result.source == "foreground_reasoning"
     assert result.answer is None
+
+
+def test_newer_ruling_supersedes_the_one_it_reverses() -> None:
+    old = _decision("Keep the order queue on plain JSONL files; do not add a database.", decision_id="dec-old")
+    new = _decision("Move the order queue to a SQLite database now.", decision_id="dec-new")
+    result = handle_question(_goal(), "Should the order queue move to a SQLite database?", decisions=[old, new])
+
+    assert result.source == "decisions_log"
+    assert result.answer == f"{new.decision} (decision dec-new)"
+
+
+def test_shared_function_words_do_not_let_an_unrelated_ruling_answer() -> None:
+    ruling = _decision("Should a flaky check appear, rerun it once with this seed before filing it.")
+    result = handle_question(_goal(), "Should I continue with this approach or stop?", decisions=[ruling])
+
+    assert result.source != "decisions_log"
+    assert result.answer is None or "decision" not in result.answer

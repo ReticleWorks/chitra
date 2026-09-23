@@ -718,6 +718,57 @@ def test_ladder_does_not_advance_from_historical_finding_after_consumption(tmp_p
     assert ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="redirect-history").action == "hold"
 
 
+def test_ladder_advances_when_the_lane_repeats_the_evasion_in_its_reply(tmp_path: Path) -> None:
+    """A gate finding on the consuming turn's own final response -- the lane
+    answered the nudge with another bare "done" -- is a recurrence. It must
+    advance once and never fire a second advance from the same reply."""
+    key = b"k" * 32
+    session_ref = f"host:{LANE}:0.0"
+    sent_at = "2026-08-21T15:00:00+00:00"
+    text = "[C] nudge-reply please continue"
+    entry = LedgerEntry(
+        order_id="order-reply",
+        session_ref=session_ref,
+        tag="[C]",
+        sig_v=4,
+        message_hash=message_hash(text),
+        sent_at=sent_at,
+        signature=sign(key, session_ref=session_ref, tag="[C]", digest=message_hash(text), sent_at=sent_at),
+    )
+    journal = (
+        _event("reply-user", CanonicalType.UNKNOWN, native_type="user", payload={"text": text}, session_id=session_ref),
+        _event("reply-final", CanonicalType.FINAL_RESPONSE, payload={"text": "done"}, session_id=session_ref),
+    )
+    finding = Finding(
+        detector="false_done",
+        fingerprint_seed={"item": "done-1", "reason": "missing receipt"},
+        event_refs=("reply-final",),
+        unmet_item="done-1",
+        expected_next_progress="produce the receipt",
+        detail="completion claimed without a verified receipt",
+    )
+    store = IncidentStore(tmp_path, LANE)
+    ladder = ResponseLadder(store, journal_events=journal, ledger_key=key)
+    assert ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="nudge-reply").action == "open"
+    store.attach_consumption(
+        track_id=_track(finding),
+        order_marker="nudge-reply",
+        proof=ConsumptionProof(
+            ledger_entry=entry,
+            session_ref=session_ref,
+            native_session_id=session_ref,
+            user_event_id="reply-user",
+            turn_event_id="reply-final",
+        ),
+    )
+    advanced = ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="redirect-reply")
+    assert advanced.action == "advance"
+    assert advanced.stage == "redirect"
+    again = ladder.evaluate(lane=LANE, finding=finding, goal_digest=GOAL_DIGEST, order_marker="rescue-reply")
+    assert again.action == "hold"
+    assert again.stage == "redirect"
+
+
 def test_ladder_consumption_requires_exact_event_session(tmp_path: Path) -> None:
     key = b"k" * 32
     sent_at = "2026-08-21T15:00:00+00:00"
