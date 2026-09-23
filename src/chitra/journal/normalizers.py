@@ -456,7 +456,9 @@ class CodexNormalizer(TranscriptNormalizer):
             # A subagent rollout replays its parent's session_meta after its own.
             if isinstance(candidate, str) and candidate != self._parent_thread_id:
                 source = payload.get("source")
-                spawn = source.get("subagent", {}).get("thread_spawn") if isinstance(source, dict) else None
+                # Built-in subagents write a bare string, e.g. {"subagent": "review"}.
+                subagent = source.get("subagent") if isinstance(source, dict) else None
+                spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
                 if isinstance(spawn, dict) and isinstance(spawn.get("parent_thread_id"), str):
                     self._parent_thread_id = spawn["parent_thread_id"]
                 if self.session_id is not None and self.session_id != candidate:

@@ -14,12 +14,14 @@ from chitra.journal import (
     CanonicalEvent,
     CanonicalType,
     Client,
+    EventJournal,
     JournalIngestor,
     JsonlTailReader,
     LifecycleReceipt,
     NormalizationContext,
     ProgressClass,
     classify_progress,
+    native_session_identity,
 )
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "w11"
@@ -557,6 +559,31 @@ def _codex_155_subagent_events(tmp_path: Path) -> tuple[CanonicalEvent, ...]:
 def test_codex_subagent_rollout_keeps_own_session_despite_parent_meta(tmp_path: Path) -> None:
     events = _codex_155_subagent_events(tmp_path)
     assert {event.session_id for event in events} == {"fixture-codex-155-child"}
+
+
+def test_codex_non_spawn_subagent_source_keeps_the_lane_ingesting(tmp_path: Path) -> None:
+    """Codex writes built-in subagents as ``{"subagent": "review"}``, a string, not a thread_spawn dict."""
+    transcript = tmp_path / "review-subagent.jsonl"
+    meta = {"type": "session_meta", "payload": {"id": "review-child", "cli_version": "0.155.1", "source": {"subagent": "review"}}}
+    transcript.write_text(json.dumps(meta) + "\n")
+    with JournalIngestor(
+        state_root=tmp_path / "state",
+        transcript_path=transcript,
+        context=NormalizationContext(instance="i", lane="codex", client=Client.CODEX, client_version="0.155.1"),
+    ) as ingestor:
+        (event,) = ingestor.poll().observed
+    assert event.session_id == "review-child"
+    assert native_session_identity(transcript) == "review-child"
+
+
+def test_event_client_accepts_any_harness_name_through_the_journal(tmp_path: Path) -> None:
+    (claude_event,) = [event for event in ingest(CASES[0], tmp_path) if event.normalized_type is CanonicalType.FINAL_RESPONSE]
+    foreign = CanonicalEvent.model_validate({**claude_event.model_dump(), "event_id": "opencode-1", "client": "opencode"})
+    journal = EventJournal(tmp_path, claude_event.lane)
+    journal.append((foreign,))
+    by_id = {event.event_id: event for event in journal.load()}
+    assert by_id["opencode-1"].client == "opencode"
+    assert by_id[claude_event.event_id].client is Client.CLAUDE
 
 
 def test_codex_function_call_normalizes_as_tool_call_and_result(tmp_path: Path) -> None:
