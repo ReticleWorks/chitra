@@ -31,7 +31,8 @@ instance template — one instance per monitor (for example a monitor named
 sole process allowed to write into a session. The older `watchd`, `triaged`,
 and `sweepd` daemons are deprecated in favor of `monitord`; their modules
 remain installed for existing declarations, but their systemd units no
-longer ship.
+longer ship. A per-lane `chitra-rate-limit-guard@` timer sweeps the same lane
+state root for usage and host-load holds.
 
 **The supervisor.** Added in 0.19.2, `monitord` is the persistent-goal-pursuit
 engine: it binds a transcript to one frozen goal, runs deterministic

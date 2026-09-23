@@ -1849,12 +1849,15 @@ def dispatch_to_tmux(
     # text without a recognized composer — a bare shell echoing the pasted
     # line, an unknown TUI shape — cannot be told apart from a terminal echo,
     # so it stays DELIVERY_UNCONFIRMED and dispatchd retries transcript
-    # verification without pasting again.
+    # verification without pasting again. So does a marker that was already
+    # on screen before the paste: a repeated canned nudge leaves the earlier
+    # copy in scrollback, which cannot prove this paste landed.
     captured = capture_dispatch_pane(
         host, pane, lines=tuning.capture_lines, runner=run, local_extra=local_extra, tmux_socket=tmux_socket
     )
     if captured and _pane_capture_confirms_marker(captured, marker):
-        if _detect_tui_backend(captured) != "unknown":
+        marker_predates_paste = marker in normalized_dispatch_text(strip_terminal_controls("\n".join(pre_capture)))
+        if not marker_predates_paste and _detect_tui_backend(captured) != "unknown":
             logger.info(
                 "tmux_dispatch_sent_pane_confirmed",
                 session_ref=order.session_ref,
