@@ -92,7 +92,7 @@ class ReviewerVerdict(_FrozenModel):
     reviewer_id: str = Field(min_length=1)
     goal_contract_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     behavior_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    verdict: Literal["accept", "reject"]
+    verdict: Literal["accept", "reject", "insufficient"]
     findings: tuple[ReviewFinding, ...] = ()
 
     @model_validator(mode="after")
@@ -118,18 +118,31 @@ class ReviewerVerdict(_FrozenModel):
 
 
 class WatchedSessionBehavior(_FrozenModel):
-    """The completed turn scrutinized by isolated reviewers."""
+    """The completed turn scrutinized by isolated reviewers.
+
+    ``still_running`` names the lane's work still in flight at that turn end
+    -- open background tool calls and Chitra orders being delivered -- so a
+    claim whose proof may still be arriving can be judged ``insufficient``
+    rather than accepted or rejected early. It is supplied context, not turn
+    content: ``behavior_sha256`` still binds only ``turn_text``.
+    """
 
     session_ref: str = Field(min_length=1)
     turn_text: str = Field(min_length=1)
     behavior_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    still_running: tuple[str, ...] = ()
 
     @classmethod
-    def from_turn(cls, session_ref: str, turn_text: str) -> WatchedSessionBehavior:
+    def from_turn(cls, session_ref: str, turn_text: str, *, still_running: Sequence[str] = ()) -> WatchedSessionBehavior:
         text = turn_text.strip()
         if not text:
             raise GoalReviewError("watched-session turn text must be non-empty")
-        return cls(session_ref=session_ref, turn_text=text, behavior_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest())
+        return cls(
+            session_ref=session_ref,
+            turn_text=text,
+            behavior_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            still_running=tuple(dict.fromkeys(item for item in still_running if item.strip())),
+        )
 
 
 class MonitorContract(_FrozenModel):
@@ -245,6 +258,11 @@ def build_review_prompt(
         "do not alter, truncate, or reformat them.\n"
         '- If verdict is "accept", findings MUST be an empty list.\n'
         '- If verdict is "reject", findings MUST contain at least one entry.\n'
+        "- watched_session_behavior.still_running names the lane's work still in flight at this turn end: "
+        "open background tool calls and Chitra orders being delivered. When it lists any item, a claim whose "
+        'proof rests on that unfinished work is not yet decidable -- answer "insufficient" for it, never '
+        '"accept" or "reject". A rejection the turn earns on its own text alone still stands; "insufficient" '
+        "never substitutes for one.\n"
         "- Each finding's citation MUST be an exact, verbatim substring copied from turn_text -- no paraphrase, "
         "no summarizing, no added or removed punctuation. Your citation is checked mechanically against the "
         "turn text, and a citation that does not appear in it verbatim voids the verdict.\n"
@@ -272,7 +290,8 @@ def build_review_prompt(
         "<output_format>\n"
         "Return exactly one JSON object and nothing else: no prose, no markdown code fences, no commentary "
         "before or after it. The object's only keys are reviewer_id, goal_contract_id, behavior_sha256, verdict "
-        '("accept" or "reject"), and findings (a list; each item has exactly code, detail, and citation).\n'
+        '("accept", "reject", or "insufficient"), and findings (a list; each item has exactly code, detail, and '
+        "citation).\n"
         "</output_format>\n"
         "INPUT=" + _canonical_json(request)
     )

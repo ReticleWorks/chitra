@@ -288,6 +288,57 @@ def _tracked_goal(root: Path) -> GoalRecord:
     return goal
 
 
+class _RunningAwareReviewer:
+    """Follows the prompt's still-running rule: insufficient while work is in flight."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.running_seen: list[tuple[str, ...]] = []
+
+    def review(self, goal, behavior, reviewer_id: str) -> ReviewerVerdict:
+        self.calls.append(reviewer_id)
+        self.running_seen.append(tuple(behavior.still_running))
+        return ReviewerVerdict(
+            reviewer_id=reviewer_id,
+            goal_contract_id=goal.contract_id,
+            behavior_sha256=behavior.behavior_sha256,
+            verdict="insufficient" if behavior.still_running else "accept",
+        )
+
+
+def _journal_event(
+    lane: str,
+    *,
+    event_id: str,
+    session_id: str,
+    normalized_type: CanonicalType,
+    native_join_id: str,
+    payload: dict[str, object],
+) -> CanonicalEvent:
+    return CanonicalEvent(
+        event_id=event_id,
+        instance="watchd-test",
+        lane=lane,
+        client=Client.CLAUDE,
+        client_version="2.1.270",
+        process_id=None,
+        transcript=TranscriptIdentity(path="/tmp/fleet-transcript.jsonl", device=1, inode=1),
+        session_id=session_id,
+        resume_id=None,
+        observed_at=datetime.now(UTC).isoformat(),
+        native_time=None,
+        native_type="assistant",
+        native_join_id=native_join_id,
+        raw_byte_range=None,
+        raw_sha256=None,
+        normalized_type=normalized_type,
+        payload_digest="0" * 64,
+        normalizer_version="test",
+        payload=payload,
+        raw_record=None,
+    )
+
+
 class _BlockingReviewer:
     """A reviewer whose review() blocks until released, to prove poll_once
     never runs the isolated review inline on the sensing thread."""
@@ -447,6 +498,215 @@ def test_turn_end_automatically_runs_review_and_marks_cited_completion_pending_c
     review = json.loads((tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8"))
     assert review["condition"] == "completion_claim"
     assert review["completion_verdict"] == "CLEAN"
+
+
+def test_turn_end_review_defers_to_insufficient_while_a_background_task_runs(tmp_path: Path) -> None:
+    """A claim judged while its lane still has work in flight is insufficient.
+
+    The lane's journal shows a background tool call whose launch placeholder
+    was consumed but whose terminal task-notification has not arrived, so the
+    reviewer's still_running list is non-empty and the round comes back
+    "insufficient" -- no done, no dispute, no escalation. The next turn end
+    re-reviews under a fresh list.
+    """
+    goal = _tracked_goal(tmp_path)
+    EventJournal(tmp_path, "fleet").append(
+        [
+            _journal_event(
+                "fleet",
+                event_id="evt-bg-open",
+                session_id="sess-1",
+                normalized_type=CanonicalType.TOOL_CALL,
+                native_join_id="call-1",
+                payload={
+                    "call_id": "call-1",
+                    "tool_name": "Bash",
+                    "input": {"command": "pytest -q", "run_in_background": True},
+                },
+            )
+        ]
+    )
+    reviewer = _RunningAwareReviewer()
+    captures = iter(["working on the implementation\nesc to interrupt\n❯\n", _CITED_CLAIM_CAPTURE])
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures, _CITED_CLAIM_CAPTURE))
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log", journal_root=tmp_path),
+        runner=runner,
+        reviewer=reviewer,
+    )
+    try:
+        watcher.poll_once()
+        watcher.poll_once()
+        review_log = tmp_path / "completion_reviews.jsonl"
+        for _ in range(100):
+            if review_log.exists():
+                break
+            threading.Event().wait(0.02)
+            watcher.poll_once()
+
+        assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
+        assert reviewer.running_seen
+        assert all(any("call-1" in item for item in running) for running in reviewer.running_seen)
+        stored = get_goal(tmp_path, goal.session_ref)
+        assert stored is not None
+        assert stored.status == "turn-finished-unverified"
+        assert stored.open_asks == ()
+        assert not list((tmp_path / "queue" / "orders").glob("*.json"))
+        record = json.loads(review_log.read_text(encoding="utf-8"))
+        assert record["review_verdict"] == "insufficient"
+        assert record["status"] == "turn-finished-unverified"
+        assert "still in flight" in record["summary"]
+    finally:
+        watcher.shutdown()
+
+
+def test_turn_end_review_with_a_finished_background_task_behaves_as_before(tmp_path: Path) -> None:
+    """Nothing running means the review verdict is unchanged.
+
+    The journal holds three non-running shapes: a background call whose
+    terminal task-notification already arrived, a foreground call still
+    mid-flight (no placeholder was ever consumed for it), and a background
+    call orphaned under a dead session id.
+    """
+    goal = _tracked_goal(tmp_path)
+    EventJournal(tmp_path, "fleet").append(
+        [
+            _journal_event(
+                "fleet",
+                event_id="evt-bg-stale-session",
+                session_id="sess-dead",
+                normalized_type=CanonicalType.TOOL_CALL,
+                native_join_id="call-0",
+                payload={
+                    "call_id": "call-0",
+                    "tool_name": "Bash",
+                    "input": {"command": "old task", "run_in_background": True},
+                },
+            ),
+            _journal_event(
+                "fleet",
+                event_id="evt-bg-call",
+                session_id="sess-1",
+                normalized_type=CanonicalType.TOOL_CALL,
+                native_join_id="call-1",
+                payload={
+                    "call_id": "call-1",
+                    "tool_name": "Bash",
+                    "input": {"command": "pytest -q", "run_in_background": True},
+                },
+            ),
+            _journal_event(
+                "fleet",
+                event_id="evt-bg-done",
+                session_id="sess-1",
+                normalized_type=CanonicalType.TOOL_RESULT,
+                native_join_id="call-1",
+                payload={"call_id": "call-1", "task_id": "task-1", "status": "completed", "is_error": False},
+            ),
+            _journal_event(
+                "fleet",
+                event_id="evt-fg-open",
+                session_id="sess-1",
+                normalized_type=CanonicalType.TOOL_CALL,
+                native_join_id="call-2",
+                payload={"call_id": "call-2", "tool_name": "Read", "input": {"file_path": "/tmp/x"}},
+            ),
+        ]
+    )
+    reviewer = _RunningAwareReviewer()
+    captures = iter(["working on the implementation\nesc to interrupt\n❯\n", _CITED_CLAIM_CAPTURE])
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures, _CITED_CLAIM_CAPTURE))
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log", journal_root=tmp_path),
+        runner=runner,
+        reviewer=reviewer,
+    )
+    try:
+        watcher.poll_once()
+        watcher.poll_once()
+        for _ in range(50):
+            stored = get_goal(tmp_path, goal.session_ref)
+            assert stored is not None
+            if stored.status == "done-pending-close":
+                break
+            threading.Event().wait(0.05)
+            watcher.poll_once()
+
+        stored = get_goal(tmp_path, goal.session_ref)
+        assert stored is not None
+        assert stored.status == "done-pending-close"
+        assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
+        assert reviewer.running_seen == [(), ()]
+        record = json.loads((tmp_path / "completion_reviews.jsonl").read_text(encoding="utf-8"))
+        assert record["review_verdict"] == "accept"
+    finally:
+        watcher.shutdown()
+
+
+def test_turn_end_review_defers_to_insufficient_while_an_order_is_in_flight(tmp_path: Path) -> None:
+    """A dispatchd order claimed into in_flight/ for this lane counts as running."""
+    goal = _tracked_goal(tmp_path)
+    in_flight_dir = tmp_path / "queue" / "in_flight"
+    in_flight_dir.mkdir(parents=True)
+    (in_flight_dir / "order-9.json").write_text(
+        DispatchOrder(order_id="order-9", session_ref=goal.session_ref, nudge="continue").model_dump_json(),
+        encoding="utf-8",
+    )
+    (in_flight_dir / "order-10.json").write_text(
+        DispatchOrder(order_id="order-10", session_ref="localhost:other:0.0", nudge="continue").model_dump_json(),
+        encoding="utf-8",
+    )
+    reviewer = _RunningAwareReviewer()
+    captures = iter(["working on the implementation\nesc to interrupt\n❯\n", _CITED_CLAIM_CAPTURE])
+
+    def runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if command[1] == "list-panes":
+            return _completed(command, "%1\tfleet:0.0\t1\tcodex\n")
+        if command[1] == "capture-pane":
+            return _completed(command, next(captures, _CITED_CLAIM_CAPTURE))
+        raise AssertionError(f"unexpected command: {command}")
+
+    watcher = Watchd(
+        WatchdConfig(state_dir=tmp_path, events_log=tmp_path / "events.log"),
+        runner=runner,
+        reviewer=reviewer,
+    )
+    try:
+        watcher.poll_once()
+        watcher.poll_once()
+        review_log = tmp_path / "completion_reviews.jsonl"
+        for _ in range(100):
+            if review_log.exists():
+                break
+            threading.Event().wait(0.02)
+            watcher.poll_once()
+
+        assert reviewer.calls == ["reviewer-1-1", "reviewer-1-2"]
+        assert reviewer.running_seen
+        for running in reviewer.running_seen:
+            assert any("order-9" in item for item in running)
+            assert not any("order-10" in item for item in running)
+        stored = get_goal(tmp_path, goal.session_ref)
+        assert stored is not None
+        assert stored.status == "turn-finished-unverified"
+        assert stored.open_asks == ()
+        assert json.loads(review_log.read_text(encoding="utf-8"))["review_verdict"] == "insufficient"
+    finally:
+        watcher.shutdown()
 
 
 def test_legacy_goal_cannot_reach_done_through_watchd(tmp_path: Path) -> None:

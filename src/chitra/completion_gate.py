@@ -166,7 +166,7 @@ class CompletionReviewRecord(BaseModel):
     condition: Literal["completion_claim", "turn_end_without_completion_claim"]
     completion_verdict: Literal["CLEAN", "COMPLETION_DISPUTE"] | None = None
     review_signal_id: str | None = None
-    review_verdict: Literal["accept", "reject", "unavailable"]
+    review_verdict: Literal["accept", "reject", "unavailable", "insufficient"]
     status: str
     summary: str
     recorded_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
