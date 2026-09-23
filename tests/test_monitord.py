@@ -554,6 +554,82 @@ def test_completion_claim_the_isolated_reviewer_accepts_is_verified(
     assert stored.status == "done-pending-close"
 
 
+class _RecordingReviewer(_StubReviewer):
+    """Stub reviewer that also records the still-running list it was shown."""
+
+    def __init__(self, verdict: str) -> None:
+        super().__init__(verdict)
+        self.still_running: list[tuple[str, ...]] = []
+
+    def review(self, goal: object, behavior: object, reviewer_id: str) -> ReviewerVerdict:
+        self.still_running.append(behavior.still_running)  # type: ignore[attr-defined]
+        return super().review(goal, behavior, reviewer_id)
+
+
+def test_insufficient_review_holds_the_claim_until_lane_work_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_response = _verified_claim_setup(tmp_path, monkeypatch)
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
+    running = ("background tool call t1 (Bash) is still running",)
+    undecided = _RecordingReviewer("insufficient")
+
+    result = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=undecided, still_running=running
+    )
+
+    assert result[1:] == (False, [], True)
+    assert undecided.still_running == [running, running]
+    stored = get_goal(tmp_path, "session-1")
+    assert stored is not None
+    assert stored.status == "working"
+
+    # Once the lane work finishes, the stored "insufficient" signal no longer
+    # holds and the same claim is judged afresh.
+    accepting = _RecordingReviewer("accept")
+    _recorded, disputed, findings, pending = check_enrollment_and_receipts(
+        config, "session-1", final_response, reviewer=accepting
+    )
+
+    assert (disputed, findings, pending) == (False, [], False)
+    assert accepting.still_running == [(), ()]
+    stored = get_goal(tmp_path, "session-1")
+    assert stored is not None
+    assert stored.status == "done-pending-close"
+
+
+def test_lane_work_in_flight_names_only_unanswered_background_calls(tmp_path: Path) -> None:
+    def call(event_id: str, join_id: str, *, background: bool) -> CanonicalEvent:
+        return _event(event_id, CanonicalType.TOOL_CALL).model_copy(
+            update={
+                "native_join_id": join_id,
+                "payload": {"tool_name": "Bash", "input": {"command": "sleep 60", "run_in_background": background}},
+            }
+        )
+
+    events = (
+        call("c1", "t-open", background=True),
+        call("c2", "t-done", background=True),
+        _event("r2", CanonicalType.TOOL_RESULT).model_copy(update={"native_join_id": "t-done"}),
+        call("c3", "t-foreground", background=False),
+    )
+
+    assert monitord_mod._lane_work_in_flight(_config(tmp_path), "session-1", events) == (
+        "background tool call t-open (Bash) is still running",
+    )
+
+
+def test_validator_pool_accepts_work_after_shutdown() -> None:
+    pool = monitord_mod._ValidatorRunPool(max_workers=1)
+    pool.shutdown()
+    ran: list[str] = []
+
+    pool.submit("lane", lambda: ran.append("ran"))
+
+    assert pool.wait_idle(timeout=5)
+    assert ran == ["ran"]
+
+
 def test_routine_question_is_queued_as_an_exact_goal_contract_answer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -108,6 +108,7 @@ from chitra.journal import (
     native_session_identity,
 )
 from chitra.journal.store import EventJournal
+from chitra.orders import DispatchOrder
 from chitra.policy_config import load_policy_config
 from chitra.presence import append_presence
 from chitra.question_handler import handle_question
@@ -682,6 +683,51 @@ def reconcile_rescue_checkpoint(
     logger.info("monitord_rescue_checkpoint_sealed", lane=lane, checkpoint_ref=checkpoint_ref)
 
 
+def _lane_work_in_flight(
+    config: MonitordConfig,
+    session_ref: str,
+    events: tuple[CanonicalEvent, ...],
+) -> tuple[str, ...]:
+    """Name this lane's work still in flight, for the completion reviewer.
+
+    Mirrors watchd's turn-end list: a ``run_in_background`` tool call in the
+    journal's latest session with no joined result or error is still
+    running, and an order dispatchd has claimed under ``in_flight/`` for
+    this session is being delivered right now.
+    """
+    running: list[str] = []
+    if events:
+        current_session = events[-1].session_id
+        answered = {
+            event.native_join_id
+            for event in events
+            if event.normalized_type in (CanonicalType.TOOL_RESULT, CanonicalType.TOOL_ERROR)
+        }
+        for event in events:
+            call_input = event.payload.get("input")
+            if (
+                event.normalized_type is CanonicalType.TOOL_CALL
+                and event.native_join_id is not None
+                and event.session_id == current_session
+                and event.native_join_id not in answered
+                and isinstance(call_input, dict)
+                and call_input.get("run_in_background") is True
+            ):
+                tool_name = event.payload.get("tool_name")
+                suffix = f" ({tool_name})" if isinstance(tool_name, str) and tool_name else ""
+                running.append(f"background tool call {event.native_join_id}{suffix} is still running")
+    in_flight_dir = config.dispatch_queue_dir / "in_flight" if config.dispatch_queue_dir is not None else None
+    if in_flight_dir is not None and in_flight_dir.is_dir():
+        for order_path in sorted(in_flight_dir.glob("*.json")):
+            try:
+                order = DispatchOrder.model_validate_json(order_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if order.session_ref == session_ref:
+                running.append(f"dispatch order {order.order_id} is being delivered to the lane")
+    return tuple(running)
+
+
 class _ValidatorRunPool:
     """Bounded worker pool that keeps validator execution off the monitor loop.
 
@@ -813,6 +859,7 @@ def check_enrollment_and_receipts(
     final_response: CanonicalEvent | None = None,
     *,
     reviewer: BehaviorReviewer | None = None,
+    still_running: tuple[str, ...] = (),
 ) -> tuple[int, bool, list[Finding], bool]:
     """Verify an explicit completion claim against its enrolled contract.
 
@@ -824,7 +871,9 @@ def check_enrollment_and_receipts(
     the execution happens on the worker pool and a claim is neither passed
     nor disputed while that run is in flight; the fourth return value
     reports that pending state so the pass does not treat a lane under
-    active validation as idle.
+    active validation as idle. ``still_running`` names lane work still in
+    flight so the isolated reviewer can answer "insufficient", which is
+    reported the same way: pending, neither passed nor disputed.
     """
     try:
         goal = get_goal(config.state_dir, session_ref)
@@ -904,7 +953,7 @@ def check_enrollment_and_receipts(
         # claimed "done". A stored signal for this exact behavior and contract
         # is reused so an unchanged disputed claim does not pay for a fresh
         # review round every pass.
-        behavior = WatchedSessionBehavior.from_turn(session_ref, final_text)
+        behavior = WatchedSessionBehavior.from_turn(session_ref, final_text, still_running=still_running)
         signal = load_latest_review_signal(review_log_path(config.state_dir), session_ref)
         try:
             contract_id = freeze_goal(goal).contract_id
@@ -914,6 +963,9 @@ def check_enrollment_and_receipts(
             signal is None
             or signal.behavior_sha256 != behavior.behavior_sha256
             or signal.goal_contract_id != contract_id
+            # An "insufficient" verdict only holds while lane work is still
+            # in flight; once it finishes, the same claim is judged afresh.
+            or (signal.verdict == "insufficient" and not behavior.still_running)
         ):
             try:
                 signal = review_watched_session(
@@ -939,6 +991,11 @@ def check_enrollment_and_receipts(
                         detail=f"the isolated completion review could not run: {exc}",
                     )
                 ]
+        if not findings and signal is not None and signal.verdict == "insufficient":
+            # The reviewers could not decide while lane work is still in
+            # flight: like watchd, leave the goal untouched and report the
+            # claim as pending rather than disputing it.
+            return len(run_evidence), False, [], True
         if not findings and signal is not None and signal.verdict != "accept":
             review_detail = "; ".join(f"{item.code}: {item.detail}" for item in signal.findings)
             findings = [
@@ -1202,6 +1259,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                 config,
                 goal.session_ref,
                 final_response,
+                still_running=_lane_work_in_flight(config, goal.session_ref, events),
             )
             refreshed_goal = get_goal(config.state_dir, goal.session_ref)
             if refreshed_goal is not None:
