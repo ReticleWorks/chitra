@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -1218,6 +1219,71 @@ def test_same_user_lane_keeps_the_synchronous_second_run(
 
     assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=0)
     assert summary["validator_receipts_recorded"] == 1
+    stored = get_goal(state, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "done-pending-close"
+
+
+def test_gate_waits_for_an_in_flight_run_even_when_records_look_fresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A running worker may be rewriting the records; the gate must not read them."""
+    state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
+    _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=_init_lane_worktree(tmp_path / "lane-worktree"))
+    monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
+    _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
+    config = _live_config(state, bindings_path, queue)
+
+    run_once(config)
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+
+    release = threading.Event()
+
+    def still_running() -> None:
+        release.wait(15)
+
+    monitord_mod._VALIDATOR_RUN_POOL.submit(f"{state}:{goal.lane_id}", still_running)
+    try:
+        run_once(config)
+        stored = get_goal(state, goal.session_ref)
+        assert stored is not None
+        assert stored.status == "working"
+    finally:
+        release.set()
+    assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+
+    run_once(config)
+    stored = get_goal(state, goal.session_ref)
+    assert stored is not None
+    assert stored.status == "done-pending-close"
+
+
+def test_validator_that_writes_into_its_tree_falls_back_instead_of_requeueing_forever(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every worker record goes stale, so the pool must stop requeueing and resolve the claim."""
+    state, bindings_path, queue, goal, transcript = _completion_case(tmp_path)
+    workdir = _init_lane_worktree(tmp_path / "lane-worktree")
+    _separate_user_lane_manifest(tmp_path, monkeypatch, workdir=workdir)
+    registry = tmp_path / "validators.json"
+    writer = f"import pathlib, uuid; pathlib.Path({str(workdir)!r}, 'out-' + uuid.uuid4().hex).write_text('x')"
+    registry.write_text(json.dumps({"pytest": {"argv": [sys.executable, "-c", writer]}}), encoding="utf-8")
+    monkeypatch.setenv("CHITRA_VALIDATORS_FILE", str(registry))
+    monkeypatch.setattr(monitord_mod, "ClaudeProcessReviewer", _AcceptingReviewer)
+    _append_completion_response(transcript, session_id="native-alpha", claim=_completion_claim_line())
+    config = _live_config(state, bindings_path, queue)
+
+    for _ in range(monitord_mod._VALIDATOR_RUN_MAX_ATTEMPTS):
+        run_once(config)
+        assert monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+        stored = get_goal(state, goal.session_ref)
+        assert stored is not None
+        assert stored.status == "working"
+
+    run_once(config)
+
     stored = get_goal(state, goal.session_ref)
     assert stored is not None
     assert stored.status == "done-pending-close"

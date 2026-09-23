@@ -11,8 +11,8 @@ collapsed out of watchd, triaged, and sweepd:
 3. **Persistent action** -- record corrective intent before publishing a
    goal-bound order, reconcile queue and signed delivery proof after a crash,
    and wait for a completed agent turn before judging recurrence.
-4. **Enrollment and receipts** -- run registered validators only for an exact
-   completion claim, isolate receipts by goal session, and close only after
+4. **Enrollment and receipts** -- run registered validators on any
+   completion claim, structured or plain, isolate receipts by goal session, and close only after
    the stored evidence verifies independently. When the lane provably runs as
    another OS user, validators execute on a bounded worker pool (one run in
    flight per lane) and the pass consumes the recorded result once the
@@ -108,6 +108,7 @@ from chitra.journal import (
     native_session_identity,
 )
 from chitra.journal.store import EventJournal
+from chitra.orders import DispatchOrder
 from chitra.policy_config import load_policy_config
 from chitra.presence import append_presence
 from chitra.question_handler import handle_question
@@ -682,6 +683,51 @@ def reconcile_rescue_checkpoint(
     logger.info("monitord_rescue_checkpoint_sealed", lane=lane, checkpoint_ref=checkpoint_ref)
 
 
+def _lane_work_in_flight(
+    config: MonitordConfig,
+    session_ref: str,
+    events: tuple[CanonicalEvent, ...],
+) -> tuple[str, ...]:
+    """Name this lane's work still in flight, for the completion reviewer.
+
+    Mirrors watchd's turn-end list: a ``run_in_background`` tool call in the
+    journal's latest session with no joined result or error is still
+    running, and an order dispatchd has claimed under ``in_flight/`` for
+    this session is being delivered right now.
+    """
+    running: list[str] = []
+    if events:
+        current_session = events[-1].session_id
+        answered = {
+            event.native_join_id
+            for event in events
+            if event.normalized_type in (CanonicalType.TOOL_RESULT, CanonicalType.TOOL_ERROR)
+        }
+        for event in events:
+            call_input = event.payload.get("input")
+            if (
+                event.normalized_type is CanonicalType.TOOL_CALL
+                and event.native_join_id is not None
+                and event.session_id == current_session
+                and event.native_join_id not in answered
+                and isinstance(call_input, dict)
+                and call_input.get("run_in_background") is True
+            ):
+                tool_name = event.payload.get("tool_name")
+                suffix = f" ({tool_name})" if isinstance(tool_name, str) and tool_name else ""
+                running.append(f"background tool call {event.native_join_id}{suffix} is still running")
+    in_flight_dir = config.dispatch_queue_dir / "in_flight" if config.dispatch_queue_dir is not None else None
+    if in_flight_dir is not None and in_flight_dir.is_dir():
+        for order_path in sorted(in_flight_dir.glob("*.json")):
+            try:
+                order = DispatchOrder.model_validate_json(order_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if order.session_ref == session_ref:
+                running.append(f"dispatch order {order.order_id} is being delivered to the lane")
+    return tuple(running)
+
+
 class _ValidatorRunPool:
     """Bounded worker pool that keeps validator execution off the monitor loop.
 
@@ -689,13 +735,16 @@ class _ValidatorRunPool:
     run is still executing is not requeued, so validators cannot pile up on
     a tree that is still moving. A worker records its result under
     ``validation-runs/`` and a later pass reads the record instead of
-    waiting on the future. ``attempts`` bounds catastrophic retries so a
-    worker that fails before it can record still surfaces the same loud
-    error the old inline path produced.
+    waiting on the future. ``attempts`` counts runs queued since the gate
+    last consumed a fresh result. It bounds both a worker that fails before
+    it can record and a run whose record is always stale (for example a
+    validator that writes into the tree it tests), so either one falls
+    back to the old synchronous call instead of queueing forever.
     """
 
     def __init__(self, max_workers: int = 4) -> None:
-        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="chitra-validator-run")
+        self._max_workers = max_workers
+        self._executor = self._new_executor()
         self._lock = threading.Lock()
         self._in_flight: dict[str, Future[None]] = {}
         self._attempts: dict[str, int] = {}
@@ -711,6 +760,15 @@ class _ValidatorRunPool:
             self._in_flight[lane_key] = future
         future.add_done_callback(lambda done: self._completed(lane_key, done))
 
+    def _new_executor(self) -> ThreadPoolExecutor:
+        return ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="chitra-validator-run")
+
+    def in_flight(self, lane_key: str) -> bool:
+        """Return whether this lane has a queued or running validator run."""
+        with self._lock:
+            current = self._in_flight.get(lane_key)
+            return current is not None and not current.done()
+
     def _completed(self, lane_key: str, future: Future[None]) -> None:
         try:
             future.result()
@@ -720,12 +778,16 @@ class _ValidatorRunPool:
         with self._lock:
             if self._in_flight.get(lane_key) is future:
                 self._in_flight.pop(lane_key, None)
-                self._attempts.pop(lane_key, None)
 
     def attempts(self, lane_key: str) -> int:
-        """Return how many queued runs for this lane have not yet succeeded."""
+        """Return how many runs this lane queued since its last consumed result."""
         with self._lock:
             return self._attempts.get(lane_key, 0)
+
+    def reset(self, lane_key: str) -> None:
+        """Clear the attempt count once the gate has consumed a result."""
+        with self._lock:
+            self._attempts.pop(lane_key, None)
 
     def wait_idle(self, timeout: float | None = None) -> bool:
         """Block until no lane has a run in flight; used by tests and shutdown."""
@@ -737,8 +799,15 @@ class _ValidatorRunPool:
         return not pending
 
     def shutdown(self) -> None:
-        """Stop accepting work without blocking exit on running validators."""
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        """Cancel queued runs without blocking exit on running validators.
+
+        The module-level pool outlives one ``run_forever`` call, so a fresh
+        executor replaces the stopped one; a later pass in the same process
+        can still queue work instead of failing on a shut-down executor.
+        """
+        with self._lock:
+            stopped, self._executor = self._executor, self._new_executor()
+        stopped.shutdown(wait=False, cancel_futures=True)
 
 
 _VALIDATOR_RUN_POOL = _ValidatorRunPool()
@@ -763,16 +832,22 @@ def _claimed_run_evidence(
     current_digest = worktree_git_digest(lane.workdir) if lane is not None else None
     if lane is None or current_digest is None:
         return record_enrolled_validator_runs(config.state_dir, session_ref, items)
+    lane_key = f"{config.state_dir}:{goal.lane_id or session_ref}"
+    if _VALIDATOR_RUN_POOL.in_flight(lane_key):
+        # A running worker may be rewriting these receipts and records right
+        # now: neither read them nor start a second run beside it.
+        return None
     if all(
         recorded_validator_run_fresh(config.state_dir, session_ref, item, current_digest=current_digest)
         for item in items
     ):
+        _VALIDATOR_RUN_POOL.reset(lane_key)
         return tuple(recorded_validator_run_proof(config.state_dir, session_ref, item) for item in items)
-    lane_key = f"{config.state_dir}:{goal.lane_id or session_ref}"
     if _VALIDATOR_RUN_POOL.attempts(lane_key) >= _VALIDATOR_RUN_MAX_ATTEMPTS:
-        # A worker that keeps failing before it can record is surfaced
-        # through the same synchronous call the inline path made instead of
-        # queueing forever.
+        # Worker runs that keep failing, or keep landing stale records, are
+        # surfaced through the same synchronous call the inline path made
+        # instead of queueing forever. The next claim tries the pool again.
+        _VALIDATOR_RUN_POOL.reset(lane_key)
         return record_enrolled_validator_runs(config.state_dir, session_ref, items)
     _VALIDATOR_RUN_POOL.submit(
         lane_key,
@@ -792,6 +867,7 @@ def check_enrollment_and_receipts(
     final_response: CanonicalEvent | None = None,
     *,
     reviewer: BehaviorReviewer | None = None,
+    still_running: tuple[str, ...] = (),
 ) -> tuple[int, bool, list[Finding], bool]:
     """Verify an explicit completion claim against its enrolled contract.
 
@@ -803,7 +879,9 @@ def check_enrollment_and_receipts(
     the execution happens on the worker pool and a claim is neither passed
     nor disputed while that run is in flight; the fourth return value
     reports that pending state so the pass does not treat a lane under
-    active validation as idle.
+    active validation as idle. ``still_running`` names lane work still in
+    flight so the isolated reviewer can answer "insufficient", which is
+    reported the same way: pending, neither passed nor disputed.
     """
     try:
         goal = get_goal(config.state_dir, session_ref)
@@ -883,7 +961,7 @@ def check_enrollment_and_receipts(
         # claimed "done". A stored signal for this exact behavior and contract
         # is reused so an unchanged disputed claim does not pay for a fresh
         # review round every pass.
-        behavior = WatchedSessionBehavior.from_turn(session_ref, final_text)
+        behavior = WatchedSessionBehavior.from_turn(session_ref, final_text, still_running=still_running)
         signal = load_latest_review_signal(review_log_path(config.state_dir), session_ref)
         try:
             contract_id = freeze_goal(goal).contract_id
@@ -893,6 +971,9 @@ def check_enrollment_and_receipts(
             signal is None
             or signal.behavior_sha256 != behavior.behavior_sha256
             or signal.goal_contract_id != contract_id
+            # An "insufficient" verdict only holds while lane work is still
+            # in flight; once it finishes, the same claim is judged afresh.
+            or (signal.verdict == "insufficient" and not behavior.still_running)
         ):
             try:
                 signal = review_watched_session(
@@ -918,6 +999,11 @@ def check_enrollment_and_receipts(
                         detail=f"the isolated completion review could not run: {exc}",
                     )
                 ]
+        if not findings and signal is not None and signal.verdict == "insufficient":
+            # The reviewers could not decide while lane work is still in
+            # flight: like watchd, leave the goal untouched and report the
+            # claim as pending rather than disputing it.
+            return len(run_evidence), False, [], True
         if not findings and signal is not None and signal.verdict != "accept":
             review_detail = "; ".join(f"{item.code}: {item.detail}" for item in signal.findings)
             findings = [
@@ -1181,6 +1267,7 @@ def run_once(config: MonitordConfig) -> dict[str, Any]:
                 config,
                 goal.session_ref,
                 final_response,
+                still_running=_lane_work_in_flight(config, goal.session_ref, events),
             )
             refreshed_goal = get_goal(config.state_dir, goal.session_ref)
             if refreshed_goal is not None:
