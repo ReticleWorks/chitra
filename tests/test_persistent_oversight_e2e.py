@@ -969,6 +969,7 @@ def _settle_claim(config: object, state: Path, session_ref: str, status: str, *,
     stored: GoalRecord | None = None
     for _ in range(max_passes):
         monitord_mod._VALIDATOR_RUN_POOL.wait_idle(timeout=15)
+        monitord_mod._REVIEW_POOL.wait_idle(timeout=15)
         run_once(config)  # type: ignore[arg-type]
         stored = get_goal(state, session_ref)
         if stored is not None and stored.status == status:

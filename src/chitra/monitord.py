@@ -18,7 +18,10 @@ collapsed out of watchd, triaged, and sweepd:
    flight per lane) and the pass consumes the recorded result once the
    worktree digest it tested still matches; a lane sharing Chitra's OS user
    keeps the synchronous run and second-execution check, because it could
-   write the record itself.
+   write the record itself. The isolated ``claude -p`` completion review runs
+   on its own bounded pool behind a per-session ``review-runs/`` record: a
+   failed round disputes and is relaunched only after its recorded backoff,
+   and a ``running`` record with no live worker counts as lost.
 5. **Presence** -- publish one advisory presence record per pass so peers can
    see which instance is observing which lanes.
 
@@ -44,10 +47,11 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -92,6 +96,7 @@ from chitra.goal_enforcement import (
     BehaviorReviewer,
     ClaudeProcessReviewer,
     GoalReviewError,
+    SessionReviewSignal,
     WatchedSessionBehavior,
     freeze_goal,
     load_latest_review_signal,
@@ -133,6 +138,7 @@ from chitra.run_pool import RunPool
 from chitra.state_paths import state_dir as default_state_dir
 from chitra.supervision import SupervisionLedger, goal_digest
 from chitra.supervisor import (
+    _retry_due,
     reconcile_corrective_action,
     reconcile_question_action,
     record_observing,
@@ -165,6 +171,8 @@ PRESENCE_INSTANCE = "chitra-monitord"
 MONITORD_SCHEMA = "chitra.monitord.pass.v1"
 IDLE_PURSUIT_SCHEMA = "chitra.monitord.idle-pursuit.v1"
 _VALIDATOR_RUN_MAX_ATTEMPTS = 3
+# At most two concurrent ``claude -p`` judge rounds across all lanes.
+_REVIEW_POOL_MAX_WORKERS = 2
 # A pending corrective order suppresses idle pursuit only for a bounded
 # lease: long enough for dispatchd to claim and deliver it, short enough
 # that a lane ignoring a consumed order — or an order the transport never
@@ -1063,11 +1071,11 @@ def _wake_monitor() -> None:
 
 # One bounded pool carries every slow call the pass must not wait on: the
 # enrolled validators, the receipt re-verification (git digests and target
-# hashing), the isolated ``claude -p`` completion review, and the gate close
-# that re-verifies inside the goal lock. Kind-suffixed lane keys keep one
-# operation in flight per lane per kind; each worker lands a durable record
-# (``validation-runs/``, ``verification-runs/``, the review log, the goal
-# store itself) that a later pass consumes instead of waiting.
+# hashing), the rescue-bundle capture, and the gate close that re-verifies
+# inside the goal lock. Kind-suffixed lane keys keep one operation in flight
+# per lane per kind; each worker lands a durable record
+# (``validation-runs/``, ``verification-runs/``, the goal store itself) that
+# a later pass consumes instead of waiting.
 _RUN_POOL = RunPool(
     max_workers=4,
     thread_name_prefix="chitra-monitor-run",
@@ -1076,6 +1084,14 @@ _RUN_POOL = RunPool(
 # Kept under the historical name: tests and operators already know the
 # validator pool by it, and it is the same shared pool now.
 _VALIDATOR_RUN_POOL = _RUN_POOL
+# The isolated ``claude -p`` completion judge gets its own bounded pool so a
+# twenty-minute round never holds a validator, verification, rescue, or
+# close worker; the cap is the concurrent spend ceiling on judge processes.
+_REVIEW_POOL = RunPool(
+    max_workers=_REVIEW_POOL_MAX_WORKERS,
+    thread_name_prefix="chitra-monitor-review",
+    on_complete=_wake_monitor,
+)
 
 
 def _op_key(config: MonitordConfig, goal: GoalRecord, session_ref: str, kind: str) -> str:
@@ -1083,14 +1099,160 @@ def _op_key(config: MonitordConfig, goal: GoalRecord, session_ref: str, kind: st
     return f"{config.state_dir}:{goal.lane_id or session_ref}:{kind}"
 
 
-def _run_completion_review(
-    state_dir: Path,
-    session_ref: str,
+_REVIEW_RUN_SCHEMA = "chitra.monitord.review-run.v1"
+# A failed judge round is relaunched on a doubling backoff instead of on
+# every pass: the claim disputes with the unchanged "review could not run"
+# finding while the recorded retry time is still in the future.
+_REVIEW_RETRY_BASE_SECONDS = 60.0
+_REVIEW_RETRY_MAX_SECONDS = 900.0
+
+
+def _review_run_path(config: MonitordConfig, session_ref: str) -> Path:
+    """Return the one in-progress and result record for a goal session's judge rounds."""
+    session_key = hashlib.sha256(session_ref.encode("utf-8")).hexdigest()
+    return config.state_dir / "review-runs" / f"{session_key}.json"
+
+
+def _read_review_run(path: Path) -> dict[str, Any]:
+    """Read a review-run record; anything unreadable or foreign counts as absent."""
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(loaded, dict) or loaded.get("schema") != _REVIEW_RUN_SCHEMA:
+        return {}
+    return loaded
+
+
+def _write_review_run(path: Path, record: dict[str, Any], *, expected_op_id: object = None) -> None:
+    """Persist a review-run record under its lock.
+
+    A worker finishing late passes ``expected_op_id`` so its result cannot
+    overwrite the record of a round relaunched after the worker was lost.
+    """
+    with locked_json_store(path):
+        if expected_op_id is not None and _read_review_run(path).get("op_id") != expected_op_id:
+            return
+        write_json_atomic(path, {**record, "schema": _REVIEW_RUN_SCHEMA}, fsync=True)
+
+
+def _run_review_on_worker(
+    config: MonitordConfig,
+    path: Path,
+    record: dict[str, Any],
     behavior: WatchedSessionBehavior,
     reviewer: BehaviorReviewer,
 ) -> None:
-    """Run the isolated review on the pool; the appended signal is the record."""
-    review_watched_session(state_dir, session_ref, behavior, reviewer=reviewer)
+    """Run one isolated review round off the monitor loop and write its outcome back.
+
+    Success is the signal ``review_watched_session`` appends to the review
+    log; the record only names it. A failure records the error and the
+    earliest retry, so a dead judge is relaunched on a backoff instead of on
+    every pass.
+    """
+    try:
+        signal = review_watched_session(
+            config.state_dir,
+            record["session_ref"],
+            behavior,
+            reviewer=reviewer,
+        )
+    except Exception as exc:
+        finished = datetime.now(UTC)
+        delay = min(
+            _REVIEW_RETRY_BASE_SECONDS * 2 ** (int(record["attempt"]) - 1),
+            _REVIEW_RETRY_MAX_SECONDS,
+        )
+        _write_review_run(
+            path,
+            {
+                **record,
+                "state": "failed",
+                "error": str(exc),
+                "finished_at": finished.isoformat(),
+                "next_retry_at": (finished + timedelta(seconds=delay)).isoformat(),
+            },
+            expected_op_id=record["op_id"],
+        )
+        return
+    _write_review_run(
+        path,
+        {
+            **record,
+            "state": "done",
+            "signal_id": signal.signal_id,
+            "finished_at": datetime.now(UTC).isoformat(),
+        },
+        expected_op_id=record["op_id"],
+    )
+
+
+def _completion_review(
+    config: MonitordConfig,
+    goal: GoalRecord,
+    behavior: WatchedSessionBehavior,
+    contract_id: str,
+    reviewer: BehaviorReviewer,
+) -> tuple[SessionReviewSignal | None, str, bool]:
+    """Return ``(signal, error, pending)`` for a claim without waiting on the judge.
+
+    A stored signal for this exact behavior and contract is reused, as
+    before. Otherwise the in-memory pool decides whether a round is running:
+    a ``running`` record with no live worker died with an earlier process or
+    a job cancelled at shutdown, so it counts as lost and is relaunched. A
+    failed round reports its recorded error until its backoff expires, then
+    relaunches.
+    """
+    session_ref = behavior.session_ref
+    signal = load_latest_review_signal(review_log_path(config.state_dir), session_ref)
+    key = _op_key(config, goal, session_ref, "review")
+    if (
+        signal is not None
+        and signal.behavior_sha256 == behavior.behavior_sha256
+        and signal.goal_contract_id == contract_id
+        # An "insufficient" verdict only holds while lane work is still in
+        # flight; once it finishes, the same claim is judged afresh.
+        and not (signal.verdict == "insufficient" and not behavior.still_running)
+    ):
+        _REVIEW_POOL.reset(key)
+        return signal, "", False
+    if _REVIEW_POOL.in_flight(key):
+        return None, "", True
+    path = _review_run_path(config, session_ref)
+    run = _read_review_run(path)
+    same = (
+        run.get("behavior_sha256") == behavior.behavior_sha256
+        and run.get("goal_contract_id") == contract_id
+    )
+    if same and run.get("state") == "failed":
+        next_retry_at = run.get("next_retry_at")
+        if not _retry_due(next_retry_at if isinstance(next_retry_at, str) else ""):
+            return None, str(run.get("error", "")), False
+    if same and run.get("state") == "running":
+        # The record outlived its worker: the monitor restarted mid-call or
+        # the job was cancelled at shutdown, so the round is lost.
+        logger.warning("monitord_review_run_lost", session_ref=session_ref, op_id=run.get("op_id"))
+    previous_attempt = run.get("attempt")
+    record: dict[str, Any] = {
+        "session_ref": session_ref,
+        "behavior_sha256": behavior.behavior_sha256,
+        "goal_contract_id": contract_id,
+        "op_id": uuid.uuid4().hex,
+        "owner_pid": os.getpid(),
+        "attempt": (
+            previous_attempt + 1
+            if same and run.get("state") != "done" and isinstance(previous_attempt, int)
+            else 1
+        ),
+        "state": "running",
+        "started_at": datetime.now(UTC).isoformat(),
+    }
+    _write_review_run(path, record)
+    _REVIEW_POOL.submit(
+        key,
+        lambda: _run_review_on_worker(config, path, record, behavior, reviewer),
+    )
+    return None, "", True
 
 
 def _verify_evidence_state(
@@ -1626,68 +1788,43 @@ def _evaluate_completion_claim(
         # now gates them here: a deterministic pass alone does not release a
         # claimed "done". A stored signal for this exact behavior and contract
         # is reused so an unchanged disputed claim does not pay for a fresh
-        # review round every pass. The review runs on the worker pool — its
-        # durable record is the review-log signal this pass already reads —
-        # so ``claude -p`` never blocks the loop; a queued or running review
-        # reports the claim as pending, like the validator stages.
+        # review round every pass. The review runs on its own bounded pool —
+        # its durable record is the review-log signal this pass already reads,
+        # and a ``review-runs/`` record carries the round's running, done, or
+        # failed state — so ``claude -p`` never blocks the loop; a queued or
+        # running review reports the claim as pending, like the validator
+        # stages.
         behavior = WatchedSessionBehavior.from_turn(session_ref, final_text, still_running=still_running)
-        signal = load_latest_review_signal(review_log_path(config.state_dir), session_ref)
         try:
             contract_id = freeze_goal(goal).contract_id
         except GoalReviewError:
             contract_id = ""
-        review_key = _op_key(config, goal, session_ref, "review")
-        signal_stale = (
-            signal is None
-            or signal.behavior_sha256 != behavior.behavior_sha256
-            or signal.goal_contract_id != contract_id
-            # An "insufficient" verdict only holds while lane work is still
-            # in flight; once it finishes, the same claim is judged afresh.
-            or (signal.verdict == "insufficient" and not behavior.still_running)
+        signal, review_error, review_pending = _completion_review(
+            config,
+            goal,
+            behavior,
+            contract_id,
+            reviewer if reviewer is not None else ClaudeProcessReviewer(),
         )
-        if signal_stale:
-            if _RUN_POOL.in_flight(review_key):
-                return len(run_evidence), False, [], True
-            if _RUN_POOL.attempts(review_key) >= _VALIDATOR_RUN_MAX_ATTEMPTS:
-                _RUN_POOL.reset(review_key)
-                try:
-                    signal = review_watched_session(
-                        config.state_dir,
-                        session_ref,
-                        behavior,
-                        reviewer=reviewer if reviewer is not None else ClaudeProcessReviewer(),
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "monitord_completion_review_unavailable",
-                        session_ref=session_ref,
-                        error=str(exc),
-                    )
-                    signal = None
-                    cacheable = False
-                    findings = [
-                        Finding(
-                            detector="false_done",
-                            fingerprint_seed={"session_ref": session_ref, "reason": "review-unavailable"},
-                            event_refs=(claim_event.event_id,),
-                            unmet_item="isolated completion review",
-                            expected_next_progress="restore the isolated reviewer and re-claim completion",
-                            detail=f"the isolated completion review could not run: {exc}",
-                        )
-                    ]
-            else:
-                _RUN_POOL.submit(
-                    review_key,
-                    lambda: _run_completion_review(
-                        config.state_dir,
-                        session_ref,
-                        behavior,
-                        reviewer if reviewer is not None else ClaudeProcessReviewer(),
-                    ),
+        if review_pending:
+            return len(run_evidence), False, [], True
+        if review_error:
+            logger.warning(
+                "monitord_completion_review_unavailable",
+                session_ref=session_ref,
+                error=review_error,
+            )
+            cacheable = False
+            findings = [
+                Finding(
+                    detector="false_done",
+                    fingerprint_seed={"session_ref": session_ref, "reason": "review-unavailable"},
+                    event_refs=(claim_event.event_id,),
+                    unmet_item="isolated completion review",
+                    expected_next_progress="restore the isolated reviewer and re-claim completion",
+                    detail=f"the isolated completion review could not run: {review_error}",
                 )
-                return len(run_evidence), False, [], True
-        else:
-            _RUN_POOL.reset(review_key)
+            ]
         if not findings and signal is not None and signal.verdict == "insufficient":
             # The reviewers could not decide while lane work is still in
             # flight: like watchd, leave the goal untouched and report the
@@ -2667,6 +2804,7 @@ def run_forever(config: MonitordConfig, *, stop_event: threading.Event | None = 
         # Running workers keep their threads; an unfinished run simply never
         # records a result and the next daemon start re-queues it.
         _RUN_POOL.shutdown()
+        _REVIEW_POOL.shutdown()
         for _key, (_context, ingestor) in _INGESTOR_POOL.items():
             ingestor.close()
         _INGESTOR_POOL.clear()
