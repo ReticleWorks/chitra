@@ -28,7 +28,7 @@ dependencies = [
     "structlog>=26.1.0,<27",
     "pydantic>=2.13.4,<3",
     "pyyaml>=6.0.3,<7",
-    "filelock>=3.20,<4",
+    "filelock>=3.20,<5",
 ]
 
 [project.optional-dependencies]
