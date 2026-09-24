@@ -226,6 +226,109 @@ def test_append_finding_records_writes_schema_stamped_jsonl(tmp_path: Path) -> N
     assert record["detector"] == "drift"
     assert record["shadow_mode"] is True
 
+
+def _finding(*, detail: str = "scope breach observed", detector: str = "drift") -> Any:
+    from chitra.detect import Finding
+
+    return Finding(
+        detector=detector,
+        fingerprint_seed={"lane": LANE},
+        event_refs=("e1",),
+        unmet_item="",
+        expected_next_progress="",
+        detail=detail,
+    )
+
+
+def _findings_lines(config: MonitordConfig) -> list[dict[str, Any]]:
+    return [
+        json.loads(line)
+        for line in config.findings_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def test_append_finding_records_suppresses_identical_repeats(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+
+    assert append_finding_records(config, LANE, [_finding()]) == 1
+    # The next pass re-detects the same finding inside the dedupe window.
+    assert append_finding_records(config, LANE, [_finding()]) == 0
+
+    assert len(_findings_lines(config)) == 1
+
+
+def test_append_finding_records_appends_changed_content(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+
+    assert append_finding_records(config, LANE, [_finding()]) == 1
+    assert append_finding_records(config, LANE, [_finding(detail="scope breach widened")]) == 1
+
+    records = _findings_lines(config)
+    assert len(records) == 2
+    assert records[0]["detail"] == "scope breach observed"
+    assert records[1]["detail"] == "scope breach widened"
+
+
+def test_append_finding_records_reappends_after_dedupe_window(tmp_path: Path) -> None:
+    import time
+
+    config = resolve_config(state_dir=tmp_path, findings_dedupe_seconds=0.05)
+
+    assert append_finding_records(config, LANE, [_finding()]) == 1
+    time.sleep(0.1)
+    # A still-live finding past the window appends again: the log keeps
+    # showing persistence instead of going silent after the first record.
+    assert append_finding_records(config, LANE, [_finding()]) == 1
+
+    assert len(_findings_lines(config)) == 2
+
+
+def test_append_finding_records_dedupe_is_per_lane(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+
+    assert append_finding_records(config, "lane-a:0.0", [_finding()]) == 1
+    assert append_finding_records(config, "lane-b:0.0", [_finding()]) == 1
+
+    records = _findings_lines(config)
+    assert len(records) == 2
+    assert {record["lane"] for record in records} == {"lane-a:0.0", "lane-b:0.0"}
+
+
+def test_append_finding_records_zero_dedupe_window_writes_every_pass(tmp_path: Path) -> None:
+    config = resolve_config(state_dir=tmp_path, findings_dedupe_seconds=0)
+
+    assert append_finding_records(config, LANE, [_finding()]) == 1
+    assert append_finding_records(config, LANE, [_finding()]) == 1
+
+    assert len(_findings_lines(config)) == 2
+
+
+def test_append_finding_records_rotates_oversized_log(tmp_path: Path) -> None:
+    config = resolve_config(state_dir=tmp_path, findings_max_bytes=1)
+
+    assert append_finding_records(config, LANE, [_finding()]) == 1
+    # The file is already over the 1-byte cap: the next append rotates the
+    # history aside and re-records the still-live finding in the fresh file.
+    assert append_finding_records(config, LANE, [_finding()]) == 1
+
+    rotated = config.findings_path.parent / f"{config.findings_path.name}.1"
+    assert len(rotated.read_text(encoding="utf-8").splitlines()) == 1
+    assert len(_findings_lines(config)) == 1
+
+
+def test_resolve_config_rejects_negative_findings_knobs() -> None:
+    with pytest.raises(ValueError):
+        resolve_config(findings_dedupe_seconds=-1)
+    with pytest.raises(ValueError):
+        resolve_config(findings_max_bytes=-1)
+
+
+def test_cli_findings_knobs_parse() -> None:
+    args = build_arg_parser().parse_args(["--findings-dedupe-seconds", "30", "--findings-max-bytes", "1024"])
+    assert args.findings_dedupe_seconds == 30
+    assert args.findings_max_bytes == 1024
+
+
 def test_run_once_observes_real_journal_and_composes_outputs(tmp_path: Path) -> None:
     journal = EventJournal(tmp_path, SEEDED_LANE)
     journal.append(tuple(_event(f"e{i}", CanonicalType.TOOL_CALL, lane=SEEDED_LANE) for i in range(1, 4)))
