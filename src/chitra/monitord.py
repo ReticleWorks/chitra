@@ -180,6 +180,13 @@ from chitra.validator_registry import validators_path
 logger = structlog.get_logger(__name__)
 
 DEFAULT_POLL_SECONDS = 60.0
+# Window during which re-detecting an unchanged finding does not append a
+# new findings record. monitord polls every few seconds and shadow mode
+# re-detects the same findings every pass; without this window the log grew
+# to gigabytes in days on a live host.
+DEFAULT_FINDINGS_DEDUPE_SECONDS = 3600.0
+# Upper bound on the findings log before it rotates to ``<path>.1``.
+DEFAULT_FINDINGS_MAX_BYTES = 256 * 1024 * 1024
 PRESENCE_INSTANCE = "chitra-monitord"
 MONITORD_SCHEMA = "chitra.monitord.pass.v1"
 IDLE_PURSUIT_SCHEMA = "chitra.monitord.idle-pursuit.v1"
@@ -238,6 +245,12 @@ class MonitordConfig:
     # (including CHITRA_AGENT_MANIFEST_DIR) when unset.
     manifest_dir: Path | None = None
     transcript_stale_seconds: int = DEFAULT_TRANSCRIPT_STALE_SECONDS
+    # Re-detecting an unchanged finding inside this window does not append a
+    # new record; 0 disables dedupe and every detection writes again.
+    findings_dedupe_seconds: float = DEFAULT_FINDINGS_DEDUPE_SECONDS
+    # The findings log rotates to ``<findings_path>.1`` once it reaches this
+    # size; 0 disables the cap.
+    findings_max_bytes: int = DEFAULT_FINDINGS_MAX_BYTES
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +283,8 @@ def resolve_config(
     socket_path: Path | None = None,
     manifest_dir: Path | None = None,
     transcript_stale_seconds: int | None = None,
+    findings_dedupe_seconds: float | None = None,
+    findings_max_bytes: int | None = None,
 ) -> MonitordConfig:
     """Resolve CLI arguments, then explicit environment overrides, then defaults."""
     resolved_state_dir = state_dir or default_state_dir()
@@ -280,6 +295,14 @@ def resolve_config(
         raise ValueError("poll_seconds must be a positive number")
     if retry_delay_seconds < 0:
         raise ValueError("retry_delay_seconds cannot be negative")
+    if findings_dedupe_seconds is None:
+        findings_dedupe_seconds = DEFAULT_FINDINGS_DEDUPE_SECONDS
+    if findings_dedupe_seconds < 0:
+        raise ValueError("findings_dedupe_seconds cannot be negative")
+    if findings_max_bytes is None:
+        findings_max_bytes = DEFAULT_FINDINGS_MAX_BYTES
+    if findings_max_bytes < 0:
+        raise ValueError("findings_max_bytes cannot be negative")
     if shadow_mode is None:
         # Shadow mode is the safe default: findings are recorded but never
         # leave the monitor's own state until an operator turns the mode off.
@@ -312,6 +335,8 @@ def resolve_config(
             if transcript_stale_seconds is not None
             else DEFAULT_TRANSCRIPT_STALE_SECONDS
         ),
+        findings_dedupe_seconds=findings_dedupe_seconds,
+        findings_max_bytes=findings_max_bytes,
     )
 
 
@@ -2358,28 +2383,85 @@ def handle_agent_question(
     return _aggregate_question_outcome(outcomes)
 
 
+# In-memory dedupe for the findings log: findings path → record digest →
+# monotonic timestamp of the last append. Keyed by path so two configs (and
+# two test roots) never share a window. A restart replays each live finding
+# once, then the window suppresses repeats again — a bounded burst, not the
+# per-poll flood this guard exists to stop.
+_FINDING_RECORD_SEEN: dict[str, dict[str, float]] = {}
+_FINDING_RECORD_LOCK = threading.Lock()
+
+
+def _finding_record_key(record: dict[str, Any]) -> str:
+    """Digest everything one findings record asserts, minus its timestamp."""
+    encoded = json.dumps(
+        {key: value for key, value in record.items() if key != "recorded_at"},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def append_finding_records(config: MonitordConfig, lane: str, findings: list[Finding]) -> int:
-    """Append one JSONL record per finding to the monitor findings log."""
+    """Append one JSONL record per finding to the monitor findings log.
+
+    A finding identical to one recorded inside ``findings_dedupe_seconds``
+    is not re-appended; a changed finding, a finding from a different lane,
+    and a finding re-detected after the window all append normally, so the
+    log still shows persistence. A file that has reached
+    ``findings_max_bytes`` rotates to ``<findings_path>.1`` before the
+    append, and the dedupe window resets so the fresh file records what is
+    still live.
+    """
     if not findings:
         return 0
     config.findings_path.parent.mkdir(parents=True, exist_ok=True)
     now = datetime.now(UTC).isoformat()
-    with config.findings_path.open("a", encoding="utf-8") as handle:
-        for finding in findings:
-            record = {
-                "schema": MONITORD_SCHEMA,
-                "recorded_at": now,
-                "lane": lane,
-                "shadow_mode": config.shadow_mode,
-                "detector": finding.detector,
-                "fingerprint": finding.fingerprint,
-                "event_refs": list(finding.event_refs),
-                "unmet_item": finding.unmet_item,
-                "expected_next_progress": finding.expected_next_progress,
-                "detail": finding.detail,
-            }
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
-    return len(findings)
+    records = [
+        {
+            "schema": MONITORD_SCHEMA,
+            "recorded_at": now,
+            "lane": lane,
+            "shadow_mode": config.shadow_mode,
+            "detector": finding.detector,
+            "fingerprint": finding.fingerprint,
+            "event_refs": list(finding.event_refs),
+            "unmet_item": finding.unmet_item,
+            "expected_next_progress": finding.expected_next_progress,
+            "detail": finding.detail,
+        }
+        for finding in findings
+    ]
+    with _FINDING_RECORD_LOCK:
+        seen = _FINDING_RECORD_SEEN.setdefault(str(config.findings_path), {})
+        now_mono = time.monotonic()
+        if config.findings_max_bytes > 0:
+            try:
+                oversized = config.findings_path.stat().st_size >= config.findings_max_bytes
+            except OSError:
+                oversized = False
+            if oversized:
+                config.findings_path.replace(config.findings_path.parent / f"{config.findings_path.name}.1")
+                # The rotated copy keeps the history; the fresh file should
+                # still record every finding that remains live right now.
+                seen.clear()
+        batch_seen: set[str] = set()
+        pending: list[tuple[str, dict[str, Any]]] = []
+        for record in records:
+            key = _finding_record_key(record)
+            last = seen.get(key)
+            if key in batch_seen or (last is not None and now_mono - last < config.findings_dedupe_seconds):
+                continue
+            batch_seen.add(key)
+            pending.append((key, record))
+        if not pending:
+            return 0
+        with config.findings_path.open("a", encoding="utf-8") as handle:
+            for key, record in pending:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+                seen[key] = now_mono
+    return len(pending)
 
 
 @dataclass(slots=True)
@@ -3088,6 +3170,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ledger-key-path", type=Path, default=None)
     parser.add_argument("--retry-delay-seconds", type=float, default=60.0)
     parser.add_argument("--findings-path", type=Path, default=None)
+    parser.add_argument(
+        "--findings-dedupe-seconds",
+        type=float,
+        default=None,
+        help="Window in which an unchanged finding is not re-appended to the findings log (0 disables; default 3600).",
+    )
+    parser.add_argument(
+        "--findings-max-bytes",
+        type=int,
+        default=None,
+        help="Rotate the findings log to <findings-path>.1 once it reaches this size (0 disables; default 268435456).",
+    )
     parser.add_argument("--poll-seconds", type=float, default=None)
     parser.add_argument(
         "--lanes-file",
@@ -3130,6 +3224,8 @@ def main(argv: list[str] | None = None) -> int:
         ledger_key_path=args.ledger_key_path,
         retry_delay_seconds=args.retry_delay_seconds,
         findings_path=args.findings_path,
+        findings_dedupe_seconds=args.findings_dedupe_seconds,
+        findings_max_bytes=args.findings_max_bytes,
         poll_seconds=args.poll_seconds,
         shadow_mode=args.shadow_mode,
         lanes_file=args.lanes_file or _env_lanes_file(),
