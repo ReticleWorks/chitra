@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1271,7 +1273,9 @@ def test_run_forever_wakes_when_a_worker_completes(monkeypatch: pytest.MonkeyPat
 
     passes = 0
 
-    def _counting_pass(_config: MonitordConfig, *, runtime: object = None) -> dict[str, int]:
+    def _counting_pass(
+        _config: MonitordConfig, *, runtime: object = None, stop_event: object = None
+    ) -> dict[str, int]:
         nonlocal passes
         passes += 1
         if passes == 1:
@@ -1292,3 +1296,121 @@ def test_run_forever_wakes_when_a_worker_completes(monkeypatch: pytest.MonkeyPat
 
     assert passes >= 2
     assert elapsed < 10.0
+
+
+def _emit_finding(tag: str = "one") -> Any:
+    from chitra.detect import Finding
+
+    return Finding(
+        detector="drift",
+        fingerprint_seed={"lane": LANE, "tag": tag},
+        event_refs=("e1",),
+        unmet_item="",
+        expected_next_progress="",
+        detail=f"scope breach observed ({tag})",
+    )
+
+
+def test_append_finding_records_emits_once_for_unchanged_findings(tmp_path: Path) -> None:
+    """A still-open finding is not re-appended every pass."""
+    config = _config(tmp_path)
+    finding = _emit_finding()
+
+    assert append_finding_records(config, LANE, [finding]) == 1
+    assert append_finding_records(config, LANE, [finding]) == 0
+    assert append_finding_records(config, LANE, [finding]) == 0
+
+    lines = config.findings_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["record_type"] == "open"
+
+
+def test_append_finding_records_emits_open_heartbeat_and_closed(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    finding = _emit_finding()
+    t0 = datetime(2026, 10, 2, tzinfo=UTC)
+
+    assert append_finding_records(config, LANE, [finding], now=t0) == 1
+    # Inside the heartbeat window the still-open finding stays silent.
+    assert append_finding_records(config, LANE, [finding], now=t0 + timedelta(hours=1)) == 0
+    assert append_finding_records(config, LANE, [finding], now=t0 + timedelta(hours=25)) == 1
+    assert append_finding_records(config, LANE, [], now=t0 + timedelta(hours=26)) == 1
+
+    records = [
+        json.loads(line) for line in config.findings_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["record_type"] for record in records] == ["open", "heartbeat", "closed"]
+    assert all(record["fingerprint"] == finding.fingerprint for record in records)
+
+
+def test_append_finding_records_tracks_lanes_independently(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    other_lane = "lane-b.0.0"
+    finding = _emit_finding()
+
+    assert append_finding_records(config, LANE, [finding]) == 1
+    # The same fingerprint under another lane is its own open transition.
+    assert append_finding_records(config, other_lane, [finding]) == 1
+    assert append_finding_records(config, LANE, [finding]) == 0
+    assert append_finding_records(config, other_lane, []) == 1
+
+    records = [
+        json.loads(line) for line in config.findings_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [(record["lane"], record["record_type"]) for record in records] == [
+        (LANE, "open"),
+        (other_lane, "open"),
+        (other_lane, "closed"),
+    ]
+    # Lane A's open fingerprint survives lane B's close.
+    assert append_finding_records(config, LANE, [finding]) == 0
+
+
+def test_run_once_honours_stop_event_between_lanes(tmp_path: Path) -> None:
+    journal = EventJournal(tmp_path, SEEDED_LANE)
+    journal.append(tuple(_event(f"e{i}", CanonicalType.TOOL_CALL, lane=SEEDED_LANE) for i in range(1, 4)))
+    stop = threading.Event()
+    stop.set()
+
+    summary = run_once(resolve_config(state_dir=tmp_path), stop_event=stop)
+
+    assert summary["lanes_observed"] == 0
+    assert summary["stopped_early"] is True
+    assert not (tmp_path / "monitord-findings.jsonl").exists()
+
+
+def test_run_once_stop_event_set_mid_pass_skips_remaining_lanes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    second_lane = "lane-b.0.0"
+    for lane in (SEEDED_LANE, second_lane):
+        journal = EventJournal(tmp_path, lane)
+        journal.append(
+            tuple(_event(f"{lane}-e{i}", CanonicalType.TOOL_CALL, lane=lane) for i in range(1, 4))
+        )
+    stop = threading.Event()
+    real_run_detectors = monitord_mod.run_detectors
+
+    def set_stop(*args: Any, **kwargs: Any) -> Any:
+        stop.set()
+        return real_run_detectors(*args, **kwargs)
+
+    monkeypatch.setattr(monitord_mod, "run_detectors", set_stop)
+
+    summary = run_once(resolve_config(state_dir=tmp_path), stop_event=stop)
+
+    assert summary["stopped_early"] is True
+    assert summary["lanes_observed"] == 1
+    assert [result["lane"] for result in summary["results"]] == [SEEDED_LANE]
+
+
+def test_run_once_stops_when_parent_is_gone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A daemon reparented to init (orphaned) exits the pass promptly."""
+    journal = EventJournal(tmp_path, SEEDED_LANE)
+    journal.append(tuple(_event(f"e{i}", CanonicalType.TOOL_CALL, lane=SEEDED_LANE) for i in range(1, 4)))
+    monkeypatch.setattr(os, "getppid", lambda: 1)
+
+    summary = run_once(resolve_config(state_dir=tmp_path))
+
+    assert summary["stopped_early"] is True
+    assert summary["lanes_observed"] == 0

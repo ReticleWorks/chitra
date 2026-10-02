@@ -63,7 +63,7 @@ from typing import Any
 
 import structlog
 
-from chitra._fsio import locked_json_store, write_json_atomic
+from chitra._fsio import locked_json_store, parse_iso8601, write_json_atomic
 from chitra.adapter.contract import AdapterError
 from chitra.adapter.registry import plug_for_client
 from chitra.agent_runtime import AgentStatusBroker
@@ -862,8 +862,13 @@ def run_detectors(
     canonical_choices_policy: CanonicalChoicesPolicy | None = None,
     deferral_phrases: Sequence[str] | None = None,
     progress_rows: Sequence[ProgressClassification] = (),
+    stop_event: threading.Event | None = None,
 ) -> list[Finding]:
-    """Run the deterministic detector set over one lane's journal."""
+    """Run the deterministic detector set over one lane's journal.
+
+    A stop event is honoured between detectors so shutdown still lands within
+    seconds; findings already produced are returned in detector order.
+    """
     scope_text = str(getattr(goal, "scope", "") or "")
     intent_text = str(getattr(goal, "intent", "") or "")
     goal_text = str(getattr(goal, "goal", "") or "")
@@ -879,8 +884,15 @@ def run_detectors(
         real_changed = worktree_changed_files(Path(declared_worktree))
         if real_changed is not None:
             changed_files = real_changed
+    active_stop = stop_event if stop_event is not None else threading.Event()
     findings: list[Finding] = []
+
+    def ordered() -> list[Finding]:
+        return [finding for name in _DETECTOR_ORDER for finding in findings if finding.detector == name]
+
     findings.extend(detect_canonical_choices(events, policy, enrolled_items=enrolled_items, met_items=met_items))
+    if _stop_requested(active_stop):
+        return ordered()
     findings.extend(
         detect_drift(
             events,
@@ -891,6 +903,8 @@ def run_detectors(
             changed_files=changed_files,
         )
     )
+    if _stop_requested(active_stop):
+        return ordered()
     findings.extend(
         detect_unnecessary_steps(
             events,
@@ -899,6 +913,8 @@ def run_detectors(
             met_items=met_items,
         )
     )
+    if _stop_requested(active_stop):
+        return ordered()
     findings.extend(
         detect_excessive_testing(
             events,
@@ -907,6 +923,8 @@ def run_detectors(
             met_items=met_items,
         )
     )
+    if _stop_requested(active_stop):
+        return ordered()
     findings.extend(
         detect_document_dithering(
             events,
@@ -915,7 +933,11 @@ def run_detectors(
             met_items=met_items,
         )
     )
+    if _stop_requested(active_stop):
+        return ordered()
     findings.extend(detect_stall(events, enrolled_items=enrolled_items))
+    if _stop_requested(active_stop):
+        return ordered()
     findings.extend(
         detect_deferral_language(
             events,
@@ -931,6 +953,8 @@ def run_detectors(
         # simply gets no blocker-claim history this pass.
         blocker_store = None
     if blocker_store is not None:
+        if _stop_requested(active_stop):
+            return ordered()
         blocker_findings, blocker_records = detect_blocker_claims(
             events,
             enrolled_items=enrolled_items,
@@ -940,7 +964,7 @@ def run_detectors(
         )
         blocker_store.append(blocker_records)
         findings.extend(blocker_findings)
-    return [finding for name in _DETECTOR_ORDER for finding in findings if finding.detector == name]
+    return ordered()
 
 
 def _bind_findings_to_goal(findings: list[Finding], goal: GoalRecord) -> list[Finding]:
@@ -2358,28 +2382,139 @@ def handle_agent_question(
     return _aggregate_question_outcome(outcomes)
 
 
-def append_finding_records(config: MonitordConfig, lane: str, findings: list[Finding]) -> int:
-    """Append one JSONL record per finding to the monitor findings log."""
-    if not findings:
+# Upper bound on how often a still-open finding is re-emitted: at most once
+# per day per fingerprint, so long-lived findings keep a pulse without the
+# findings log growing one row per pass.
+FINDING_HEARTBEAT_SECONDS = 24 * 60 * 60
+
+
+def _findings_state_path(config: MonitordConfig) -> Path:
+    return config.findings_path.with_suffix(".state.json")
+
+
+def _findings_state(path: Path) -> dict[str, Any]:
+    """Load per-lane emit state; a corrupt file degrades to a fresh state."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _finding_record(
+    config: MonitordConfig,
+    lane: str,
+    finding: Finding,
+    recorded_at: str,
+    record_type: str,
+) -> dict[str, Any]:
+    return {
+        "schema": MONITORD_SCHEMA,
+        "recorded_at": recorded_at,
+        "record_type": record_type,
+        "lane": lane,
+        "shadow_mode": config.shadow_mode,
+        "detector": finding.detector,
+        "fingerprint": finding.fingerprint,
+        "event_refs": list(finding.event_refs),
+        "unmet_item": finding.unmet_item,
+        "expected_next_progress": finding.expected_next_progress,
+        "detail": finding.detail,
+    }
+
+
+def _last_emitted_at(entry: object) -> datetime | None:
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get("last_emitted_at")
+    if not isinstance(value, str):
+        return None
+    try:
+        return parse_iso8601(value, require_timezone=True, normalize_utc=True)
+    except ValueError:
+        return None
+
+
+def append_finding_records(
+    config: MonitordConfig,
+    lane: str,
+    findings: list[Finding],
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Append finding records only on open/close transitions or a heartbeat.
+
+    The findings log is an audit surface -- nothing in chitra reads it back.
+    Re-appending every still-open finding each pass grew it unboundedly (7.4M
+    rows observed for 2,290 unique fingerprints). Emit state lives per lane in
+    ``<findings>.state.json`` beside the log: a finding is appended when it
+    opens (fingerprint first seen), when it closes (fingerprint absent this
+    pass, emitted as ``record_type="closed"``), and at most once per
+    ``FINDING_HEARTBEAT_SECONDS`` while it stays open.
+    """
+    now_dt = now if now is not None else datetime.now(UTC)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=UTC)
+    now_iso = now_dt.isoformat()
+    state_path = _findings_state_path(config)
+    state = _findings_state(state_path)
+    lanes = state.setdefault("lanes", {})
+    if not isinstance(lanes, dict):
+        lanes = {}
+        state["lanes"] = lanes
+    open_findings = lanes.setdefault(lane, {})
+    if not isinstance(open_findings, dict):
+        open_findings = {}
+        lanes[lane] = open_findings
+
+    current = {finding.fingerprint: finding for finding in findings}
+    records: list[dict[str, Any]] = []
+    for fingerprint, finding in current.items():
+        entry = open_findings.get(fingerprint)
+        if entry is None:
+            record = _finding_record(config, lane, finding, now_iso, "open")
+            records.append(record)
+            open_findings[fingerprint] = {
+                "record": record,
+                "first_seen_at": now_iso,
+                "last_emitted_at": now_iso,
+            }
+            continue
+        last_emitted = _last_emitted_at(entry)
+        if last_emitted is None or (
+            now_dt - last_emitted
+        ).total_seconds() >= FINDING_HEARTBEAT_SECONDS:
+            records.append(_finding_record(config, lane, finding, now_iso, "heartbeat"))
+            if isinstance(entry, dict):
+                entry["last_emitted_at"] = now_iso
+    for fingerprint in list(open_findings):
+        if fingerprint in current:
+            continue
+        entry = open_findings.pop(fingerprint)
+        stored = entry.get("record") if isinstance(entry, dict) else None
+        record = dict(stored) if isinstance(stored, dict) else {"lane": lane, "fingerprint": fingerprint}
+        record.update(
+            {
+                "schema": MONITORD_SCHEMA,
+                "recorded_at": now_iso,
+                "record_type": "closed",
+                "shadow_mode": config.shadow_mode,
+            }
+        )
+        records.append(record)
+    if not records:
         return 0
     config.findings_path.parent.mkdir(parents=True, exist_ok=True)
-    now = datetime.now(UTC).isoformat()
     with config.findings_path.open("a", encoding="utf-8") as handle:
-        for finding in findings:
-            record = {
-                "schema": MONITORD_SCHEMA,
-                "recorded_at": now,
-                "lane": lane,
-                "shadow_mode": config.shadow_mode,
-                "detector": finding.detector,
-                "fingerprint": finding.fingerprint,
-                "event_refs": list(finding.event_refs),
-                "unmet_item": finding.unmet_item,
-                "expected_next_progress": finding.expected_next_progress,
-                "detail": finding.detail,
-            }
+        for record in records:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
-    return len(findings)
+    write_json_atomic(state_path, state)
+    return len(records)
+
+
+def _stop_requested(stop_event: threading.Event) -> bool:
+    """Stop when signalled, or when the daemon was orphaned (reparented to init)."""
+    return stop_event.is_set() or os.getppid() == 1
 
 
 @dataclass(slots=True)
@@ -2467,8 +2602,19 @@ def _sense_governed_panes(
     return emitted
 
 
-def run_once(config: MonitordConfig, *, runtime: MonitorRuntime | None = None) -> dict[str, Any]:
-    """Run one full observe-classify-record-publish pass and return its summary."""
+def run_once(
+    config: MonitordConfig,
+    *,
+    runtime: MonitorRuntime | None = None,
+    stop_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    """Run one full observe-classify-record-publish pass and return its summary.
+
+    ``stop_event`` is checked between lanes so a daemon-level SIGTERM (or an
+    orphaned daemon whose parent became init) ends the pass promptly; the
+    summary then reports ``stopped_early``.
+    """
+    active_stop_event = stop_event if stop_event is not None else threading.Event()
     runtime = runtime or MonitorRuntime(
         broker=AgentStatusBroker(config.state_dir, ManifestRepository(config.manifest_dir))
     )
@@ -2538,7 +2684,11 @@ def run_once(config: MonitordConfig, *, runtime: MonitorRuntime | None = None) -
         logger.error("monitord_unsafe_lane_names_skipped", lanes=unsafe_lanes)
     observed_lanes = sorted(discovered_lanes - set(unsafe_lanes))
     _sense_governed_panes(config, runtime, goals_by_session=goals_by_session, bindings=bindings)
+    stopped_early = False
     for lane in observed_lanes:
+        if _stop_requested(active_stop_event):
+            stopped_early = True
+            break
         binding = bindings_by_lane.get(lane)
         loaded_events = load_lane_events(config, lane)
         if binding is not None:
@@ -2803,7 +2953,14 @@ def run_once(config: MonitordConfig, *, runtime: MonitorRuntime | None = None) -
         detection_findings = (
             []
             if goal is not None and goal.status in {"held", "done-pending-verification", "done-pending-close"}
-            else run_detectors(config, lane, goal, detector_events, progress_rows=progress_rows)
+            else run_detectors(
+                config,
+                lane,
+                goal,
+                detector_events,
+                progress_rows=progress_rows,
+                stop_event=active_stop_event,
+            )
         )
         if detection_findings and goal is not None:
             # While a corrective order is owed or freshly consumed, the ladder
@@ -2982,6 +3139,7 @@ def run_once(config: MonitordConfig, *, runtime: MonitorRuntime | None = None) -
         "questions_operator_required": sum(result.question_outcome == "operator_required" for result in results),
         "validator_receipts_recorded": sum(result.validator_receipts_recorded for result in results),
         "shadow_mode": config.shadow_mode,
+        "stopped_early": stopped_early,
         "results": [
             {
                 "lane": result.lane,
@@ -3048,11 +3206,11 @@ def run_forever(config: MonitordConfig, *, stop_event: threading.Event | None = 
     )
     notify_ready()
     try:
-        while not active_stop_event.is_set():
+        while not _stop_requested(active_stop_event):
             # A completion landing during the pass still counts: the wake is
             # cleared before the pass so its signal is not consumed early.
             _MONITOR_WAKE.clear()
-            run_once(config, runtime=runtime)
+            run_once(config, runtime=runtime, stop_event=active_stop_event)
             notify_watchdog()
             # Sleep in short slices so a finished worker wakes the loop for
             # the pass that consumes its record, while the stop event keeps
@@ -3060,8 +3218,10 @@ def run_forever(config: MonitordConfig, *, stop_event: threading.Event | None = 
             deadline = time.monotonic() + config.poll_seconds
             while not _MONITOR_WAKE.is_set():
                 remaining = deadline - time.monotonic()
-                if remaining <= 0 or active_stop_event.wait(min(remaining, 0.25)):
+                if remaining <= 0 or active_stop_event.wait(min(remaining, 0.25)) or os.getppid() == 1:
                     break
+        if os.getppid() == 1:
+            logger.warning("monitord_orphaned_shutdown", detail="parent process gone; daemon reparented to init")
     finally:
         # Running workers keep their threads; an unfinished run simply never
         # records a result and the next daemon start re-queues it.
