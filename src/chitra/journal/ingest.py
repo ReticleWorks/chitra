@@ -33,6 +33,11 @@ class JournalIngestor:
         self.normalizer: TranscriptNormalizer = make_normalizer(context)
         self.journal = EventJournal(state_root, context.lane)
         self._normalizer_generation: int | None = None
+        # First raw sha256 of every generation observed. An inode replacement
+        # that restarts the same transcript (atomic sync rewrite) re-presents
+        # a leading record this ingestor already saw, which is how a replay
+        # is told apart from a genuinely different file at the same path.
+        self._generation_heads: set[str] = set()
 
     def close(self) -> None:
         self.reader.close()
@@ -45,31 +50,28 @@ class JournalIngestor:
 
     def poll(self) -> IngestResult:
         batch = self.reader.poll()
-        rewrites = {
-            (rotation.previous.generation, rotation.current.generation)
+        rewritten_generations = {
+            rotation.current.generation
             for rotation in batch.rotations
             if (rotation.previous.device, rotation.previous.inode)
             == (rotation.current.device, rotation.current.inode)
         }
         observed: list[CanonicalEvent] = []
-        for rotation in batch.rotations:
-            if (rotation.previous.device, rotation.previous.inode) != (
-                rotation.current.device,
-                rotation.current.inode,
-            ):
-                continue
-            if self._normalizer_generation != rotation.previous.generation:
-                continue
-            self.normalizer.begin_replay()
-            self._normalizer_generation = rotation.current.generation
         for record in batch.records:
-            if record.transcript.generation != self._normalizer_generation:
+            generation = record.transcript.generation
+            if generation != self._normalizer_generation:
+                # A generation is a full re-read from byte zero. For a
+                # same-inode rewrite that is always a replay of the current
+                # transcript. For an inode replacement it is a replay only
+                # when the new file restarts the same content, detected by
+                # its first record matching a generation head already seen.
                 if (
-                    self._normalizer_generation is not None
-                    and (self._normalizer_generation, record.transcript.generation) in rewrites
+                    generation in rewritten_generations
+                    or record.raw_sha256 in self._generation_heads
                 ):
                     self.normalizer.begin_replay()
-                self._normalizer_generation = record.transcript.generation
+                self._generation_heads.add(record.raw_sha256)
+                self._normalizer_generation = generation
             observed.extend(self.normalizer.normalize(record))
         appended = self.journal.append(tuple(observed))
         return IngestResult(observed=tuple(observed), appended=appended, rotations=batch.rotations)
