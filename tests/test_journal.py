@@ -740,3 +740,54 @@ def test_load_from_reads_only_the_tail(tmp_path: Path) -> None:
     loaded_all, start_all, _end_all, _ = journal.load_from(offset, inode=fd_stat.st_ino + 1)
     assert start_all == 0
     assert [event.event_id for event in loaded_all] == [event.event_id for event in events[:5]]
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.client.value)
+def test_inode_replacement_replay_appends_no_duplicate_events(tmp_path: Path, case: FixtureCase) -> None:
+    """An atomic transcript swap (new inode, same bytes) is a replay.
+
+    The replayed generation must reproduce each row's stored event ID so the
+    journal appends nothing, instead of minting fresh IDs per generation.
+    """
+    baseline = ingest(case, tmp_path / "baseline")
+    transcript = tmp_path / "synced.jsonl"
+    transcript.write_bytes(case.path.read_bytes())
+    with JournalIngestor(
+        state_root=tmp_path / "state",
+        transcript_path=transcript,
+        context=context(case),
+    ) as ingestor:
+        first = ingestor.poll()
+        replacement = tmp_path / "synced.jsonl.next"
+        replacement.write_bytes(case.path.read_bytes())
+        os.replace(replacement, transcript)
+        second = ingestor.poll()
+
+    assert len(second.rotations) == 1
+    assert second.rotations[0].previous.inode != second.rotations[0].current.inode
+    assert semantic_projection(second.observed) == semantic_projection(first.observed)
+    assert second.appended == ()
+    assert len(EventJournal(tmp_path / "state", case.client.value).load()) == case.line_count
+    assert semantic_projection(first.observed) == semantic_projection(baseline)
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.client.value)
+def test_appended_only_file_still_ingests_incrementally(tmp_path: Path, case: FixtureCase) -> None:
+    lines = case.path.read_bytes().splitlines(keepends=True)
+    boundary = len(lines) // 2
+    transcript = tmp_path / "appending.jsonl"
+    transcript.write_bytes(b"".join(lines[:boundary]))
+    with JournalIngestor(
+        state_root=tmp_path / "state",
+        transcript_path=transcript,
+        context=context(case),
+    ) as ingestor:
+        first = ingestor.poll()
+        with transcript.open("ab") as output:
+            output.write(b"".join(lines[boundary:]))
+        second = ingestor.poll()
+
+    baseline = ingest(case, tmp_path / "baseline")
+    assert not second.rotations
+    assert len(second.appended) == case.line_count - boundary
+    assert semantic_projection(first.observed + second.observed) == semantic_projection(baseline)

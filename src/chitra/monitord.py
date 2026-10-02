@@ -137,7 +137,7 @@ from chitra.journal import (
     derive_progress_rows,
     native_session_identity,
 )
-from chitra.journal.store import EventJournal
+from chitra.journal.store import EventJournal, event_dedupe_key
 from chitra.lane_config import LANES_FILE_ENV_VAR, LaneSpec, enabled_lanes
 from chitra.orders import DispatchOrder
 from chitra.pane_sensing import DEFAULT_TRANSCRIPT_STALE_SECONDS, PaneSenseState, sense_lane_panes
@@ -754,9 +754,16 @@ def _idle_pursuit_finding(
 
 @dataclass
 class _LaneJournalCache:
-    """Parsed events plus the byte watermark they cover for one journal file."""
+    """Unique parsed events plus the byte watermark they cover for one journal file.
 
-    events: list[CanonicalEvent]
+    ``events`` is keyed by each row's replay-dedupe identity and retains every
+    distinct event the lane has ever journaled: dedupe removes replay copies
+    of the same native row, so memory scales with the count of unique events
+    rather than with transcript re-syncs. It is not bounded over a lane's
+    lifetime.
+    """
+
+    events: dict[tuple[str, str, str, str], CanonicalEvent]
     offset: int
     inode: int
     mtime_ns: int
@@ -772,7 +779,12 @@ def load_lane_events(config: MonitordConfig, lane: str) -> tuple[CanonicalEvent,
     limits each monitor pass to the delta. An inode change, a shrink, or a
     same-size rewrite (mtime moved while size stayed put) discards the cache
     and reloads in full; a malformed tail fails the pass exactly as a full
-    ``load()`` would.
+    ``load()`` would. Rows kept in memory are deduplicated on (native key,
+    payload digest) so journals inflated by transcript replays do not grow
+    the cache or the detector input with copies of the same native row. The
+    cache still retains every unique event for the lane's lifetime; it is
+    not bounded -- it grows with the unique-event count, not the re-sync
+    count.
     """
     journal = EventJournal(config.state_dir, lane)
     key = (str(config.state_dir), lane)
@@ -789,7 +801,7 @@ def load_lane_events(config: MonitordConfig, lane: str) -> tuple[CanonicalEvent,
     ):
         cached = None
     if cached is not None and stat.st_size == cached.offset:
-        return tuple(cached.events)
+        return tuple(cached.events.values())
     parsed, start, end_offset, fd_stat = journal.load_from(
         cached.offset if cached is not None else 0,
         inode=cached.inode if cached is not None else None,
@@ -798,17 +810,21 @@ def load_lane_events(config: MonitordConfig, lane: str) -> tuple[CanonicalEvent,
         _LANE_JOURNALS.pop(key, None)
         return ()
     if cached is None:
-        cached = _LaneJournalCache(events=[], offset=0, inode=fd_stat.st_ino, mtime_ns=fd_stat.st_mtime_ns)
+        cached = _LaneJournalCache(events={}, offset=0, inode=fd_stat.st_ino, mtime_ns=fd_stat.st_mtime_ns)
         _LANE_JOURNALS[key] = cached
     elif start == 0:
         # The path was replaced between the stat above and the open inside
         # load_from; the returned events cover the whole current file.
         cached.events.clear()
-    cached.events.extend(parsed)
+    for event in parsed:
+        # Journals written before replay dedupe can hold many copies of one
+        # native row; the pass needs each semantic event only once, so the
+        # first stored copy under its replay identity wins.
+        cached.events.setdefault(event_dedupe_key(event), event)
     cached.offset = end_offset
     cached.inode = fd_stat.st_ino
     cached.mtime_ns = fd_stat.st_mtime_ns
-    return tuple(cached.events)
+    return tuple(cached.events.values())
 
 
 def _final_response(events: tuple[CanonicalEvent, ...]) -> CanonicalEvent | None:

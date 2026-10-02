@@ -175,10 +175,12 @@ class TranscriptNormalizer:
     def begin_replay(self) -> None:
         """Restart per-incarnation stream state before a full-file replay.
 
-        A detected same-inode rewrite replays the whole current transcript
-        from byte zero. Occurrence numbering must restart with it so every
-        unchanged record reproduces the event ID it already received;
-        otherwise the journal would append duplicates of durable events.
+        A detected rewrite -- the same inode mutated in place, or the path
+        swapped for a new inode by an atomic replace -- replays the whole
+        current transcript from byte zero. Occurrence numbering must restart
+        with it so every unchanged record reproduces the event ID it already
+        received; otherwise the journal would append duplicates of durable
+        events.
         """
         self._native_occurrences = {}
         self._current_occurrence = 0

@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +18,7 @@ from .models import (
     ProgressClass,
     ProgressClassification,
 )
+from .normalizers import _native_key
 from .tools import (
     call_signature,
     check_signature,
@@ -43,6 +44,54 @@ _PROGRESS_KEYS = frozenset(
 def _digest(value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def event_dedupe_key(event: CanonicalEvent) -> tuple[str, str, str, str]:
+    """Return the replay-identity of one normalized journal row.
+
+    The key pairs the native record identity with the normalized type and
+    payload digest -- the (native key, payload digest) pair scoped by client
+    and type -- so rows replayed byte-for-byte collapse while a rewrite of
+    the same bytes under another harness name, or a distinct normalization,
+    stays a separate event. Events with no native row (for example
+    receipt-bound lifecycle events) key on their own event ID and are never
+    deduplicated.
+    """
+    raw_sha = event.raw_sha256
+    native = (
+        _native_key(event.raw_record or {}, raw_sha)
+        if isinstance(raw_sha, str) and raw_sha
+        else f"event:{event.event_id}"
+    )
+    return native, event.normalized_type.value, str(event.client), event.payload_digest
+
+
+def journal_row_dedupe_key(row: Mapping[str, Any]) -> tuple[str, str, str, str] | None:
+    """Return the dedupe key for one raw journal line, or None to always keep.
+
+    Mirrors :func:`event_dedupe_key` on unvalidated JSON so compaction can run
+    without constructing CanonicalEvent models for every retained row.
+    """
+    payload_digest = row.get("payload_digest")
+    if not isinstance(payload_digest, str) or not payload_digest:
+        return None
+    raw_sha = row.get("raw_sha256")
+    if isinstance(raw_sha, str) and raw_sha:
+        record = row.get("raw_record")
+        native = _native_key(record if isinstance(record, dict) else {}, raw_sha)
+    else:
+        event_id = row.get("event_id")
+        if not isinstance(event_id, str) or not event_id:
+            return None
+        native = f"event:{event_id}"
+    normalized_type = row.get("normalized_type")
+    client = row.get("client")
+    return (
+        native,
+        normalized_type if isinstance(normalized_type, str) else "",
+        client if isinstance(client, str) else str(client),
+        payload_digest,
+    )
 
 
 def classify_progress(
@@ -271,11 +320,12 @@ class EventJournal:
         self.path = self.directory / f"{lane}.jsonl"
         self.progress_path = self.directory / f"{lane}.progress.jsonl"
         self.lock_path = self.directory / f"{lane}.lock"
-        # Per-file scan watermarks for append dedupe: (inode, offset, mtime_ns, ids).
-        # The journal only grows by appends under this directory's lock, so an
-        # id seen below the watermark cannot reappear above it; an inode swap,
-        # a shrink, or a same-size rewrite (mtime moved) forces a full rescan.
-        self._id_scans: dict[str, tuple[int, int, int, set[str]]] = {}
+        # Per-file scan watermarks for append dedupe:
+        # (inode, offset, mtime_ns, ids, dedupe keys). The journal only grows
+        # by appends under this directory's lock, so an identity seen below
+        # the watermark cannot reappear above it; an inode swap, a shrink, or
+        # a same-size rewrite (mtime moved) forces a full rescan.
+        self._id_scans: dict[str, tuple[int, int, int, set[str], set[tuple[str, str, str, str]]]] = {}
 
     def load(self) -> list[CanonicalEvent]:
         if not self.path.exists():
@@ -337,13 +387,17 @@ class EventJournal:
         for event in candidates:
             if event.lane != self.lane:
                 raise ValueError(f"event lane {event.lane!r} does not match journal lane {self.lane!r}")
-        return self._append_unique(self.path, candidates, "event_id")
+        return self._append_unique(self.path, candidates, "event_id", content_key=event_dedupe_key)
 
     def append_progress(self, rows: Iterable[ProgressClassification]) -> tuple[ProgressClassification, ...]:
         return self._append_unique(self.progress_path, tuple(rows), "derivation_id")
 
-    def _scanned_identities(self, path: Path, id_field: str) -> set[str]:
-        """Return every ``id_field`` value already stored, reading only new bytes.
+    def _scanned_identities(
+        self,
+        path: Path,
+        id_field: str,
+    ) -> tuple[set[str], set[tuple[str, str, str, str]]]:
+        """Return stored ``id_field`` values and dedupe keys, reading only new bytes.
 
         Append dedupe calls this on every write; keeping a byte watermark per
         file makes a steady-state append O(new rows) instead of O(file). The
@@ -352,7 +406,7 @@ class EventJournal:
         """
         if not path.exists():
             self._id_scans.pop(str(path), None)
-            return set()
+            return set(), set()
         stat = path.stat()
         key = str(path)
         entry = self._id_scans.get(key)
@@ -362,9 +416,9 @@ class EventJournal:
             or entry[1] > stat.st_size
             or (stat.st_size == entry[1] and stat.st_mtime_ns != entry[2])
         ):
-            offset, ids = 0, set()
+            offset, ids, keys = 0, set(), set()
         else:
-            offset, ids = entry[1], entry[3]
+            offset, ids, keys = entry[1], entry[3], entry[4]
         with path.open("rb") as current:
             current.seek(offset)
             for line in current:
@@ -375,27 +429,36 @@ class EventJournal:
                 identity = value.get(id_field)
                 if isinstance(identity, str):
                     ids.add(identity)
-        self._id_scans[key] = (stat.st_ino, offset, stat.st_mtime_ns, ids)
-        return ids
+                dedupe_key = journal_row_dedupe_key(value)
+                if dedupe_key is not None:
+                    keys.add(dedupe_key)
+        self._id_scans[key] = (stat.st_ino, offset, stat.st_mtime_ns, ids, keys)
+        return ids, keys
 
     def _append_unique[T: CanonicalEvent | ProgressClassification](
         self,
         path: Path,
         candidates: tuple[T, ...],
         id_field: str,
+        *,
+        content_key: Callable[[T], tuple[str, str, str, str]] | None = None,
     ) -> tuple[T, ...]:
         if not candidates:
             return ()
         self.directory.mkdir(parents=True, exist_ok=True)
         os.chmod(self.directory, 0o700)
         with exclusive_lock(self.lock_path, mode=0o600):
-            existing = self._scanned_identities(path, id_field)
+            existing, existing_keys = self._scanned_identities(path, id_field)
             new_rows: list[T] = []
             for candidate in candidates:
                 identity = getattr(candidate, id_field)
-                if identity not in existing:
-                    new_rows.append(candidate)
-                    existing.add(identity)
+                dedupe_key = content_key(candidate) if content_key is not None else None
+                if identity in existing or (dedupe_key is not None and dedupe_key in existing_keys):
+                    continue
+                new_rows.append(candidate)
+                existing.add(identity)
+                if dedupe_key is not None:
+                    existing_keys.add(dedupe_key)
             if new_rows:
                 fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
                 try:
@@ -414,5 +477,6 @@ class EventJournal:
                     final_stat.st_size,
                     final_stat.st_mtime_ns,
                     existing,
+                    existing_keys,
                 )
             return tuple(new_rows)
