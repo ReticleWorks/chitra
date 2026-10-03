@@ -624,7 +624,8 @@ def test_ladder_never_advances_without_a_consumption_receipt(tmp_path: Path) -> 
     assert second.reason and "consumption" in second.reason
 
 
-def test_ladder_advances_only_after_proven_consumption(tmp_path: Path) -> None:
+def test_ladder_advances_only_after_proven_consumption(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_process_identity_observer(monkeypatch)
     key = b"k" * 32
     sent_at = "2026-08-21T15:00:00+00:00"
     session_ref = f"host:{LANE}:0.0"
@@ -1226,7 +1227,8 @@ def _latest_rescue_sha(state_root: Path) -> str:
     return str(payload["bundle_sha256"])
 
 
-def test_rescue_seal_requires_verified_bundle_and_checkpoint(tmp_path: Path) -> None:
+def test_rescue_seal_requires_verified_bundle_and_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_process_identity_observer(monkeypatch)
     key = b"k" * 32
     session_ref = f"host:{LANE}:0.0"
     sent_at = "2026-08-21T15:00:00+00:00"
@@ -1441,7 +1443,8 @@ def test_relaunch_rejects_self_authored_checkpoint_and_null_target_pid(tmp_path:
         )
 
 
-def test_rescue_bundle_is_bounded_hash_bound_and_brief_renders(tmp_path: Path) -> None:
+def test_rescue_bundle_is_bounded_hash_bound_and_brief_renders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_process_identity_observer(monkeypatch)
     worktree = tmp_path / "wt"
     worktree.mkdir()
     subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True, text=True)
@@ -1650,10 +1653,11 @@ def _rescue_stage_incident(tmp_path: Path) -> tuple[IncidentStore, Finding, str]
     return store, finding, session_ref
 
 
-def test_checkpoint_seal_rejects_duplicate_receipt_nonce_and_appends_once(tmp_path: Path) -> None:
+def test_checkpoint_seal_rejects_duplicate_receipt_nonce_and_appends_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """One governed checkpoint receipt seals exactly once: the duplicate
     check, durable consumption, and the incident append are atomic, survive
     restart, and reject replayed refs and replayed nonces alike."""
+    _stub_process_identity_observer(monkeypatch)
     store, finding, session_ref = _rescue_stage_incident(tmp_path)
     consumed_rescue = store.latest(_track(finding))
     assert consumed_rescue is not None
@@ -1918,6 +1922,11 @@ def _patch_live_lane(monkeypatch: pytest.MonkeyPatch, *, pid: int | None, worktr
         lambda *_a, **_k: [SimpleNamespace(binding=SimpleNamespace(worktree_realpath=str(worktree)))],
     )
     monkeypatch.setattr(monitord_mod, "list_receipts", lambda *_a, **_k: [])
+    _stub_process_identity_observer(monkeypatch)
+
+
+def _stub_process_identity_observer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deterministic ``/proc`` identity so the rescue seal path runs off-Linux."""
     monkeypatch.setattr(
         rescue_mod,
         "_observe_process_identity",
