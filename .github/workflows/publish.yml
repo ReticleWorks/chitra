@@ -3,83 +3,150 @@ name: Publish to PyPI
 # Fires ONLY when a maintainer manually publishes a GitHub Release — never on
 # push or tag-create. Cutting the Release is the human gate; nothing here
 # runs unattended before that.
+#
+# workflow_dispatch is a maintainer-run dry run: it executes checkout, build,
+# twine-check, and hashing and skips every publishing step, so the pipeline
+# can be exercised without cutting a Release.
 on:
   release:
     types: [published]
+  workflow_dispatch: {}
 
+# This repository's Actions policy rejects every step-level `uses:` ref
+# outside ReticleWorks — any external action fails the whole run at startup
+# (every release since 0.20.0 has ended in startup_failure). This workflow
+# therefore uses `run:` steps only: git fetch in place of actions/checkout,
+# twine in place of pypa/gh-action-pypi-publish, `gh release upload` in place
+# of upload/download-artifact, and a PyJWT-minted installation token in
+# place of actions/create-github-app-token. Do not reintroduce external
+# `uses:` refs here — the pipeline goes straight back to startup_failure.
 permissions:
   contents: read
 
 jobs:
-  build:
-    name: Build distribution
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-
-      - name: Install build tooling
-        run: python -m pip install --upgrade pip build twine
-
-      - name: Build sdist and wheel
-        run: python -m build
-
-      - name: Check distribution metadata
-        run: python -m twine check dist/*
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: dist
-          path: dist/
-          if-no-files-found: error
-
   publish:
-    name: Publish to PyPI
-    needs: build
+    name: Build and publish to PyPI
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/project/chitra-monitor/
+    permissions:
+      # gh release upload needs contents:write; scoped to this job only.
+      contents: write
     steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: dist
-          path: dist/
+      - name: Check out the released commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth 1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
 
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
-        with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
-          # PyPI attestations require trusted publishing. This repository uses
-          # a project-scoped API token until its PyPI publisher is configured.
-          attestations: false
-          print-hash: true
+      - name: Pin the build timestamp to the tagged commit
+        run: |
+          # SOURCE_DATE_EPOCH makes the wheel byte-reproducible: setuptools
+          # stamps archive member mtimes from it instead of the wall clock,
+          # so a re-run on the same tag yields the same sha256. research-ops
+          # pins wheels by release-asset sha256, so this is a requirement,
+          # not a nicety.
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+      - name: Install build tooling
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip build twine
+
+      - name: Build sdist and wheel
+        run: .venv/bin/python -m build
+
+      - name: Check distribution metadata
+        run: .venv/bin/python -m twine check dist/*
+
+      - name: Print distribution hashes
+        run: sha256sum dist/*
+
+      - name: Attach distributions to the GitHub Release
+        # Before the PyPI upload so a failed publish leaves a clean,
+        # rerunnable state; --clobber makes the attach itself idempotent.
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Publish to PyPI
+        # Equivalent to pypa/gh-action-pypi-publish with a project-scoped API
+        # token: `twine upload` with __token__ auth. PyPI attestations
+        # require trusted publishing, which this repository does not use, so
+        # there is no attestation step (attestations: false in the action).
+        if: github.event_name == 'release'
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: .venv/bin/python -m twine upload --disable-progress-bar dist/*
 
   notify-fleet:
     name: Notify fleet-repo of the release
     needs: publish
+    if: github.event_name == 'release'
     runs-on: ubuntu-latest
+    permissions: {}
     steps:
-      # ReticleWorks/fleet-repo pins this distribution and opens its own pin
-      # bump pull request on each release; GitHub has no cross-repo release
-      # trigger, so the fleet listens for a repository_dispatch of type
-      # chitra-release instead. The default job token cannot dispatch to
-      # another repository, so this job mints a short-lived installation
-      # token at runtime for the polyphony-automation GitHub App (installed
-      # on all ReticleWorks repos) from the repo secrets
-      # FLEET_DISPATCH_APP_ID and FLEET_DISPATCH_APP_PRIVATE_KEY, scoped to
-      # ReticleWorks/fleet-repo only. If minting or dispatch fails, the step
-      # fails closed without touching PyPI state, and fleet-repo's weekly
-      # poll enumerates every unreconciled release as the fallback path.
-      - uses: actions/create-github-app-token@v1
+      # Same dispatch contract as before: a short-lived polyphony-automation
+      # installation token scoped to ReticleWorks/fleet-repo. It is minted
+      # inline with PyJWT because actions/create-github-app-token is blocked
+      # by this repo's policy. If minting or dispatch fails, the step fails
+      # closed without touching PyPI state, and fleet-repo's weekly poll
+      # enumerates every unreconciled release as the fallback path.
+      - name: Install token tooling
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet 'pyjwt[crypto]'
+
+      - name: Mint polyphony-automation installation token
         id: fleet-token
-        with:
-          app-id: ${{ secrets.FLEET_DISPATCH_APP_ID }}
-          private-key: ${{ secrets.FLEET_DISPATCH_APP_PRIVATE_KEY }}
-          owner: ReticleWorks
-          repositories: fleet-repo
+        env:
+          APP_ID: ${{ secrets.FLEET_DISPATCH_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.FLEET_DISPATCH_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          .venv/bin/python - <<'PYEOF'
+          import json, os, time, urllib.request
+
+          import jwt
+
+          now = int(time.time())
+          app_jwt = jwt.encode(
+              {"iat": now - 60, "exp": now + 540, "iss": os.environ["APP_ID"]},
+              os.environ["APP_PRIVATE_KEY"],
+              algorithm="RS256",
+          )
+
+          def call(method, path, body=None):
+              req = urllib.request.Request(
+                  "https://api.github.com" + path,
+                  method=method,
+                  data=None if body is None else json.dumps(body).encode(),
+                  headers={
+                      "Authorization": "Bearer " + app_jwt,
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "Content-Type": "application/json",
+                  },
+              )
+              return json.load(urllib.request.urlopen(req))
+
+          inst = call("GET", "/repos/ReticleWorks/fleet-repo/installation")
+          tok = call(
+              "POST",
+              "/app/installations/{}/access_tokens".format(inst["id"]),
+              {"repositories": ["fleet-repo"]},
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write("token=" + tok["token"] + "\n")
+          PYEOF
 
       - name: Send repository_dispatch to ReticleWorks/fleet-repo
         env:
