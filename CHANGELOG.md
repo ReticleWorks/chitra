@@ -4,6 +4,44 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-10-02
+
+### Added
+
+- `chitra-journal-compact` console script rewrites a journal keeping the
+  first row per (native key, payload digest), atomically via a
+  same-directory temp file and `os.replace`. It refuses to run while the
+  lane lock is held and `--dry-run` prints before/after counts; accepts
+  `--state-dir` + `--lane` or a direct `--journal` path.
+
+### Changed
+
+- `monitord` appends a findings record only on a state change: a
+  fingerprint opens (`record_type="open"`), closes
+  (`record_type="closed"`), or re-beats at most once per 24 h while open
+  (`record_type="heartbeat"`). Per-lane emit state lives in
+  `monitord-findings.state.json` beside the findings log; a corrupt or
+  missing state file degrades to a fresh state. Findings rows gain the
+  `record_type` field, which nothing reads back.
+- `EventJournal.append` dedupes a second way — a candidate is skipped
+  when its (native key, normalized type, client, payload digest) already
+  exists — and `load_lane_events` dedupes cached events on the same key,
+  so already-bloated journals stop feeding progress derivation and
+  detectors copies of the same native row.
+
+### Fixed
+
+- Journal ingest treats an inode replacement as a replay when the new
+  generation's first raw record sha256 matches a head this ingestor
+  already saw. An `os.replace` transcript sync therefore no longer
+  re-journals every row under a fresh `event_id` — the chain that left
+  ~30 duplicate rows per native record and `chitra-monitord` burning
+  ~98% CPU and multiple GB of RSS.
+- `monitord` honors its stop event between lanes and between detectors
+  instead of only between passes, and exits on its own once orphaned
+  (`os.getppid() == 1`), so launchd's exit timeout no longer SIGKILLs a
+  multi-hour pass mid-flight and strands the daemon.
+
 ## [0.22.0] - 2026-09-23
 
 ### Added
