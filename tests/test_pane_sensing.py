@@ -1,10 +1,16 @@
-"""Tests for monitord's pane sensing — the checks that lived in watchd.
+"""Tests for monitord's pane sensing kept in the wave-1 burn-down.
 
-On 2026-08-15 an atlas-v5 respawn did not re-arm ``tmux pipe-pane``. The pane
-stayed healthy, its transcript stopped growing at 13:15Z, and every file-based
-liveness check that read that transcript was blind for twenty-five hours. The
-pane alone cannot tell the two apart, which is why this reads tmux's own
-``pane_pipe`` and the transcript's mtime rather than the screen.
+Kept:
+- the two monitord-pass tests -- the daemon-surface end of sensing: a capped
+  lane produces a foreground task carrying the resume time, and shadow mode
+  records but never raises one;
+- the ownership boundary -- a pane that is not bound to a known session_ref
+  still feeds the status socket but must never write lane facts.
+
+Removed: scripted-tmux sensing internals (transcript_pipe_fault units,
+list-panes parsing, activity timestamp bookkeeping, dead-server tolerance).
+The pipe-fault detection itself is still exercised end to end through the
+monitord-pass tests below.
 """
 
 from __future__ import annotations
@@ -13,7 +19,7 @@ import os
 import subprocess
 import time
 from collections.abc import Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -24,9 +30,7 @@ from chitra.lane_activity import load_lane_activity
 from chitra.lane_config import LaneCredentials, LaneSpec
 from chitra.pane_sensing import (
     PaneSenseState,
-    list_session_panes,
     sense_lane_panes,
-    transcript_pipe_fault,
 )
 
 NOW = datetime(2026, 8, 16, 14, 15, tzinfo=UTC)
@@ -34,7 +38,6 @@ LANE = "tophand:atlas-v5:0.0"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 HARD_CAP = (FIXTURES / "codex_weekly_hard_cap_20260814.txt").read_text(encoding="utf-8")
 LANE_TIMEZONE = "America/New_York"
-
 
 @pytest.fixture
 def lane_timezone(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
@@ -58,150 +61,6 @@ def _transcript(root: Path, *, age_seconds: int, at: datetime = NOW) -> Path:
     stamp = at.timestamp() - age_seconds
     os.utime(path, (stamp, stamp))
     return path
-
-
-def _iso(seconds_ago: int) -> str:
-    return (NOW - timedelta(seconds=seconds_ago)).isoformat()
-
-
-def test_an_unarmed_pipe_is_a_fault_even_while_the_lane_is_busy(tmp_path: Path) -> None:
-    """The atlas-v5 shape, measured live on 2026-08-16: pane_pipe was 0."""
-    _transcript(tmp_path, age_seconds=90_000)
-
-    reason = transcript_pipe_fault(
-        lane_directory=tmp_path,
-        pipe_armed=False,
-        last_change_at=_iso(5),
-        now=NOW,
-    )
-
-    assert "no pipe-pane running" in reason
-
-
-def test_an_unarmed_pipe_is_a_fault_even_while_the_lane_is_quiet(tmp_path: Path) -> None:
-    """An idle lane with a dead pipe is not fine; its next output is lost."""
-    _transcript(tmp_path, age_seconds=90_000)
-
-    reason = transcript_pipe_fault(
-        lane_directory=tmp_path,
-        pipe_armed=False,
-        last_change_at=_iso(90_000),
-        now=NOW,
-    )
-
-    assert "no pipe-pane running" in reason
-
-
-def test_an_armed_pipe_writing_nowhere_is_a_fault(tmp_path: Path) -> None:
-    _transcript(tmp_path, age_seconds=3_600)
-
-    reason = transcript_pipe_fault(
-        lane_directory=tmp_path,
-        pipe_armed=True,
-        last_change_at=_iso(10),
-        now=NOW,
-    )
-
-    assert "has not grown for 3600s" in reason
-    assert "the pane changed 10s ago" in reason
-
-
-def test_a_quiet_lane_with_a_quiet_transcript_is_agreement_not_a_fault(tmp_path: Path) -> None:
-    _transcript(tmp_path, age_seconds=3_600)
-
-    reason = transcript_pipe_fault(
-        lane_directory=tmp_path,
-        pipe_armed=True,
-        last_change_at=_iso(3_500),
-        now=NOW,
-    )
-
-    assert reason == ""
-
-
-def test_a_growing_transcript_is_healthy(tmp_path: Path) -> None:
-    _transcript(tmp_path, age_seconds=5)
-
-    reason = transcript_pipe_fault(
-        lane_directory=tmp_path,
-        pipe_armed=True,
-        last_change_at=_iso(5),
-        now=NOW,
-    )
-
-    assert reason == ""
-
-
-def test_a_governed_lane_with_no_transcript_at_all_is_a_fault(tmp_path: Path) -> None:
-    """The measured atlas-v5 shape on 2026-08-16: launch record, no transcript.
-
-    Keying on the transcript's existence instead would have stayed silent on
-    the exact lane this check was written for.
-    """
-    _governed_lane(tmp_path)
-
-    reason = transcript_pipe_fault(
-        lane_directory=tmp_path,
-        pipe_armed=False,
-        last_change_at=_iso(5),
-        now=NOW,
-    )
-
-    assert "no transcript file" in reason
-
-
-def test_an_ungoverned_lane_gets_no_opinion(tmp_path: Path) -> None:
-    """The lane-launch record is the declaration; without it, no claim."""
-    reason = transcript_pipe_fault(
-        lane_directory=tmp_path,
-        pipe_armed=False,
-        last_change_at=_iso(5),
-        now=NOW,
-    )
-
-    assert reason == ""
-
-
-def test_an_unreadable_change_time_is_not_treated_as_a_fault(tmp_path: Path) -> None:
-    _transcript(tmp_path, age_seconds=3_600)
-
-    for last_change_at in ("", "tuesday", "2026-08-16T14:00:00"):
-        assert (
-            transcript_pipe_fault(
-                lane_directory=tmp_path,
-                pipe_armed=True,
-                last_change_at=last_change_at,
-                now=NOW,
-            )
-            == ""
-        )
-
-
-def test_list_session_panes_reads_the_pipe_state_from_tmux() -> None:
-    def runner(_command: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(
-            args=list(_command),
-            returncode=0,
-            stdout="%1\tatlas-v5:0.0\t1\tclaude\t0\n%2\tatlas-v5:0.1\t1\tcodex\t1\n",
-            stderr="",
-        )
-
-    panes = list_session_panes("atlas-v5", runner=runner)
-
-    assert [(pane.target, pane.pipe_armed, pane.backend) for pane in panes] == [
-        ("atlas-v5:0.0", False, "claude"),
-        ("atlas-v5:0.1", True, "codex"),
-    ]
-
-
-def test_a_pane_line_without_the_pipe_field_reads_as_unarmed() -> None:
-    """An older tmux, or a truncated line, must not read as healthy."""
-
-    def runner(_command: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(args=list(_command), returncode=0, stdout="%1\tatlas-v5:0.0\n", stderr="")
-
-    assert list_session_panes("atlas-v5", runner=runner)[0].pipe_armed is False
-
 
 def _lane_spec(state_dir: Path, tmux_socket: Path) -> LaneSpec:
     return LaneSpec(
@@ -260,84 +119,6 @@ def _sense(
         now=now,
     )
 
-
-def test_sensing_publishes_status_and_activity_facts(tmp_path: Path) -> None:
-    """The rate-limit guard reads lane_activity.json; the socket reads the broker."""
-    lane = _lane_spec(tmp_path / "lane-state", tmp_path / "tmux.sock")
-    _transcript(lane.state_dir, age_seconds=5)
-    calls, runner = _sensing_runner()
-    broker = AgentStatusBroker(lane.state_dir, ManifestRepository(tmp_path / "no-manifests"))
-
-    emitted = _sense(lane, runner=runner, broker=broker, now=NOW)
-
-    assert emitted == 0
-    [status] = broker.statuses()
-    assert status.pane_id == "%1"
-    assert status.session_ref == LANE
-    assert status.lane_id == "atlas-v5"
-    assert status.state == "working"
-    [activity] = load_lane_activity(lane.state_dir)
-    assert activity.session_ref == LANE
-    assert activity.pane_id == "%1"
-    assert activity.backend == "codex"
-    assert activity.attached is True
-    assert activity.last_change_at == NOW.isoformat()
-
-
-def test_activity_last_change_tracks_semantic_transitions(tmp_path: Path) -> None:
-    """A second identical capture advances last_seen_at, not last_change_at."""
-    lane = _lane_spec(tmp_path / "lane-state", tmp_path / "tmux.sock")
-    _transcript(lane.state_dir, age_seconds=5)
-    _calls, runner = _sensing_runner()
-    state = PaneSenseState()
-    broker = AgentStatusBroker(lane.state_dir, ManifestRepository(tmp_path / "no-manifests"))
-    later = NOW + timedelta(seconds=60)
-
-    _sense(lane, runner=runner, broker=broker, state=state, now=NOW)
-    _sense(lane, runner=runner, broker=broker, state=state, now=later)
-
-    [activity] = load_lane_activity(lane.state_dir)
-    assert activity.last_change_at == NOW.isoformat()
-    assert activity.last_seen_at == later.isoformat()
-
-
-def test_a_hard_rate_limit_banner_alerts_with_the_resume_time(tmp_path: Path, lane_timezone: None) -> None:
-    """End to end: capped pane in, operator alert carrying the resume time out."""
-    lane = _lane_spec(tmp_path / "lane-state", tmp_path / "tmux.sock")
-    _transcript(lane.state_dir, age_seconds=5)
-    _calls, runner = _sensing_runner(capture=HARD_CAP)
-    alerts: list[tuple[str, str]] = []
-
-    emitted = _sense(lane, runner=runner, alerts=alerts, now=NOW)
-
-    assert emitted == 1
-    assert alerts[0][0] == LANE
-    assert "rate-limit" in alerts[0][1]
-    assert "2026-08-20T03:37:00Z" in alerts[0][1]
-
-
-def test_a_transcript_pipe_fault_alerts_once_per_breakage(tmp_path: Path) -> None:
-    """A dead pipe reports once, not once per pass, then re-reports on relapse."""
-    lane = _lane_spec(tmp_path / "lane-state", tmp_path / "tmux.sock")
-    _governed_lane(lane.state_dir)
-    _calls, dead_runner = _sensing_runner(pane_line="%1\tatlas-v5:0.0\t1\tcodex\t0\n")
-    state = PaneSenseState()
-    broker = AgentStatusBroker(lane.state_dir, ManifestRepository(tmp_path / "no-manifests"))
-    alerts: list[tuple[str, str]] = []
-
-    assert _sense(lane, runner=dead_runner, state=state, broker=broker, alerts=alerts, now=NOW) == 1
-    assert _sense(lane, runner=dead_runner, state=state, broker=broker, alerts=alerts, now=NOW) == 0
-    assert "no transcript file" in alerts[0][1]
-
-    _transcript(lane.state_dir, age_seconds=5)
-    _calls2, armed_runner = _sensing_runner(pane_line="%1\tatlas-v5:0.0\t1\tcodex\t1\n")
-    assert _sense(lane, runner=armed_runner, state=state, broker=broker, alerts=alerts, now=NOW) == 0
-
-    os.remove(lane.state_dir / "tmux-transcript.log")
-    assert _sense(lane, runner=dead_runner, state=state, broker=broker, alerts=alerts, now=NOW) == 1
-    assert len(alerts) == 2
-
-
 def test_an_unmatched_pane_is_classified_but_not_recorded(tmp_path: Path) -> None:
     """Foreign panes still feed the socket; only bound panes write lane facts."""
     lane = _lane_spec(tmp_path / "lane-state", tmp_path / "tmux.sock")
@@ -353,14 +134,6 @@ def test_an_unmatched_pane_is_classified_but_not_recorded(tmp_path: Path) -> Non
     assert status.session_ref is None
     assert load_lane_activity(lane.state_dir) == []
 
-
-def test_sensing_survives_a_dead_tmux_server(tmp_path: Path) -> None:
-    lane = _lane_spec(tmp_path / "lane-state", tmp_path / "tmux.sock")
-
-    def runner(command: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(list(command), 1, "", "no server running")
-
-    assert _sense(lane, runner=runner, now=NOW) == 0
 
 
 def test_monitord_pass_raises_a_foreground_task_for_a_capped_lane(
