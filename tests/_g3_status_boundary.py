@@ -11,11 +11,13 @@ that gives a tmux pane a recognized agent identity.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -68,10 +70,34 @@ def stdout_json(result: subprocess.CompletedProcess[str]) -> dict:
     return json.loads(result.stdout[result.stdout.index("{") :])
 
 
+def real_tmux() -> str:
+    """Resolve the unwrapped tmux binary.
+
+    Some hosts put an env-scrubbing tmux wrapper first on PATH: it replaces
+    the tmux server's environment, which drops the stub bin directory's PATH
+    lead and any stub env vars, so panes end up running the provider's real
+    CLI instead of the stubs. A wrapper keeps the real binary beside it as
+    ``tmux.real``.
+    """
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        pytest.skip("tmux is required for a real pane launch")
+    resolved = Path(tmux).resolve()
+    real = resolved.with_name("tmux.real")
+    return str(real if real.is_file() else resolved)
+
+
+def install_real_tmux(bin_dir: Path) -> Path:
+    """Symlink the unwrapped tmux binary into a PATH-leading bin dir."""
+    link = bin_dir / "tmux"
+    link.symlink_to(real_tmux())
+    return link
+
+
 def tmux(socket_path: Path, *argv: str) -> subprocess.CompletedProcess[str]:
     """Run tmux against one test-owned socket (never the shared default)."""
     return subprocess.run(
-        ["tmux", "-S", str(socket_path), *argv],
+        [real_tmux(), "-S", str(socket_path), *argv],
         capture_output=True,
         text=True,
         timeout=20,
@@ -156,8 +182,28 @@ def kill_tmux(socket_path: Path, session: str) -> None:
     tmux(socket_path, "kill-session", "-t", session)
 
 
+_SOCKET_DIRS: list[Path] = []
+
+
+def _cleanup_socket_dirs() -> None:
+    for directory in _SOCKET_DIRS:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+atexit.register(_cleanup_socket_dirs)
+
+
 def unique_socket(tmp_path: Path, name: str = "chitra-g3") -> Path:
-    return tmp_path / f"{name}-{uuid.uuid4().hex[:8]}.sock"
+    """A unix socket path short enough for every platform's AF_UNIX limit.
+
+    macOS caps socket paths at about 104 characters and pytest ``tmp_path``
+    under the default macOS TMPDIR exceeds that, so sockets live in a short
+    ``/tmp`` directory instead of under ``tmp_path``.
+    """
+    del tmp_path  # unused: the socket must not live under tmp_path (see docstring)
+    socket_dir = Path(tempfile.mkdtemp(prefix="g3t", dir="/tmp"))
+    _SOCKET_DIRS.append(socket_dir)
+    return socket_dir / f"{name}-{uuid.uuid4().hex[:8]}.sock"
 
 
 def wait_pane_command(socket_path: Path, session: str, want: str, timeout: float = 10.0) -> None:

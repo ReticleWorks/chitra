@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 from _g3_status_boundary import (
     install_fake_codex,
+    install_real_tmux,
     kill_tmux,
     launch_codex_pane,
     respawn_codex_pane,
@@ -43,9 +44,18 @@ SESSION_REF = "host-b:feeds:0.0"
 
 
 @pytest.fixture
-def codex_bin(tmp_path: Path) -> Path:
+def codex_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A fake ``codex`` plus the unwrapped tmux binary, first on PATH.
+
+    In-process chitra code (pane sensing, the control socket adapter) spawns
+    ``tmux`` through PATH; on hosts whose PATH tmux is an env-scrubbing
+    wrapper, the server would lose the test's PATH lead and stub env vars, so
+    the real binary is linked ahead of it for the whole test.
+    """
     bin_dir = tmp_path / "fake-bin"
     bin_dir.mkdir()
+    install_real_tmux(bin_dir)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     return install_fake_codex(bin_dir)
 
 
@@ -555,7 +565,8 @@ def test_d14_lifecycle_report_is_authoritative_over_screen(tmp_path: Path, codex
         wait_pane_command(socket, session, "codex")
         broker = AgentStatusBroker(tmp_path / "broker", ManifestRepository())
         api = ApiRuntime(broker)
-        server = ControlServer(tmp_path / "ctl.sock", api)
+        ctl_sock = unique_socket(tmp_path, "ctl")
+        server = ControlServer(ctl_sock, api)
         server.start()
         try:
             pane = _pane_id(socket, session)
@@ -564,7 +575,7 @@ def test_d14_lifecycle_report_is_authoritative_over_screen(tmp_path: Path, codex
                 [
                     script("chitra-agent"),
                     "--socket-path",
-                    str(tmp_path / "ctl.sock"),
+                    str(ctl_sock),
                     "report",
                     "--pane-id",
                     pane,
@@ -601,7 +612,8 @@ def test_d15_session_identity_change_releases_lifecycle_authority(tmp_path: Path
         wait_pane_command(socket, session, "codex")
         broker = AgentStatusBroker(tmp_path / "broker", ManifestRepository())
         api = ApiRuntime(broker)
-        server = ControlServer(tmp_path / "ctl.sock", api)
+        ctl_sock = unique_socket(tmp_path, "ctl")
+        server = ControlServer(ctl_sock, api)
         server.start()
         try:
             pane = _pane_id(socket, session)
@@ -609,7 +621,7 @@ def test_d15_session_identity_change_releases_lifecycle_authority(tmp_path: Path
                 [
                     script("chitra-agent"),
                     "--socket-path",
-                    str(tmp_path / "ctl.sock"),
+                    str(ctl_sock),
                     "report",
                     "--pane-id",
                     pane,
