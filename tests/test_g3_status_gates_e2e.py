@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -653,7 +654,9 @@ def test_d16_pane_exec_refuses_unknown_pane_identity(tmp_path: Path) -> None:
     """pane_exec binds CHITRA_PANE_ID only to a real tmux pane id; anything
     else is refused before the child ever runs."""
     marker = tmp_path / "child-ran"
-    argv = [sys.executable, "-m", "chitra.pane_exec", "--", "/bin/touch", str(marker)]
+    touch = shutil.which("touch")
+    assert touch is not None
+    argv = [sys.executable, "-m", "chitra.pane_exec", "--", touch, str(marker)]
     for bogus in ("", "17", "%", "%abc", "%-1"):
         result = run_cli(argv, env_extra={"TMUX_PANE": bogus})
         assert result.returncode != 0

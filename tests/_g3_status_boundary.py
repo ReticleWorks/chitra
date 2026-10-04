@@ -110,10 +110,15 @@ def install_fake_codex(bin_dir: Path) -> Path:
 
     tmux reports ``pane_current_command`` as the running program's name, so a
     real executable named ``codex`` gives ``list_session_panes`` a recognized
-    backend without faking anything inside chitra.
+    backend without faking anything inside chitra. A copy of the suite's own
+    interpreter plays that role: macOS treats ``/bin/sleep`` and friends as
+    platform binaries and SIGKILLs any copy run from a test path, while the
+    resolved ``sys.executable`` is an ordinary user binary whose copy runs
+    anywhere. ``PYTHONHOME`` lets that relocated copy find its standard
+    library.
     """
     path = bin_dir / "codex"
-    shutil.copy("/bin/sleep", path)
+    shutil.copy(Path(sys.executable).resolve(), path)
     path.chmod(0o755)
     return path
 
@@ -143,7 +148,7 @@ def _pane_shell_command(codex_bin: Path, content: str) -> str:
     return (
         f"yes '' | head -n {pad}; "
         f"printf '%s\\n' '{literal}'; "
-        f"exec '{codex_bin}' 600"
+        f"exec env PYTHONHOME='{sys.base_prefix}' '{codex_bin}' -c 'import time; time.sleep(600)'"
     )
 
 

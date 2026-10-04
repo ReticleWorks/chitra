@@ -302,7 +302,9 @@ def test_abandoned_handoff_expires_and_unfreezes_without_an_api_request(
     with pytest.raises(StatusRuntimeError, match="frozen"):
         broker.report_agent(pane_id="%1", source="test", agent="codex", state="working")
 
-    threading.Event().wait(0.1)
+    deadline = time.monotonic() + 2.0
+    while broker.frozen and time.monotonic() < deadline:
+        threading.Event().wait(0.005)
     assert broker.report_agent(pane_id="%1", source="test", agent="codex", state="working") is not None
 
 
