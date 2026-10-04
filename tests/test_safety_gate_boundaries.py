@@ -1736,6 +1736,20 @@ def _receipts(*argv: str, env: dict[str, str] | None = None) -> subprocess.Compl
     return _run([_script("chitra-receipts"), *argv], env=env or _env())
 
 
+def _verifier_argv0() -> str:
+    """The interpreter path the receipt verifier binds its trusted argv to.
+
+    ``chitra-receipts`` resolves ``sys.executable`` from its own shebang, so
+    a declared exercise command must spell that exact interpreter — which is
+    not necessarily the alias this test run itself was invoked under.
+    """
+    script = Path(_script("chitra-receipts"))
+    shebang = script.read_text(encoding="utf-8").splitlines()[0]
+    if shebang.startswith("#!"):
+        return shebang[2:]
+    return sys.executable
+
+
 def _marker_command(marker: Path) -> list[str]:
     return [
         sys.executable,
@@ -1775,7 +1789,7 @@ def test_a_receipt_target_outside_the_approved_root_never_executes(tmp_path: Pat
         declared = root / "target-alias.py"
         declared.symlink_to(external)
 
-    command = [sys.executable, "-m", "pytest", str(declared)]
+    command = [_verifier_argv0(), "-m", "pytest", str(declared)]
     _stored_receipt(root, declared, command=command)
 
     run = _receipts(
@@ -1808,7 +1822,7 @@ def test_an_unregistered_in_workspace_target_verifies_and_executes(tmp_path: Pat
         f"from pathlib import Path\ndef test_target() -> None:\n    Path({str(marker)!r}).write_text('ran')\n",
         encoding="utf-8",
     )
-    _stored_receipt(root, target, command=[sys.executable, "-m", "pytest", str(target)])
+    _stored_receipt(root, target, command=[_verifier_argv0(), "-m", "pytest", str(target)])
 
     run = _receipts(
         "verify",
