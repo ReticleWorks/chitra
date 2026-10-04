@@ -835,6 +835,23 @@ def _write_agent_stub(bin_dir: Path, name: str) -> Path:
     return script
 
 
+def _real_tmux() -> str:
+    """Resolve the unwrapped tmux binary.
+
+    Some hosts put an env-scrubbing tmux wrapper first on PATH: it replaces
+    the tmux server's environment, which drops both the stub bin directory's
+    lead and the CHITRA_STUB_* variables the agent stub reads, so the pane
+    ends up running the provider's real CLI instead of the stub.  A wrapper
+    keeps the real binary beside it as ``tmux.real``.
+    """
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        pytest.skip("tmux is required for a real lane launch")
+    resolved = Path(tmux).resolve()
+    real = resolved.with_name("tmux.real")
+    return str(real if real.is_file() else resolved)
+
+
 def _lane_fixture(tmp_path: Path, *, backend: str = "claude", lane_index: int = 0) -> dict[str, object]:
     """A rendered lanes.yaml + enrolled goal + stub agent for one launch."""
     root = tmp_path / f"lane{lane_index}"
@@ -877,6 +894,10 @@ def _lane_fixture(tmp_path: Path, *, backend: str = "claude", lane_index: int = 
     tmux_session = f"g3{os.getpid()}l{lane_index}x{abs(hash(tmp_path.name)) % 10000}"
     tmux_socket = root / f"tmux-{tmux_session}.sock"
     _write_agent_stub(bin_dir, backend)
+    # The launch resolves ``tmux`` through PATH like the agent stub does; put
+    # the unwrapped binary first so an env-scrubbing host wrapper never sees
+    # the call.
+    (bin_dir / "tmux").symlink_to(_real_tmux())
 
     session_ref = f"tophand:{tmux_session}:0.0"
     upsert_goal(state_dir, _goal(session_ref))
@@ -969,7 +990,7 @@ def _lane_cleanup():
     yield sockets
     for socket_path, session in sockets:
         subprocess.run(
-            ["tmux", "-S", str(socket_path), "kill-session", "-t", session],
+            [_real_tmux(), "-S", str(socket_path), "kill-session", "-t", session],
             check=False,
             capture_output=True,
         )
@@ -997,7 +1018,7 @@ def _probe_argv(calls: list[list[str]], backend: str) -> list[str]:
 
 def _tmux_has_session(socket_path: Path, session: str) -> bool:
     result = subprocess.run(
-        ["tmux", "-S", str(socket_path), "has-session", "-t", session],
+        [_real_tmux(), "-S", str(socket_path), "has-session", "-t", session],
         check=False,
         capture_output=True,
     )
@@ -1754,7 +1775,7 @@ def test_a_receipt_target_outside_the_approved_root_never_executes(tmp_path: Pat
         declared = root / "target-alias.py"
         declared.symlink_to(external)
 
-    command = [str(VENV_BIN / "python3"), "-m", "pytest", str(declared)]
+    command = [sys.executable, "-m", "pytest", str(declared)]
     _stored_receipt(root, declared, command=command)
 
     run = _receipts(
@@ -1787,7 +1808,7 @@ def test_an_unregistered_in_workspace_target_verifies_and_executes(tmp_path: Pat
         f"from pathlib import Path\ndef test_target() -> None:\n    Path({str(marker)!r}).write_text('ran')\n",
         encoding="utf-8",
     )
-    _stored_receipt(root, target, command=[str(VENV_BIN / "python3"), "-m", "pytest", str(target)])
+    _stored_receipt(root, target, command=[sys.executable, "-m", "pytest", str(target)])
 
     run = _receipts(
         "verify",
