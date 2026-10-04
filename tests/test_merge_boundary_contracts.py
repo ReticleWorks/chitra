@@ -16,14 +16,14 @@ from pathlib import Path
 import filelock
 import pytest
 from _g3_boundary import (
-    json_block,
     fresh_timestamp,
     gh_calls,
     gh_rule,
-    green_gh_rules,
     graphql_payload,
+    green_gh_rules,
     install_gh_shim,
     install_mint_stub,
+    json_block,
     merge_policy_yaml,
     read_gh_log,
     read_jsonl,
@@ -150,9 +150,21 @@ def test_merge_cli_green_path_merges_and_records(tmp_path: Path, rig) -> None:
         ({"mergeable": "CONFLICTING"}, "not_mergeable", "CONFLICTING"),
         ({"mergeStateStatus": "UNSTABLE"}, "merge_state_not_clean", "UNSTABLE"),
         ({"mergeStateStatus": "BEHIND"}, "merge_state_not_clean", "BEHIND"),
-        ({"commits": {"nodes": [{"commit": {"oid": "b" * 40, "statusCheckRollup": {"state": "FAILURE"}}}]}}, "checks_not_successful", "FAILURE"),
-        ({"commits": {"nodes": [{"commit": {"oid": "b" * 40, "statusCheckRollup": {"state": "PENDING"}}}]}}, "checks_not_successful", "PENDING"),
-        ({"commits": {"nodes": [{"commit": {"oid": "b" * 40, "statusCheckRollup": None}}]}}, "checks_not_successful", "MISSING"),
+        (
+            {"commits": {"nodes": [{"commit": {"oid": "b" * 40, "statusCheckRollup": {"state": "FAILURE"}}}]}},
+            "checks_not_successful",
+            "FAILURE",
+        ),
+        (
+            {"commits": {"nodes": [{"commit": {"oid": "b" * 40, "statusCheckRollup": {"state": "PENDING"}}}]}},
+            "checks_not_successful",
+            "PENDING",
+        ),
+        (
+            {"commits": {"nodes": [{"commit": {"oid": "b" * 40, "statusCheckRollup": None}}]}},
+            "checks_not_successful",
+            "MISSING",
+        ),
     ],
     ids=lambda case: case if isinstance(case, str) else "",
 )
@@ -160,7 +172,13 @@ def test_merge_cli_refuses_each_disqualifying_state(rig, node: dict, reason: str
     """Every disqualifying state is refused with its own reason, the refusal is
     ledgered with the identity that was refused, and no merge is attempted."""
     repo = "someone/else" if node.pop("repo_outside", False) else REPO
-    write_gh_config(rig.gh_config, [gh_rule(["api", "/installation/repositories"], stdout="5\n"), gh_rule(["api", "graphql"], stdout=graphql_payload(**node))])
+    write_gh_config(
+        rig.gh_config,
+        [
+            gh_rule(["api", "/installation/repositories"], stdout="5\n"),
+            gh_rule(["api", "graphql"], stdout=graphql_payload(**node)),
+        ],
+    )
 
     result = rig.merge_cli(repo, "7", "--policy-config", str(rig.policy), "--state-dir", str(rig.state_dir))
 

@@ -170,7 +170,14 @@ def gh_rule(match: list[str], *, stdout: str = "", stderr: str = "", exit: int =
     return {"match": match, "stdout": stdout, "stderr": stderr, "exit": exit}
 
 
-def run_module(module: str, argv: list[str], *, env_extra: dict[str, str], stdin: str = "", bin_dir: Path | None = None) -> subprocess.CompletedProcess[str]:
+def run_module(
+    module: str,
+    argv: list[str],
+    *,
+    env_extra: dict[str, str],
+    stdin: str = "",
+    bin_dir: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env.pop("GH_SHIM_CONFIG", None)
     env.pop("GH_SHIM_LOG", None)

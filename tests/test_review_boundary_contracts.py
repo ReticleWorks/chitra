@@ -288,7 +288,11 @@ def test_pr_review_fails_when_gh_cannot_read_the_diff(rig) -> None:
 def test_pr_review_surfaces_a_failed_comment_without_failing_the_run(rig) -> None:
     write_gh_config(
         rig.gh_config,
-        [gh_rule(["pr", "view"], stdout=META), gh_rule(["pr", "diff"], stdout=DIFF_TEXT), gh_rule(["pr", "comment"], exit=1, stderr="rate limited")],
+        [
+            gh_rule(["pr", "view"], stdout=META),
+            gh_rule(["pr", "diff"], stdout=DIFF_TEXT),
+            gh_rule(["pr", "comment"], exit=1, stderr="rate limited"),
+        ],
     )
 
     result = rig.pr_review("--reviewer-count", "1")
@@ -439,7 +443,14 @@ def test_review_lane_mode_binds_the_recomputed_goal_and_raw_turn(rig, tmp_path: 
     message = "Continuing against the recorded goal."
     envelope = _lane_envelope(rig, tmp_path, message)
 
-    result = rig.review("lane", envelope, env_extra={"STUB_MODE": "reject", "STUB_FINDINGS": json.dumps([{"code": "other", "detail": "d", "citation": "Continuing against the recorded goal"}])})
+    result = rig.review(
+        "lane",
+        envelope,
+        env_extra={
+            "STUB_MODE": "reject",
+            "STUB_FINDINGS": json.dumps([{"code": "other", "detail": "d", "citation": "Continuing against the recorded goal"}]),
+        },
+    )
 
     assert result.returncode == 0, result.stderr
     verdict = json.loads(result.stdout)

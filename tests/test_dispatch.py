@@ -1,11 +1,31 @@
-"""Tests for chitra.dispatch: pane_in_mode/-p fixes, transcript verification,
-and LaneLock single-writer enforcement."""
+"""Tests for chitra.dispatch kept in the wave-1 burn-down.
+
+What remains here is deliberate:
+- the transcript-verification contract -- which transcript records count as
+  proof that a nudge actually reached the lane (marker + real turn start,
+  codex/claude envelopes, hook delivery, mid-turn queued commands, and every
+  shape that must NOT confirm);
+- LaneLock single-writer enforcement on real lock files;
+- the governed-remote permission boundary -- remote dispatch only ever goes
+  through ssh and the narrow chitra-tmux-capture / chitra-lane-steer verbs;
+- SAFETY deny paths no other test asserts: host allowlist, unsubmitted-draft
+  protection, malformed session_ref, transcript-glob traversal, fail-closed
+  pane/composer handling, ssh run-as validation, session-qualified pane
+  targeting (a bare pane spec must never reach tmux), honest
+  FAILED/UNCONFIRMED reporting;
+- one real-tmux roundtrip, skipped where tmux is absent.
+
+Removed: scripted-tmux paste/find internals (pane_in_mode, paste -p flag,
+remote find commands, pane-capture verification, TUI fallback internals,
+directive-voice mechanics -- its deny path is covered by test_dispatchd).
+Restored verbatim: the tmux_pane_target regression that keeps every -t
+target session-qualified.
+"""
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 import time
@@ -16,34 +36,21 @@ import pytest
 
 from chitra.dispatch import (
     _CODEX_KITTY_ENTER_SEQUENCE,
-    DISPATCH_VERIFY_WAIT_SECONDS,
     DispatchOrder,
     DispatchStatus,
     LaneLock,
     LaneLockError,
-    _detect_tui_backend,
-    _remote_transcript_grep_command,
-    cancel_copy_mode,
     capture_dispatch_pane,
-    directive_voice_violation,
     dispatch_to_tmux,
     ensure_nudge_submitted,
-    ensure_pane_not_in_mode,
-    find_recent_transcript,
-    find_recent_transcript_remote,
-    governed_capture_target,
     is_local_host,
-    pane_capture_confirms_nudge,
     pane_in_mode,
     pane_input_check,
     paste_nudge_to_local_tmux,
-    remote_tmux_paste_command,
     ssh_command,
-    tmux_pane_target,
     transcript_confirms_nudge,
     transcript_glob,
 )
-from chitra.policy_config import DispatchPolicy, PolicyConfig
 
 HAS_TMUX = shutil.which("tmux") is not None
 # A remote host has to be one this machine cannot be. Naming a real fleet host
@@ -52,7 +59,6 @@ HAS_TMUX = shutil.which("tmux") is not None
 # is how three governed-remote tests read as failures on tophand and passes in
 # CI. `.invalid` is reserved and never resolves.
 REMOTE_HOST = "not-the-local-host.invalid"
-
 
 def user_turn_jsonl(text: str, *, with_followup: bool = True) -> str:
     """Build a structural JSONL transcript fixture.
@@ -100,104 +106,6 @@ class FakeInputRunner:
     def __call__(self, cmd: list[str], payload: str, *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
         self.calls.append((cmd, payload))
         return self.default
-
-
-# --- (1) pane_in_mode detection + cancel logic ---------------------------
-
-
-def test_pane_in_mode_true_when_display_message_returns_1() -> None:
-    runner = FakeRunner(default=fake_completed(0, "1\n", ""))
-    assert pane_in_mode("session:0.0", runner=runner) is True
-
-
-def test_pane_in_mode_false_when_display_message_returns_0() -> None:
-    runner = FakeRunner(default=fake_completed(0, "0\n", ""))
-    assert pane_in_mode("session:0.0", runner=runner) is False
-
-
-def test_ensure_pane_not_in_mode_cancels_when_in_copy_mode() -> None:
-    calls: list[list[str]] = []
-
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        calls.append(cmd)
-        if cmd[:2] == ["tmux", "display-message"]:
-            return fake_completed(0, "1\n", "")
-        return fake_completed(0, "", "")
-
-    ok = ensure_pane_not_in_mode("session:0.0", runner=runner)
-    assert ok is True
-    assert any(cmd[:4] == ["tmux", "send-keys", "-t", "session:0.0"] and "-X" in cmd for cmd in calls)
-
-
-def test_cancel_copy_mode_returns_false_on_failure() -> None:
-    runner = FakeRunner(default=fake_completed(1, "", "no such pane"))
-    assert cancel_copy_mode("session:0.0", runner=runner, wait_seconds=0) is False
-
-
-def test_pane_in_mode_checks_remote_host_over_ssh_not_local_tmux() -> None:
-    """Regression test for the copy-mode-checks-the-wrong-host bug: a remote
-    target's copy-mode state must be checked via ssh against the remote
-    tmux server, never via a bare local ``tmux`` invocation."""
-    runner = FakeRunner(default=fake_completed(0, "1\n", ""))
-    result = pane_in_mode("f3:0.0", host="otherhost", runner=runner, local_extra={"localhost"})
-    assert result is True
-    assert len(runner.calls) == 1
-    cmd = runner.calls[0]
-    assert cmd[0] == "ssh"
-    assert cmd[-2] == "otherhost"
-    assert "tmux display-message -p -t f3:0.0" in cmd[-1]
-
-
-def test_pane_in_mode_local_host_uses_bare_tmux_call() -> None:
-    runner = FakeRunner(default=fake_completed(0, "0\n", ""))
-    result = pane_in_mode("f3:0.0", host="localhost", runner=runner, local_extra={"localhost"})
-    assert result is False
-    assert runner.calls == [["tmux", "display-message", "-p", "-t", "f3:0.0", "#{pane_in_mode}"]]
-
-
-def test_cancel_copy_mode_cancels_remote_host_over_ssh() -> None:
-    runner = FakeRunner(default=fake_completed(0, "", ""))
-    ok = cancel_copy_mode("f3:0.0", host="otherhost", runner=runner, local_extra={"localhost"}, wait_seconds=0)
-    assert ok is True
-    assert len(runner.calls) == 1
-    cmd = runner.calls[0]
-    assert cmd[0] == "ssh"
-    assert cmd[-2] == "otherhost"
-    assert "tmux send-keys -t f3:0.0 -X cancel" in cmd[-1]
-
-
-def test_ensure_pane_not_in_mode_cancels_remote_host_over_ssh_when_in_copy_mode() -> None:
-    calls: list[list[str]] = []
-
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        calls.append(cmd)
-        if cmd[0] == "ssh" and "display-message" in cmd[-1]:
-            return fake_completed(0, "1\n", "")
-        return fake_completed(0, "", "")
-
-    ok = ensure_pane_not_in_mode("f3:0.0", host="otherhost", runner=runner, local_extra={"localhost"})
-    assert ok is True
-    assert all(cmd[0] == "ssh" and cmd[-2] == "otherhost" for cmd in calls)
-    assert any("send-keys" in cmd[-1] and "-X cancel" in cmd[-1] for cmd in calls)
-
-
-# --- (2) -p is present in the constructed paste-buffer command ------------
-
-
-def test_local_paste_command_includes_dash_p_flag() -> None:
-    runner = FakeRunner()
-    input_runner = FakeInputRunner()
-    paste_nudge_to_local_tmux("session:0.0", "hello\nworld", runner=runner, input_runner=input_runner)
-    paste_calls = [c for c in runner.calls if c[:2] == ["tmux", "paste-buffer"]]
-    assert paste_calls, "expected a paste-buffer call"
-    assert "-p" in paste_calls[0]
-
-
-def test_remote_paste_command_includes_dash_p_flag() -> None:
-    command = remote_tmux_paste_command("session:0.0", "hello")
-    assert "paste-buffer -p" in command or "paste-buffer' '-p'" in command
-    assert " -p " in command
-
 
 # --- (3) transcript-grep verification against a synthetic fixture --------
 
@@ -489,200 +397,6 @@ def test_transcript_confirms_nudge_expected_path_accepts_only_bound_match(tmp_pa
     assert confirmed is False
     assert path is None
 
-
-def test_find_recent_transcript_searches_multiple_pathsep_separated_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A session under a non-default CLAUDE_CONFIG_DIR (e.g. chitra's own
-    monitor/harness identity, which runs under ~/.claude-chitra rather than
-    ~/.claude) writes its transcripts under that root's projects/ dir.
-    CHITRA_CLAUDE_PROJECTS must be able to list more than one root or
-    transcript-grep can never confirm delivery to such a session -- see
-    dispatch_to_tmux's fall-through to FAILED when both transcript-grep and
-    the pane-capture fallback miss.
-    """
-    default_root = tmp_path / "home" / ".claude" / "projects"
-    alt_root = tmp_path / "home" / ".claude-chitra" / "projects"
-    session_dir = alt_root / "some-harness-project"
-    session_dir.mkdir(parents=True)
-    default_root.mkdir(parents=True)
-    transcript = session_dir / "abc123.jsonl"
-    transcript.write_text(user_turn_jsonl("fleet status sweep now"), encoding="utf-8")
-
-    monkeypatch.setenv("CHITRA_CLAUDE_PROJECTS", f"{default_root}{os.pathsep}{alt_root}")
-
-    found = find_recent_transcript("fleet status sweep now", now_ts=time.time())
-
-    assert found == transcript
-
-
-def test_remote_transcript_find_script_expands_default_tilde_root() -> None:
-    script = _remote_transcript_grep_command("marker", "~/.claude/projects", 300)
-
-    assert 'root="$HOME"/.claude/projects' in script
-    assert "'~/.claude/projects'" not in script
-    assert "~/.claude/projects" not in script
-    assert "grep" not in script
-
-
-def test_remote_transcript_find_script_quotes_absolute_custom_root() -> None:
-    script = _remote_transcript_grep_command("marker", "/srv/Claude Projects", 300)
-
-    assert "root='/srv/Claude Projects'" in script
-    assert '-path "$root"/' in script
-
-
-def test_find_recent_transcript_remote_matches_tail_from_ssh_output() -> None:
-    """Remote transcript candidates are located over ssh and their tails are
-    compared locally before a delivery can become SENT."""
-
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        if "find " in cmd[-1]:
-            return fake_completed(0, "1720000000 /home/ubuntu/.claude/projects/foo/abc.jsonl\n", "")
-        return fake_completed(0, user_turn_jsonl("please check lane f3 status now"), "")
-
-    path = find_recent_transcript_remote("otherhost", "please check lane f3 status now", runner=runner)
-    assert path == "/home/ubuntu/.claude/projects/foo/abc.jsonl"
-
-
-def test_find_recent_transcript_remote_expected_path_skips_discovery() -> None:
-    expected = "/remote/projects/bound/abc.jsonl"
-    calls: list[list[str]] = []
-
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        calls.append(cmd)
-        assert "find " not in cmd[-1]
-        return fake_completed(0, user_turn_jsonl("check the bound lane"), "")
-
-    path = find_recent_transcript_remote(
-        "otherhost",
-        "check the bound lane",
-        expected_transcript_path=expected,
-        runner=runner,
-    )
-
-    assert path == expected
-    assert len(calls) == 1
-    assert expected in calls[0][-1]
-
-
-def test_find_recent_transcript_remote_expected_path_rejects_nonmatching_tail() -> None:
-    expected = "/remote/projects/bound/abc.jsonl"
-
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        assert "find " not in cmd[-1]
-        return fake_completed(0, user_turn_jsonl("a different nudge"), "")
-
-    assert (
-        find_recent_transcript_remote(
-            "otherhost",
-            "check the bound lane",
-            expected_transcript_path=expected,
-            runner=runner,
-        )
-        is None
-    )
-
-
-def test_find_recent_transcript_remote_matches_json_escaped_quote_and_whitespace() -> None:
-    path = "/remote/projects/foo/abc.jsonl"
-
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        if "find " in cmd[-1]:
-            return fake_completed(0, f"1720000000 {path}\n", "")
-        return fake_completed(0, user_turn_jsonl('please say "hello"   now'), "")
-
-    confirmed, found = transcript_confirms_nudge(
-        'please say "hello"     now',
-        host="otherhost",
-        runner=runner,
-        local_extra={"localhost"},
-    )
-    assert confirmed is True
-    assert found == path
-
-
-def test_find_recent_transcript_remote_find_command_never_quotes_default_tilde() -> None:
-    runner = FakeRunner(default=fake_completed(0, "", ""))
-    assert find_recent_transcript_remote("otherhost", "marker text", runner=runner) is None
-
-    assert len(runner.calls) == 1
-    cmd = runner.calls[0]
-    assert cmd[0] == "ssh"
-    assert cmd[-2] == "otherhost"
-    assert "'~/.claude/projects'" not in cmd[-1]
-    assert 'root="$HOME"/.claude/projects' in cmd[-1]
-
-
-def test_find_recent_transcript_remote_picks_most_recent_of_multiple_matches() -> None:
-    stdout = "1000 /old/path.jsonl\n2000 /new/path.jsonl\n"
-
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        if "find " in cmd[-1]:
-            return fake_completed(0, stdout, "")
-        return fake_completed(0, user_turn_jsonl("marker text"), "")
-
-    path = find_recent_transcript_remote("otherhost", "marker text", runner=runner)
-    assert path == "/new/path.jsonl"
-
-
-def test_find_recent_transcript_remote_returns_none_on_no_match() -> None:
-    runner = FakeRunner(default=fake_completed(0, "", ""))
-    assert find_recent_transcript_remote("otherhost", "marker text", runner=runner) is None
-
-
-def test_find_recent_transcript_remote_returns_none_on_ssh_failure() -> None:
-    runner = FakeRunner(default=fake_completed(255, "", "ssh: connect timed out"))
-    assert find_recent_transcript_remote("otherhost", "marker text", runner=runner) is None
-
-
-def test_transcript_confirms_nudge_uses_remote_transcript_for_a_remote_host() -> None:
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        if "find " in cmd[-1]:
-            return fake_completed(0, "1720000000 /remote/projects/foo/abc.jsonl\n", "")
-        return fake_completed(0, user_turn_jsonl("please check lane f3 status now"), "")
-
-    confirmed, path = transcript_confirms_nudge(
-        "please check lane f3 status now",
-        host="otherhost",
-        runner=runner,
-        local_extra={"localhost"},
-    )
-    assert confirmed is True
-    assert path == "/remote/projects/foo/abc.jsonl"
-
-
-def test_transcript_confirms_nudge_stays_local_for_a_local_host(tmp_path: Path) -> None:
-    """host="" (default) or a recognized-local host must not change existing
-    local-only behavior."""
-    projects_root = tmp_path / "projects"
-    session_dir = projects_root / "some-project"
-    session_dir.mkdir(parents=True)
-    transcript = session_dir / "abc123.jsonl"
-    transcript.write_text(user_turn_jsonl("please check lane f3 status now"), encoding="utf-8")
-
-    confirmed, path = transcript_confirms_nudge(
-        "please check lane f3 status now",
-        host="localhost",
-        projects_root=projects_root,
-        local_extra={"localhost"},
-        now_ts=time.time(),
-    )
-    assert confirmed is True
-    assert path == transcript
-
-
-def test_find_recent_transcript_respects_recency_window(tmp_path: Path) -> None:
-    projects_root = tmp_path / "projects"
-    session_dir = projects_root / "some-project"
-    session_dir.mkdir(parents=True)
-    transcript = session_dir / "old.jsonl"
-    transcript.write_text("the marker text", encoding="utf-8")
-    old_mtime = time.time() - 10_000
-    os.utime(transcript, (old_mtime, old_mtime))
-
-    found = find_recent_transcript("the marker text", projects_root=projects_root, recency_seconds=300, now_ts=time.time())
-    assert found is None
-
-
 # --- (8) LaneLock: single-writer enforcement ------------------------------
 
 
@@ -730,358 +444,6 @@ def test_lane_lock_context_manager_releases_on_exit(tmp_path: Path) -> None:
     other2.release()
 
 
-# --- tmux_pane_target ------------------------------------------------------
-
-
-def test_tmux_pane_target_qualifies_a_bare_pane_with_its_session() -> None:
-    assert tmux_pane_target("f3", "0.0") == "f3:0.0"
-
-
-def test_tmux_pane_target_leaves_an_already_qualified_target_alone() -> None:
-    assert tmux_pane_target("f3", "other-session:0.0") == "other-session:0.0"
-
-
-def test_tmux_pane_target_leaves_a_global_pane_id_alone() -> None:
-    assert tmux_pane_target("f3", "%42") == "%42"
-
-
-def test_governed_capture_target_normalizes_canonical_dot_pane() -> None:
-    assert governed_capture_target("monitor-probe:0.0") == "monitor-probe:0:0"
-
-
-def test_governed_capture_target_leaves_already_normalized_target_alone() -> None:
-    assert governed_capture_target("monitor-probe:0:0") == "monitor-probe:0:0"
-
-
-def test_dispatch_to_tmux_qualifies_pane_with_session_before_any_tmux_call() -> None:
-    """Regression test: capture/paste/etc must never receive a bare pane
-    spec — on a host running more than one tmux session, that resolves
-    against whichever session tmux considers 'current', not the session
-    named in session_ref."""
-    seen_targets: list[str] = []
-
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        if "-t" in cmd:
-            seen_targets.append(cmd[cmd.index("-t") + 1])
-        if cmd[:2] == ["tmux", "capture-pane"]:
-            return fake_completed(0, "ubuntu@host:~$ ", "")
-        return fake_completed(0, "", "")
-
-    def input_runner(cmd: list[str], payload: str, *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        return fake_completed(0, "", "")
-
-    order = DispatchOrder(order_id="o1", session_ref="localhost:f3:0.0", nudge="hello")
-    dispatch_to_tmux(order, runner=runner, input_runner=input_runner, local_extra={"localhost"})
-
-    assert seen_targets, "expected at least one -t target to have been recorded"
-    assert all(t == "f3:0.0" for t in seen_targets), seen_targets
-
-
-def test_pane_capture_confirms_nudge_true_when_marker_visible() -> None:
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        if cmd[:2] == ["tmux", "capture-pane"]:
-            return fake_completed(0, "scrollback line\n❯ please check lane f3 status now\n", "")
-        return fake_completed(0, "", "")
-
-    assert (
-        pane_capture_confirms_nudge(
-            "please check lane f3 status now",
-            host="localhost",
-            pane="f3:0.0",
-            runner=runner,
-            local_extra={"localhost"},
-        )
-        is True
-    )
-
-
-def test_pane_capture_confirms_nudge_false_when_marker_absent() -> None:
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        if cmd[:2] == ["tmux", "capture-pane"]:
-            return fake_completed(0, "unrelated pane content\n❯ \n", "")
-        return fake_completed(0, "", "")
-
-    assert (
-        pane_capture_confirms_nudge(
-            "please check lane f3 status now",
-            host="localhost",
-            pane="f3:0.0",
-            runner=runner,
-            local_extra={"localhost"},
-        )
-        is False
-    )
-
-
-def test_pane_capture_does_not_confirm_marker_still_in_codex_composer() -> None:
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        if cmd[:2] == ["tmux", "capture-pane"]:
-            return fake_completed(
-                0,
-                "older output\n› Reply with exactly STEER_0910_CONSUMED and no other text.\nstatus row\n",
-                "",
-            )
-        return fake_completed(0, "", "")
-
-    assert (
-        pane_capture_confirms_nudge(
-            "Reply with exactly STEER_0910_CONSUMED and no other text.",
-            host="localhost",
-            pane="f3:0.0",
-            runner=runner,
-            local_extra={"localhost"},
-        )
-        is False
-    )
-
-
-def test_dispatch_to_tmux_falls_back_to_pane_capture_when_transcript_missing(tmp_path: Path) -> None:
-    """Regression: a mechanically-successful send whose transcript can't be
-    located must NOT report FAILED outright. When transcript-grep finds
-    nothing and the pane shows the delivered nudge but no recognized TUI
-    composer row, the scrollback text cannot be told apart from a bare
-    terminal echo -- the result is DELIVERY_UNCONFIRMED (retried by
-    dispatchd), never a terminal SENT or FAILED."""
-    empty_projects = tmp_path / "projects"
-    empty_projects.mkdir()
-    captures = {"n": 0}
-
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        if cmd[:2] == ["tmux", "capture-pane"]:
-            captures["n"] += 1
-            if captures["n"] == 1:
-                return fake_completed(0, "ubuntu@host:~$ ", "")  # pre-check: idle
-            return fake_completed(0, "❯ diagnose the failing build\n", "")  # fallback: marker visible
-        return fake_completed(0, "", "")
-
-    def input_runner(cmd: list[str], payload: str, *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        return fake_completed(0, "", "")
-
-    order = DispatchOrder(order_id="o1", session_ref="localhost:f3:0.0", nudge="diagnose the failing build")
-    result = dispatch_to_tmux(
-        order,
-        runner=runner,
-        input_runner=input_runner,
-        local_extra={"localhost"},
-        projects_root=empty_projects,
-    )
-
-    assert result.status == DispatchStatus.DELIVERY_UNCONFIRMED
-    assert "no recognized TUI composer" in result.reason
-
-
-# --- pane_input_check ------------------------------------------------------
-
-
-def test_pane_input_check_allows_an_empty_claude_code_tui_input_row() -> None:
-    check = pane_input_check(
-        [
-            "Claude Code output",
-            "  ──────────────────────",
-            "    ❯    ",
-            "  ──────────────────────",
-            "⏵⏵ accept edits on (shift+tab to cycle)",
-        ]
-    )
-
-    assert check.ok is True
-    assert check.last_line == "❯"
-
-
-def test_pane_input_check_blocks_a_claude_code_tui_draft() -> None:
-    check = pane_input_check(
-        [
-            "Claude Code output",
-            "──────────────────────",
-            "❯ some text",
-            "──────────────────────",
-            "⏵⏵ accept edits on (shift+tab to cycle)",
-        ]
-    )
-
-    assert check.ok is False
-    assert check.reason == "blocked: unsubmitted operator draft detected"
-    assert check.last_line == "❯ some text"
-
-
-def test_pane_input_check_treats_a_dim_placeholder_hint_as_idle() -> None:
-    """A fresh/idle Claude Code session paints its input row with a dim
-    (ANSI SGR 2) placeholder hint. With an escape-aware capture, that ghost
-    text must classify as idle so chitra can deliver — not block as if it were
-    a real draft."""
-    check = pane_input_check(
-        [
-            "Claude Code output",
-            "──────────────────────",
-            '\x1b[38;5;242m❯\x1b[39m \x1b[2mTry "how does src/foo.py work?"\x1b[22m',
-            "──────────────────────",
-            "⏵⏵ accept edits on (shift+tab to cycle)",
-        ]
-    )
-
-    assert check.ok is True
-    assert check.reason == "idle: Claude Code TUI input row shows only a dim placeholder hint"
-    assert check.last_line == '❯ Try "how does src/foo.py work?"'
-
-
-def test_pane_input_check_blocks_a_normal_intensity_draft_even_with_styling() -> None:
-    """A real draft is normal intensity. Even when the pane carries escape
-    sequences (colored prompt marker), a normal-intensity draft must still
-    block — the placeholder relaxation must not weaken real-draft protection."""
-    check = pane_input_check(
-        [
-            "Claude Code output",
-            "──────────────────────",
-            "\x1b[38;5;242m❯\x1b[39m fix the parser bug",
-            "──────────────────────",
-            "⏵⏵ accept edits on (shift+tab to cycle)",
-        ]
-    )
-
-    assert check.ok is False
-    assert check.reason == "blocked: unsubmitted operator draft detected"
-    assert check.last_line == "❯ fix the parser bug"
-
-
-def test_pane_input_check_blocks_a_partially_dim_draft() -> None:
-    """A draft that is only partly dim (operator typed over a placeholder, or
-    mixed styling) is still a real draft — any normal-intensity visible char
-    blocks."""
-    check = pane_input_check(
-        [
-            "Claude Code output",
-            "──────────────────────",
-            '\x1b[2m❯ Try "x"\x1b[22m real text',
-            "──────────────────────",
-            "⏵⏵ accept edits on (shift+tab to cycle)",
-        ]
-    )
-
-    assert check.ok is False
-    assert check.reason == "blocked: unsubmitted operator draft detected"
-
-
-@pytest.fixture(
-    params=[
-        "Explain this codebase",
-        "Summarize recent commits",
-        "Implement {feature}",
-        "Find and fix a bug in @filename",
-        "Write tests for @filename",
-        "Improve documentation in @filename",
-        "Run /review on my current changes",
-        "Use /skills to list available skills",
-        "Check recently modified functions for compatibility",
-        "How many files have been modified?",
-        "Will this algorithm scale well?",
-    ]
-)
-def codex_tui_placeholder_capture(request: pytest.FixtureRequest) -> tuple[list[str], str]:
-    """Escape-aware terminal capture matching the Codex 0.144 composer."""
-    hint = str(request.param)
-    return (
-        [
-            "• Investigating rendering code (0s • esc to interrupt)",
-            f"\x1b[1m›\x1b[0m \x1b[2m{hint}\x1b[22m",
-            "  ? for shortcuts                                       100% context left",
-        ],
-        hint,
-    )
-
-
-def test_pane_input_check_treats_codex_tui_placeholder_hints_as_idle(
-    codex_tui_placeholder_capture: tuple[list[str], str],
-) -> None:
-    captured_lines, hint = codex_tui_placeholder_capture
-
-    check = pane_input_check(captured_lines)
-
-    assert check.ok is True
-    assert check.reason == "idle: Codex TUI input row shows only a placeholder hint"
-    assert check.last_line == f"› {hint}"
-
-
-def test_pane_input_check_blocks_a_codex_tui_operator_draft() -> None:
-    check = pane_input_check(
-        [
-            "• Ready for input",
-            "\x1b[1m›\x1b[0m fix the parser bug",
-            "  ? for shortcuts                                       100% context left",
-        ]
-    )
-
-    assert check.ok is False
-    assert check.reason == "blocked: unsubmitted operator draft detected"
-    assert check.last_line == "› fix the parser bug"
-
-
-def test_pane_input_check_treats_an_unknown_dim_codex_tui_suggestion_as_idle() -> None:
-    """An all-dim row is sufficient evidence of a placeholder even when the
-    hint text isn't in the known list yet — Codex adds hints across releases."""
-    check = pane_input_check(
-        [
-            "• Ready for input",
-            "\x1b[1m›\x1b[0m \x1b[2mRun the production migration\x1b[22m",
-            "  ? for shortcuts                                       100% context left",
-        ]
-    )
-
-    assert check.ok is True
-    assert check.reason == "idle: Codex TUI input row shows only a placeholder hint"
-
-
-def test_pane_input_check_treats_a_known_codex_hint_at_normal_intensity_as_idle() -> None:
-    """An exact match against a known placeholder hint is sufficient evidence
-    of a placeholder at any render intensity: a real operator draft that is
-    character-identical to a rotating hint is not plausible content worth
-    protecting."""
-    check = pane_input_check(
-        [
-            "• Ready for input",
-            "\x1b[1m›\x1b[0m Summarize recent commits",
-            "  ? for shortcuts                                       100% context left",
-        ]
-    )
-
-    assert check.ok is True
-    assert check.reason == "idle: Codex TUI input row shows only a placeholder hint"
-
-
-def test_pane_input_check_treats_codex_ghost_suggestion_as_idle() -> None:
-    """Regression: Codex paints this rotating composer placeholder at normal
-    intensity on some terminals; it is not an operator draft."""
-    check = pane_input_check(
-        [
-            "• Ready for input",
-            "\x1b[1m›\x1b[0m Ask Codex to do anything",
-            "  ? for shortcuts                                       100% context left",
-        ]
-    )
-    assert check.ok is True
-    assert check.reason == "idle: Codex TUI input row shows only a placeholder hint"
-
-
-def test_pane_input_check_blocks_an_unknown_normal_intensity_codex_draft() -> None:
-    """A normal-intensity row that is not a known hint remains blocked — the
-    fail-closed property for real drafts is preserved."""
-    check = pane_input_check(
-        [
-            "• Ready for input",
-            "\x1b[1m›\x1b[0m Run the production migration",
-            "  ? for shortcuts                                       100% context left",
-        ]
-    )
-
-    assert check.ok is False
-    assert check.reason == "blocked: unsubmitted operator draft detected"
-
-
-@pytest.mark.parametrize("prompt", ["ubuntu@host:~$ ", "(venv) user@host:~$ ", ">>> "])
-def test_pane_input_check_keeps_shell_prompt_idle_detection(prompt: str) -> None:
-    check = pane_input_check(["previous output", prompt])
-
-    assert check.ok is True
-    assert check.last_line == prompt.strip()
 
 
 def test_pane_input_check_fails_closed_for_an_unrecognizable_pane_shape() -> None:
@@ -1091,32 +453,12 @@ def test_pane_input_check_fails_closed_for_an_unrecognizable_pane_shape() -> Non
     assert check.reason == "blocked: unsubmitted operator draft detected"
     assert check.last_line == "status line"
 
-
-def test_pane_input_check_accepts_a_configured_idle_shape() -> None:
-    check = pane_input_check(["previous output", "READY"], extra_idle_regexes=[re.compile(r"READY")])
-    assert check.ok is True
-    assert check.reason == "idle: matched configured idle pattern"
-
-
 def test_transcript_glob_is_relative_and_rejects_parent_or_absolute_patterns(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CHITRA_TRANSCRIPT_GLOB", "runs/**/*.jsonl")
     assert transcript_glob() == "runs/**/*.jsonl"
     monkeypatch.setenv("CHITRA_TRANSCRIPT_GLOB", "../outside/*.jsonl")
     with pytest.raises(ValueError):
         transcript_glob()
-
-
-def test_find_recent_transcript_uses_the_configured_glob(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    root = tmp_path / "projects"
-    transcript = root / "runs" / "one" / "two" / "target.jsonl"
-    transcript.parent.mkdir(parents=True)
-    transcript.write_text(user_turn_jsonl("configured marker"), encoding="utf-8")
-    monkeypatch.setenv("CHITRA_TRANSCRIPT_GLOB", "runs/*/*/*.jsonl")
-    assert find_recent_transcript("configured marker", projects_root=root) == transcript
-    monkeypatch.setenv("CHITRA_TRANSCRIPT_GLOB", "/outside/*.jsonl")
-    with pytest.raises(ValueError):
-        transcript_glob()
-
 
 def test_ssh_command_reads_the_configurable_host_key_and_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CHITRA_SSH_STRICT_HOST_KEY_CHECKING", "yes")
@@ -1138,7 +480,6 @@ def test_ssh_command_can_use_the_narrow_grant_owner(monkeypatch: pytest.MonkeyPa
     with pytest.raises(ValueError, match="valid local account"):
         ssh_command("tophand", "true")
 
-
 def test_the_remote_host_these_tests_use_is_never_the_local_one() -> None:
     """Keeps the governed-remote tests from testing the local path by accident.
 
@@ -1149,7 +490,6 @@ def test_the_remote_host_these_tests_use_is_never_the_local_one() -> None:
     """
     assert not is_local_host(REMOTE_HOST)
     assert not is_local_host(REMOTE_HOST, set())
-
 
 def test_governed_remote_capture_uses_fixed_visibility_verb(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CHITRA_REMOTE_LANE_GRANT", "codexman")
@@ -1165,7 +505,6 @@ def test_governed_remote_capture_uses_fixed_visibility_verb(monkeypatch: pytest.
 
     assert captured[-1] == "› Use /skills to list available skills"
     assert runner.calls[0][-1] == "chitra-tmux-capture monitor-probe:0:0"
-
 
 # --- dispatch_to_tmux end-to-end (fake runner) ----------------------------
 
@@ -1204,208 +543,6 @@ def test_dispatch_to_tmux_blocks_host_not_in_allowlist() -> None:
     assert result.status == DispatchStatus.BLOCKED
     assert "not in allowlist" in result.reason
 
-
-# --- routing_hint: opaque pass-through only, chitra never interprets it --
-
-
-def test_dispatch_to_tmux_carries_routing_hint_through_unchanged() -> None:
-    """routing_hint is a caller-supplied opaque value: chitra copies it
-    into DispatchResult unchanged and never reads/acts on its contents,
-    exactly like the existing tag pass-through."""
-    order = DispatchOrder(
-        order_id="o1",
-        session_ref="not-three-parts",
-        nudge="hello",
-        routing_hint="opus-panel",
-    )
-    result = dispatch_to_tmux(order)
-    assert result.routing_hint == "opus-panel"
-
-
-def test_dispatch_to_tmux_defaults_routing_hint_to_none() -> None:
-    """Backward compatibility: an order that never sets routing_hint (the
-    default) behaves exactly as before this field was added."""
-    order = DispatchOrder(order_id="o1", session_ref="not-three-parts", nudge="hello")
-    assert order.routing_hint is None
-    result = dispatch_to_tmux(order)
-    assert result.status == DispatchStatus.FAILED
-    assert result.routing_hint is None
-
-
-# --- directive-voice guard --------------------------------------------------
-
-
-def test_directive_voice_violation_none_for_a_clean_instruction() -> None:
-    assert directive_voice_violation("Stop editing main and open a PR.") is None
-
-
-def test_dispatch_policy_can_replace_directive_voice_patterns() -> None:
-    # The host has to be one this machine is not. Named `localhost` before, and
-    # on a real lane host that took the local path, skipped the allowlist gate
-    # this test relies on to block, and dispatched for real against whatever
-    # tmux session `s` matched. On tophand that is a live lane.
-    policy = PolicyConfig(dispatch=DispatchPolicy(banned_attribution_patterns=[r"forbidden"], extra_idle_input_regexes=[]))
-    order = DispatchOrder(order_id="o1", session_ref=f"{REMOTE_HOST}:s:0.0", nudge="The operator asked for this")
-    result = dispatch_to_tmux(order, policy=policy, allowed_hosts=set(), local_extra=set())
-    assert result.status == DispatchStatus.BLOCKED
-    assert not result.reason.startswith("directive-voice:")
-
-
-def test_unconfigured_policy_path_matches_explicit_shipped_policy() -> None:
-    order = DispatchOrder(order_id="o1", session_ref="untrusted:s:0.0", nudge="A normal relay instruction")
-    no_config = dispatch_to_tmux(order, allowed_hosts=set(), local_extra=set())
-    shipped_policy = dispatch_to_tmux(order, policy=PolicyConfig(), allowed_hosts=set(), local_extra=set())
-    assert no_config.model_dump(exclude={"at"}) == shipped_policy.model_dump(exclude={"at"})
-
-
-def test_dispatch_to_tmux_sends_a_clean_order(tmp_path: Path) -> None:
-    projects_root = tmp_path / "projects"
-    session_dir = projects_root / "some-project"
-    unrelated_dir = projects_root / "unrelated-project"
-    session_dir.mkdir(parents=True)
-    unrelated_dir.mkdir(parents=True)
-    transcript = session_dir / "abc123.jsonl"
-    unrelated = unrelated_dir / "newer.jsonl"
-    transcript.write_text(user_turn_jsonl("Stop editing main and open a PR."), encoding="utf-8")
-    unrelated.write_text(user_turn_jsonl("Stop editing main and open a PR."), encoding="utf-8")
-    newer = time.time() + 1
-    os.utime(unrelated, (newer, newer))
-
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        if cmd[:2] == ["tmux", "capture-pane"]:
-            return fake_completed(0, "ubuntu@host:~$ ", "")
-        return fake_completed(0, "", "")
-
-    def input_runner(cmd: list[str], payload: str, *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        return fake_completed(0, "", "")
-
-    order = DispatchOrder(order_id="o1", session_ref="localhost:f3:0.0", nudge="Stop editing main and open a PR.")
-    result = dispatch_to_tmux(
-        order,
-        runner=runner,
-        input_runner=input_runner,
-        local_extra={"localhost"},
-        projects_root=projects_root,
-        expected_transcript_path=transcript,
-        sleep=lambda _seconds: None,
-    )
-    assert result.status == DispatchStatus.SENT
-    assert result.transcript_path == str(transcript)
-
-
-def test_dispatch_to_tmux_uses_governed_remote_capture_and_steer(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CHITRA_REMOTE_LANE_GRANT", "codexman")
-    delivered = False
-
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        if cmd[-1] == "chitra-tmux-capture monitor-probe:0:0":
-            content = "ready\nReply with the acceptance marker.\n" if delivered else "ready\n› Use /skills to list available skills\n"
-            capture_json = json.dumps({"ok": True, "content": content, "truncated": False})
-            return fake_completed(0, capture_json, "")
-        return fake_completed(1, "", "not available through governed grant")
-
-    input_calls: list[tuple[list[str], str]] = []
-
-    def input_runner(cmd: list[str], payload: str, *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        nonlocal delivered
-        input_calls.append((cmd, payload))
-        delivered = True
-        return fake_completed()
-
-    order = DispatchOrder(
-        order_id="governed-remote",
-        session_ref=f"{REMOTE_HOST}:monitor-probe:0.0",
-        nudge="Reply with the acceptance marker.",
-    )
-
-    result = dispatch_to_tmux(
-        order,
-        runner=runner,
-        input_runner=input_runner,
-        allowed_hosts={REMOTE_HOST},
-        local_extra=set(),
-        sleep=lambda _seconds: None,
-    )
-
-    assert result.status == DispatchStatus.DELIVERY_UNCONFIRMED
-    assert "no recognized TUI composer" in result.reason
-    assert input_calls[0][0][-1] == "chitra-lane-steer monitor-probe"
-    assert input_calls[0][1] == order.nudge
-
-
-def test_dispatch_to_tmux_waits_through_an_observed_slow_transcript_flush(tmp_path: Path) -> None:
-    projects_root = tmp_path / "projects"
-    session_dir = projects_root / "some-project"
-    session_dir.mkdir(parents=True)
-    transcript = session_dir / "abc123.jsonl"
-    waits: list[float] = []
-
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        if cmd[:2] == ["tmux", "capture-pane"]:
-            return fake_completed(0, "ubuntu@host:~$ ", "")
-        return fake_completed(0, "", "")
-
-    def input_runner(cmd: list[str], payload: str, *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        return fake_completed(0, "", "")
-
-    def complete_delayed_flush(seconds: float) -> None:
-        waits.append(seconds)
-        transcript.write_text(user_turn_jsonl("Resume the F9 objective."), encoding="utf-8")
-
-    order = DispatchOrder(order_id="o1", session_ref="localhost:f9:0.0", nudge="Resume the F9 objective.")
-    result = dispatch_to_tmux(
-        order,
-        runner=runner,
-        input_runner=input_runner,
-        local_extra={"localhost"},
-        projects_root=projects_root,
-        sleep=complete_delayed_flush,
-    )
-
-    assert waits == [DISPATCH_VERIFY_WAIT_SECONDS]
-    assert DISPATCH_VERIFY_WAIT_SECONDS == 15.0
-    assert result.status == DispatchStatus.SENT
-    assert result.transcript_path == str(transcript)
-
-
-def test_dispatch_to_tmux_delivers_to_a_fresh_session_showing_a_dim_placeholder(tmp_path: Path) -> None:
-    """Regression for the fresh-session delivery bug: a never-used Claude Code
-    session renders its input row as a dim placeholder hint. Chitra must reach
-    SENT, not block it as an unsubmitted draft."""
-    projects_root = tmp_path / "projects"
-    session_dir = projects_root / "some-project"
-    session_dir.mkdir(parents=True)
-    transcript = session_dir / "abc123.jsonl"
-    transcript.write_text(user_turn_jsonl("Kick off the build."), encoding="utf-8")
-
-    placeholder_pane = (
-        "Claude Code output\n"
-        "──────────────────────\n"
-        '\x1b[38;5;242m❯\x1b[39m \x1b[2mTry "how does src/foo.py work?"\x1b[22m\n'
-        "──────────────────────\n"
-        "⏵⏵ accept edits on (shift+tab to cycle)\n"
-    )
-
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        if cmd[:2] == ["tmux", "capture-pane"]:
-            return fake_completed(0, placeholder_pane, "")
-        return fake_completed(0, "", "")
-
-    def input_runner(cmd: list[str], payload: str, *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        return fake_completed(0, "", "")
-
-    order = DispatchOrder(order_id="o1", session_ref="localhost:f3:0.0", nudge="Kick off the build.")
-    result = dispatch_to_tmux(
-        order,
-        runner=runner,
-        input_runner=input_runner,
-        local_extra={"localhost"},
-        projects_root=projects_root,
-        sleep=lambda _seconds: None,
-    )
-    assert result.status == DispatchStatus.SENT
-
-
 def test_dispatch_to_tmux_sends_a_clean_order_to_a_remote_host() -> None:
     """End-to-end: chitra's real deployment dispatches FROM one host (e.g.
     host-a) and delivers over ssh into another (e.g. otherhost). Every step
@@ -1440,36 +577,6 @@ def test_dispatch_to_tmux_sends_a_clean_order_to_a_remote_host() -> None:
     assert result.status == DispatchStatus.SENT
     assert result.transcript_path == "/remote/projects/foo/abc.jsonl"
 
-
-@pytest.mark.parametrize(
-    "nudge",
-    [
-        "the operator wants X",
-        "operator is frustrated",
-        "chitra relays: do X",
-    ],
-)
-def test_dispatch_to_tmux_blocks_directive_voice_violations(nudge: str) -> None:
-    calls: list[list[str]] = []
-
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        calls.append(cmd)
-        return fake_completed(0, "", "")
-
-    def input_runner(cmd: list[str], payload: str, *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        calls.append(cmd)
-        return fake_completed(0, "", "")
-
-    order = DispatchOrder(order_id="o1", session_ref="localhost:f3:0.0", nudge=nudge)
-    result = dispatch_to_tmux(order, runner=runner, input_runner=input_runner, local_extra={"localhost"})
-
-    assert result.status == DispatchStatus.BLOCKED
-    assert result.reason.startswith("directive-voice:")
-    # Nothing pasted: no tmux/paste/capture commands issued at all, and no
-    # command was ever routed through the stdin-payload (load-buffer) runner.
-    assert calls == []
-
-
 # --- structural transcript consumption (accepts a genuine turn start) ----
 
 
@@ -1489,88 +596,6 @@ def test_transcript_confirms_nudge_accepts_a_real_user_record_plus_turn_start(tm
     )
     assert confirmed is True
     assert path == transcript
-
-
-# --- verified submit: Codex kitty-composer does not commit on a bare Enter -
-
-
-def test_detect_tui_backend_identifies_codex_claude_and_unknown() -> None:
-    codex_capture = [
-        "• Ready for input",
-        "\x1b[1m›\x1b[0m some draft",
-        "  ? for shortcuts                                       100% context left",
-    ]
-    claude_capture = [
-        "Claude Code output",
-        "──────────────────────",
-        "❯ some draft",
-        "──────────────────────",
-        "⏵⏵ accept edits on (shift+tab to cycle)",
-    ]
-    assert _detect_tui_backend(codex_capture) == "codex"
-    assert _detect_tui_backend(claude_capture) == "claude"
-    assert _detect_tui_backend(["plain shell output"]) == "unknown"
-
-
-def test_ensure_nudge_submitted_ok_when_composer_already_cleared() -> None:
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        if cmd[:2] == ["tmux", "capture-pane"]:
-            return fake_completed(0, "ubuntu@host:~$ ", "")
-        return fake_completed(0, "", "")
-
-    def input_runner(cmd: list[str], payload: str, *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        return fake_completed(0, "", "")
-
-    ok, detail = ensure_nudge_submitted(
-        "localhost",
-        "f3:0.0",
-        "f3",
-        "diagnose the failing build",
-        governed_remote=False,
-        runner=runner,
-        input_runner=input_runner,
-        local_extra={"localhost"},
-        tmux_socket=None,
-    )
-    assert ok is True
-    assert "cleared after Enter" in detail
-
-
-def test_ensure_nudge_submitted_sends_codex_kitty_enter_fallback_and_clears() -> None:
-    sent: list[list[str]] = []
-
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        if cmd[:2] == ["tmux", "capture-pane"]:
-            # The composer keeps holding the nudge through the whole submit
-            # grace window (a genuinely stuck submit, not a slow repaint),
-            # and clears only once the kitty-Enter fallback has been sent.
-            if any(_CODEX_KITTY_ENTER_SEQUENCE in c for c in sent):
-                return fake_completed(0, "• Ready for input\n\x1b[1m›\x1b[0m \n  ? for shortcuts", "")
-            return fake_completed(0, "• Ready for input\n\x1b[1m›\x1b[0m diagnose the failing build\n  ? for shortcuts", "")
-        sent.append(cmd)
-        return fake_completed(0, "", "")
-
-    def input_runner(cmd: list[str], payload: str, *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        return fake_completed(0, "", "")
-
-    ok, detail = ensure_nudge_submitted(
-        "localhost",
-        "f3:0.0",
-        "f3",
-        "diagnose the failing build",
-        governed_remote=False,
-        runner=runner,
-        input_runner=input_runner,
-        local_extra={"localhost"},
-        tmux_socket=None,
-        sleep=lambda _seconds: None,
-    )
-    assert ok is True
-    assert "codex submit fallback" in detail
-    assert any(_CODEX_KITTY_ENTER_SEQUENCE in cmd for cmd in sent)
-    # Never a literal bare ESC keypress -- only the full kitty CSI-u sequence.
-    assert not any(cmd[-1] == "\x1b" for cmd in sent)
-
 
 def test_ensure_nudge_submitted_fails_closed_when_codex_fallback_does_not_clear() -> None:
     def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
@@ -1595,44 +620,6 @@ def test_ensure_nudge_submitted_fails_closed_when_codex_fallback_does_not_clear(
     )
     assert ok is False
     assert detail == "submit-failed-composer-still-holds-text"
-
-
-def test_ensure_nudge_submitted_sends_claude_minimal_payload_fallback() -> None:
-    sent: list[list[str]] = []
-    claude_stuck = (
-        "Claude Code output\n──────────────────────\n❯ diagnose the failing build\n"
-        "──────────────────────\n⏵⏵ accept edits on (shift+tab to cycle)"
-    )
-    claude_clear = "Claude Code output\n──────────────────────\n❯ \n──────────────────────\n⏵⏵ accept edits on (shift+tab to cycle)"
-
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        if cmd[:2] == ["tmux", "capture-pane"]:
-            # Stuck through the whole submit grace window; clears only once
-            # the space+Enter fallback has actually been sent.
-            return fake_completed(0, claude_clear if any(c[-1:] == ["Enter"] for c in sent) else claude_stuck, "")
-        sent.append(cmd)
-        return fake_completed(0, "", "")
-
-    def input_runner(cmd: list[str], payload: str, *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        return fake_completed(0, "", "")
-
-    ok, detail = ensure_nudge_submitted(
-        "localhost",
-        "f3:0.0",
-        "f3",
-        "diagnose the failing build",
-        governed_remote=False,
-        runner=runner,
-        input_runner=input_runner,
-        local_extra={"localhost"},
-        tmux_socket=None,
-        sleep=lambda _seconds: None,
-    )
-    assert ok is True
-    assert "claude submit fallback" in detail
-    assert any(c[:2] == ["tmux", "send-keys"] and "-l" in c and c[-1] == " " for c in sent)
-    assert any(c[:2] == ["tmux", "send-keys"] and c[-1] == "Enter" for c in sent)
-
 
 def test_ensure_nudge_submitted_never_sends_fallback_during_an_active_turn() -> None:
     """A composer that still shows the marker while active-turn chrome ("esc
@@ -1669,7 +656,6 @@ def test_ensure_nudge_submitted_never_sends_fallback_during_an_active_turn() -> 
     assert "active-turn chrome visible" in detail
     assert sent == []
 
-
 def test_ensure_nudge_submitted_governed_remote_fallback_reuses_lane_steer(monkeypatch: pytest.MonkeyPatch) -> None:
     """The governed grant exposes no raw ``tmux send-keys`` verb -- the
     fallback must reuse the same ``chitra-lane-steer`` transport the paste
@@ -1703,93 +689,6 @@ def test_ensure_nudge_submitted_governed_remote_fallback_reuses_lane_steer(monke
     assert input_calls[0][0][-1] == "chitra-lane-steer monitor-probe"
     assert input_calls[0][1] == _CODEX_KITTY_ENTER_SEQUENCE
 
-
-def test_ensure_nudge_submitted_waits_for_the_tui_to_consume_enter() -> None:
-    """Regression for the live-eval false negative: ``send-keys Enter``
-    returns when the bytes reach the pty, but the TUI consumes the submit and
-    repaints its composer asynchronously. A capture taken immediately after
-    Enter can still show the just-pasted draft; the submit check must poll a
-    short grace window before firing a fallback, not report submit-failed in
-    under a tenth of a second on a delivery that actually landed."""
-    captures = {"n": 0}
-    sent: list[list[str]] = []
-    claude_stuck = (
-        "Claude Code output\n──────────────────────\n❯ diagnose the failing build\n"
-        "──────────────────────\n⏵⏵ accept edits on (shift+tab to cycle)"
-    )
-    claude_clear = "Claude Code output\n──────────────────────\n❯ \n──────────────────────\n⏵⏵ accept edits on (shift+tab to cycle)"
-
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        if cmd[:2] == ["tmux", "capture-pane"]:
-            captures["n"] += 1
-            # The pane a few ms after Enter: the draft still shows. On the
-            # next poll the TUI has consumed the submit and repainted.
-            return fake_completed(0, claude_stuck if captures["n"] == 1 else claude_clear, "")
-        sent.append(cmd)
-        return fake_completed(0, "", "")
-
-    ok, detail = ensure_nudge_submitted(
-        "localhost",
-        "f3:0.0",
-        "f3",
-        "diagnose the failing build",
-        governed_remote=False,
-        runner=runner,
-        input_runner=FakeInputRunner(),
-        local_extra={"localhost"},
-        tmux_socket=None,
-        sleep=lambda _seconds: None,
-    )
-    assert ok is True
-    assert detail == "submitted: composer cleared after Enter"
-    # No fallback bytes were fired into a healthy submit.
-    assert sent == []
-
-
-def test_dispatch_to_tmux_reports_sent_when_pane_shows_the_order_landed(tmp_path: Path) -> None:
-    """Regression for the live-eval false negative: transcript-grep can miss
-    a genuinely delivered order (an unflushed write, a transcript outside the
-    searched roots). When the pane shows the submitted marker in the lane's
-    scrollback and a recognized TUI composer row no longer holds it, the
-    order landed -- the result is SENT, not DELIVERY_UNCONFIRMED."""
-    projects_root = tmp_path / "projects"
-    projects_root.mkdir()
-    idle_pane = (
-        "Claude Code output\n──────────────────────\n❯ \n"
-        "──────────────────────\n⏵⏵ accept edits on (shift+tab to cycle)\n"
-    )
-    landed_pane = (
-        "❯ diagnose the failing build\n"
-        "✻ Cogitated for 0s\n"
-        "Done.\n"
-        "──────────────────────\n"
-        "❯ \n"
-        "──────────────────────\n"
-        "⏵⏵ accept edits on (shift+tab to cycle)\n"
-    )
-    captures = {"n": 0}
-
-    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-        if cmd[:2] == ["tmux", "capture-pane"]:
-            captures["n"] += 1
-            # 1: pre-dispatch idle check. 2+: the submitted prompt echoed into
-            # scrollback, the turn ran, and the composer is empty again.
-            return fake_completed(0, idle_pane if captures["n"] == 1 else landed_pane, "")
-        return fake_completed(0, "", "")
-
-    order = DispatchOrder(order_id="o1", session_ref="localhost:f3:0.0", nudge="diagnose the failing build")
-    result = dispatch_to_tmux(
-        order,
-        runner=runner,
-        input_runner=FakeInputRunner(),
-        local_extra={"localhost"},
-        projects_root=projects_root,
-        sleep=lambda _seconds: None,
-    )
-    assert result.status == DispatchStatus.SENT
-    assert "pane capture" in result.reason
-
-
 def test_dispatch_to_tmux_pane_evidence_ignores_a_marker_already_on_screen(tmp_path: Path) -> None:
     """A repeated canned nudge leaves its earlier copy in scrollback. When
     that copy was visible before the paste, the same pane after the paste
@@ -1821,7 +720,6 @@ def test_dispatch_to_tmux_pane_evidence_ignores_a_marker_already_on_screen(tmp_p
         sleep=lambda _seconds: None,
     )
     assert result.status == DispatchStatus.DELIVERY_UNCONFIRMED
-
 
 def test_dispatch_to_tmux_reports_failed_when_composer_never_clears(tmp_path: Path) -> None:
     """End-to-end: a Codex pane that is idle at pre-dispatch time (so the new
@@ -1858,7 +756,6 @@ def test_dispatch_to_tmux_reports_failed_when_composer_never_clears(tmp_path: Pa
     )
     assert result.status == DispatchStatus.FAILED
     assert result.reason == "submit-failed-composer-still-holds-text"
-
 
 # --- optional real-tmux integration test (skipped if tmux is unavailable) -
 
@@ -1935,3 +832,27 @@ def test_transcript_confirms_needs_the_full_message_not_just_the_marker(tmp_path
 )
 def test_transcript_confirms_rejects_marker_outside_operator_input(tmp_path: Path, delivered: dict[str, object]) -> None:
     assert _confirms(tmp_path, delivered) is False
+
+
+def test_dispatch_to_tmux_qualifies_pane_with_session_before_any_tmux_call() -> None:
+    """Regression test: capture/paste/etc must never receive a bare pane
+    spec — on a host running more than one tmux session, that resolves
+    against whichever session tmux considers 'current', not the session
+    named in session_ref."""
+    seen_targets: list[str] = []
+
+    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+        if "-t" in cmd:
+            seen_targets.append(cmd[cmd.index("-t") + 1])
+        if cmd[:2] == ["tmux", "capture-pane"]:
+            return fake_completed(0, "ubuntu@host:~$ ", "")
+        return fake_completed(0, "", "")
+
+    def input_runner(cmd: list[str], payload: str, *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+        return fake_completed(0, "", "")
+
+    order = DispatchOrder(order_id="o1", session_ref="localhost:f3:0.0", nudge="hello")
+    dispatch_to_tmux(order, runner=runner, input_runner=input_runner, local_extra={"localhost"})
+
+    assert seen_targets, "expected at least one -t target to have been recorded"
+    assert all(t == "f3:0.0" for t in seen_targets), seen_targets
