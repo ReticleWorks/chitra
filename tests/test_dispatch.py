@@ -10,13 +10,16 @@ What remains here is deliberate:
   through ssh and the narrow chitra-tmux-capture / chitra-lane-steer verbs;
 - SAFETY deny paths no other test asserts: host allowlist, unsubmitted-draft
   protection, malformed session_ref, transcript-glob traversal, fail-closed
-  pane/composer handling, ssh run-as validation, honest FAILED/UNCONFIRMED
-  reporting;
+  pane/composer handling, ssh run-as validation, session-qualified pane
+  targeting (a bare pane spec must never reach tmux), honest
+  FAILED/UNCONFIRMED reporting;
 - one real-tmux roundtrip, skipped where tmux is absent.
 
 Removed: scripted-tmux paste/find internals (pane_in_mode, paste -p flag,
 remote find commands, pane-capture verification, TUI fallback internals,
 directive-voice mechanics -- its deny path is covered by test_dispatchd).
+Restored verbatim: the tmux_pane_target regression that keeps every -t
+target session-qualified.
 """
 
 from __future__ import annotations
@@ -829,3 +832,27 @@ def test_transcript_confirms_needs_the_full_message_not_just_the_marker(tmp_path
 )
 def test_transcript_confirms_rejects_marker_outside_operator_input(tmp_path: Path, delivered: dict[str, object]) -> None:
     assert _confirms(tmp_path, delivered) is False
+
+
+def test_dispatch_to_tmux_qualifies_pane_with_session_before_any_tmux_call() -> None:
+    """Regression test: capture/paste/etc must never receive a bare pane
+    spec — on a host running more than one tmux session, that resolves
+    against whichever session tmux considers 'current', not the session
+    named in session_ref."""
+    seen_targets: list[str] = []
+
+    def runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+        if "-t" in cmd:
+            seen_targets.append(cmd[cmd.index("-t") + 1])
+        if cmd[:2] == ["tmux", "capture-pane"]:
+            return fake_completed(0, "ubuntu@host:~$ ", "")
+        return fake_completed(0, "", "")
+
+    def input_runner(cmd: list[str], payload: str, *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+        return fake_completed(0, "", "")
+
+    order = DispatchOrder(order_id="o1", session_ref="localhost:f3:0.0", nudge="hello")
+    dispatch_to_tmux(order, runner=runner, input_runner=input_runner, local_extra={"localhost"})
+
+    assert seen_targets, "expected at least one -t target to have been recorded"
+    assert all(t == "f3:0.0" for t in seen_targets), seen_targets
