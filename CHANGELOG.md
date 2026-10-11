@@ -4,6 +4,22 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-10-11
+
+### Fixed
+
+- Run monitord directly under launchd without treating PID 1 as an orphan.
+- Read native macOS memory pressure and process identity, use portable
+  transcript timestamps, and shorten Unix socket addresses consistently.
+- Isolate failing lanes, stream journal batches, keep dedupe identities on
+  disk, bound working context, and reuse unchanged detector results.
+  Compaction preserves the original journal. Missing historical context
+  reports UNKNOWN instead of proving completion or absence.
+- Contain stuck monitor passes with CPU and RSS limits checked by a
+  separate watchdog process.
+- Queue busy Codex input with Tab and confirm delivery only after native
+  transcript consumption. Preserve operator drafts and verify-only retries.
+
 ## [0.23.0] - 2026-10-02
 
 ### Added

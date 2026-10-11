@@ -28,19 +28,17 @@ class JournalIngestor:
         transcript_path: Path,
         context: NormalizationContext,
         chunk_size: int = 64 * 1024,
+        max_batch_bytes: int | None = None,
+        lock_timeout: float = -1.0,
     ) -> None:
-        self.reader = JsonlTailReader(transcript_path, chunk_size=chunk_size)
+        self.reader = JsonlTailReader(transcript_path, chunk_size=chunk_size, max_batch_bytes=max_batch_bytes)
         self.normalizer: TranscriptNormalizer = make_normalizer(context)
-        self.journal = EventJournal(state_root, context.lane)
+        self.journal = EventJournal(state_root, context.lane, lock_timeout=lock_timeout)
         self._normalizer_generation: int | None = None
-        # First raw sha256 of every generation observed. An inode replacement
-        # that restarts the same transcript (atomic sync rewrite) re-presents
-        # a leading record this ingestor already saw, which is how a replay
-        # is told apart from a genuinely different file at the same path.
-        self._generation_heads: set[str] = set()
 
     def close(self) -> None:
         self.reader.close()
+        self.normalizer.close()
 
     def __enter__(self) -> JournalIngestor:
         return self
@@ -65,12 +63,9 @@ class JournalIngestor:
                 # transcript. For an inode replacement it is a replay only
                 # when the new file restarts the same content, detected by
                 # its first record matching a generation head already seen.
-                if (
-                    generation in rewritten_generations
-                    or record.raw_sha256 in self._generation_heads
-                ):
+                seen_head = self.normalizer.seen_generation_head(record.raw_sha256)
+                if generation in rewritten_generations or seen_head:
                     self.normalizer.begin_replay()
-                self._generation_heads.add(record.raw_sha256)
                 self._normalizer_generation = generation
             observed.extend(self.normalizer.normalize(record))
         appended = self.journal.append(tuple(observed))

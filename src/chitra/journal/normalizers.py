@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -169,8 +170,20 @@ class TranscriptNormalizer:
         self.context = context
         self.session_id = context.session_id
         self.resume_id = context.resume_id
-        self._native_occurrences: dict[str, int] = {}
+        # SQLite's unnamed database lives on disk and is removed on close.
+        self._occurrences = sqlite3.connect("", check_same_thread=False)
+        self._occurrences.execute("PRAGMA cache_size=-256")
+        self._occurrences.execute("CREATE TABLE occurrences (key TEXT PRIMARY KEY, count INTEGER)")
+        self._occurrences.execute("CREATE TABLE heads (key TEXT PRIMARY KEY)")
         self._current_occurrence = 0
+
+    def close(self) -> None:
+        self._occurrences.close()
+
+    def seen_generation_head(self, key: str) -> bool:
+        seen = self._occurrences.execute("SELECT 1 FROM heads WHERE key=?", (key,)).fetchone() is not None
+        self._occurrences.execute("INSERT OR IGNORE INTO heads VALUES (?)", (key,))
+        return seen
 
     def begin_replay(self) -> None:
         """Restart per-incarnation stream state before a full-file replay.
@@ -182,13 +195,14 @@ class TranscriptNormalizer:
         received; otherwise the journal would append duplicates of durable
         events.
         """
-        self._native_occurrences = {}
+        self._occurrences.execute("DELETE FROM occurrences")
         self._current_occurrence = 0
 
     def _begin_record(self, raw: RawRecord) -> None:
         key = _native_key(raw.record or {}, raw.raw_sha256)
-        occurrence = self._native_occurrences.get(key, 0)
-        self._native_occurrences[key] = occurrence + 1
+        row = self._occurrences.execute("SELECT count FROM occurrences WHERE key=?", (key,)).fetchone()
+        occurrence = row[0] if row is not None else 0
+        self._occurrences.execute("INSERT OR REPLACE INTO occurrences VALUES (?, ?)", (key, occurrence + 1))
         self._current_occurrence = occurrence
 
     def normalize(self, raw: RawRecord) -> tuple[CanonicalEvent, ...]:
@@ -313,13 +327,13 @@ class ClaudeNormalizer(TranscriptNormalizer):
         super().__init__(context)
         self._pending_text: tuple[str, str | None] | None = None
         self._stop_hook_seen = False
-        self._background_tasks: dict[str, str] = {}
+        self._occurrences.execute("CREATE TABLE tasks (task_id TEXT PRIMARY KEY, call_id TEXT)")
 
     def begin_replay(self) -> None:
         super().begin_replay()
         self._pending_text = None
         self._stop_hook_seen = False
-        self._background_tasks = {}
+        self._occurrences.execute("DELETE FROM tasks")
 
     def normalize(self, raw: RawRecord) -> tuple[CanonicalEvent, ...]:
         self._begin_record(raw)
@@ -385,7 +399,10 @@ class ClaudeNormalizer(TranscriptNormalizer):
             if isinstance(content, str):
                 notification = _parse_task_notification(content)
                 if notification is not None and notification["status"] is not None:
-                    call_id = self._background_tasks.pop(notification["task_id"] or "", None)
+                    task_id = notification["task_id"] or ""
+                    task = self._occurrences.execute("SELECT call_id FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+                    self._occurrences.execute("DELETE FROM tasks WHERE task_id=?", (task_id,))
+                    call_id = task[0] if task is not None else None
                     if call_id is not None:
                         is_error = notification["status"] != "completed"
                         events.append(
@@ -421,7 +438,7 @@ class ClaudeNormalizer(TranscriptNormalizer):
                         # "running" placeholder, not the tool's outcome. Track
                         # it as in progress; only the later terminal
                         # task-notification supplies the real result.
-                        self._background_tasks[background_task_id] = call_id
+                        self._occurrences.execute("INSERT OR REPLACE INTO tasks VALUES (?, ?)", (background_task_id, call_id))
                         continue
                     is_error = block.get("is_error") is True
                     events.append(
@@ -684,4 +701,6 @@ def native_session_identity(transcript_path: Path | str) -> str | None:
             normalizer.normalize(raw)
     except ValueError:
         return None
+    finally:
+        normalizer.close()
     return normalizer.session_id

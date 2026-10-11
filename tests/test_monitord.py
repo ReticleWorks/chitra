@@ -1404,13 +1404,13 @@ def test_run_once_stop_event_set_mid_pass_skips_remaining_lanes(
     assert [result["lane"] for result in summary["results"]] == [SEEDED_LANE]
 
 
-def test_run_once_stops_when_parent_is_gone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A daemon reparented to init (orphaned) exits the pass promptly."""
+def test_run_once_runs_with_launchd_parent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """PID 1 is the ordinary launchd parent, not a shutdown request."""
     journal = EventJournal(tmp_path, SEEDED_LANE)
     journal.append(tuple(_event(f"e{i}", CanonicalType.TOOL_CALL, lane=SEEDED_LANE) for i in range(1, 4)))
     monkeypatch.setattr(os, "getppid", lambda: 1)
 
     summary = run_once(resolve_config(state_dir=tmp_path))
 
-    assert summary["stopped_early"] is True
-    assert summary["lanes_observed"] == 0
+    assert summary["stopped_early"] is False
+    assert summary["lanes_observed"] == 1

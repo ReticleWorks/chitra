@@ -892,7 +892,9 @@ def _lane_fixture(tmp_path: Path, *, backend: str = "claude", lane_index: int = 
     )
 
     tmux_session = f"g3{os.getpid()}l{lane_index}x{abs(hash(tmp_path.name)) % 10000}"
-    tmux_socket = root / f"tmux-{tmux_session}.sock"
+    from chitra.state_paths import portable_socket_path
+
+    tmux_socket = portable_socket_path(root / f"tmux-{tmux_session}.sock")
     _write_agent_stub(bin_dir, backend)
     # The launch resolves ``tmux`` through PATH like the agent stub does; put
     # the unwrapped binary first so an env-scrubbing host wrapper never sees

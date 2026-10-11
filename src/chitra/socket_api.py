@@ -25,6 +25,7 @@ from chitra.agent_runtime import AgentStatusBroker, PaneStatus, StatusRuntimeErr
 from chitra.agent_status import AGENT_STATES, AgentState
 from chitra.api_protocol import API_PROTOCOL_VERSION, ProtocolError, api_schema, parse_subscriptions
 from chitra.api_protocol import MAX_WAIT_MS as MAX_WAIT_MS
+from chitra.state_paths import portable_socket_path as portable_socket_path
 
 DEFAULT_SOCKET_PATH = Path("/run/chitra/chitra.sock")
 SOCKET_PATH_ENV_VAR = "CHITRA_SOCKET_PATH"
@@ -58,17 +59,6 @@ def default_socket_path() -> Path:
     if sys.platform == "darwin":
         return Path("/tmp") / f"chitra-{os.geteuid()}" / "chitra.sock"
     return DEFAULT_SOCKET_PATH
-
-
-def portable_socket_path(path: Path) -> Path:
-    """Keep the encoded address, including its NUL, within Darwin's 104 bytes."""
-    encoded = os.fsencode(path)
-    if b"\0" in encoded:
-        raise ValueError("Unix socket path contains a NUL")
-    if len(encoded) + 1 <= 104:
-        return path
-    digest = hashlib.sha256(os.fsencode(path.absolute())).hexdigest()
-    return Path("/tmp") / f"chitra-{digest}.sock"
 
 
 def _check_default_socket_directory(path: Path) -> None:

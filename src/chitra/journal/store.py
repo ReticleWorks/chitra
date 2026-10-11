@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import re
+import sqlite3
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -312,7 +314,7 @@ def _prior_outcome_fingerprints(
 class EventJournal:
     """An append-only JSONL event journal and derivation log for one lane."""
 
-    def __init__(self, state_root: Path, lane: str) -> None:
+    def __init__(self, state_root: Path, lane: str, *, lock_timeout: float = -1.0) -> None:
         if _LANE_RE.fullmatch(lane) is None:
             raise ValueError(f"unsafe lane name: {lane!r}")
         self.lane = lane
@@ -320,12 +322,7 @@ class EventJournal:
         self.path = self.directory / f"{lane}.jsonl"
         self.progress_path = self.directory / f"{lane}.progress.jsonl"
         self.lock_path = self.directory / f"{lane}.lock"
-        # Per-file scan watermarks for append dedupe:
-        # (inode, offset, mtime_ns, ids, dedupe keys). The journal only grows
-        # by appends under this directory's lock, so an identity seen below
-        # the watermark cannot reappear above it; an inode swap, a shrink, or
-        # a same-size rewrite (mtime moved) forces a full rescan.
-        self._id_scans: dict[str, tuple[int, int, int, set[str], set[tuple[str, str, str, str]]]] = {}
+        self.lock_timeout = lock_timeout
 
     def load(self) -> list[CanonicalEvent]:
         if not self.path.exists():
@@ -346,6 +343,9 @@ class EventJournal:
         offset: int,
         *,
         inode: int | None = None,
+        consume: Callable[[CanonicalEvent, int], None] | None = None,
+        max_bytes: int | None = None,
+        max_row_bytes: int | None = None,
     ) -> tuple[list[CanonicalEvent], int, int, os.stat_result | None]:
         """Read rows appended after ``offset`` bytes.
 
@@ -370,14 +370,22 @@ class EventJournal:
             handle.seek(offset)
             start = offset
             position = offset
-            for line in handle:
+            for line in iter(lambda: handle.readline(max_row_bytes + 1 if max_row_bytes is not None else -1), b""):
                 position += len(line)
+                if max_row_bytes is not None and len(line) > max_row_bytes:
+                    raise ValueError(f"journal row exceeds {max_row_bytes} bytes at {self.path}:{position - len(line)}")
                 if not line.strip():
                     continue
                 try:
-                    events.append(CanonicalEvent.model_validate_json(line))
+                    event = CanonicalEvent.model_validate_json(line)
+                    if consume is None:
+                        events.append(event)
+                    else:
+                        consume(event, len(line))
                 except ValueError as exc:
                     raise ValueError(f"invalid journal row {self.path} after byte {offset}: {exc}") from exc
+                if max_bytes is not None and position - start >= max_bytes:
+                    break
         return events, start, position, fd_stat
 
     def append(self, events: Iterable[CanonicalEvent]) -> tuple[CanonicalEvent, ...]:
@@ -396,44 +404,40 @@ class EventJournal:
         self,
         path: Path,
         id_field: str,
-    ) -> tuple[set[str], set[tuple[str, str, str, str]]]:
-        """Return stored ``id_field`` values and dedupe keys, reading only new bytes.
-
-        Append dedupe calls this on every write; keeping a byte watermark per
-        file makes a steady-state append O(new rows) instead of O(file). The
-        caller must hold ``self.lock_path``. A malformed tail raises the same
-        way the previous full-file scan did.
-        """
-        if not path.exists():
-            self._id_scans.pop(str(path), None)
-            return set(), set()
-        stat = path.stat()
-        key = str(path)
-        entry = self._id_scans.get(key)
-        if (
-            entry is None
-            or entry[0] != stat.st_ino
-            or entry[1] > stat.st_size
-            or (stat.st_size == entry[1] and stat.st_mtime_ns != entry[2])
+        index: sqlite3.Connection,
+    ) -> None:
+        """Incrementally rebuild a disposable disk index under the journal lock."""
+        index.execute("CREATE TABLE IF NOT EXISTS identities (identity TEXT, content TEXT, UNIQUE(identity, content))")
+        index.execute("CREATE INDEX IF NOT EXISTS content_keys ON identities(content)")
+        index.execute("CREATE TABLE IF NOT EXISTS watermark (inode INTEGER, offset INTEGER, mtime INTEGER)")
+        entry = index.execute("SELECT inode, offset, mtime FROM watermark").fetchone()
+        stat = path.stat() if path.exists() else None
+        if stat is None or entry is None or (
+            entry[0] != stat.st_ino or entry[1] > stat.st_size
+            or (stat.st_size == entry[1] and entry[2] != stat.st_mtime_ns)
         ):
-            offset, ids, keys = 0, set(), set()
+            index.execute("DELETE FROM identities")
+            offset = 0
         else:
-            offset, ids, keys = entry[1], entry[3], entry[4]
-        with path.open("rb") as current:
-            current.seek(offset)
-            for line in current:
-                offset += len(line)
-                if not line.strip():
-                    continue
-                value = json.loads(line)
-                identity = value.get(id_field)
-                if isinstance(identity, str):
-                    ids.add(identity)
-                dedupe_key = journal_row_dedupe_key(value)
-                if dedupe_key is not None:
-                    keys.add(dedupe_key)
-        self._id_scans[key] = (stat.st_ino, offset, stat.st_mtime_ns, ids, keys)
-        return ids, keys
+            offset = entry[1]
+        if stat is not None:
+            with path.open("rb") as current:
+                current.seek(offset)
+                for line in current:
+                    offset += len(line)
+                    if not line.strip():
+                        continue
+                    value = json.loads(line)
+                    identity = value.get(id_field)
+                    if isinstance(identity, str):
+                        key = journal_row_dedupe_key(value)
+                        index.execute(
+                            "INSERT OR IGNORE INTO identities VALUES (?, ?)",
+                            (identity, json.dumps(key) if key is not None else None),
+                        )
+        index.execute("DELETE FROM watermark")
+        if stat is not None:
+            index.execute("INSERT INTO watermark VALUES (?, ?, ?)", (stat.st_ino, offset, stat.st_mtime_ns))
 
     def _append_unique[T: CanonicalEvent | ProgressClassification](
         self,
@@ -447,36 +451,50 @@ class EventJournal:
             return ()
         self.directory.mkdir(parents=True, exist_ok=True)
         os.chmod(self.directory, 0o700)
-        with exclusive_lock(self.lock_path, mode=0o600):
-            existing, existing_keys = self._scanned_identities(path, id_field)
-            new_rows: list[T] = []
-            for candidate in candidates:
-                identity = getattr(candidate, id_field)
-                dedupe_key = content_key(candidate) if content_key is not None else None
-                if identity in existing or (dedupe_key is not None and dedupe_key in existing_keys):
-                    continue
-                new_rows.append(candidate)
-                existing.add(identity)
-                if dedupe_key is not None:
-                    existing_keys.add(dedupe_key)
-            if new_rows:
-                fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-                try:
-                    os.fchmod(fd, 0o600)
-                    encoded = "".join(row.model_dump_json() + "\n" for row in new_rows).encode()
-                    view = memoryview(encoded)
-                    while view:
-                        written = os.write(fd, view)
-                        view = view[written:]
-                    os.fsync(fd)
-                    final_stat = os.fstat(fd)
-                finally:
-                    os.close(fd)
-                self._id_scans[str(path)] = (
-                    final_stat.st_ino,
-                    final_stat.st_size,
-                    final_stat.st_mtime_ns,
-                    existing,
-                    existing_keys,
-                )
-            return tuple(new_rows)
+        with exclusive_lock(self.lock_path, mode=0o600, timeout=self.lock_timeout) as held:
+            if not held:
+                raise BlockingIOError(f"journal writer lock is held: {self.lock_path}")
+            index_path = path.with_suffix(".index.sqlite3")
+            fd = os.open(index_path, os.O_CREAT | os.O_WRONLY, 0o600)
+            os.close(fd)
+            with contextlib.closing(sqlite3.connect(index_path)) as index, index:
+                index.execute("PRAGMA cache_size=-1024")
+                self._scanned_identities(path, id_field, index)
+                return self._append_indexed(index, path, candidates, id_field, content_key)
+
+    def _append_indexed[T: CanonicalEvent | ProgressClassification](
+        self,
+        index: sqlite3.Connection,
+        path: Path,
+        candidates: tuple[T, ...],
+        id_field: str,
+        content_key: Callable[[T], tuple[str, str, str, str]] | None,
+    ) -> tuple[T, ...]:
+        new_rows: list[T] = []
+        for candidate in candidates:
+            identity = getattr(candidate, id_field)
+            dedupe_key = content_key(candidate) if content_key is not None else None
+            encoded_key = json.dumps(dedupe_key) if dedupe_key is not None else None
+            if index.execute(
+                "SELECT 1 FROM identities WHERE identity=? OR content=? LIMIT 1", (identity, encoded_key)
+            ).fetchone():
+                continue
+            new_rows.append(candidate)
+            index.execute("INSERT INTO identities VALUES (?, ?)", (identity, encoded_key))
+        if new_rows:
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                encoded = "".join(row.model_dump_json() + "\n" for row in new_rows).encode()
+                view = memoryview(encoded)
+                while view:
+                    written = os.write(fd, view)
+                    view = view[written:]
+                os.fsync(fd)
+                final_stat = os.fstat(fd)
+            finally:
+                os.close(fd)
+            index.execute("DELETE FROM watermark")
+            index.execute("INSERT INTO watermark VALUES (?, ?, ?)",
+                          (final_stat.st_ino, final_stat.st_size, final_stat.st_mtime_ns))
+        return tuple(new_rows)

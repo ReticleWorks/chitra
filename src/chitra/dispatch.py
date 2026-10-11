@@ -1022,10 +1022,15 @@ def ensure_nudge_submitted(
             break
         sleep(SUBMIT_VERIFY_POLL_SECONDS)
         captured = capture_dispatch_pane(host, pane, lines=lines, runner=runner, local_extra=local_extra, tmux_socket=tmux_socket)
-    if not captured or not _composer_holds_marker(captured, marker):
-        return True, "submission-unconfirmed: pasted marker not visible in composer"
     backend = _detect_tui_backend(captured)
     busy = _active_turn_chrome_visible(captured)
+    # An idle terminal may disable echo, so its pasted text cannot appear.
+    idle_terminal = bool(
+        captured and backend == "unknown" and not busy
+        and _IDLE_INPUT_LINE_RE.match(strip_terminal_controls(str(captured[-1])))
+    )
+    if not captured or (not _composer_holds_marker(captured, marker) and not idle_terminal):
+        return True, "submission-unconfirmed: pasted marker not visible in composer"
     if busy and (backend == "unknown" or governed_remote):
         return True, "submission-unconfirmed: active turn has no safe queue transport"
     key = "Tab" if busy and backend == "codex" else "Enter"
@@ -1036,6 +1041,8 @@ def ensure_nudge_submitted(
         )
         if proc.returncode != 0:
             return False, f"submit-failed-composer-still-holds-text ({key} command failed)"
+    if idle_terminal:
+        return True, "submission-unconfirmed: Enter sent to idle terminal; awaiting native consumption"
     captured = _capture_pane_until_composer_clears(
         host,
         pane,

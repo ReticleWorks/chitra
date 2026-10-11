@@ -17,8 +17,10 @@ trusting the prose or opening a fresh track per wording.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
+import sqlite3
 from collections.abc import Sequence, Set
 from pathlib import Path
 from typing import Literal
@@ -129,9 +131,14 @@ class BlockerClaimStore:
         self.path = self.directory / f"{lane}.jsonl"
         self.lock_path = self.directory / f"{lane}.lock"
 
-    def load(self) -> list[BlockerClaimRecord]:
+    def load(self, *, limit: int | None = None) -> list[BlockerClaimRecord]:
         if not self.path.exists():
             return []
+        if limit is not None:
+            with exclusive_lock(self.lock_path), contextlib.closing(self._index()) as index, index:
+                self._sync_index(index)
+                rows = index.execute("SELECT payload FROM claims ORDER BY rowid DESC LIMIT ?", (limit,)).fetchall()
+                return [BlockerClaimRecord.model_validate_json(row[0]) for row in reversed(rows)]
         records: list[BlockerClaimRecord] = []
         with self.path.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, 1):
@@ -143,29 +150,66 @@ class BlockerClaimStore:
                     raise ValueError(f"invalid blocker claim row {self.path}:{line_number}: {exc}") from exc
         return records
 
+    def _index(self) -> sqlite3.Connection:
+        path = self.path.with_suffix(".index.sqlite3")
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
+        os.close(fd)
+        index = sqlite3.connect(path)
+        index.execute("PRAGMA cache_size=-256")
+        index.execute("CREATE TABLE IF NOT EXISTS claims (event TEXT, claim TEXT, payload TEXT, UNIQUE(event, claim))")
+        index.execute("CREATE TABLE IF NOT EXISTS watermark (inode INTEGER, offset INTEGER, mtime INTEGER)")
+        return index
+
+    def _sync_index(self, index: sqlite3.Connection) -> None:
+        stat = self.path.stat() if self.path.exists() else None
+        previous = index.execute("SELECT inode, offset, mtime FROM watermark").fetchone()
+        if stat is None or previous is None or previous[0] != stat.st_ino or previous[1] > stat.st_size or (
+            previous[1] == stat.st_size and previous[2] != stat.st_mtime_ns
+        ):
+            index.execute("DELETE FROM claims")
+            offset = 0
+        else:
+            offset = previous[1]
+        if stat is not None:
+            with self.path.open("rb") as handle:
+                handle.seek(offset)
+                for line in handle:
+                    offset += len(line)
+                    if not line.strip():
+                        continue
+                    record = BlockerClaimRecord.model_validate_json(line)
+                    index.execute("INSERT OR IGNORE INTO claims VALUES (?, ?, ?)",
+                                  (record.event_id, record.claim_key, record.model_dump_json()))
+        index.execute("DELETE FROM watermark")
+        if stat is not None:
+            index.execute("INSERT INTO watermark VALUES (?, ?, ?)", (stat.st_ino, offset, stat.st_mtime_ns))
+
     def append(self, records: Sequence[BlockerClaimRecord]) -> int:
         """Durably append records, skipping duplicates already on disk."""
         if not records:
             return 0
         self.directory.mkdir(parents=True, exist_ok=True)
         os.chmod(self.directory, 0o700)
-        with exclusive_lock(self.lock_path, mode=0o600):
-            seen = {(record.event_id, record.claim_key) for record in self.load()}
+        with exclusive_lock(self.lock_path, mode=0o600), contextlib.closing(self._index()) as index, index:
+            self._sync_index(index)
             appended = 0
             fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
             try:
                 os.fchmod(fd, 0o600)
                 for record in records:
-                    if (record.event_id, record.claim_key) in seen:
+                    if index.execute("SELECT 1 FROM claims WHERE event=? AND claim=?", (record.event_id, record.claim_key)).fetchone():
                         continue
                     encoded = (record.model_dump_json() + "\n").encode()
                     view = memoryview(encoded)
                     while view:
                         written = os.write(fd, view)
                         view = view[written:]
-                    seen.add((record.event_id, record.claim_key))
+                    index.execute("INSERT INTO claims VALUES (?, ?, ?)", (record.event_id, record.claim_key, record.model_dump_json()))
                     appended += 1
                 os.fsync(fd)
+                stat = os.fstat(fd)
+                index.execute("DELETE FROM watermark")
+                index.execute("INSERT INTO watermark VALUES (?, ?, ?)", (stat.st_ino, stat.st_size, stat.st_mtime_ns))
             finally:
                 os.close(fd)
             return appended
