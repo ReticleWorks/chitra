@@ -24,6 +24,7 @@ from chitra.convert import (
     run_shadow_scan,
     snapshot_state_root,
 )
+from chitra.state_paths import portable_socket_path
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -638,8 +639,8 @@ def test_authority_handoff_binds_to_preexisting_non_caller_mintable_trust_roots(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_root = tmp_path / "state"
-    old_socket_path = tmp_path / "old.sock"
-    new_socket_path = tmp_path / "new.sock"
+    old_socket_path = portable_socket_path(tmp_path / "old.sock")
+    new_socket_path = portable_socket_path(tmp_path / "new.sock")
     _start_tmux(old_socket_path, "monitor-old")
     _start_tmux(new_socket_path, "monitor-new")
     manifest_path = tmp_path / "etc" / "chitra" / "lanes.yaml"
