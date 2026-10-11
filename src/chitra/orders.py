@@ -42,11 +42,9 @@ class DispatchStatus(enum.StrEnum):
     # real delivery's own idempotency check. See
     # docs/SOL-ADVERSARIAL-REVIEW finding #1.
     DEFERRED = "deferred"
-    # dispatch_to_tmux pasted the nudge and transcript-grep could not confirm
-    # it structurally (see chitra.dispatch.transcript_confirms_nudge). The
-    # weaker pane signal saw the marker in the pane's recent scrollback, but
-    # with no recognized TUI composer row it cannot be told apart from a bare
-    # shell echoing the pasted line, so it is not a terminal SENT. dispatchd
+    # dispatch_to_tmux pasted or queued the nudge but transcript-grep has not
+    # confirmed consumption (see chitra.dispatch.transcript_confirms_nudge).
+    # Pane evidence alone never yields a terminal SENT. dispatchd
     # retries consumption verification using the same durable attempt sidecar
     # the lane-lock timeout path uses (chitra.dispatchd._process_claimed_order),
     # without pasting again. A transient failure never becomes terminal merely

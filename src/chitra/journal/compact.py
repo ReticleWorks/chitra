@@ -4,18 +4,21 @@ Transcript syncs that atomically replace the transcript path historically
 replayed the whole file without resetting event identity, so journals could
 hold dozens of copies of every native row. Compaction rewrites the journal
 keeping the first row per (native key, payload digest), atomically via a
-same-directory temporary file, and refuses to run while the journal's lane
-lock is held.
+same-directory temporary file. The entire original inode is preserved as
+``<journal>.<unique-id>.original`` before replacement. It refuses to run
+while the journal's lane lock is held.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import sqlite3
 import sys
 import tempfile
-from collections.abc import Iterable
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -26,30 +29,6 @@ from .store import EventJournal, journal_row_dedupe_key
 
 class JournalCompactionLockedError(RuntimeError):
     """The journal's lane lock is held by a live writer."""
-
-
-def _compact_lines(lines: Iterable[bytes]) -> tuple[list[bytes], int]:
-    """Keep the first line per dedupe key; unkeyed lines are always kept."""
-    kept: list[bytes] = []
-    seen: set[tuple[str, str, str, str]] = set()
-    removed = 0
-    for line in lines:
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except ValueError:
-            # An unparseable tail is preserved untouched; load() reports it.
-            kept.append(line)
-            continue
-        key = journal_row_dedupe_key(row) if isinstance(row, dict) else None
-        if key is not None:
-            if key in seen:
-                removed += 1
-                continue
-            seen.add(key)
-        kept.append(line)
-    return kept, removed
 
 
 def compact_journal(path: Path, *, dry_run: bool = False) -> dict[str, Any]:
@@ -74,29 +53,51 @@ def compact_journal(path: Path, *, dry_run: bool = False) -> dict[str, Any]:
                 "removed": 0,
                 "dry_run": dry_run,
             }
-        lines = path.read_bytes().splitlines(keepends=True)
-        kept, removed = _compact_lines(lines)
-        if removed and not dry_run:
-            fd, tmp_name = tempfile.mkstemp(
-                dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
-            )
-            try:
-                with os.fdopen(fd, "wb") as tmp:
-                    tmp.write(b"".join(kept))
-                    tmp.flush()
-                    os.fsync(tmp.fileno())
-                os.chmod(tmp_name, 0o600)
-                os.replace(tmp_name, path)
-            except BaseException:
-                if os.path.exists(tmp_name):
-                    os.unlink(tmp_name)
-                raise
+        before = after = removed = 0
+        archive: Path | None = None
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as tmp, path.open("rb") as source, contextlib.closing(sqlite3.connect("")) as seen:
+                seen.execute("PRAGMA cache_size=-1024")
+                seen.execute("CREATE TABLE seen (key TEXT PRIMARY KEY)")
+                for line in source:
+                    before += 1
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        row = None
+                    key = journal_row_dedupe_key(row) if isinstance(row, dict) else None
+                    if key is not None:
+                        inserted = seen.execute("INSERT OR IGNORE INTO seen VALUES (?)", (json.dumps(key),)).rowcount
+                        if not inserted:
+                            removed += 1
+                            continue
+                    tmp.write(line)
+                    after += 1
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            if removed and not dry_run:
+                # The old inode is immutable after replacement; all event IDs,
+                # raw byte ranges, replay copies and malformed rows remain evidence.
+                archive = path.with_name(f"{path.name}.{uuid.uuid4().hex}.original")
+                os.link(path, archive)
+                directory_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                    os.replace(tmp_name, path)
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
         return {
             "journal": str(path),
-            "before": len(lines),
-            "after": len(kept),
+            "before": before,
+            "after": after,
             "removed": removed,
             "dry_run": dry_run,
+            "original": str(archive) if archive is not None else None,
         }
 
 

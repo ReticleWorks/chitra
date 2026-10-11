@@ -589,8 +589,8 @@ def test_action_pending_restarts_and_retries_enqueue_with_same_deterministic_id(
         raise RuntimeError("simulated enqueue crash after action_pending")
 
     monkeypatch.setattr(supervisor, "enqueue_dispatch_order", fail_enqueue)
-    with pytest.raises(RuntimeError, match="action_pending"):
-        run_once(_live_config(state, bindings_path, queue))
+    summary = run_once(_live_config(state, bindings_path, queue))
+    assert "action_pending" in summary["lane_errors"][goal.lane_id]
 
     pending = SupervisionLedger(state, goal.lane_id).latest()
     assert pending is not None
@@ -619,8 +619,8 @@ def test_action_queued_transition_restarts_after_order_enqueue_without_duplicate
         return real_transition(self, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(SupervisionLedger, "transition", fail_queued_transition)
-    with pytest.raises(RuntimeError, match="action_queued"):
-        run_once(_live_config(state, bindings_path, queue))
+    summary = run_once(_live_config(state, bindings_path, queue))
+    assert "action_queued" in summary["lane_errors"][goal.lane_id]
 
     queued_order = list((queue / "orders").glob("*.json"))
     assert len(queued_order) == 1

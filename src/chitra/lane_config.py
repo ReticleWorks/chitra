@@ -14,6 +14,7 @@ from typing import Any
 import yaml
 
 from chitra.knowledge import KnowledgeBundle
+from chitra.state_paths import portable_socket_path
 
 LANES_FILE_ENV_VAR = "CHITRA_LANES_FILE"
 DEFAULT_LANES_FILE = Path("/etc/chitra/lanes.yaml")
@@ -44,6 +45,9 @@ class LaneSpec:
     credentials: LaneCredentials
     enabled: bool = True
     knowledge_bundle: KnowledgeBundle = field(default_factory=KnowledgeBundle.empty)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "tmux_socket", portable_socket_path(self.tmux_socket))
 
     @property
     def queue_dir(self) -> Path:

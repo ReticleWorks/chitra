@@ -11,6 +11,7 @@ import socket
 import socketserver
 import stat
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -24,6 +25,7 @@ from chitra.agent_runtime import AgentStatusBroker, PaneStatus, StatusRuntimeErr
 from chitra.agent_status import AGENT_STATES, AgentState
 from chitra.api_protocol import API_PROTOCOL_VERSION, ProtocolError, api_schema, parse_subscriptions
 from chitra.api_protocol import MAX_WAIT_MS as MAX_WAIT_MS
+from chitra.state_paths import portable_socket_path as portable_socket_path
 
 DEFAULT_SOCKET_PATH = Path("/run/chitra/chitra.sock")
 SOCKET_PATH_ENV_VAR = "CHITRA_SOCKET_PATH"
@@ -52,7 +54,54 @@ class PendingHandoff:
 
 def default_socket_path() -> Path:
     configured = os.environ.get(SOCKET_PATH_ENV_VAR, "").strip()
-    return Path(configured) if configured else DEFAULT_SOCKET_PATH
+    if configured:
+        return portable_socket_path(Path(configured))
+    if sys.platform == "darwin":
+        return Path("/tmp") / f"chitra-{os.geteuid()}" / "chitra.sock"
+    return DEFAULT_SOCKET_PATH
+
+
+def _check_default_socket_directory(path: Path) -> None:
+    if path.parent != Path("/tmp") / f"chitra-{os.geteuid()}":
+        return
+    directory = path.parent.lstat()
+    if (
+        not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.geteuid()
+        or stat.S_IMODE(directory.st_mode) & 0o077
+    ):
+        raise PermissionError(f"control socket directory must be private and owned by this user: {path.parent}")
+
+
+def recover_stale_socket(path: Path) -> None:
+    """Remove only an unchanged, same-user socket proven to have no listener."""
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(existing.st_mode):
+        raise RuntimeError(f"refusing to replace non-socket path: {path}")
+    if existing.st_uid != os.geteuid():
+        raise RuntimeError(f"refusing to replace another user's socket: {path}")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.settimeout(SOCKET_PROBE_TIMEOUT_SECONDS)
+        try:
+            probe.connect(str(path))
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            if exc.errno != errno.ECONNREFUSED:
+                raise OSError(errno.EADDRINUSE, f"cannot prove existing socket is stale: {path}: {exc}") from exc
+        else:
+            raise OSError(errno.EADDRINUSE, f"live server already owns socket: {path}")
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        return
+    if (current.st_dev, current.st_ino, current.st_mode, current.st_uid) != (
+        existing.st_dev, existing.st_ino, existing.st_mode, existing.st_uid
+    ):
+        raise RuntimeError(f"refusing to replace changed socket path: {path}")
+    path.unlink()
 
 
 def verify_tmux_pane(status: PaneStatus) -> bool:
@@ -464,61 +513,28 @@ class ControlServer:
     """Own one restricted Unix socket around an :class:`ApiRuntime`."""
 
     def __init__(self, socket_path: Path, runtime: ApiRuntime) -> None:
-        self.socket_path = socket_path
+        self.socket_path = portable_socket_path(socket_path)
         self.runtime = runtime
         self._server: _ThreadingUnixServer | None = None
         self._thread: threading.Thread | None = None
-        self._bound_inode: int | None = None
+        self._bound_identity: tuple[int, int] | None = None
 
     def bind(self) -> None:
         if self._server is not None:
             raise RuntimeError("control server is already bound")
-        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
-        self._recover_stale_socket()
+        self.socket_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _check_default_socket_directory(self.socket_path)
+        recover_stale_socket(self.socket_path)
         self._server = _ThreadingUnixServer(self.socket_path, self.runtime)
         os.chmod(self.socket_path, 0o600)
-        self._bound_inode = self.socket_path.stat().st_ino
+        bound = self.socket_path.lstat()
+        self._bound_identity = (bound.st_dev, bound.st_ino)
         self.runtime.set_shutdown_callback(self.shutdown)
 
     @property
     def active_handler_count(self) -> int:
         server = self._server
         return 0 if server is None else server.active_handler_count
-
-    def _recover_stale_socket(self) -> None:
-        try:
-            existing = self.socket_path.lstat()
-        except FileNotFoundError:
-            return
-        if not stat.S_ISSOCK(existing.st_mode):
-            raise RuntimeError(f"refusing to replace non-socket path: {self.socket_path}")
-        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        probe.settimeout(SOCKET_PROBE_TIMEOUT_SECONDS)
-        try:
-            probe.connect(str(self.socket_path))
-        except ConnectionRefusedError:
-            pass
-        except FileNotFoundError:
-            return
-        except OSError as exc:
-            if exc.errno == errno.ECONNREFUSED:
-                pass
-            else:
-                raise OSError(
-                    errno.EADDRINUSE,
-                    f"cannot prove existing control socket is stale: {self.socket_path}: {exc}",
-                ) from exc
-        else:
-            raise OSError(errno.EADDRINUSE, f"live control server already owns socket: {self.socket_path}")
-        finally:
-            probe.close()
-        try:
-            current = self.socket_path.lstat()
-        except FileNotFoundError:
-            return
-        if (current.st_dev, current.st_ino, current.st_mode) != (existing.st_dev, existing.st_ino, existing.st_mode):
-            raise RuntimeError(f"refusing to replace changed socket path: {self.socket_path}")
-        self.socket_path.unlink()
 
     def start(self) -> None:
         if self._server is None:
@@ -547,26 +563,35 @@ class ControlServer:
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=2.0)
         try:
-            if self._bound_inode is not None and self.socket_path.stat().st_ino == self._bound_inode:
+            current = self.socket_path.lstat()
+            if stat.S_ISSOCK(current.st_mode) and (current.st_dev, current.st_ino) == self._bound_identity:
                 self.socket_path.unlink()
         except FileNotFoundError:
             pass
-        self._bound_inode = None
+        self._bound_identity = None
 
 
 class SocketClient:
     """Small correlated NDJSON client; one instance may span handoff steps."""
 
     def __init__(self, socket_path: Path, *, timeout: float = 10.0) -> None:
-        self.socket_path = socket_path
+        self.socket_path = portable_socket_path(socket_path)
         self.timeout = timeout
         self._socket: socket.socket | None = None
         self._reader: BinaryIO | None = None
 
     def __enter__(self) -> SocketClient:
+        _check_default_socket_directory(self.socket_path)
+        existing = self.socket_path.lstat()
+        if not stat.S_ISSOCK(existing.st_mode) or existing.st_uid != os.geteuid():
+            raise PermissionError(f"control socket must be owned by this user: {self.socket_path}")
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(self.timeout)
-        sock.connect(str(self.socket_path))
+        try:
+            sock.connect(str(self.socket_path))
+        except BaseException:
+            sock.close()
+            raise
         self._socket = sock
         self._reader = sock.makefile("rb")
         return self

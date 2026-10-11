@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from chitra.dispatch import run_cmd
+from chitra.state_paths import portable_socket_path
 from chitra.systemd_notify import notify_ready, notify_watchdog, watchdog_usec
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -22,7 +23,7 @@ def test_run_command_timeout_is_a_loud_failed_result() -> None:
 
 
 def test_ready_and_watchdog_datagrams_reach_systemd_socket(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    socket_path = tmp_path / "notify.sock"
+    socket_path = portable_socket_path(tmp_path / "notify.sock")
     with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as receiver:
         receiver.bind(str(socket_path))
         receiver.settimeout(1)
@@ -34,6 +35,7 @@ def test_ready_and_watchdog_datagrams_reach_systemd_socket(tmp_path: Path, monke
         assert receiver.recv(128) == b"READY=1"
         assert notify_watchdog() is True
         assert receiver.recv(128) == b"WATCHDOG=1"
+    socket_path.unlink()
 
 
 def test_watchdog_usec_must_be_positive() -> None:

@@ -30,11 +30,16 @@ class ReadBatch:
 class JsonlTailReader:
     """Read only completed lines while retaining partial append bytes."""
 
-    def __init__(self, path: Path, *, chunk_size: int = 64 * 1024) -> None:
+    def __init__(self, path: Path, *, chunk_size: int = 64 * 1024, max_batch_bytes: int | None = None) -> None:
         if chunk_size < 1:
             raise ValueError("chunk_size must be positive")
         self.path = path
         self.chunk_size = chunk_size
+        if max_batch_bytes is not None and max_batch_bytes < 1:
+            raise ValueError("max_batch_bytes must be positive")
+        self.max_batch_bytes = max_batch_bytes
+        # A record may span batches; cap partial buffering separately from poll work.
+        self.max_record_bytes = max_batch_bytes * 8 if max_batch_bytes is not None else None
         self._handle: BinaryIO | None = None
         self._identity: TranscriptIdentity | None = None
         self._offset = 0
@@ -58,6 +63,10 @@ class JsonlTailReader:
     @property
     def offset(self) -> int:
         return self._offset
+
+    @property
+    def pending_bytes(self) -> int:
+        return len(self._buffer)
 
     def close(self) -> None:
         if self._handle is not None:
@@ -95,7 +104,8 @@ class JsonlTailReader:
             # re-verify. This is the steady-state poll and it stays O(1).
             return ReadBatch(())
         rewritten = path_key == current_key and (
-            path_stat.st_size < self._offset or not self._anchor_matches() or not self._consumed_intact()
+            path_stat.st_size < self._offset or not self._anchor_matches()
+            or (path_stat.st_mtime_ns != self._last_mtime_ns and not self._consumed_intact())
         )
         records = self._drain() if replaced else []
         if replaced or rewritten:
@@ -210,11 +220,15 @@ class JsonlTailReader:
         assert self._handle is not None
         assert self._identity is not None
         records: list[RawRecord] = []
+        drained_bytes = 0
         while True:
+            if self.max_batch_bytes is not None and drained_bytes >= self.max_batch_bytes:
+                break
             chunk = self._handle.read(self.chunk_size)
             if not chunk:
                 break
             chunk_start = self._offset
+            drained_bytes += len(chunk)
             self._offset += len(chunk)
             self._anchor = (self._anchor + chunk)[-64:]
             if not self._buffer:
@@ -225,6 +239,8 @@ class JsonlTailReader:
                 if newline < 0:
                     break
                 raw_line = bytes(self._buffer[: newline + 1])
+                if self.max_record_bytes is not None and len(raw_line) > self.max_record_bytes:
+                    raise ValueError(f"transcript record exceeds {self.max_record_bytes} bytes at {self.path}:{self._buffer_start}")
                 line_start = self._buffer_start
                 line_end = line_start + len(raw_line)
                 del self._buffer[: newline + 1]
@@ -233,6 +249,8 @@ class JsonlTailReader:
                     records.append(self._decode(raw_line, line_start, line_end))
                 else:
                     self._consumed_digest.update(raw_line)
+            if self.max_record_bytes is not None and len(self._buffer) > self.max_record_bytes:
+                raise ValueError(f"transcript record exceeds {self.max_record_bytes} bytes at {self.path}:{self._buffer_start}")
         return records
 
     def _decode(self, raw_line: bytes, start: int, end: int) -> RawRecord:

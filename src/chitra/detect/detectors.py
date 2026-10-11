@@ -17,6 +17,7 @@ import hashlib
 import json
 import posixpath
 import re
+from bisect import bisect_right
 from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
 from pathlib import Path
@@ -159,28 +160,15 @@ def _joined_results(events: Sequence[CanonicalEvent]) -> dict[str, CanonicalEven
     return joined
 
 
-def _has_progress_between(
-    events: Sequence[CanonicalEvent], progress_rows: Sequence[ProgressClassification], start: int, end: int
-) -> bool:
+def _progress_positions(events: Sequence[CanonicalEvent], progress_rows: Sequence[ProgressClassification]) -> list[int]:
     positions = {event.event_id: position for position, event in enumerate(events)}
-    for row in progress_rows:
-        if row.classification is not ProgressClass.PROGRESS:
-            continue
-        for source in row.source_event_ids:
-            index = positions.get(source)
-            if index is not None and start < index < end:
-                return True
-    return False
+    return sorted({positions[source] for row in progress_rows if row.classification is ProgressClass.PROGRESS
+                   for source in row.source_event_ids if source in positions})
 
 
-def _has_progress_at(
-    events: Sequence[CanonicalEvent], progress_rows: Sequence[ProgressClassification], position: int
-) -> bool:
-    event_id = events[position].event_id
-    return any(
-        row.classification is ProgressClass.PROGRESS and event_id in row.source_event_ids
-        for row in progress_rows
-    )
+def _has_progress_between(progress: Sequence[int], start: int, end: int) -> bool:
+    index = bisect_right(progress, start)
+    return index < len(progress) and progress[index] < end
 
 
 def _contained_in_worktree(path: str, *, declared_worktree: str, cwd: str | None = None) -> bool:
@@ -682,6 +670,8 @@ def detect_unnecessary_steps(
     unmet = first_unmet_item_id(enrolled_items, met_items)
     results = _joined_results(events)
     positions = {event.event_id: position for position, event in enumerate(events)}
+    progress = _progress_positions(events, progress_rows)
+    progress_at = set(progress)
     seen: dict[tuple[str, str], list[tuple[int, str]]] = {}
     for position, event in enumerate(events):
         if event.normalized_type is not CanonicalType.TOOL_CALL:
@@ -690,17 +680,17 @@ def detect_unnecessary_steps(
         signature = (call_signature(event), result_class(result))
         outcome_position = positions.get(result.event_id, position) if result is not None else position
         occurrences = seen.setdefault(signature, [])
-        if _has_progress_at(events, progress_rows, outcome_position):
+        if outcome_position in progress_at:
             occurrences.clear()
             continue
-        if occurrences and _has_progress_between(events, progress_rows, occurrences[-1][0], outcome_position):
+        if occurrences and _has_progress_between(progress, occurrences[-1][0], outcome_position):
             occurrences.clear()
         occurrences.append((outcome_position, event.event_id))
         if len(occurrences) < threshold:
             continue
         prior = [entry for entry in occurrences[:-1]]
         start_position = prior[-1][0]
-        if _has_progress_between(events, progress_rows, start_position, outcome_position):
+        if _has_progress_between(progress, start_position, outcome_position):
             occurrences.clear()
             occurrences.append((position, event.event_id))
             continue
@@ -740,6 +730,8 @@ def detect_excessive_testing(
     unmet = first_unmet_item_id(enrolled_items, met_items)
     results = _joined_results(events)
     positions = {event.event_id: position for position, event in enumerate(events)}
+    progress = _progress_positions(events, progress_rows)
+    progress_at = set(progress)
     runs: list[tuple[int, tuple[tuple[str, tuple[str, ...]], str], CanonicalEvent]] = []
     for position, event in enumerate(events):
         if event.normalized_type is not CanonicalType.TOOL_CALL:
@@ -749,19 +741,19 @@ def detect_excessive_testing(
             result = results.get(event.native_join_id or "")
             signature = (check, result_class(result))
             outcome_position = positions.get(result.event_id, position) if result is not None else position
-            if _has_progress_at(events, progress_rows, outcome_position):
+            if outcome_position in progress_at:
                 continue
             runs.append((outcome_position, signature, event))
     streak: list[tuple[int, tuple[tuple[str, tuple[str, ...]], str], CanonicalEvent]] = []
     for run in runs:
-        if streak and streak[-1][1] == run[1] and not _has_progress_between(events, progress_rows, streak[-1][0], run[0]):
+        if streak and streak[-1][1] == run[1] and not _has_progress_between(progress, streak[-1][0], run[0]):
             streak.append(run)
         else:
             streak = [run]
         if len(streak) < threshold:
             continue
         start_position = streak[len(streak) - threshold][0]
-        if _has_progress_between(events, progress_rows, start_position, run[0]):
+        if _has_progress_between(progress, start_position, run[0]):
             streak = [run]
             continue
         refs = tuple(entry[2].event_id for entry in streak[len(streak) - threshold :])
@@ -790,6 +782,15 @@ def _write_targets(event: CanonicalEvent) -> tuple[str, ...]:
     if cls in {"shell", "other"}:
         return shell_write_targets(event)
     return ()
+
+
+def is_implementation_evidence(event: CanonicalEvent) -> bool:
+    if event.normalized_type is not CanonicalType.TOOL_CALL or tool_class(event.payload.get("tool_name")) not in _WORK_CAPABLE_CLASSES:
+        return False
+    targets = _write_targets(event)
+    if targets and all(path.lower().endswith(tuple(_DOC_SUFFIXES)) for path in targets):
+        return False
+    return any(path.lower().endswith(tuple(_CODE_SUFFIXES)) for path in targets) or check_signature(event) is not None
 
 
 def detect_document_dithering(
@@ -823,7 +824,7 @@ def detect_document_dithering(
         if targets and all(path.lower().endswith(tuple(_DOC_SUFFIXES)) for path in targets):
             doc_events.append(event)
             continue
-        if any(path.lower().endswith(tuple(_CODE_SUFFIXES)) for path in targets) or check_signature(event) is not None:
+        if is_implementation_evidence(event):
             implementation_evidence = True
     if implementation_evidence or len(doc_events) < minimum_recurrence:
         return []

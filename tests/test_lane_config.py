@@ -16,6 +16,7 @@ from chitra.goals import EnrolledScopeImmutableError, GoalRecord, hold_goal, red
 from chitra.lane_anchor import LaneLaunchRefused, LaneStartupFailed, _pane_pythonpath, ingestion_gate, start_lane
 from chitra.lane_config import load_lanes
 from chitra.recovery import get_lane_lifecycle
+from chitra.state_paths import portable_socket_path
 
 
 def _manifest(tmp_path):
@@ -65,7 +66,7 @@ def test_lane_manifest_is_one_explicit_contract(tmp_path):
     assert lane.identifier == "alpha"
     assert lane.account == "alpha"
     assert lane.queue_dir == tmp_path / "alpha-state/queue"
-    assert lane.tmux_socket == tmp_path / "alpha.sock"
+    assert lane.tmux_socket == portable_socket_path(tmp_path / "alpha.sock")
     assert not hasattr(lane, "model")
 
 
@@ -106,7 +107,7 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
         calls.append(list(command))
         return subprocess.CompletedProcess(command, 1 if len(calls) == 1 else 0, "", "")
 
-    control_socket = tmp_path / "chitra.sock"
+    control_socket = portable_socket_path(tmp_path / "chitra.sock")
     # The launch self-test spends a live agent call, which this test does not
     # need: it is checking the command the launcher builds, and the self-test
     # has its own tests in test_lane_permissions.py.
@@ -121,7 +122,7 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
         "CLAUDE_CONFIG_DIR=/home/alpha/.claude-alpha",
         "tmux",
         "-S",
-        str(tmp_path / "alpha.sock"),
+        str(lane.tmux_socket),
         "has-session",
         "-t",
         "alpha",
@@ -136,7 +137,7 @@ def test_lane_anchor_selects_lane_socket_and_starts_only_a_shell(tmp_path):
         "CLAUDE_CONFIG_DIR=/home/alpha/.claude-alpha",
         "tmux",
         "-S",
-        str(tmp_path / "alpha.sock"),
+        str(lane.tmux_socket),
         "new-session",
         "-d",
         "-e",
@@ -256,7 +257,7 @@ def test_lane_identity_reaches_a_new_session_on_an_existing_tmux_server(
     )
     monkeypatch.setattr("chitra.lane_anchor._agent_command", lambda *_args: [sys.executable, "-c", proof_code])
     monkeypatch.delenv("PYTHONPATH", raising=False)
-    control_socket = tmp_path / "control.sock"
+    control_socket = portable_socket_path(tmp_path / "control.sock")
     subprocess.run(
         ["tmux", "-S", str(lane.tmux_socket), "new-session", "-d", "-s", "keeper", "sleep 30"],
         check=True,
@@ -635,7 +636,7 @@ def test_shared_dispatch_wrapper_uses_only_enabled_lane_roots(tmp_path, monkeypa
     monkeypatch.setattr(dispatchd, "run_once", fake_run_once)
     assert dispatchd.run_lanes_once(path) == {"alpha": []}
     assert calls[0][0] == tmp_path / "alpha-state/queue"
-    assert calls[0][1]["tmux_socket"] == tmp_path / "alpha.sock"
+    assert calls[0][1]["tmux_socket"] == portable_socket_path(tmp_path / "alpha.sock")
     assert calls[0][1]["goals_root"] == tmp_path / "alpha-state"
 
 

@@ -21,7 +21,7 @@ def _server(tmp_path: Path) -> tuple[AgentStatusBroker, ControlServer, Path]:
     socket_path = tmp_path / "chitra.sock"
     server = ControlServer(socket_path, ApiRuntime(broker, pane_verifier=lambda _status: True))
     server.start()
-    return broker, server, socket_path
+    return broker, server, server.socket_path
 
 
 def _wait_until(predicate, *, timeout: float = 2.0) -> bool:
@@ -176,8 +176,7 @@ def test_typed_subscription_filters_blocked_by_pane_and_echoes_subscription_id(t
     thread = threading.Thread(target=subscribe)
     thread.start()
     try:
-        while not received:
-            threading.Event().wait(0.01)
+        assert _wait_until(lambda: bool(received))
         broker.report_agent(pane_id="%2", source="test", agent="codex", state="blocked")
         broker.report_agent(pane_id="%1", source="test", agent="codex", state="working")
         broker.report_agent(pane_id="%1", source="test", agent="codex", state="blocked")
@@ -339,7 +338,7 @@ def test_control_server_refuses_to_unlink_an_existing_owner_socket(tmp_path: Pat
 
 
 def test_control_server_recovers_a_stale_crash_socket(tmp_path: Path) -> None:
-    socket_path = tmp_path / "chitra.sock"
+    socket_path = socket_api.portable_socket_path(tmp_path / "chitra.sock")
     crashed = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     crashed.bind(str(socket_path))
     crashed.close()

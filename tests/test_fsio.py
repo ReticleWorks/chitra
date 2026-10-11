@@ -18,10 +18,6 @@ def test_exclusive_lock_excludes_a_contender_then_releases(tmp_path: Path) -> No
     try:
         with exclusive_lock(lock_path), pytest.raises(BlockingIOError):
             fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    finally:
-        os.close(contender)
-    contender = os.open(lock_path, os.O_RDWR)
-    try:
         fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
         fcntl.flock(contender, fcntl.LOCK_UN)
     finally:

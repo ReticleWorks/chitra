@@ -9,15 +9,17 @@ a checkpoint. Process exit is evidence; silence or elapsed time never is.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import hmac
 import json
 import os
 import subprocess
+import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict
 
@@ -91,6 +93,8 @@ def _sha256_file(path: Path) -> str:
 def _observe_process_identity(pid: int) -> dict[str, Any]:
     if type(pid) is not int or pid <= 0:
         raise RuntimeError("RESCUE capture requires affected process identity")
+    if sys.platform == "darwin":
+        return _observe_darwin_process_identity(pid)
     proc_dir = Path("/proc") / str(pid)
     try:
         stat = proc_dir.stat()
@@ -117,6 +121,59 @@ def _observe_process_identity(pid: int) -> dict[str, Any]:
     except OSError:
         identity["target_exe"] = ""
     return identity
+
+
+class _ProcBsdInfo(ctypes.Structure):
+    # Darwin's PROC_PIDTBSDINFO ABI from <sys/proc_info.h>.
+    _fields_: ClassVar[list[tuple[str, Any]]] = [
+        (name, ctypes.c_uint32) for name in (
+            "flags", "status", "xstatus", "pid", "ppid", "uid", "gid",
+            "ruid", "rgid", "svuid", "svgid", "reserved",
+        )
+    ] + [
+        ("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32),
+        ("nfiles", ctypes.c_uint32), ("pgid", ctypes.c_uint32),
+        ("jobc", ctypes.c_uint32), ("tdev", ctypes.c_uint32),
+        ("tpgid", ctypes.c_uint32), ("nice", ctypes.c_int32),
+        ("start_sec", ctypes.c_uint64), ("start_usec", ctypes.c_uint64),
+    ]
+
+
+def _observe_darwin_process_identity(pid: int) -> dict[str, Any]:
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        libproc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+        libproc.proc_pidinfo.restype = ctypes.c_int
+        info = _ProcBsdInfo()
+        size = ctypes.sizeof(info)
+        if libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), size) != size or info.pid != pid:
+            raise RuntimeError(f"RESCUE capture target process is not observable: {pid}")
+        comm = info.comm.decode("utf-8", errors="replace")
+        if info.start_sec <= 0 or info.start_usec >= 1_000_000 or not comm:
+            raise RuntimeError(f"RESCUE capture target process identity is incomplete: {pid}")
+        libproc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        libproc.proc_pidpath.restype = ctypes.c_int
+        exe = ctypes.create_string_buffer(4096)
+        exe_path = exe.value.decode("utf-8", errors="replace") if libproc.proc_pidpath(pid, exe, len(exe)) > 0 else ""
+        after = _ProcBsdInfo()
+        if (
+            libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(after), size) != size
+            or any(
+                getattr(after, name) != getattr(info, name)
+                for name in ("pid", "uid", "gid", "comm", "start_sec", "start_usec")
+            )
+        ):
+            raise RuntimeError(f"RESCUE capture target process identity changed: {pid}")
+    except (OSError, AttributeError) as exc:
+        raise RuntimeError(f"RESCUE capture target process is not observable: {pid}") from exc
+    return {
+        "target_pid": pid,
+        "target_uid": info.uid,
+        "target_gid": info.gid,
+        "target_start_time": str(info.start_sec * 1_000_000 + info.start_usec),
+        "target_comm": comm,
+        "target_exe": exe_path,
+    }
 
 
 def _checkpoint_key_path(state_root: Path) -> Path:

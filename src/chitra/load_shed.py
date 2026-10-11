@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import math
+import os
+import subprocess
+import sys
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +20,7 @@ from chitra.rate_limit_state import LoadHostState, PauseBackend
 
 @dataclass(frozen=True, slots=True)
 class PressureSample:
-    """One host's memory availability and Linux PSI avg60 facts."""
+    """Memory availability and pressure; Darwin CPU is estimated from loadavg."""
 
     mem_available_pct: float
     memory_some_avg60: float
@@ -79,7 +83,38 @@ def sample_pressure(
     memory_pressure_path: Path = Path("/proc/pressure/memory"),
     cpu_pressure_path: Path = Path("/proc/pressure/cpu"),
 ) -> PressureSample:
-    """Read one local Linux pressure sample from procfs."""
+    """Read Linux PSI, or Darwin available memory and runnable CPU pressure.
+
+    Darwin has no PSI: memory stall fields are zero, and CPU pressure is the
+    estimated percentage of runnable work beyond CPU capacity over one minute.
+    Explicit procfs paths still select the Linux reader for replay/fixtures.
+    """
+    if sys.platform == "darwin" and (
+        meminfo_path == Path("/proc/meminfo")
+        and memory_pressure_path == Path("/proc/pressure/memory")
+        and cpu_pressure_path == Path("/proc/pressure/cpu")
+    ):
+        try:
+            result = subprocess.run(
+                ["/usr/sbin/sysctl", "-n", "kern.memorystatus_level"],
+                capture_output=True, text=True, check=True, timeout=5,
+            )
+            available_pct = float(result.stdout.strip())
+            load = os.getloadavg()[0]
+            cpus = os.cpu_count()
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise ValueError("Darwin host pressure is not observable") from exc
+        if not math.isfinite(available_pct) or not 0 <= available_pct <= 100:
+            raise ValueError("Darwin memory availability must be between 0 and 100")
+        if cpus is None or cpus <= 0 or not math.isfinite(load) or load < 0:
+            raise ValueError("Darwin CPU capacity/load is not observable")
+        # shortcut: runnable-load estimate, replace when Darwin exposes CPU stall time.
+        return PressureSample(
+            mem_available_pct=available_pct,
+            memory_some_avg60=0.0,
+            memory_full_avg60=0.0,
+            cpu_some_avg60=100.0 * max(0.0, 1.0 - cpus / load) if load > 0 else 0.0,
+        )
     total, available = _meminfo_kib(meminfo_path)
     if total <= 0:
         raise ValueError(f"{meminfo_path} MemTotal must be positive")

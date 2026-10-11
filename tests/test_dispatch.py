@@ -621,7 +621,7 @@ def test_ensure_nudge_submitted_fails_closed_when_codex_fallback_does_not_clear(
     assert ok is False
     assert detail == "submit-failed-composer-still-holds-text"
 
-def test_ensure_nudge_submitted_never_sends_fallback_during_an_active_turn() -> None:
+def test_ensure_nudge_submitted_queues_without_enter_during_an_active_turn() -> None:
     """A composer that still shows the marker while active-turn chrome ("esc
     to interrupt") is visible must never get an ESC-shaped fallback byte --
     that would cancel a running turn instead of submitting stale text."""
@@ -631,7 +631,8 @@ def test_ensure_nudge_submitted_never_sends_fallback_during_an_active_turn() -> 
         if cmd[:2] == ["tmux", "capture-pane"]:
             return fake_completed(
                 0,
-                "• Investigating rendering code (0s • esc to interrupt)\n\x1b[1m›\x1b[0m diagnose the failing build\n  ? for shortcuts",
+                "• Investigating rendering code (0s • esc to interrupt)\n\x1b[1m›\x1b[0m "
+                + ("diagnose the failing build" if not sent else "") + "\n  ? for shortcuts",
                 "",
             )
         sent.append(cmd)
@@ -653,8 +654,8 @@ def test_ensure_nudge_submitted_never_sends_fallback_during_an_active_turn() -> 
         tmux_socket=None,
     )
     assert ok is True
-    assert "active-turn chrome visible" in detail
-    assert sent == []
+    assert detail == "queued: composer cleared after Tab"
+    assert sent == [["tmux", "send-keys", "-t", "f3:0.0", "Tab"]]
 
 def test_ensure_nudge_submitted_governed_remote_fallback_reuses_lane_steer(monkeypatch: pytest.MonkeyPatch) -> None:
     """The governed grant exposes no raw ``tmux send-keys`` verb -- the
@@ -763,14 +764,18 @@ def test_dispatch_to_tmux_reports_failed_when_composer_never_clears(tmp_path: Pa
 @pytest.mark.skipif(not HAS_TMUX, reason="tmux binary not available in this sandbox")
 def test_real_tmux_paste_and_pane_in_mode_roundtrip() -> None:
     session_name = f"pytest-chitra-{uuid.uuid4().hex[:8]}"
-    subprocess.run(["tmux", "new-session", "-d", "-s", session_name, "-x", "80", "-y", "24"], check=True)
+
+    def runner(cmd: list[str], payload: str | None = None, *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["tmux", "-L", session_name, *cmd[1:]], input=payload, capture_output=True, text=True, timeout=timeout)
+
+    runner(["tmux", "new-session", "-d", "-s", session_name, "-x", "80", "-y", "24"]).check_returncode()
     try:
         pane = f"{session_name}:0.0"
-        assert pane_in_mode(pane) is False
-        proc = paste_nudge_to_local_tmux(pane, "echo hi-from-chitra-test")
+        assert pane_in_mode(pane, runner=runner) is False
+        proc = paste_nudge_to_local_tmux(pane, "echo hi-from-chitra-test", runner=runner, input_runner=runner)
         assert proc.returncode == 0
     finally:
-        subprocess.run(["tmux", "kill-session", "-t", session_name], check=False)
+        runner(["tmux", "kill-server"])
 
 
 # --- mid-turn delivery: Claude records a busy-lane paste as queued_command --

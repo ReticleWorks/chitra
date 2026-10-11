@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 
 STATE_DIR_ENV_VAR = "CHITRA_STATE_DIR"
 DEFAULT_STATE_DIR = Path("/var/lib/chitra")
+
+
+def portable_socket_path(path: Path) -> Path:
+    """Keep the encoded address, including its NUL, within Darwin's 104 bytes."""
+    encoded = os.fsencode(path)
+    if b"\0" in encoded:
+        raise ValueError("Unix socket path contains a NUL")
+    if len(encoded) + 1 <= 104:
+        return path
+    digest = hashlib.sha256(os.fsencode(path.absolute())).hexdigest()
+    return Path("/tmp") / f"chitra-{digest}.sock"
 
 
 def state_dir() -> Path:
