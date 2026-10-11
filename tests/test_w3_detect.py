@@ -1443,8 +1443,7 @@ def test_relaunch_rejects_self_authored_checkpoint_and_null_target_pid(tmp_path:
         )
 
 
-def test_rescue_bundle_is_bounded_hash_bound_and_brief_renders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _stub_process_identity_observer(monkeypatch)
+def test_rescue_bundle_is_bounded_hash_bound_and_brief_renders(tmp_path: Path) -> None:
     worktree = tmp_path / "wt"
     worktree.mkdir()
     subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True, text=True)
@@ -1474,6 +1473,14 @@ def test_rescue_bundle_is_bounded_hash_bound_and_brief_renders(tmp_path: Path, m
     assert bundle.transcript_sha256
     assert bundle.process_identity["target_pid"] == os.getpid()
     assert bundle.process_identity["target_start_time"]
+    assert bundle.process_identity["target_uid"] == os.geteuid()
+    assert bundle.process_identity["target_gid"] == os.getegid()
+    assert rescue_mod.rescue_bundle_process_fresh(bundle)
+    reused = bundle.model_copy(update={"process_identity": {
+        **bundle.process_identity,
+        "target_start_time": str(int(bundle.process_identity["target_start_time"]) + 1),
+    }})
+    assert not rescue_mod.rescue_bundle_process_fresh(reused)
     assert bundle.git_state["diff_staged"]
     assert bundle.git_state["diff_unstaged"]
     assert bundle.checkpoint_requested is True

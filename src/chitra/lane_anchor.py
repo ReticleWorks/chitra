@@ -38,7 +38,7 @@ from chitra.recovery import (
     transition_lane_lifecycle,
     validate_lane_resume,
 )
-from chitra.socket_api import default_socket_path
+from chitra.socket_api import default_socket_path, portable_socket_path
 from chitra.supervision import goal_digest
 
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
@@ -853,7 +853,7 @@ def start_lane(
     if self_test:
         # The cheap half of the self-test, before anything is created.
         _require_full_permissions(backend, agent_command)
-    control_socket = socket_path or default_socket_path()
+    control_socket = portable_socket_path(socket_path or default_socket_path())
     existing = runner(_run_as_lane(lane, _tmux(lane, "has-session", "-t", lane.tmux_session)))
     if existing.returncode == 0:
         # A lane that is already up still gets its pipe re-armed. This early

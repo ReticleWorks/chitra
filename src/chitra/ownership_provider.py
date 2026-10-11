@@ -28,6 +28,7 @@ from typing import Final
 from chitra._fsio import exclusive_lock
 from chitra.goals import GOAL_STATUSES, GOALS_SCHEMA_RE, _schema_version
 from chitra.goals import SCHEMA as CURRENT_GOALS_SCHEMA
+from chitra.socket_api import portable_socket_path, recover_stale_socket
 from chitra.state_paths import state_dir as default_state_dir
 
 QUERY_SCHEMA: Final = "chitra.ownership.query.v1"
@@ -691,6 +692,7 @@ def request_json_line(
     expected_peer_uid: int | None = None,
 ) -> object:
     """Timeout-bounded client helper for both local authority protocols."""
+    socket_path = portable_socket_path(socket_path)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(timeout_seconds)
         connection.connect(str(socket_path))
@@ -714,18 +716,9 @@ def serve_unix_json_lines(
     socket_mode: int = 0o660,
 ) -> None:
     """Serve one request per local connection until interrupted."""
+    socket_path = portable_socket_path(socket_path)
     socket_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        existing = socket_path.lstat()
-    except FileNotFoundError:
-        pass
-    else:
-        if not stat.S_ISSOCK(existing.st_mode):
-            raise RuntimeError(f"refusing to replace non-socket path: {socket_path}")
-        current = socket_path.lstat()
-        if current.st_dev != existing.st_dev or current.st_ino != existing.st_ino or not stat.S_ISSOCK(current.st_mode):
-            raise RuntimeError(f"refusing to replace changed socket path: {socket_path}")
-        socket_path.unlink()
+    recover_stale_socket(socket_path)
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     bound_identity: tuple[int, int] | None = None
     try:
