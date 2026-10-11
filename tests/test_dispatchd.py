@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -14,9 +15,20 @@ import pytest
 import yaml
 from _goal_fixtures import enrollment_fields
 
+import chitra.dispatch as dispatch_mod
 import chitra.dispatchd as dispatchd_mod
 import chitra.ledger as ledger_mod
-from chitra.dispatch import DISPATCH_VERIFY_WAIT_SECONDS, DispatchOrder, DispatchResult, DispatchStatus, LaneLock, LaneLockError
+from chitra.dispatch import (
+    DISPATCH_VERIFY_WAIT_SECONDS,
+    DispatchOrder,
+    DispatchResult,
+    DispatchStatus,
+    DispatchTuning,
+    LaneLock,
+    LaneLockError,
+    pane_capture_tail_hash,
+    transcript_mtime,
+)
 from chitra.dispatchd import build_arg_parser, main, process_one_order, requeue_deferred_for_session, resolve_session_prefixes, run_once
 from chitra.goals import GOALS_SCHEMA_NEWER_MESSAGE, GoalRecord, hold_goal, redirect_goal, resume_goal, upsert_goal
 from chitra.policy_config import PolicyConfig
@@ -45,6 +57,140 @@ def _write_order(orders_dir: Path, order: DispatchOrder) -> Path:
     path = orders_dir / f"{order.order_id}.json"
     path.write_text(order.model_dump_json(), encoding="utf-8")
     return path
+
+
+class _BusyPane:
+    """Transport boundary: Codex queues with Tab, Claude queues with Enter."""
+
+    def __init__(self, *, draft: str = "", fail_queue: bool = False, stuck_queue: bool = False, client: str = "codex") -> None:
+        self.client = client
+        self.draft = draft
+        self.fail_queue = fail_queue
+        self.stuck_queue = stuck_queue
+        self.loaded = ""
+        self.queued = ""
+        self.pastes = 0
+        self.keys: list[str] = []
+        self.paint_pending = False
+
+    @property
+    def screen(self) -> str:
+        draft = "" if self.paint_pending else self.draft
+        chrome = f"Queued: {self.queued}\n• Working\n"
+        if self.client == "claude":
+            draft = "[Pasted text #1 +4 lines]" if draft and self.loaded else draft
+            return chrome + f"──────────────────────\n❯ {draft}\n──────────────────────\n"
+        return chrome + f"› {draft}\n  ? for shortcuts\n"
+
+    def __call__(self, cmd: list[str], payload: str | None = None, *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+        stdout = ""
+        rc = 0
+        if "capture-pane" in cmd:
+            stdout = self.screen
+            self.paint_pending = False
+        elif "load-buffer" in cmd:
+            assert payload is not None
+            self.loaded = payload
+        elif "paste-buffer" in cmd:
+            assert not self.draft, "dispatch must never paste into a draft"
+            self.draft = self.loaded
+            self.pastes += 1
+            self.paint_pending = True
+        elif "send-keys" in cmd:
+            self.keys.append(cmd[-1])
+            assert cmd[-1] == ("Tab" if self.client == "codex" else "Enter"), "wrong busy queue key"
+            if self.fail_queue:
+                rc = 1
+            elif not self.stuck_queue:
+                self.queued, self.draft = self.draft, ""
+        return subprocess.CompletedProcess(cmd, rc, stdout=stdout, stderr="queue key failed" if rc else "")
+
+
+@pytest.mark.parametrize("client", ["codex", "claude"])
+def test_busy_queue_becomes_sent_only_after_transcript_consumption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client: str,
+) -> None:
+    pane = _BusyPane(client=client)
+    key = "Tab" if client == "codex" else "Enter"
+    monkeypatch.setattr(dispatch_mod, "run_cmd", pane)
+    queue = tmp_path / "queue"
+    transcript = tmp_path / "projects" / "codex lane" / "session.jsonl"
+    transcript.parent.mkdir(parents=True)
+    old_turn = json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "old turn still working"}}) + "\n"
+    transcript.write_text(old_turn, encoding="utf-8")
+    assert transcript_mtime(str(transcript), host="localhost") == transcript.stat().st_mtime
+
+    def remote_stat_runner(cmd: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+        assert cmd[0] == "ssh"
+        # Exercise this host's actual GNU/BSD stat through the SSH boundary.
+        return subprocess.run(shlex.split(cmd[-1]), capture_output=True, text=True, timeout=timeout)
+
+    assert transcript_mtime(str(transcript), host="remote.invalid", runner=remote_stat_runner) == int(transcript.stat().st_mtime)
+    order = DispatchOrder(order_id="busy-codex", session_ref="localhost:s:0.0", nudge="check the delivery contract next")
+    _write_order(queue / "orders", order)
+    kwargs = {
+        "lock_dir": tmp_path / "locks",
+        "ledger_path": tmp_path / "ledger.jsonl",
+        "goals_root": tmp_path / "state",
+        "projects_root": transcript.parent.parent,
+        "tuning": DispatchTuning(post_paste_wait_seconds=0),
+    }
+
+    first = run_once(queue, **kwargs)[0]
+    assert first.status is DispatchStatus.DELIVERY_UNCONFIRMED
+    assert f"queued: composer cleared after {key}" in first.reason
+    assert pane.queued == order.nudge
+    assert pane.keys == [key]
+    assert not (queue / "results" / f"{order.order_id}.json").exists()
+    assert not (tmp_path / "ledger.jsonl").exists()
+
+    # Continued old-turn activity and an accepted input without new activity
+    # cannot turn the queued prompt into a consumed receipt.
+    assert run_once(queue, **kwargs)[0].status is DispatchStatus.DELIVERY_UNCONFIRMED
+    user = json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user", "content": order.nudge}}) + "\n"
+    transcript.write_text(old_turn + user, encoding="utf-8")
+    assert run_once(queue, **kwargs)[0].status is DispatchStatus.DELIVERY_UNCONFIRMED
+    transcript.write_text(old_turn + user + old_turn, encoding="utf-8")
+    consumed = run_once(queue, **kwargs)[0]
+    assert consumed.status is DispatchStatus.SENT
+    assert consumed.transcript_path == str(transcript)
+    assert consumed.delivery_ledger_verified
+    assert pane.pastes == 1
+    assert pane.keys == [key]
+    assert (queue / "processed" / f"{order.order_id}.json").exists()
+    assert ledger_mod.verify_delivery(
+        tmp_path / "ledger.jsonl", key=ledger_mod.load_or_create_signing_key(tmp_path / "ledger.key"),
+        order_id=order.order_id, session_ref=order.session_ref, nudge=order.nudge,
+    ) is not None
+
+
+@pytest.mark.parametrize("draft,stuck_queue", [("keep this draft", False), ("Explain this codebase", False), ("", False), ("", True)])
+def test_busy_codex_preserves_draft_or_failed_queue_without_consumed_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, draft: str, stuck_queue: bool,
+) -> None:
+    pane = _BusyPane(draft=draft, fail_queue=not stuck_queue, stuck_queue=stuck_queue)
+    monkeypatch.setattr(dispatch_mod, "run_cmd", pane)
+    queue = tmp_path / "queue"
+    order = DispatchOrder(
+        order_id="blocked-codex", session_ref="localhost:s:0.0", nudge="check the delivery contract next",
+        input_baseline_hash=pane_capture_tail_hash(pane.screen.splitlines()),
+    )
+    _write_order(queue / "orders", order)
+    result = run_once(
+        queue, lock_dir=tmp_path / "locks", goals_root=tmp_path / "state", projects_root=tmp_path / "projects",
+        ledger_path=tmp_path / "ledger.jsonl", tuning=DispatchTuning(post_paste_wait_seconds=0),
+    )[0]
+    expected = DispatchStatus.DELIVERY_UNCONFIRMED if stuck_queue else DispatchStatus.BLOCKED if draft else DispatchStatus.FAILED
+    assert result.status is expected
+    assert pane.draft == (draft or order.nudge)
+    assert pane.pastes == (0 if draft else 1)
+    assert pane.keys == ([] if draft else ["Tab"])
+    assert not result.delivery_ledger_verified
+    assert not (tmp_path / "ledger.jsonl").exists()
+    assert transcript_mtime(str(tmp_path / "missing.jsonl"), host="localhost") is None
+    if stuck_queue:
+        assert (queue / "deferred" / f"{order.order_id}.json").exists()
+        assert not (queue / "results" / f"{order.order_id}.json").exists()
 
 
 def _write_transcript_binding(path: Path, *, session_ref: str, lane: str, transcript: Path) -> Path:

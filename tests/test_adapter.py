@@ -225,6 +225,19 @@ def test_tmux_plug_send_delegates_and_receipt_proves(monkeypatch: pytest.MonkeyP
     proof = plug.prove_read(handle, wire, receipt)
     assert proof.level == "consumed"
     assert proof.native_session_id == "sess-1"
+    for status, reason, delivery in (
+        (DispatchStatus.DELIVERY_UNCONFIRMED, "delivery-unconfirmed: queued: composer cleared after Tab", "queued"),
+        (DispatchStatus.SENT, "sent: legacy pane fallback", "pasted"),
+    ):
+        monkeypatch.setattr(
+            "chitra.dispatch.dispatch_to_tmux",
+            lambda order, status=status, reason=reason, **kwargs: DispatchResult(
+                order_id=order.order_id, session_ref=order.session_ref, status=status, reason=reason,
+            ),
+        )
+        receipt = plug.send(handle, wire)
+        assert receipt.delivery == delivery
+        assert plug.prove_read(handle, wire, receipt).level == "accepted"
 
 
 def test_tmux_plug_send_rejection_maps_to_contract_error(monkeypatch: pytest.MonkeyPatch) -> None:

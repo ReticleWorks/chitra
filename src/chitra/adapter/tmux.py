@@ -3,7 +3,7 @@
 ``send`` delegates to ``chitra.dispatch.dispatch_to_tmux`` — the governed,
 verified paste path — so a lane behind the interface behaves exactly like the
 historical dispatch path: directive-voice guard, copy-mode cancel, bracketed
-paste, verified submit, transcript proof, pane fallback. Read proof stays
+paste, verified queue/submit, transcript proof. Read proof stays
 fused inside that call on the send path; ``prove_read`` decodes the receipt's
 embedded dispatch result, or — with no receipt, the nonce-reconcile shape —
 re-verifies against the bound transcript alone.
@@ -297,7 +297,7 @@ class TmuxLanePlug:
         return SendReceipt(
             order_id=order.order_id,
             sent_at=result.at,
-            delivery="pasted",
+            delivery="queued" if result.reason.startswith("delivery-unconfirmed: queued:") else "pasted",
             ack=result.reason,
             native={"dispatch_result": result.model_dump(mode="json")},
         )
@@ -323,7 +323,7 @@ class TmuxLanePlug:
         stored = receipt.native.get("dispatch_result") if receipt is not None else None
         if isinstance(stored, dict):
             result = DispatchResult.model_validate(stored)
-            if result.status is DispatchStatus.SENT:
+            if result.status is DispatchStatus.SENT and result.transcript_path:
                 return ReadProof(
                     order_id=order.order_id,
                     level="consumed",
@@ -331,7 +331,7 @@ class TmuxLanePlug:
                     native_session_id=result.native_session_id,
                     binding_ref=result.transcript_path or handle.binding_ref,
                 )
-            if result.status is DispatchStatus.DELIVERY_UNCONFIRMED:
+            if result.status in (DispatchStatus.SENT, DispatchStatus.DELIVERY_UNCONFIRMED):
                 return ReadProof(
                     order_id=order.order_id,
                     level="accepted",
