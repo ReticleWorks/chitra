@@ -411,7 +411,7 @@ def test_check_enrollment_disputes_a_plain_claim_when_the_validator_fails(
     _write_registry(tmp_path, monkeypatch)
     upsert_goal(tmp_path, _goal("session-1"))
     final_response = _event("completion-plain-fail", CanonicalType.FINAL_RESPONSE).model_copy(
-        update={"payload": {"text": "Done. The digest file exists and is verified."}}
+        update={"payload": {"text": "Complete this morning. The digest file exists and is verified."}}
     )
 
     recorded, disputed, findings, pending = check_enrollment_and_receipts(

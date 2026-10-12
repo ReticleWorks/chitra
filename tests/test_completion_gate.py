@@ -35,7 +35,31 @@ GOOD_EVIDENCE = [
 ]
 
 
-def test_dispatchd_blocks_delivery_on_completion_dispute_and_never_calls_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("nudge", "todo_state"),
+    [
+        ("Complete", "none"),
+        ("The task is complete", "none"),
+        ("The task is complete this morning", "none"),
+        ("DONE", "none"),
+        ("Progress continues.\nThe task is complete", "none"),
+        ("the feature is done", "open"),
+        ("Complete this continuation in the existing lane.", "open"),
+        ("Complete this morning", "none"),
+        ("Complete this week", "none"),
+        ("Complete that evening", "none"),
+        ("Complete all day", "none"),
+        ("Complete one day", "none"),
+        ("Complete the continuation in the existing lane.\nDONE", "none"),
+        ("Complete the continuation in the existing lane.", "empty"),
+    ],
+)
+def test_dispatchd_blocks_completion_claims_and_structured_metadata_without_proof(
+    nudge: str,
+    todo_state: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     call_count = {"n": 0}
 
     def fake_dispatch(order: DispatchOrder, **kwargs: object) -> None:  # pragma: no cover - must never be called
@@ -52,8 +76,10 @@ def test_dispatchd_blocks_delivery_on_completion_dispute_and_never_calls_dispatc
     order = DispatchOrder(
         order_id="ord-audit-1",
         session_ref="localhost:s:0.0",
-        nudge="the feature is done",
-        completion_todo_items=[TodoItem(text="write tests", status="open")],
+        nudge=nudge,
+        completion_todo_items=(
+            [TodoItem(text="write tests", status="open")] if todo_state == "open" else [] if todo_state == "empty" else None
+        ),
     )
     order_path = orders_dir / "ord-audit-1.json"
     order_path.write_text(order.model_dump_json(), encoding="utf-8")
@@ -69,7 +95,8 @@ def test_dispatchd_blocks_delivery_on_completion_dispute_and_never_calls_dispatc
     assert call_count["n"] == 0
     assert result is not None
     assert result.status == DispatchStatus.COMPLETION_DISPUTE
-    assert "write tests" in result.reason
+    if todo_state == "open":
+        assert "write tests" in result.reason
     assert (queue_dir / "processed" / "ord-audit-1.json").exists()
 
 
@@ -149,10 +176,24 @@ def test_dispatchd_proceeds_to_dispatch_on_clean_completion_claim(tmp_path: Path
     assert result.status == DispatchStatus.SENT
 
 
-def test_dispatchd_leaves_a_non_completion_nudge_unaffected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "nudge",
+    [
+        "hi",
+        "Complete this continuation in the existing lane.",
+        "Complete the task in the existing lane.",
+        "**Complete the task in the existing lane.**",
+    ],
+)
+def test_dispatchd_delivers_sentence_initial_completion_imperative(
+    nudge: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from chitra.dispatch import DispatchResult
 
+    call_count = {"n": 0}
+
     def fake_dispatch(order: DispatchOrder, **kwargs: object) -> DispatchResult:
+        call_count["n"] += 1
         return DispatchResult(order_id=order.order_id, session_ref=order.session_ref, status=DispatchStatus.SENT)
 
     monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", fake_dispatch)
@@ -162,7 +203,11 @@ def test_dispatchd_leaves_a_non_completion_nudge_unaffected(tmp_path: Path, monk
     orders_dir.mkdir(parents=True)
     (queue_dir / "results").mkdir(parents=True)
     (queue_dir / "processed").mkdir(parents=True)
-    order = DispatchOrder(order_id="ord-plain", session_ref="localhost:s:0.0", nudge="hi")
+    order = DispatchOrder(
+        order_id="ord-plain",
+        session_ref="localhost:s:0.0",
+        nudge=nudge,
+    )
     order_path = orders_dir / "ord-plain.json"
     order_path.write_text(order.model_dump_json(), encoding="utf-8")
 
@@ -176,6 +221,7 @@ def test_dispatchd_leaves_a_non_completion_nudge_unaffected(tmp_path: Path, monk
         ledger_key_path=tmp_path / "ledger.key",
     )
 
+    assert call_count["n"] == 1
     assert result is not None
     assert result.status == DispatchStatus.SENT
 
