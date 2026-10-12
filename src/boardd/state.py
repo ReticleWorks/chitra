@@ -19,6 +19,7 @@ Honesty rules enforced here, not in the template:
 """
 
 import json
+import math
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,10 +27,151 @@ from typing import Any
 
 from chitra.goals import GoalsSchemaNewerError, load_goals_document, session_name
 
+from . import config
 from .config import DIGEST_FILE, GOALS_FILE, STALE_AFTER_SECONDS
 from .translate import TranslationCache
 
 SCHEMA = "boardd.state.v2"
+
+WATCHER_LABELS = frozenset({
+    "working", "idle-at-prompt", "waiting-on-watcher >20 min", "waiting-on-operator",
+    "blocked", "ready-to-close", "dead", "logged-out", "question-pending", "queued-input-unconsumed",
+})
+CLASSIFICATION_FIELDS = (
+    "label", "provider", "model", "confidence", "probabilities", "packet_hash",
+    "observed_at", "usage", "latency_ms", "reason",
+)
+
+
+def _watcher_age(value: Any, now: datetime) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if stamp.tzinfo is None or stamp > now:
+        return None
+    return (now - stamp).total_seconds()
+
+
+def _watcher_classification(value: Any) -> dict[str, Any]:
+    result = {key: value.get(key) if isinstance(value, dict) else None for key in CLASSIFICATION_FIELDS}
+    label, confidence, probabilities = result["label"], result["confidence"], result["probabilities"]
+    def valid_number(n: Any) -> bool:
+        return isinstance(n, (int, float)) and not isinstance(n, bool) and math.isfinite(n) and 0 <= n <= 1
+    invalid = (
+        (label is not None and (not isinstance(label, str) or label not in WATCHER_LABELS))
+        or (confidence is not None and not valid_number(confidence))
+        or (probabilities is not None and (
+            not isinstance(probabilities, dict)
+            or any(key not in WATCHER_LABELS or not valid_number(n) for key, n in probabilities.items())
+        ))
+    )
+    if invalid:
+        result.update(label=None, confidence=None, probabilities=None, reason="invalid watcher classification")
+    elif label is None and not result["reason"]:
+        result["reason"] = "watcher classification unavailable"
+    return result
+
+
+def _finite_json_number(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("non-finite JSON number")
+    return number
+
+
+def build_watcher_view(state_dir: Path, host: str, now: datetime | None = None) -> dict[str, Any]:
+    """Project the independent watcher feed without granting model labels authority."""
+    now = now or datetime.now(UTC)
+    errors: list[str] = []
+    doc: dict[str, Any] = {}
+    try:
+        value = json.loads(
+            (state_dir / config.WATCHER_LANES_FILE).read_text(encoding="utf-8"),
+            parse_constant=_finite_json_number, parse_float=_finite_json_number,
+        )
+        if (
+            not isinstance(value, dict) or value.get("host") != host
+            or not isinstance(value.get("lanes"), list)
+            or any(not isinstance(lane, dict) or not isinstance(lane.get("id"), str) or not lane["id"] for lane in value["lanes"])
+            or len({lane["id"] for lane in value["lanes"]}) != len(value["lanes"])
+            or (value.get("health") is not None and not isinstance(value["health"], dict))
+        ):
+            raise ValueError("invalid watcher document")
+        doc = value
+    except (OSError, ValueError, UnicodeError) as exc:
+        errors.append(f"{config.WATCHER_LANES_FILE} unavailable: {type(exc).__name__}")
+    age = _watcher_age(doc.get("updated_at"), now)
+    if doc and age is None:
+        errors.append(f"{config.WATCHER_LANES_FILE} updated_at missing, invalid or in the future")
+    stale = age > STALE_AFTER_SECONDS if age is not None else None
+    lanes = []
+    counts: dict[str, int] = {}
+    for lane in doc.get("lanes", []):
+        classification = _watcher_classification(lane.get("classification"))
+        classification_age = _watcher_age(classification["observed_at"], now)
+        classification_stale = classification_age > STALE_AFTER_SECONDS if classification_age is not None else None
+        label = classification["label"]
+        if classification["reason"] == "invalid watcher classification":
+            errors.append(f"lane {lane['id']}: invalid watcher classification")
+        if label is not None:
+            counts[label] = counts.get(label, 0) + 1
+        # Preserve the last model observation, but never present old/unknown evidence as current work.
+        current_label = label if stale is False and classification_stale is False else None
+        lanes.append({
+            **lane, "host": host, "classification": classification,
+            "harness": lane.get("harness"), "native_session_id": lane.get("native_session_id"),
+            "goal": lane.get("goal"), "evidence": lane.get("evidence"), "delivery": lane.get("delivery"),
+            "lane_id": lane["id"], "title": lane["id"],
+            "classification_age_seconds": classification_age, "classification_stale": classification_stale,
+            "movement": {"status": current_label, "pill": {"tone": "hold", "label": current_label or "UNKNOWN"}},
+        })
+    events = []
+    seen: dict[str, dict[str, Any]] = {}
+    try:
+        # shortcut: reread the host's rotated event file; use journal cursors if measured history size makes this costly.
+        with (state_dir / config.WATCHER_EVENTS_FILE).open(encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line, parse_constant=_finite_json_number, parse_float=_finite_json_number)
+                    if (
+                        not isinstance(event, dict) or event.get("host") != host
+                        or not isinstance(event.get("id"), str) or not event["id"]
+                        or "\n" in event["id"] or "\r" in event["id"]
+                        or "lane" not in event or (event["lane"] is not None and not isinstance(event["lane"], str))
+                        or not isinstance(event.get("kind"), str)
+                        or _watcher_age(event.get("emitted_at"), now) is None
+                    ):
+                        raise ValueError("invalid watcher event")
+                except ValueError:
+                    errors.append(f"{config.WATCHER_EVENTS_FILE} invalid record at line {line_number}")
+                    continue
+                if event["id"] not in seen:
+                    events.append(event)
+                    seen[event["id"]] = event
+                elif event != seen[event["id"]]:
+                    errors.append(f"{config.WATCHER_EVENTS_FILE} contradictory retry at line {line_number}")
+    except (OSError, UnicodeError) as exc:
+        errors.append(f"{config.WATCHER_EVENTS_FILE} unavailable: {type(exc).__name__}")
+    source = {
+        "kind": "hybrid-watcher", "state_dir": str(state_dir), "updated_at": doc.get("updated_at"),
+        "age_seconds": age, "data_stale": stale, "errors": errors,
+    }
+    health = doc.get("health")
+    snapshot = {"host": host, "updated_at": doc.get("updated_at"), "lanes": lanes, "health": health, "source": source}
+    return {
+        "schema": SCHEMA, "generated_at": now.isoformat(), **snapshot, "hosts": {host: snapshot},
+        "summary": {
+            "lane_count": len(lanes) if doc else None, "counts": counts, "needs_you_count": None,
+            "unclassified_count": sum(lane["classification"]["label"] is None for lane in lanes),
+            "sentence": f"{len(lanes)} observed lanes; classifier labels do not establish authority or completion.",
+        },
+        "needs_you": [], "events": events,
+    }
 
 # ---------------------------------------------------------------- loading
 
@@ -254,6 +396,9 @@ def build_scope(goal: dict[str, Any], tc: TranslationCache) -> dict[str, Any]:
 
 
 def build_view(state_dir: Path, tc: TranslationCache, now: datetime | None = None) -> dict[str, Any]:
+    for host, root in config.watcher_roots().items():
+        if root == state_dir:
+            return build_watcher_view(state_dir, host, now)
     raw = load_state_files(state_dir)
     now = now or datetime.now(UTC)
     goals_doc = raw["goals"] or {}

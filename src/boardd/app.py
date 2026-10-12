@@ -35,7 +35,7 @@ import json
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -56,6 +56,9 @@ _bridge = board_bridge.BoardBridge()
 
 @asynccontextmanager
 async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
+    if config.FEED_ONLY:
+        yield
+        return
     # BOARDD_DEV=1 (tests, local non-systemd smoke) never spawns a real
     # Node process — same escape hatch discovery.py already uses. The
     # bridge still runs under it, so a dev smoke against a fixture state
@@ -74,6 +77,13 @@ async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="boardd", docs_url=None, redoc_url=None, lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=config.PKG_DIR / "static"), name="static")
+
+
+@app.middleware("http")
+async def _feed_reader(request: Request, call_next: Any) -> Any:
+    if config.FEED_ONLY and request.method != "GET":
+        return JSONResponse({"error": "native watcher feed is read-only"}, status_code=405)
+    return await call_next(request)
 
 MAX_REQUEST_BODY_BYTES = 64 * 1024
 
@@ -152,6 +162,11 @@ def current_monitors() -> dict[str, discovery.MonitorInfo]:
             lane_count=view["summary"]["lane_count"],
             needs_feedback_count=view["summary"]["needs_you_count"],
             has_state_root=root.is_dir(),
+            host=view.get("host"),
+            source_errors=tuple(view["source"]["errors"]),
+            age_seconds=view["source"].get("age_seconds", view["source"].get("goals_age_seconds")),
+            data_stale=view["source"].get("data_stale"),
+            health=view.get("health"),
         )
     return out
 
@@ -191,10 +206,15 @@ def _combined_view(roots: dict[str, Path], discovery_errors: list[str] | None = 
     needs_you: list[dict[str, Any]] = []
     errors: list[str] = list(discovery_errors or [])
     counts: dict[str, int] = {}
+    hosts: dict[str, Any] = {}
+    lane_count_known = asks_known = True
     last_view: dict[str, Any] | None = None
     for monitor_id, root in sorted(roots.items()):
         view = build_view(root, _tcache)
         last_view = view
+        hosts.update(view.get("hosts", {}))
+        lane_count_known = lane_count_known and view["summary"]["lane_count"] is not None
+        asks_known = asks_known and view["summary"]["needs_you_count"] is not None
         for lane in view["lanes"]:
             lanes.append({**lane, "monitor": monitor_id})
         for ev in view["events"]:
@@ -212,11 +232,19 @@ def _combined_view(roots: dict[str, Path], discovery_errors: list[str] | None = 
     merged["events"] = events
     merged["needs_you"] = needs_you
     merged["summary"] = {
-        "lane_count": len(lanes),
+        "lane_count": len(lanes) if lane_count_known else None,
         "counts": counts,
-        "sentence": f"{len(roots)} monitor{'s' if len(roots) != 1 else ''}, {len(lanes)} lanes total.",
-        "needs_you_count": len(needs_you),
+        "sentence": f"{len(roots)} monitor{'s' if len(roots) != 1 else ''}, "
+                    + (f"{len(lanes)} lanes total." if lane_count_known else "lane total UNKNOWN."),
+        "needs_you_count": len(needs_you) if asks_known else None,
     }
+    if hosts:
+        merged["hosts"] = hosts
+        # A combined response must not inherit the last host's identity or health.
+        for key in ("host", "updated_at", "health"):
+            merged.pop(key, None)
+        stale_states = [snapshot["source"]["data_stale"] for snapshot in hosts.values()]
+        merged["source"]["data_stale"] = True if True in stale_states else None if None in stale_states else False
     return merged
 
 
@@ -242,8 +270,20 @@ async def api_state(monitor: str | None = None) -> JSONResponse:
     return JSONResponse(await asyncio.to_thread(_view_for, monitor))
 
 
-def _sse(event: str, data: Any) -> str:
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+def _sse(event: str, data: Any, event_id: str | None = None) -> str:
+    identifier = f"id: {event_id}\n" if event_id is not None else ""
+    return f"{identifier}event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _state_key(value: Any) -> Any:
+    """Elapsed seconds alone are not a state change; crossing stale is."""
+    if isinstance(value, dict):
+        return {key: _state_key(item) for key, item in value.items() if key not in {
+            "generated_at", "age_seconds", "goals_age_seconds", "classification_age_seconds",
+        }}
+    if isinstance(value, list):
+        return [_state_key(item) for item in value]
+    return value
 
 
 @app.get("/api/events")
@@ -251,40 +291,55 @@ async def events(monitor: str | None = None) -> StreamingResponse:
     # Resolved before the stream starts: an unknown monitor id must come back
     # as a normal 404, not fail silently mid-stream.
     roots = await asyncio.to_thread(discovery.discover_monitors)
-    watch_root: Path | None
-    if monitor == "all":
-        watch_root = None  # no single dir to watch; the client still gets fresh state on the heartbeat/monitors tick
-    elif roots:
-        watch_root = _resolve_root(monitor or _default_monitor_id(roots), roots)
-    else:
-        watch_root = config.STATE_DIR
+    if roots and monitor != "all":
+        _resolve_root(monitor or _default_monitor_id(roots), roots)
 
     async def stream() -> AsyncIterator[str]:
         queue: asyncio.Queue[str] = asyncio.Queue()
 
         async def watcher() -> None:
-            if watch_root is None:
-                return
-            try:
-                async for _changes in awatch(watch_root):
+            while True:
+                discovered = await asyncio.to_thread(discovery.discover_monitors)
+                selected = discovered if monitor == "all" else {
+                    monitor or (_default_monitor_id(discovered) if discovered else discovery.DEFAULT_MONITOR_ID):
+                    discovered.get(monitor or (_default_monitor_id(discovered) if discovered else ""), config.STATE_DIR)
+                }
+                watched = {root for root in selected.values() if root.is_dir()}
+                if not watched:
+                    await asyncio.sleep(config.MONITORS_TICK_SECONDS)
                     await queue.put("change")
-            except Exception as e:  # surfaced to the client, not swallowed
-                await queue.put(f"watch-error: {e}")
+                    continue
+                try:
+                    async for _changes in awatch(
+                        *watched, rust_timeout=int(config.MONITORS_TICK_SECONDS * 1000), yield_on_timeout=True,
+                    ):
+                        if queue.empty():
+                            await queue.put("change")
+                        break  # Rediscover missing/new host roots on each tick.
+                except Exception as e:  # surfaced to the client, not swallowed
+                    await queue.put(f"watch-error: {type(e).__name__}")
+                    await asyncio.sleep(config.MONITORS_TICK_SECONDS)
 
         task = asyncio.create_task(watcher())
         loop = asyncio.get_event_loop()
         last_monitors_push = loop.time()
+        seen_events: set[tuple[str, str]] = set()
         try:
-            yield _sse("state", await asyncio.to_thread(_view_for, monitor))
+            view = await asyncio.to_thread(_view_for, monitor)
+            last_state = _state_key(view)
+            yield _sse("state", view)
             while True:
+                for event in view["events"]:
+                    key = (event.get("host"), event.get("id"))
+                    if key[0] and key[1] and key not in seen_events:
+                        seen_events.add(key)
+                        yield _sse("watcher", event, event_id=event["id"])
                 try:
                     msg = await asyncio.wait_for(queue.get(), timeout=config.HEARTBEAT_SECONDS)
                     while not queue.empty():
                         queue.get_nowait()
                     if isinstance(msg, str) and msg.startswith("watch-error"):
                         yield _sse("error", {"detail": msg})
-                    else:
-                        yield _sse("state", await asyncio.to_thread(_view_for, monitor))
                 except TimeoutError:
                     now = loop.time()
                     if now - last_monitors_push >= config.MONITORS_TICK_SECONDS:
@@ -292,8 +347,15 @@ async def events(monitor: str | None = None) -> StreamingResponse:
                         monitors = await asyncio.to_thread(current_monitors)
                         yield _sse("monitors", [vars(m) for m in monitors.values()])
                     yield _sse("heartbeat", {"ts": datetime.now(UTC).isoformat()})
+                view = await asyncio.to_thread(_view_for, monitor)
+                state_key = _state_key(view)
+                if state_key != last_state:
+                    last_state = state_key
+                    yield _sse("state", view)
         finally:
             task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
     return StreamingResponse(
         stream(),
@@ -403,12 +465,14 @@ async def _proxy_get(url: str) -> StreamingResponse:
 
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
-    view = await asyncio.to_thread(current_view)
+    view = await asyncio.to_thread(_view_for, "all")
     return JSONResponse(
         {
             "ok": not view["source"]["errors"],
             "state_dir": view["source"]["state_dir"],
             "errors": view["source"]["errors"],
+            "data_stale": view["source"]["data_stale"],
+            "hosts": {host: snapshot["source"] for host, snapshot in view.get("hosts", {}).items()},
         }
     )
 
@@ -417,7 +481,10 @@ def _root_for_write(monitor: str | None) -> Path:
     roots = discovery.discover_monitors()
     if not roots:
         return config.STATE_DIR
-    return _resolve_root(monitor or _default_monitor_id(roots), roots)
+    resolved = monitor or _default_monitor_id(roots)
+    if resolved in config.watcher_roots():
+        raise HTTPException(status_code=409, detail="watcher feeds are read-only; use the owning host's governed answer path")
+    return _resolve_root(resolved, roots)
 
 
 def _root_for_answer(key: str) -> tuple[Path, str]:
@@ -431,10 +498,10 @@ def _root_for_answer(key: str) -> tuple[Path, str]:
     roots = discovery.discover_monitors()
     monitor, sep, lane = key.partition(":")
     if sep and lane and monitor in roots:
-        return roots[monitor], lane
+        return _root_for_write(monitor), lane
     if not roots:
         return config.STATE_DIR, key
-    return roots[_default_monitor_id(roots)], key
+    return _root_for_write(None), key
 
 
 def _lane_action_status(e: actions.LaneActionError, *, default: int) -> int:

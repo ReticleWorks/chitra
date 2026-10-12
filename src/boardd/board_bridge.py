@@ -35,6 +35,7 @@ from watchfiles import awatch
 from chitra.goals import load_goals, session_name
 
 from . import agenttrail_bridge, config, discovery
+from .state import build_watcher_view
 
 logger = logging.getLogger("boardd.board_bridge")
 
@@ -62,7 +63,7 @@ def slug(text: str) -> str:
     return out if out and out[0].isalnum() else f"lane-{out}" if out else "lane"
 
 
-def clean(text: str, limit: int = 0) -> str:
+def clean(text: object, limit: int = 0) -> str:
     """One line, collapsed whitespace, and never a stray ``{#`` that would
     read as a node id to agenttrail's PLAN.md parser."""
     out = " ".join(str(text or "").split()).replace("{#", "{ #")
@@ -84,7 +85,7 @@ def lane_key(record: dict[str, Any]) -> str:
     ``actions._find_record`` accepts either a lane_id or a session_ref, so
     whichever this returns is a valid write target.
     """
-    return str(record.get("lane_id") or session_name(str(record.get("session_ref", ""))) or "lane")
+    return str(record.get("lane_id") or record.get("id") or session_name(str(record.get("session_ref", ""))) or "lane")
 
 
 def escalation_key(monitor_id: str, record: dict[str, Any]) -> str:
@@ -105,6 +106,9 @@ def mark_for(record: dict[str, Any]) -> str:
     An open ask wins over everything else: it is a live, unanswered request
     to the operator no matter what the lane's status says.
     """
+    if "classification" in record:
+        # A model label never proves completion or creates an operator ask.
+        return WORKING if record.get("movement", {}).get("status") == "working" else IDLE
     if record.get("open_asks") or record.get("foreground_tasks"):
         return NEEDS_INPUT
     status = record.get("status", "")
@@ -223,7 +227,12 @@ def render_plan(sections: list[tuple[str, list[dict[str, Any]]]]) -> str:
             goal = clean(record.get("goal", "")) or "no goal recorded"
             out.append(f"## {key} — {clean(goal, 70)} {{#{cid}}}")
 
-            tech = ["chitra", str(record.get("session_ref", "")), f"monitor {monitor_id}"]
+            if "classification" in record:
+                classification = record["classification"]
+                tech = ["hybrid watcher", f"host {monitor_id}", clean(record.get("harness")), clean(record.get("native_session_id"))]
+                tech.extend(clean(classification.get(key)) for key in ("label", "provider", "model"))
+            else:
+                tech = ["chitra", str(record.get("session_ref", "")), f"monitor {monitor_id}"]
             if record.get("scope"):
                 tech.append("scope " + clean(record["scope"], 60))
             if record.get("goal_version"):
@@ -294,6 +303,28 @@ class BoardBridge:
         for monitor_id, root in sorted(roots.items()):
             if self.monitor_filter and self.monitor_filter not in ("all", monitor_id):
                 continue
+            if monitor_id in config.watcher_roots():
+                view = build_watcher_view(root, monitor_id)
+                records = []
+                for lane in view["lanes"]:
+                    classification = lane["classification"]
+                    detail = (
+                        f"Label: {classification['label'] or 'UNKNOWN'}; "
+                        f"classifier: {classification['provider'] or 'UNKNOWN'}/{classification['model'] or 'UNKNOWN'}; "
+                        f"confidence: {classification['confidence']}; "
+                        f"observed: {classification['observed_at'] or 'UNKNOWN'}; "
+                        f"source age seconds: {view['source']['age_seconds']}; stale: {view['source']['data_stale']}; "
+                        f"classification stale: {lane['classification_stale']}. "
+                        f"{classification['reason'] or ''}"
+                    )
+                    records.append({**lane, "now": detail})
+                if view["source"]["errors"]:
+                    records.append({
+                        "lane_id": f"{monitor_id}-source", "goal": "Watcher feed UNKNOWN",
+                        "status": "unknown", "now": "; ".join(view["source"]["errors"]),
+                    })
+                out.append((monitor_id, records))
+                continue
             try:
                 records = [r.to_dict() for r in load_goals(root, allow_newer=True)]
             except (ValueError, OSError) as e:
@@ -307,6 +338,7 @@ class BoardBridge:
         sections it rendered so the caller can post hook events for them."""
         sections = self.sections()
         self.workspace.mkdir(parents=True, exist_ok=True)
+        self.workspace.chmod(0o700)
         self._plan_text = self._write_if_changed("PLAN.md", render_plan(sections), self._plan_text)
         roster = json.dumps(render_roster(sections), indent=2, ensure_ascii=False)
         # The timestamp changes every render; compare on the escalations only.
@@ -322,7 +354,10 @@ class BoardBridge:
         path = self.workspace / name
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(text)
+        tmp.chmod(0o600)
         tmp.replace(path)
+        if path.read_text() != text:
+            raise OSError(f"board output readback failed: {name}")
         return text
 
     def post_hooks(self, sections: list[tuple[str, list[dict[str, Any]]]]) -> None:

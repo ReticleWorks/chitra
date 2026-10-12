@@ -26,12 +26,14 @@ def _register_builtins() -> None:
     from chitra.adapter.plugs.amp_orb import AmpOrbPlug
     from chitra.adapter.plugs.claude_tmux import ClaudeTmuxPlug
     from chitra.adapter.plugs.codex_tmux import CodexTmuxPlug
+    from chitra.adapter.plugs.lane_run import LaneRunPlug
     from chitra.adapter.plugs.opencode_tmux import OpenCodeTmuxPlug
 
     _PLUG_FACTORIES.update(
         {
             ClaudeTmuxPlug.name: ClaudeTmuxPlug,
             CodexTmuxPlug.name: CodexTmuxPlug,
+            LaneRunPlug.name: LaneRunPlug,
             OpenCodeTmuxPlug.name: OpenCodeTmuxPlug,
             AmpOrbPlug.name: AmpOrbPlug,
         }
@@ -51,6 +53,10 @@ _UNBUILT: dict[str, str] = {
 _CLIENT_PLUGS: dict[str, str] = {
     "claude": "claude-tmux",
     "codex": "codex-tmux",
+    "lane-run-codex": "lane-run",
+    "lane-run-claude": "lane-run",
+    "lane-run-devin": "lane-run",
+    "lane-run-amp": "lane-run",
     "opencode": "opencode-tmux",
     "amp": "amp-orb",
 }
