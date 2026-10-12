@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
+import runpy
 import shutil
 import subprocess
 import sys
@@ -31,10 +34,16 @@ from chitra.adapter.plugs.claude_tmux import ClaudeTmuxPlug
 from chitra.adapter.plugs.codex_tmux import CodexTmuxPlug
 from chitra.adapter.proof import prove_read_from_events
 from chitra.journal import native_session_identity
+from chitra.journal.models import CanonicalEvent, CanonicalType, TranscriptIdentity
 from chitra.orders import DispatchOrder
 from chitra.transcript_bindings import BoundTranscript
 
-_CLIENTS = {"lane-run-codex": "codex", "lane-run-claude": "claude"}
+_CLIENTS = {
+    "lane-run-codex": "codex",
+    "lane-run-claude": "claude",
+    "lane-run-devin": "devin",
+    "lane-run-amp": "amp",
+}
 
 
 def _lane_root() -> Path:
@@ -55,11 +64,43 @@ def _continuation_text(nonce: str, order: DispatchOrder) -> str:
     )
 
 
-def _native_id(path: str) -> str | None:
+def _rollout_query() -> dict[str, Any]:
+    executable = shutil.which("lane-run")
+    if executable is None:
+        raise StreamUnavailable("UNKNOWN: managed lane-run parser unavailable")
+    parser = Path(executable).resolve().with_name("rollout-query")
     try:
-        return native_session_identity(path)
-    except (OSError, ValueError, RuntimeError):
+        return runpy.run_path(str(parser))
+    except (OSError, RuntimeError) as exc:
+        raise StreamUnavailable("UNKNOWN: managed rollout-query parser unavailable") from exc
+
+
+def _native_id(path: str, cli: str) -> str | None:
+    if cli in ("codex", "claude"):
+        try:
+            identity = native_session_identity(path)
+            return identity if isinstance(identity, str) else None
+        except (OSError, ValueError, RuntimeError):
+            return None
+    try:
+        with Path(path).open(encoding="utf-8") as stream:
+            transcript = json.load(stream)
+        if cli == "amp":
+            native_id = transcript.get("id") if isinstance(transcript, dict) else None
+            if (isinstance(native_id, str)
+                    and isinstance(transcript.get("messages"), list)
+                    and isinstance(transcript.get("meta"), dict)
+                    and transcript["meta"].get("executorType") == "local"):
+                return native_id
+            return None
+        parser = _rollout_query()
+        rows = list(parser["transcript_rows"](io.StringIO(json.dumps(transcript)), cli))
+        identity = rows[0].get("session_id") if rows else None
+        if isinstance(identity, str):
+            return identity
+    except (OSError, ValueError, TypeError, KeyError, StreamUnavailable):
         return None
+    return None
 
 
 class LaneRunPlug:
@@ -79,7 +120,7 @@ class LaneRunPlug:
         transcript = Path(str(bound.path)[len(prefix):])
         if not transcript.is_absolute():
             raise StreamUnavailable("lane-run transcript must be an absolute local path")
-        native_id = _native_id(str(transcript))
+        native_id = _native_id(str(transcript), cli)
         if native_id is None:
             raise StreamUnavailable("UNKNOWN: lane-run native transcript identity unavailable")
         try:
@@ -143,7 +184,7 @@ class LaneRunPlug:
             or not isinstance(record.get("ownership_token"), str)
             or not record["ownership_token"]
             or str(cwd) != handle.locator["cwd"]
-            or _native_id(handle.locator["transcript_path"]) != handle.native_session_id
+            or _native_id(handle.locator["transcript_path"], handle.locator["client"]) != handle.native_session_id
         ):
             raise StreamUnavailable("UNKNOWN: lane-run native ownership or transcript binding changed")
         return {
@@ -225,8 +266,87 @@ class LaneRunPlug:
         )
 
     def events(self, handle: LaneHandle, cursor: str | None = None) -> EventBatch:
+        cli = handle.locator["client"]
+        if cli == "amp":
+            from chitra.adapter.plugs.amp_orb import amp_events_from_export
+
+            try:
+                with Path(handle.locator["transcript_path"]).open(encoding="utf-8") as stream:
+                    export = json.load(stream)
+                if _native_id(handle.locator["transcript_path"], cli) != handle.native_session_id:
+                    raise ValueError("Amp thread identity or local executor changed")
+                events = amp_events_from_export(
+                    export,
+                    instance=handle.locator["instance"],
+                    lane=handle.lane_id,
+                    client_version=handle.locator["client_version"],
+                    goal_ref=handle.session_ref,
+                    binding_ref=handle.binding_ref or handle.locator["transcript_path"],
+                )
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise StreamUnavailable(f"UNKNOWN: bound native Amp thread unavailable: {type(exc).__name__}") from exc
+            return EventBatch(events=events)
+        if cli == "devin":
+            return self._devin_events(handle)
         local = replace(handle, binding_ref=handle.locator["transcript_path"])
-        return self._native[handle.locator["client"]].events(local, cursor)
+        return self._native[cli].events(local, cursor)
+
+    @staticmethod
+    def _devin_events(handle: LaneHandle) -> EventBatch:
+        path = Path(handle.locator["transcript_path"])
+        try:
+            parser = _rollout_query()
+            with path.open(encoding="utf-8") as stream:
+                transcript = json.load(stream)
+            native_session_id = handle.native_session_id
+            if (not native_session_id or not isinstance(transcript, dict)
+                    or transcript.get("session_id") != native_session_id
+                    or not isinstance(transcript.get("steps"), list)):
+                raise ValueError("ATIF session binding changed")
+            rows = list(parser["transcript_rows"](io.StringIO(json.dumps(transcript)), "devin"))
+            steps = transcript["steps"]
+            if len(rows) != len(steps) + 1:
+                raise ValueError("rollout-query could not read every ATIF step")
+            stat = path.stat()
+            identity = TranscriptIdentity(path=str(path), device=stat.st_dev, inode=stat.st_ino)
+            events = []
+            for step, row in zip(steps, rows[1:], strict=True):
+                if not isinstance(step, dict) or step.get("step_id") is None:
+                    raise ValueError("ATIF step has no native step_id")
+                source = row.get("role")
+                step_id = str(step["step_id"])
+                user_text = parser["first_user_prompt"](row)
+                if source == "user":
+                    normalized = CanonicalType.UNKNOWN
+                    native_type = "user"
+                    payload = {"native_type": "user", "text": user_text}
+                elif source in ("devin", "assistant", "agent") or row.get("tool_calls"):
+                    normalized = CanonicalType.TOOL_CALL if row.get("tool_calls") else CanonicalType.FINAL_RESPONSE
+                    native_type = str(source or "agent")
+                    payload = {"native_type": native_type}
+                else:
+                    normalized = CanonicalType.UNKNOWN
+                    native_type = str(source or "unknown")
+                    payload = {"native_type": native_type}
+                stamp = parser["row_timestamp"](row)
+                events.append(CanonicalEvent(
+                    event_id=f"devin:{native_session_id}:{step_id}",
+                    instance=handle.locator["instance"], lane=handle.lane_id, client="devin",
+                    client_version=handle.locator["client_version"], process_id=None,
+                    transcript=identity, session_id=native_session_id, resume_id=None,
+                    observed_at=utc_now_iso(), native_time=stamp.isoformat() if stamp else None,
+                    native_type=native_type, native_join_id=step_id, normalized_type=normalized,
+                    raw_byte_range=None, raw_sha256=None,
+                    goal_ref=handle.session_ref,
+                    payload_digest=hashlib.sha256(
+                        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                    normalizer_version="lane-run-atif-v1",
+                    payload=payload, raw_record=step,
+                ))
+            return EventBatch(events=tuple(events))
+        except (OSError, ValueError, KeyError, TypeError, StreamUnavailable) as exc:
+            raise StreamUnavailable(f"UNKNOWN: bound Devin ATIF transcript unavailable: {type(exc).__name__}") from exc
 
     def prove_read(
         self, handle: LaneHandle, order: WireOrder, receipt: SendReceipt | None = None, *, deadline_s: float = 60.0,
@@ -279,6 +399,16 @@ class LaneRunPlug:
             binding_ref=handle.binding_ref,
             acked=accepted,
         )
+        if proof.level == "consumed" and handle.locator["client"] in {"devin", "amp"}:
+            by_event_id = {event.event_id: event for event in events}
+            input_event = by_event_id.get(proof.input_event_id or "")
+            consuming_event = by_event_id.get(proof.consuming_event_id or "")
+            if (input_event is None or consuming_event is None or not input_event.native_join_id
+                    or not consuming_event.native_join_id):
+                return replace(proof, level="accepted", detail="UNKNOWN: native message/step IDs unavailable",
+                               consuming_event_id=None)
+            proof = replace(proof, input_event_id=input_event.native_join_id,
+                             consuming_event_id=consuming_event.native_join_id)
         return proof if proof.level == "consumed" else replace(proof, detail=f"UNKNOWN: {proof.detail}")
 
     def start(self, spec: LaneStart) -> LaneHandle:

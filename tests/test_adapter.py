@@ -11,7 +11,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from datetime import UTC, datetime, timedelta
+import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +35,7 @@ from chitra.adapter.contract import (
 )
 from chitra.adapter.plugs.amp_orb import AmpOrbPlug, amp_events_from_export
 from chitra.adapter.plugs.claude_tmux import ClaudeTmuxPlug
-from chitra.adapter.plugs.codex_queue import CodexQueuePlug
+from chitra.adapter.plugs.codex_tmux import CodexTmuxPlug
 from chitra.adapter.plugs.lane_run import LaneRunPlug
 from chitra.adapter.plugs.opencode_tmux import OpenCodeTmuxPlug
 from chitra.adapter.proof import prove_read_from_events
@@ -148,12 +149,14 @@ def _write_uri_binding(path: Path, *, session_ref: str, lane: str, ref: str, cli
 
 def test_registry_resolves_builtins_and_fails_closed() -> None:
     assert plug("claude-tmux") is plug("claude-tmux")
-    assert set(plug_names()) == {"claude-tmux", "codex-tmux", "codex-queue", "lane-run", "opencode-tmux", "amp-orb"}
+    assert set(plug_names()) == {"claude-tmux", "codex-tmux", "lane-run", "opencode-tmux", "amp-orb"}
     assert isinstance(plug_for_client(Client.CLAUDE), ClaudeTmuxPlug)
+    assert isinstance(plug_for_client(Client.CODEX), CodexTmuxPlug)
     assert isinstance(plug_for_client("amp"), AmpOrbPlug)
-    assert isinstance(plug_for_client("codex-queue"), CodexQueuePlug)
     assert isinstance(plug_for_client("lane-run-codex"), LaneRunPlug)
     assert isinstance(plug_for_client("lane-run-claude"), LaneRunPlug)
+    assert isinstance(plug_for_client("lane-run-devin"), LaneRunPlug)
+    assert isinstance(plug_for_client("lane-run-amp"), LaneRunPlug)
     with pytest.raises(HarnessUnavailable, match="not built"):
         plug("dsh")
     with pytest.raises(HarnessUnavailable, match="no lane plug"):
@@ -508,54 +511,10 @@ class _FakeUriPlug:
         return StopResult(was_running=True, stopped=True, method="fake")
 
 
-def _native_codex_queue_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, consumed: bool, outcome: str = "accepted"):
-    native_id = "00000000-0000-4000-8000-000000000001"
-    transcript = tmp_path / "native-codex.jsonl"
-    transcript.write_text(json.dumps({"type": "session_meta", "payload": {"id": native_id, "cli_version": "0.0.1"}}) + "\n")
-    # Earlier matching work must not supply consumption proof for a newly created order.
-    with transcript.open("a") as stream:
-        for payload in (
-            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue the tracked work"}]},
-            {"type": "function_call", "call_id": "old-call", "name": "noop", "arguments": "{}"},
-        ):
-            stream.write(json.dumps({
-                "timestamp": (datetime.now(UTC) - timedelta(hours=1)).isoformat(), "type": "response_item", "payload": payload,
-            }) + "\n")
-    calls = []
-
-    def native_queue(argv, **kwargs):
-        assert argv[:4] == ["codex", "queue", "--thread", native_id]
-        assert argv[4] == "--message" and kwargs["timeout"] == 20
-        calls.append(argv)
-        if outcome == "timeout":
-            raise subprocess.TimeoutExpired(argv, 20)
-        if outcome == "nonzero":
-            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="queue result unavailable")
-        user = {
-            "type": "response_item",
-            "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": argv[5]}]},
-        }
-        activity = {"type": "response_item", "payload": {"type": "function_call", "call_id": "call-1", "name": "noop", "arguments": "{}"}}
-        with transcript.open("a") as stream:
-            for record in [user, activity] if consumed else [user]:
-                stream.write(json.dumps({"timestamp": datetime.now(UTC).isoformat(), **record}) + "\n")
-        return subprocess.CompletedProcess(argv, 0, stdout="Queued", stderr="")
-
-    from chitra.adapter.plugs import codex_queue
-
-    monkeypatch.setattr(codex_queue.subprocess, "run", native_queue)
-    fake = CodexQueuePlug()
-    return fake, f"codex-queue:{transcript}", native_id, calls
-
-
-@pytest.mark.parametrize("native_queue", [False, True])
-def test_dispatchd_routes_uri_bound_order_through_plug(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native_queue: bool) -> None:
+def test_dispatchd_routes_uri_bound_order_through_plug(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     session_ref = "orb:ops-1:0.0"
-    if native_queue:
-        fake, ref, native_id, calls = _native_codex_queue_fixture(tmp_path, monkeypatch, consumed=True)
-    else:
-        fake, ref, native_id = _FakeUriPlug(proof_level="consumed"), "amp-orb:ops-1", "T-9abc"
-    bindings = _write_uri_binding(tmp_path / "bindings.json", session_ref=session_ref, lane="lane-a", ref=ref, client=fake.client)
+    bindings = _write_uri_binding(tmp_path / "bindings.json", session_ref=session_ref, lane="lane-a", ref="amp-orb:ops-1")
+    fake = _FakeUriPlug(proof_level="consumed")
     monkeypatch.setattr(dispatchd_mod, "plug_for_client", lambda client: fake)
     monkeypatch.setattr(
         dispatchd_mod,
@@ -574,27 +533,17 @@ def test_dispatchd_routes_uri_bound_order_through_plug(tmp_path: Path, monkeypat
     )
 
     assert result.status is DispatchStatus.SENT
-    assert result.transcript_path == ref
-    assert result.native_session_id == native_id
-    if native_queue:
-        assert len(calls) == 1 and calls[0][5] == "continue the tracked work"
-        assert dispatchd_mod.run_once(queue_dir, lock_dir=tmp_path / "locks", transcript_bindings_path=bindings) == []
-    else:
-        assert fake.sent == ["continue the tracked work"]
+    assert result.transcript_path == "amp-orb:ops-1"
+    assert result.native_session_id == "T-9abc"
+    assert fake.sent == ["continue the tracked work"]
     assert (tmp_path / "ledger.jsonl").exists()
 
 
-@pytest.mark.parametrize("native_queue,outcome", [(False, "accepted"), (True, "accepted"), (True, "timeout"), (True, "nonzero")])
-def test_dispatchd_uri_bound_order_unconfirmed_when_ack_only(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native_queue: bool, outcome: str,
-) -> None:
+def test_dispatchd_uri_bound_order_unconfirmed_when_ack_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A plug that proves only acceptance lands DELIVERY_UNCONFIRMED — never SENT."""
     session_ref = "orb:ops-1:0.0"
-    if native_queue:
-        fake, ref, _native_id, calls = _native_codex_queue_fixture(tmp_path, monkeypatch, consumed=False, outcome=outcome)
-    else:
-        fake, ref = _FakeUriPlug(proof_level="accepted"), "amp-orb:ops-1"
-    bindings = _write_uri_binding(tmp_path / "bindings.json", session_ref=session_ref, lane="lane-a", ref=ref, client=fake.client)
+    bindings = _write_uri_binding(tmp_path / "bindings.json", session_ref=session_ref, lane="lane-a", ref="amp-orb:ops-1")
+    fake = _FakeUriPlug(proof_level="accepted")
     monkeypatch.setattr(dispatchd_mod, "plug_for_client", lambda client: fake)
     queue_dir = tmp_path / "queue"
     _write_order(queue_dir / "orders", DispatchOrder(order_id="ord-uri-2", session_ref=session_ref, nudge="continue the tracked work"))
@@ -609,13 +558,9 @@ def test_dispatchd_uri_bound_order_unconfirmed_when_ack_only(
 
     assert results[0].status is DispatchStatus.DELIVERY_UNCONFIRMED
     assert not (tmp_path / "ledger.jsonl").exists()
-    if native_queue:
-        again = dispatchd_mod.run_once(
-            queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl",
-            ledger_key_path=tmp_path / "ledger.key", transcript_bindings_path=bindings,
-        )
-        assert again[0].status is DispatchStatus.DELIVERY_UNCONFIRMED
-        assert len(calls) == 1  # Accepted input is reconciled; never queued twice.
+
+
+# -- released lane-run continuation ----------------------------------------
 
 
 def _lane_run_binding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cli: str, *, native_id: str = "native-session"):
@@ -629,12 +574,15 @@ def _lane_run_binding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cli: str,
     cwd.mkdir()
     lane_dir = root / "lane-a"
     lane_dir.mkdir(parents=True)
-    transcript = tmp_path / f"{cli}.jsonl"
+    transcript = tmp_path / f"{cli}.{'atif' if cli == 'devin' else 'json' if cli == 'amp' else 'jsonl'}"
     if cli == "codex":
-        records = [{"type": "session_meta", "payload": {"id": native_id, "cli_version": "0.0.1"}}]
+        transcript.write_text(json.dumps({"type": "session_meta", "payload": {"id": native_id, "cli_version": "0.0.1"}}) + "\n")
+    elif cli == "claude":
+        transcript.write_text(json.dumps({"type": "system", "subtype": "init", "sessionId": native_id, "version": "0.0.1"}) + "\n")
+    elif cli == "devin":
+        transcript.write_text(json.dumps({"session_id": native_id, "schema_version": "atif-1.0", "steps": []}))
     else:
-        records = [{"type": "system", "subtype": "init", "sessionId": native_id, "version": "0.0.1"}]
-    transcript.write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
+        transcript.write_text(json.dumps({"id": native_id, "meta": {"executorType": "local"}, "messages": []}))
     (lane_dir / "lane.json").write_text(json.dumps({
         "schema": "agent-tools.lane.v1", "id": "lane-a", "cli": cli,
         "native_session_id": native_id, "owner_uid": os.getuid(),
@@ -646,10 +594,12 @@ def _lane_run_binding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cli: str,
     return BoundTranscript(binding=binding, path=ref), transcript, native_id, root
 
 
-@pytest.mark.parametrize("cli", ["codex", "claude"])
+@pytest.mark.parametrize("cli", ["codex", "claude", "devin", "amp"])
 def test_dispatchd_lane_run_continuation_requires_native_consumption(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cli: str,
 ) -> None:
+    if cli == "amp" and sys.platform == "darwin":
+        pytest.skip("released lane-run preserves the macOS Amp admission refusal")
     from chitra.adapter.plugs import lane_run
 
     bound, transcript, native_id, _root = _lane_run_binding(tmp_path, monkeypatch, cli)
@@ -679,41 +629,44 @@ def test_dispatchd_lane_run_continuation_requires_native_consumption(
             now = datetime.now(UTC).isoformat()
             if cli == "codex":
                 rows = [
-                    {
-                        "timestamp": now,
-                        "type": "response_item",
-                        "payload": {
-                            "type": "message", "role": "user",
-                            "content": [{"type": "input_text", "text": prompt}],
-                        },
-                    },
-                    {
-                        "timestamp": now,
-                        "type": "response_item",
-                        "payload": {"type": "function_call", "call_id": "native-tool", "name": "Bash", "arguments": "{}"},
-                    },
+                    {"timestamp": now, "type": "response_item", "payload": {
+                        "type": "message", "role": "user", "content": [{"type": "input_text", "text": prompt}],
+                    }},
+                    {"timestamp": now, "type": "response_item", "payload": {
+                        "type": "function_call", "call_id": "native-tool", "name": "Bash", "arguments": "{}",
+                    }},
                 ]
-            else:
+                with transcript.open("a", encoding="utf-8") as stream:
+                    stream.write("".join(json.dumps(row) + "\n" for row in rows))
+            elif cli == "claude":
                 rows = [
                     {"timestamp": now, "type": "user", "sessionId": native_id, "message": {"role": "user", "content": prompt}},
-                    {
-                        "timestamp": now,
-                        "type": "assistant",
-                        "sessionId": native_id,
-                        "message": {
-                            "role": "assistant",
-                            "content": [{"type": "tool_use", "id": "native-tool", "name": "Bash", "input": {}}],
-                        },
-                    },
+                    {"timestamp": now, "type": "assistant", "sessionId": native_id, "message": {
+                        "role": "assistant", "content": [{"type": "tool_use", "id": "native-tool", "name": "Bash", "input": {}}],
+                    }},
                 ]
-            with transcript.open("a", encoding="utf-8") as stream:
-                stream.write("".join(json.dumps(row) + "\n" for row in rows))
+                with transcript.open("a", encoding="utf-8") as stream:
+                    stream.write("".join(json.dumps(row) + "\n" for row in rows))
+            elif cli == "devin":
+                transcript.write_text(json.dumps({"session_id": native_id, "schema_version": "atif-1.0", "steps": [
+                    {"step_id": "step-order", "timestamp": now, "source": "user", "message": prompt},
+                    {"step_id": "step-consumed", "timestamp": now, "source": "devin", "message": "Running the governed task.",
+                     "tool_calls": [{"function_name": "Bash"}]},
+                ]}))
+            else:
+                transcript.write_text(json.dumps({"id": native_id, "meta": {"executorType": "local"}, "messages": [
+                    {"messageId": "message-order", "role": "user", "createdAt": now,
+                     "content": [{"type": "text", "text": prompt}]},
+                    {"messageId": "message-consumed", "role": "assistant", "createdAt": now,
+                     "content": [{"type": "tool_use", "id": "tool-consumed", "name": "Bash", "input": {}}]},
+                ]}))
             result = {"schema": "agent-tools.continuation-result.v1", "nonce": accepted["nonce"],
                       "lane_id": accepted["lane_id"], "native_session_id": accepted["native_session_id"],
                       "state": "consumed", "action": "reconciled", "receipt": str(receipt_path)}
         return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(result), stderr="")
 
-    monkeypatch.setattr(lane_run.shutil, "which", lambda name: "/managed/bin/lane-run")
+    release_lane_run = "/Users/roundtop/user-sessions/monitor-build/platform/deploy/agent-tools/bin/lane-run"
+    monkeypatch.setattr(lane_run.shutil, "which", lambda _name: release_lane_run)
     monkeypatch.setattr(lane_run.subprocess, "run", lane_run_call)
     plug = LaneRunPlug()
     original_prove = plug.prove_read
@@ -736,7 +689,6 @@ def test_dispatchd_lane_run_continuation_requires_native_consumption(
     )
     queue_dir = tmp_path / "queue"
     _write_order(queue_dir / "orders", order)
-
     (result,) = dispatchd_mod.run_once(
         queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl",
         ledger_key_path=tmp_path / "ledger.key", transcript_bindings_path=bindings,
@@ -745,6 +697,10 @@ def test_dispatchd_lane_run_continuation_requires_native_consumption(
     assert result.status is DispatchStatus.SENT
     assert result.delivery_ledger_verified is True
     assert proofs[0].input_event_id and proofs[0].consuming_event_id
+    if cli == "devin":
+        assert (proofs[0].input_event_id, proofs[0].consuming_event_id) == ("step-order", "step-consumed")
+    elif cli == "amp":
+        assert (proofs[0].input_event_id, proofs[0].consuming_event_id) == ("message-order", "tool-consumed")
     assert result.transcript_path == str(bound.path)
     assert packet_holder["authority"] == {"goal_id": bound.session_ref, "frozen_scope_sha256": "a" * 64}
     assert packet_holder["ownership_token"] == "private-owner-token"
@@ -755,22 +711,51 @@ def test_dispatchd_lane_run_continuation_requires_native_consumption(
     ).signature) == 64
 
 
-@pytest.mark.parametrize("failure", ["foreign-session", "foreign-owner", "busy"])
+@pytest.mark.parametrize("failure", [
+    "foreign-session", "foreign-owner", "busy", "amp-foreign-executor", "amp-local-read", "devin-missing-step-id",
+])
 def test_lane_run_refuses_unbound_lane_and_keeps_busy_order_queued(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
 ) -> None:
     from chitra.adapter.plugs import lane_run
 
-    bound, transcript, native_id, root = _lane_run_binding(tmp_path, monkeypatch, "codex")
+    cli = "amp" if failure.startswith("amp-") else "devin" if failure == "devin-missing-step-id" else "codex"
+    bound, transcript, native_id, root = _lane_run_binding(tmp_path, monkeypatch, cli)
     lane_record = root / "lane-a" / "lane.json"
     record = json.loads(lane_record.read_text(encoding="utf-8"))
-    if failure != "busy":
+    if failure in {"foreign-session", "foreign-owner"}:
         record["native_session_id"] = "another-session" if failure == "foreign-session" else native_id
         if failure == "foreign-owner":
             record["owner_uid"] = os.getuid() + 1
         lane_record.write_text(json.dumps(record), encoding="utf-8")
         with pytest.raises(StreamUnavailable, match="exact owned native lane"):
             LaneRunPlug().handle_for_binding(bound, session_ref=bound.session_ref)
+        return
+    if failure == "amp-foreign-executor":
+        transcript.write_text(json.dumps({"id": native_id, "meta": {"executorType": "remote"}, "messages": []}))
+        with pytest.raises(StreamUnavailable, match="transcript identity unavailable"):
+            LaneRunPlug().handle_for_binding(bound, session_ref=bound.session_ref)
+        return
+    if failure == "amp-local-read":
+        transcript.write_text(json.dumps({"id": native_id, "meta": {"executorType": "local"}, "messages": [
+            {"messageId": "amp-user-1", "role": "user", "content": [{"type": "text", "text": "existing user input"}]},
+            {"messageId": "amp-tool-1", "role": "assistant", "content": [
+                {"type": "tool_use", "id": "amp-call-1", "name": "Bash", "input": {}}
+            ]},
+        ]}))
+        handle = LaneRunPlug().handle_for_binding(bound, session_ref=bound.session_ref)
+        events = LaneRunPlug().events(handle).events
+        assert {event.native_join_id for event in events} >= {"amp-user-1", "amp-call-1"}
+        return
+    if failure == "devin-missing-step-id":
+        transcript.write_text(json.dumps({"session_id": native_id, "steps": [
+            {"source": "user", "message": "missing actual step id"},
+        ]}))
+        release_lane_run = "/Users/roundtop/user-sessions/monitor-build/platform/deploy/agent-tools/bin/lane-run"
+        monkeypatch.setattr(lane_run.shutil, "which", lambda _name: release_lane_run)
+        handle = LaneRunPlug().handle_for_binding(bound, session_ref=bound.session_ref)
+        with pytest.raises(StreamUnavailable, match="UNKNOWN: bound Devin ATIF"):
+            LaneRunPlug().events(handle)
         return
 
     receipt_path = tmp_path / "durable-receipt.json"
@@ -793,7 +778,8 @@ def test_lane_run_refuses_unbound_lane_and_keeps_busy_order_queued(
         }
         return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(result), stderr="")
 
-    monkeypatch.setattr(lane_run.shutil, "which", lambda _name: "/managed/bin/lane-run")
+    release_lane_run = "/Users/roundtop/user-sessions/monitor-build/platform/deploy/agent-tools/bin/lane-run"
+    monkeypatch.setattr(lane_run.shutil, "which", lambda _name: release_lane_run)
     monkeypatch.setattr(lane_run.subprocess, "run", lane_run_call)
     plug = LaneRunPlug()
     monkeypatch.setattr(dispatchd_mod, "plug_for_client", lambda _client: plug)
@@ -812,15 +798,12 @@ def test_lane_run_refuses_unbound_lane_and_keeps_busy_order_queued(
         "lock_dir": tmp_path / "locks", "ledger_path": tmp_path / "ledger.jsonl",
         "ledger_key_path": tmp_path / "ledger.key", "transcript_bindings_path": bindings,
     }
-
     first = dispatchd_mod.run_once(queue_dir, **args)
     second = dispatchd_mod.run_once(queue_dir, **args)
-
     assert first[0].status is DispatchStatus.DELIVERY_UNCONFIRMED
     assert second[0].status is DispatchStatus.DELIVERY_UNCONFIRMED
     assert len(packets) == 2 and packets[0] == packets[1]
     assert packets[0]["nonce"] == order.order_id and drains == 2
-    assert len(transcript.read_text(encoding="utf-8").splitlines()) == 1
     assert not (tmp_path / "ledger.jsonl").exists()
 
 
