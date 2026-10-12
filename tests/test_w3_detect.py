@@ -1959,8 +1959,9 @@ def _rescue_goal(session_ref: str) -> GoalRecord:
     )
 
 
+@pytest.mark.parametrize("shadow_mode", [False, True])
 def test_rescue_reconcile_collects_while_alive_seals_after_consumption_then_relaunches(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shadow_mode: bool
 ) -> None:
     """The production rescue wiring in order: capture the bundle while the
     pane process is alive, seal only once the rescue order's consumption is
@@ -2020,7 +2021,7 @@ def test_rescue_reconcile_collects_while_alive_seals_after_consumption_then_rela
     subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, capture_output=True, text=True)
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text('{"type":"user"}\n', encoding="utf-8")
-    config = resolve_config(state_dir=tmp_path)
+    config = resolve_config(state_dir=tmp_path, shadow_mode=shadow_mode)
     _patch_live_lane(monkeypatch, pid=os.getpid(), worktree=worktree)
 
     # Phase 1: the bundle is captured while the process is alive. Capture
@@ -2035,6 +2036,11 @@ def test_rescue_reconcile_collects_while_alive_seals_after_consumption_then_rela
         config, lane=LANE, goal=goal, track_id=track_id, transcript_path=transcript
     )
     bundle = find_rescue_bundle(tmp_path, record, session_ref=session_ref)
+    if shadow_mode:
+        assert bundle is None
+        assert store.latest(track_id) == record
+        assert not (tmp_path / "rescue").exists()
+        return
     assert bundle is not None
     unsealed = store.latest(track_id)
     assert unsealed is not None
@@ -2082,7 +2088,7 @@ def test_rescue_reconcile_holds_when_the_lane_process_is_gone(
     assert record is not None and record.stage == "rescue" and record.consumption is not None
 
     goal = _rescue_goal(session_ref)
-    config = resolve_config(state_dir=tmp_path)
+    config = resolve_config(state_dir=tmp_path, shadow_mode=False)
     _patch_live_lane(monkeypatch, pid=None, worktree=tmp_path)
 
     reconcile_rescue_checkpoint(

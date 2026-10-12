@@ -1259,6 +1259,8 @@ def reconcile_rescue_checkpoint(
     sealable bundle. Sealing waits for proven consumption of the rescue
     order; the next recurrence then advances the track to relaunch.
     """
+    if config.shadow_mode:
+        return
     store = IncidentStore(config.state_dir, lane)
     record = store.latest(track_id)
     if record is None or record.stage != "rescue" or record.checkpoint_ref:
