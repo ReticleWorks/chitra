@@ -58,6 +58,11 @@ def test_watcher_host_feed_api_sse_bridge_and_launchd(tmp_path, monkeypatch):
     roundtop = _write_feed(roots["roundtop"], "roundtop", labels=labels)
     _write_feed(roots["renegade"], "renegade")
     _configure(monkeypatch, roots)
+    monkeypatch.setattr(config, "FEED_ONLY", True)
+    with TestClient(app_module.app) as feed_client:
+        assert feed_client.get("/api/state?monitor=roundtop").status_code == 200
+        assert feed_client.post("/answer", json={"key": "fixture", "answer": "ignored"}).status_code == 405
+        assert feed_client.post("/api/lanes/fixture/ack").status_code == 405
     monkeypatch.setenv("BOARDD_LAUNCHD_LABELS", "roundtop=example.watcher,roundtop=example.dispatchd,renegade=example.peer")
     native_calls = []
 

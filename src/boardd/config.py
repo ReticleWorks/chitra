@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 
 PKG_DIR = Path(__file__).resolve().parent
+FEED_ONLY = os.environ.get("BOARDD_FEED_ONLY") == "1"
 
 # Directory holding goals.json (chitra.goals.v1) and sweep-digest.json.
 # Real deployment: /var/lib/polyphony-chitra on host twinridge.

@@ -56,6 +56,9 @@ _bridge = board_bridge.BoardBridge()
 
 @asynccontextmanager
 async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
+    if config.FEED_ONLY:
+        yield
+        return
     # BOARDD_DEV=1 (tests, local non-systemd smoke) never spawns a real
     # Node process — same escape hatch discovery.py already uses. The
     # bridge still runs under it, so a dev smoke against a fixture state
@@ -74,6 +77,13 @@ async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="boardd", docs_url=None, redoc_url=None, lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=config.PKG_DIR / "static"), name="static")
+
+
+@app.middleware("http")
+async def _feed_reader(request: Request, call_next: Any) -> Any:
+    if config.FEED_ONLY and request.method != "GET":
+        return JSONResponse({"error": "native watcher feed is read-only"}, status_code=405)
+    return await call_next(request)
 
 MAX_REQUEST_BODY_BYTES = 64 * 1024
 
