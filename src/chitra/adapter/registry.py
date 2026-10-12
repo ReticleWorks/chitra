@@ -25,6 +25,7 @@ _PLUG_FACTORIES: dict[str, Callable[[], LanePlug]] = {}
 def _register_builtins() -> None:
     from chitra.adapter.plugs.amp_orb import AmpOrbPlug
     from chitra.adapter.plugs.claude_tmux import ClaudeTmuxPlug
+    from chitra.adapter.plugs.codex_queue import CodexQueuePlug
     from chitra.adapter.plugs.codex_tmux import CodexTmuxPlug
     from chitra.adapter.plugs.opencode_tmux import OpenCodeTmuxPlug
 
@@ -32,6 +33,7 @@ def _register_builtins() -> None:
         {
             ClaudeTmuxPlug.name: ClaudeTmuxPlug,
             CodexTmuxPlug.name: CodexTmuxPlug,
+            CodexQueuePlug.name: CodexQueuePlug,
             OpenCodeTmuxPlug.name: OpenCodeTmuxPlug,
             AmpOrbPlug.name: AmpOrbPlug,
         }
@@ -51,6 +53,7 @@ _UNBUILT: dict[str, str] = {
 _CLIENT_PLUGS: dict[str, str] = {
     "claude": "claude-tmux",
     "codex": "codex-tmux",
+    "codex-queue": "codex-queue",
     "opencode": "opencode-tmux",
     "amp": "amp-orb",
 }

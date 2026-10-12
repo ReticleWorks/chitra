@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,7 @@ from chitra.adapter.contract import (
 )
 from chitra.adapter.plugs.amp_orb import AmpOrbPlug, amp_events_from_export
 from chitra.adapter.plugs.claude_tmux import ClaudeTmuxPlug
+from chitra.adapter.plugs.codex_queue import CodexQueuePlug
 from chitra.adapter.plugs.opencode_tmux import OpenCodeTmuxPlug
 from chitra.adapter.proof import prove_read_from_events
 from chitra.adapter.registry import plug, plug_for_client, plug_names
@@ -144,9 +146,10 @@ def _write_uri_binding(path: Path, *, session_ref: str, lane: str, ref: str, cli
 
 def test_registry_resolves_builtins_and_fails_closed() -> None:
     assert plug("claude-tmux") is plug("claude-tmux")
-    assert set(plug_names()) == {"claude-tmux", "codex-tmux", "opencode-tmux", "amp-orb"}
+    assert set(plug_names()) == {"claude-tmux", "codex-tmux", "codex-queue", "opencode-tmux", "amp-orb"}
     assert isinstance(plug_for_client(Client.CLAUDE), ClaudeTmuxPlug)
     assert isinstance(plug_for_client("amp"), AmpOrbPlug)
+    assert isinstance(plug_for_client("codex-queue"), CodexQueuePlug)
     with pytest.raises(HarnessUnavailable, match="not built"):
         plug("dsh")
     with pytest.raises(HarnessUnavailable, match="no lane plug"):
@@ -501,10 +504,54 @@ class _FakeUriPlug:
         return StopResult(was_running=True, stopped=True, method="fake")
 
 
-def test_dispatchd_routes_uri_bound_order_through_plug(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _native_codex_queue_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, consumed: bool, outcome: str = "accepted"):
+    native_id = "00000000-0000-4000-8000-000000000001"
+    transcript = tmp_path / "native-codex.jsonl"
+    transcript.write_text(json.dumps({"type": "session_meta", "payload": {"id": native_id, "cli_version": "0.0.1"}}) + "\n")
+    # Earlier matching work must not supply consumption proof for a newly created order.
+    with transcript.open("a") as stream:
+        for payload in (
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue the tracked work"}]},
+            {"type": "function_call", "call_id": "old-call", "name": "noop", "arguments": "{}"},
+        ):
+            stream.write(json.dumps({
+                "timestamp": (datetime.now(UTC) - timedelta(hours=1)).isoformat(), "type": "response_item", "payload": payload,
+            }) + "\n")
+    calls = []
+
+    def native_queue(argv, **kwargs):
+        assert argv[:4] == ["codex", "queue", "--thread", native_id]
+        assert argv[4] == "--message" and kwargs["timeout"] == 20
+        calls.append(argv)
+        if outcome == "timeout":
+            raise subprocess.TimeoutExpired(argv, 20)
+        if outcome == "nonzero":
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="queue result unavailable")
+        user = {
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": argv[5]}]},
+        }
+        activity = {"type": "response_item", "payload": {"type": "function_call", "call_id": "call-1", "name": "noop", "arguments": "{}"}}
+        with transcript.open("a") as stream:
+            for record in [user, activity] if consumed else [user]:
+                stream.write(json.dumps({"timestamp": datetime.now(UTC).isoformat(), **record}) + "\n")
+        return subprocess.CompletedProcess(argv, 0, stdout="Queued", stderr="")
+
+    from chitra.adapter.plugs import codex_queue
+
+    monkeypatch.setattr(codex_queue.subprocess, "run", native_queue)
+    fake = CodexQueuePlug()
+    return fake, f"codex-queue:{transcript}", native_id, calls
+
+
+@pytest.mark.parametrize("native_queue", [False, True])
+def test_dispatchd_routes_uri_bound_order_through_plug(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native_queue: bool) -> None:
     session_ref = "orb:ops-1:0.0"
-    bindings = _write_uri_binding(tmp_path / "bindings.json", session_ref=session_ref, lane="lane-a", ref="amp-orb:ops-1")
-    fake = _FakeUriPlug(proof_level="consumed")
+    if native_queue:
+        fake, ref, native_id, calls = _native_codex_queue_fixture(tmp_path, monkeypatch, consumed=True)
+    else:
+        fake, ref, native_id = _FakeUriPlug(proof_level="consumed"), "amp-orb:ops-1", "T-9abc"
+    bindings = _write_uri_binding(tmp_path / "bindings.json", session_ref=session_ref, lane="lane-a", ref=ref, client=fake.client)
     monkeypatch.setattr(dispatchd_mod, "plug_for_client", lambda client: fake)
     monkeypatch.setattr(
         dispatchd_mod,
@@ -523,17 +570,27 @@ def test_dispatchd_routes_uri_bound_order_through_plug(tmp_path: Path, monkeypat
     )
 
     assert result.status is DispatchStatus.SENT
-    assert result.transcript_path == "amp-orb:ops-1"
-    assert result.native_session_id == "T-9abc"
-    assert fake.sent == ["continue the tracked work"]
+    assert result.transcript_path == ref
+    assert result.native_session_id == native_id
+    if native_queue:
+        assert len(calls) == 1 and calls[0][5] == "continue the tracked work"
+        assert dispatchd_mod.run_once(queue_dir, lock_dir=tmp_path / "locks", transcript_bindings_path=bindings) == []
+    else:
+        assert fake.sent == ["continue the tracked work"]
     assert (tmp_path / "ledger.jsonl").exists()
 
 
-def test_dispatchd_uri_bound_order_unconfirmed_when_ack_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("native_queue,outcome", [(False, "accepted"), (True, "accepted"), (True, "timeout"), (True, "nonzero")])
+def test_dispatchd_uri_bound_order_unconfirmed_when_ack_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native_queue: bool, outcome: str,
+) -> None:
     """A plug that proves only acceptance lands DELIVERY_UNCONFIRMED — never SENT."""
     session_ref = "orb:ops-1:0.0"
-    bindings = _write_uri_binding(tmp_path / "bindings.json", session_ref=session_ref, lane="lane-a", ref="amp-orb:ops-1")
-    fake = _FakeUriPlug(proof_level="accepted")
+    if native_queue:
+        fake, ref, _native_id, calls = _native_codex_queue_fixture(tmp_path, monkeypatch, consumed=False, outcome=outcome)
+    else:
+        fake, ref = _FakeUriPlug(proof_level="accepted"), "amp-orb:ops-1"
+    bindings = _write_uri_binding(tmp_path / "bindings.json", session_ref=session_ref, lane="lane-a", ref=ref, client=fake.client)
     monkeypatch.setattr(dispatchd_mod, "plug_for_client", lambda client: fake)
     queue_dir = tmp_path / "queue"
     _write_order(queue_dir / "orders", DispatchOrder(order_id="ord-uri-2", session_ref=session_ref, nudge="continue the tracked work"))
@@ -548,6 +605,13 @@ def test_dispatchd_uri_bound_order_unconfirmed_when_ack_only(tmp_path: Path, mon
 
     assert results[0].status is DispatchStatus.DELIVERY_UNCONFIRMED
     assert not (tmp_path / "ledger.jsonl").exists()
+    if native_queue:
+        again = dispatchd_mod.run_once(
+            queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl",
+            ledger_key_path=tmp_path / "ledger.key", transcript_bindings_path=bindings,
+        )
+        assert again[0].status is DispatchStatus.DELIVERY_UNCONFIRMED
+        assert len(calls) == 1  # Accepted input is reconciled; never queued twice.
 
 
 # -- monitord URI ingest -----------------------------------------------------

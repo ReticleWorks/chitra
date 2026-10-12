@@ -25,8 +25,10 @@ systemd and no /var/lib to scan.
 import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from . import config
 
@@ -110,6 +112,8 @@ def discover_units(timeout: float = 3.0) -> dict[str, str]:
     Best-effort: no systemctl, no systemd, or a timeout all mean "no unit
     signal", never an error — root discovery still stands on its own.
     """
+    if sys.platform == "darwin":
+        return discover_launchd_units(timeout)
     found: dict[str, str] = {}
     try:
         proc = subprocess.run(
@@ -136,10 +140,34 @@ def discover_units(timeout: float = 3.0) -> dict[str, str]:
     return found
 
 
+def discover_launchd_units(timeout: float = 3.0) -> dict[str, str]:
+    """Read only the installer's declared jobs, without inferring model health."""
+    found: dict[str, str] = {}
+    for entry in os.environ.get("BOARDD_LAUNCHD_LABELS", "").split(","):
+        monitor, _, label = entry.partition("=")
+        if not monitor.strip() or not label.strip():
+            continue
+        monitor, label = monitor.strip(), label.strip()
+        try:
+            proc = subprocess.run(
+                ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            state = "unknown"
+        else:
+            match = re.search(r"^\s*state = (.+)$", proc.stdout, re.MULTILINE)
+            state = match.group(1).strip() if proc.returncode == 0 and match else "unknown"
+        # One running job must not conceal another job's failure or unknown state.
+        if monitor not in found or state != "running":
+            found[monitor] = state
+    return found
+
+
 def _dev_roots() -> dict[str, Path]:
     raw = os.environ.get("BOARDD_STATE_ROOTS", "")
     if not raw.strip():
-        return {DEFAULT_MONITOR_ID: config.STATE_DIR}
+        return {} if config.watcher_roots() else {DEFAULT_MONITOR_ID: config.STATE_DIR}
     roots: dict[str, Path] = {}
     for entry in raw.split(","):
         entry = entry.strip()
@@ -156,12 +184,17 @@ class MonitorInfo:
     id: str
     state_root: str
     unit_active_state: str
-    lane_count: int
-    needs_feedback_count: int
+    lane_count: int | None
+    needs_feedback_count: int | None
     # False for a unit discovered with no goals.json directory behind it yet
     # (root_for_id's synthetic path doesn't exist on disk). The mobile
     # monitor picker greys this row out rather than pretending it has data.
     has_state_root: bool = True
+    host: str | None = None
+    source_errors: tuple[str, ...] = ()
+    age_seconds: float | None = None
+    data_stale: bool | None = None
+    health: dict[str, Any] | None = None
 
 
 def is_dev_mode() -> bool:
@@ -171,8 +204,9 @@ def is_dev_mode() -> bool:
 def discover_monitors(errors: list[str] | None = None) -> dict[str, Path]:
     """Return {monitor_id: state_root} — the roots half only, unit state added by the caller."""
     if is_dev_mode():
-        return _dev_roots()
+        return {**_dev_roots(), **config.watcher_roots()}
     roots = discover_state_roots(errors=errors)
     for monitor_id in discover_units():
         roots.setdefault(monitor_id, root_for_id(monitor_id))
+    roots.update(config.watcher_roots())
     return roots

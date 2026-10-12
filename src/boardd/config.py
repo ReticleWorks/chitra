@@ -21,6 +21,18 @@ TRANSLATION_SEED = Path(
 
 GOALS_FILE = "goals.json"
 DIGEST_FILE = "sweep-digest.json"
+WATCHER_LANES_FILE = "lanes.json"
+WATCHER_EVENTS_FILE = "events.jsonl"
+
+
+def watcher_roots() -> dict[str, Path]:
+    """Installer-selected host-local watcher roots; retain missing sources."""
+    roots = {}
+    for entry in os.environ.get("BOARDD_WATCHER_ROOTS", "").split(","):
+        host, _, path = entry.partition("=")
+        if host.strip() and path.strip():
+            roots[host.strip()] = Path(path.strip())
+    return roots
 
 # Seconds without a state-file write before the data itself is called stale
 # in the UI copy (the SSE liveness state is separate and client-observed).
