@@ -20,21 +20,21 @@ COMPLETION_DEFERRAL_PHRASES: tuple[str, ...] = cue_phrases("DEFERRAL_STUB")
 # ..."), so natural phrasings land without matching mid-sentence filler. A
 # claim plus a same-line negation ("the work is not done", "still working")
 # is not a claim; ``is_completion_claim`` applies the sieve per line.
-COMPLETION_CLAIM_RE = re.compile(
-    r"^\s*(?:"
-    r"[^\n.!?;]{0,80}?\s+"
-    r"(?:am|is|was|are|were|has|have|had|been|now|finally)\s+"
-    r"|[A-Za-z][A-Za-z ]{0,60}?['’](?:m|s|re|ve|d)\s+"
-    r")?"
-    # A markdown emphasis marker (e.g. "**DONE**") may sit between the
-    # optional subject clause and the claim word without breaking the
-    # sentence-initial anchor.
-    r"(?:[*_`]{1,3}\s*)?"
-    r"(?:"
-    r"done|complete(?:d)?|finished|fixed|repaired|implemented|resolved|"
+_COMPLETION_WORK_OBJECTS = (
+    "task", "work", "job", "step", "phase", "part", "item", "ticket", "build", "deploy",
+    "deployment", "implementation", "fix", "migration", "patch", "review", "analysis", "writeup",
+    "write-up", "continuation",
+)
+_COMPLETION_WORK_OBJECT_PATTERN = "|".join(re.escape(noun) for noun in _COMPLETION_WORK_OBJECTS)
+_COMPLETION_SUBJECT_PREFIX = (
+    r"(?:[^\n.!?;]{0,80}?\s+(?:am|is|was|are|were|has|have|had|been|now|finally)\s+"
+    r"|[A-Za-z][A-Za-z ]{0,60}?['’](?:m|s|re|ve|d)\s+)"
+)
+_COMPLETION_MARKDOWN_PREFIX = r"(?:[*_`]{1,3}\s*)?"
+_COMPLETION_CLAIM_TERMS = (
+    r"(?:done|complete(?:d)?|finished|fixed|repaired|implemented|resolved|"
     r"shipped|deployed|publication[- ]ready|all\s+set|wrapped\s+up"
-    r"|(?:task|work|job|step|phase|part|item|ticket|build|deploy(?:ment)?|implementation|fix|"
-    r"migration|patch|review|analysis|writeup|write-up)\s+"
+    r"|(?:" + _COMPLETION_WORK_OBJECT_PATTERN + r")\s+"
     r"\w{0,15}?\s*(?:is\s+|was\s+|now\s+)?(?:done|complete|completed|finished)\b"
     r"|ready\s+(?:for|to)\s+"
     r"(?:merge|merging|ship|shipping|release|review|publication|submission|deploy\w*|"
@@ -43,7 +43,21 @@ COMPLETION_CLAIM_RE = re.compile(
     r"|all\s+(?:the\s+)?tests?\s+(?:now\s+)?(?:pass(?:es|ed|ing)?|are\s+green|is\s+green)"
     r"|tests?\s+(?:are|is|now)\s+green"
     r"|all\s+(?:the\s+)?checks?\s+(?:now\s+)?pass(?:es|ed|ing)?"
-    r")\b",
+    r")"
+)
+COMPLETION_CLAIM_RE = re.compile(
+    # Exempt only a bare, sentence-initial imperative with a known work object.
+    r"^\s*(?:"
+    + _COMPLETION_SUBJECT_PREFIX
+    + _COMPLETION_MARKDOWN_PREFIX
+    + _COMPLETION_CLAIM_TERMS
+    + r"|"
+    + _COMPLETION_MARKDOWN_PREFIX
+    + r"(?!complete\s+(?:(?:a|an|the|this|that)\s+)?(?:"
+    + _COMPLETION_WORK_OBJECT_PATTERN
+    + r")\b)"
+    + _COMPLETION_CLAIM_TERMS
+    + r")\b",
     re.I | re.M,
 )
 # Negation applies per line: a claim survives caveats on other lines but not

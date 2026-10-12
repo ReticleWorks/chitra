@@ -304,9 +304,17 @@ def test_completion_claim_vocabulary_is_one_shared_predicate() -> None:
     claim on either side, and no detector-local vocabulary remains."""
     assert is_completion_claim("All work is complete and every item passes.")
     assert is_completion_claim("Done. Tests are green.")
+    assert is_completion_claim("Complete this morning")
     assert not is_completion_claim("Still working; tests remain to run.")
     assert not is_completion_claim("The work is not done yet.")
     items = (EnrolledDoneWhenItem(id="done-1", text="tests green", validator="pytest", required_receipt="tests-green"),)
+    ambiguous_time_findings = detect_false_done(
+        final_response=_final_text("f-ambiguous", "Complete this morning"),
+        enrolled_items=items,
+        receipt_names_by_item={},
+    )
+    assert len(ambiguous_time_findings) == 1
+    assert ambiguous_time_findings[0].detector == "false_done"
     assert (
         detect_false_done(
             final_response=_final_text("f-1", "Still working; tests remain to run."),
