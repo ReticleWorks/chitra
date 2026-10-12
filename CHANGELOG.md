@@ -4,6 +4,14 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.23.3] - 2026-10-12
+
+### Fixed
+
+- Distinguish sentence-initial completion requests with explicit work objects
+  from completion claims. Ambiguous phrases and structured completion metadata
+  still require the existing evidence checks.
+
 ## [0.23.1] - 2026-10-11
 
 ### Fixed
