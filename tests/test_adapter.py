@@ -9,6 +9,7 @@ routing. Nothing here shells out to a real harness — every runner is fake.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -34,6 +35,7 @@ from chitra.adapter.contract import (
 from chitra.adapter.plugs.amp_orb import AmpOrbPlug, amp_events_from_export
 from chitra.adapter.plugs.claude_tmux import ClaudeTmuxPlug
 from chitra.adapter.plugs.codex_queue import CodexQueuePlug
+from chitra.adapter.plugs.lane_run import LaneRunPlug
 from chitra.adapter.plugs.opencode_tmux import OpenCodeTmuxPlug
 from chitra.adapter.proof import prove_read_from_events
 from chitra.adapter.registry import plug, plug_for_client, plug_names
@@ -146,10 +148,12 @@ def _write_uri_binding(path: Path, *, session_ref: str, lane: str, ref: str, cli
 
 def test_registry_resolves_builtins_and_fails_closed() -> None:
     assert plug("claude-tmux") is plug("claude-tmux")
-    assert set(plug_names()) == {"claude-tmux", "codex-tmux", "codex-queue", "opencode-tmux", "amp-orb"}
+    assert set(plug_names()) == {"claude-tmux", "codex-tmux", "codex-queue", "lane-run", "opencode-tmux", "amp-orb"}
     assert isinstance(plug_for_client(Client.CLAUDE), ClaudeTmuxPlug)
     assert isinstance(plug_for_client("amp"), AmpOrbPlug)
     assert isinstance(plug_for_client("codex-queue"), CodexQueuePlug)
+    assert isinstance(plug_for_client("lane-run-codex"), LaneRunPlug)
+    assert isinstance(plug_for_client("lane-run-claude"), LaneRunPlug)
     with pytest.raises(HarnessUnavailable, match="not built"):
         plug("dsh")
     with pytest.raises(HarnessUnavailable, match="no lane plug"):
@@ -612,6 +616,212 @@ def test_dispatchd_uri_bound_order_unconfirmed_when_ack_only(
         )
         assert again[0].status is DispatchStatus.DELIVERY_UNCONFIRMED
         assert len(calls) == 1  # Accepted input is reconciled; never queued twice.
+
+
+def _lane_run_binding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cli: str, *, native_id: str = "native-session"):
+    from chitra.adapter.plugs import lane_run
+
+    selector = f"lane-run-{cli}"
+    session_ref = "host:lane-a:0.0"
+    root = tmp_path / "lane-root"
+    monkeypatch.setattr(lane_run, "_lane_root", lambda: root)
+    cwd = tmp_path / "worktree"
+    cwd.mkdir()
+    lane_dir = root / "lane-a"
+    lane_dir.mkdir(parents=True)
+    transcript = tmp_path / f"{cli}.jsonl"
+    if cli == "codex":
+        records = [{"type": "session_meta", "payload": {"id": native_id, "cli_version": "0.0.1"}}]
+    else:
+        records = [{"type": "system", "subtype": "init", "sessionId": native_id, "version": "0.0.1"}]
+    transcript.write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
+    (lane_dir / "lane.json").write_text(json.dumps({
+        "schema": "agent-tools.lane.v1", "id": "lane-a", "cli": cli,
+        "native_session_id": native_id, "owner_uid": os.getuid(),
+        "owner_session_id": os.getsid(0), "ownership_token": "private-owner-token",
+        "cwd": str(cwd), "record": str(lane_dir / "lane.json"), "state": "exited",
+    }), encoding="utf-8")
+    ref = f"{selector}:{transcript}"
+    binding = _binding(session_ref=session_ref, lane="lane-a", path=ref, client=selector)
+    return BoundTranscript(binding=binding, path=ref), transcript, native_id, root
+
+
+@pytest.mark.parametrize("cli", ["codex", "claude"])
+def test_dispatchd_lane_run_continuation_requires_native_consumption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cli: str,
+) -> None:
+    from chitra.adapter.plugs import lane_run
+
+    bound, transcript, native_id, _root = _lane_run_binding(tmp_path, monkeypatch, cli)
+    receipt_path = tmp_path / "durable-receipt.json"
+    packet_holder: dict[str, Any] = {}
+    proofs: list[ReadProof] = []
+
+    def lane_run_call(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert Path(argv[0]).is_absolute() and kwargs["timeout"] == 120
+        if argv[1] == "enqueue":
+            packet = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+            assert (Path(argv[2]).stat().st_mode & 0o777) == 0o600
+            packet_holder.update(packet)
+            receipt_path.write_text(json.dumps({"schema": "agent-tools.continuation-receipt.v1", "packet": packet}))
+            result = {"schema": "agent-tools.continuation-result.v1", "nonce": packet["nonce"],
+                      "lane_id": packet["lane_id"], "native_session_id": packet["native_session_id"],
+                      "state": "accepted", "action": "queued", "receipt": str(receipt_path)}
+        else:
+            accepted = json.loads(receipt_path.read_text(encoding="utf-8"))["packet"]
+            assert accepted == packet_holder
+            prompt = (
+                f'NATIVE_ORDER_NONCE={json.dumps(accepted["nonce"])}\n'
+                f'NATIVE_GOAL_ID={json.dumps(accepted["authority"]["goal_id"])}\n'
+                f'FROZEN_SCOPE_SHA256={accepted["authority"]["frozen_scope_sha256"]}\n\n'
+                f'{accepted["message"]}\n\n'
+            )
+            now = datetime.now(UTC).isoformat()
+            if cli == "codex":
+                rows = [
+                    {
+                        "timestamp": now,
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message", "role": "user",
+                            "content": [{"type": "input_text", "text": prompt}],
+                        },
+                    },
+                    {
+                        "timestamp": now,
+                        "type": "response_item",
+                        "payload": {"type": "function_call", "call_id": "native-tool", "name": "Bash", "arguments": "{}"},
+                    },
+                ]
+            else:
+                rows = [
+                    {"timestamp": now, "type": "user", "sessionId": native_id, "message": {"role": "user", "content": prompt}},
+                    {
+                        "timestamp": now,
+                        "type": "assistant",
+                        "sessionId": native_id,
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "tool_use", "id": "native-tool", "name": "Bash", "input": {}}],
+                        },
+                    },
+                ]
+            with transcript.open("a", encoding="utf-8") as stream:
+                stream.write("".join(json.dumps(row) + "\n" for row in rows))
+            result = {"schema": "agent-tools.continuation-result.v1", "nonce": accepted["nonce"],
+                      "lane_id": accepted["lane_id"], "native_session_id": accepted["native_session_id"],
+                      "state": "consumed", "action": "reconciled", "receipt": str(receipt_path)}
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(result), stderr="")
+
+    monkeypatch.setattr(lane_run.shutil, "which", lambda name: "/managed/bin/lane-run")
+    monkeypatch.setattr(lane_run.subprocess, "run", lane_run_call)
+    plug = LaneRunPlug()
+    original_prove = plug.prove_read
+
+    def capture_proof(*args: Any, **kwargs: Any) -> ReadProof:
+        proof = original_prove(*args, **kwargs)
+        proofs.append(proof)
+        return proof
+
+    monkeypatch.setattr(plug, "prove_read", capture_proof)
+    monkeypatch.setattr(dispatchd_mod, "plug_for_client", lambda _client: plug)
+    monkeypatch.setattr(dispatchd_mod, "_goal_contract_rejection", lambda *_args: None)
+    bindings = _write_uri_binding(
+        tmp_path / "bindings.json", session_ref=bound.session_ref, lane=bound.lane,
+        ref=str(bound.path), client=str(bound.binding.client),
+    )
+    order = DispatchOrder(
+        order_id="lane-run-main", session_ref=bound.session_ref, nudge="continue the governed work",
+        goal_version=1, goal_digest="a" * 64,
+    )
+    queue_dir = tmp_path / "queue"
+    _write_order(queue_dir / "orders", order)
+
+    (result,) = dispatchd_mod.run_once(
+        queue_dir, lock_dir=tmp_path / "locks", ledger_path=tmp_path / "ledger.jsonl",
+        ledger_key_path=tmp_path / "ledger.key", transcript_bindings_path=bindings,
+    )
+
+    assert result.status is DispatchStatus.SENT
+    assert result.delivery_ledger_verified is True
+    assert proofs[0].input_event_id and proofs[0].consuming_event_id
+    assert result.transcript_path == str(bound.path)
+    assert packet_holder["authority"] == {"goal_id": bound.session_ref, "frozen_scope_sha256": "a" * 64}
+    assert packet_holder["ownership_token"] == "private-owner-token"
+    assert "private-owner-token" not in repr(result)
+    assert len(dispatchd_mod.ledger_mod.verify_delivery(
+        tmp_path / "ledger.jsonl", key=(tmp_path / "ledger.key").read_bytes(),
+        order_id=order.order_id, session_ref=order.session_ref, nudge=order.nudge,
+    ).signature) == 64
+
+
+@pytest.mark.parametrize("failure", ["foreign-session", "foreign-owner", "busy"])
+def test_lane_run_refuses_unbound_lane_and_keeps_busy_order_queued(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    from chitra.adapter.plugs import lane_run
+
+    bound, transcript, native_id, root = _lane_run_binding(tmp_path, monkeypatch, "codex")
+    lane_record = root / "lane-a" / "lane.json"
+    record = json.loads(lane_record.read_text(encoding="utf-8"))
+    if failure != "busy":
+        record["native_session_id"] = "another-session" if failure == "foreign-session" else native_id
+        if failure == "foreign-owner":
+            record["owner_uid"] = os.getuid() + 1
+        lane_record.write_text(json.dumps(record), encoding="utf-8")
+        with pytest.raises(StreamUnavailable, match="exact owned native lane"):
+            LaneRunPlug().handle_for_binding(bound, session_ref=bound.session_ref)
+        return
+
+    receipt_path = tmp_path / "durable-receipt.json"
+    packets: list[dict[str, Any]] = []
+    drains = 0
+
+    def lane_run_call(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal drains
+        if argv[1] == "enqueue":
+            packet = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+            packets.append(packet)
+            receipt_path.write_text(json.dumps({"schema": "agent-tools.continuation-receipt.v1", "packet": packet}))
+        else:
+            drains += 1
+            packet = json.loads(receipt_path.read_text(encoding="utf-8"))["packet"]
+        result = {
+            "schema": "agent-tools.continuation-result.v1", "nonce": packet["nonce"],
+            "lane_id": packet["lane_id"], "native_session_id": packet["native_session_id"],
+            "state": "accepted", "action": "busy", "receipt": str(receipt_path),
+        }
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(result), stderr="")
+
+    monkeypatch.setattr(lane_run.shutil, "which", lambda _name: "/managed/bin/lane-run")
+    monkeypatch.setattr(lane_run.subprocess, "run", lane_run_call)
+    plug = LaneRunPlug()
+    monkeypatch.setattr(dispatchd_mod, "plug_for_client", lambda _client: plug)
+    monkeypatch.setattr(dispatchd_mod, "_goal_contract_rejection", lambda *_args: None)
+    bindings = _write_uri_binding(
+        tmp_path / "bindings.json", session_ref=bound.session_ref, lane=bound.lane,
+        ref=str(bound.path), client=str(bound.binding.client),
+    )
+    order = DispatchOrder(
+        order_id="lane-run-busy", session_ref=bound.session_ref, nudge="continue the governed work",
+        goal_version=1, goal_digest="a" * 64,
+    )
+    queue_dir = tmp_path / "queue"
+    _write_order(queue_dir / "orders", order)
+    args = {
+        "lock_dir": tmp_path / "locks", "ledger_path": tmp_path / "ledger.jsonl",
+        "ledger_key_path": tmp_path / "ledger.key", "transcript_bindings_path": bindings,
+    }
+
+    first = dispatchd_mod.run_once(queue_dir, **args)
+    second = dispatchd_mod.run_once(queue_dir, **args)
+
+    assert first[0].status is DispatchStatus.DELIVERY_UNCONFIRMED
+    assert second[0].status is DispatchStatus.DELIVERY_UNCONFIRMED
+    assert len(packets) == 2 and packets[0] == packets[1]
+    assert packets[0]["nonce"] == order.order_id and drains == 2
+    assert len(transcript.read_text(encoding="utf-8").splitlines()) == 1
+    assert not (tmp_path / "ledger.jsonl").exists()
 
 
 # -- monitord URI ingest -----------------------------------------------------
