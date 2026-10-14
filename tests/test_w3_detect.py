@@ -27,6 +27,7 @@ from chitra.detect import (
     detect_drift,
     detect_excessive_testing,
     detect_false_done,
+    detect_permission_loop,
     detect_stall,
     detect_unnecessary_steps,
     find_rescue_bundle,
@@ -200,6 +201,49 @@ def test_false_done_finding_names_the_open_item_and_missing_receipt(
     assert len(findings) == 1
     assert findings[0].unmet_item == "done-1"
     assert findings[0].event_refs == (_final(event_sets["claude-false-done"]).event_id,)
+
+
+def _denial_events(count: int) -> list[CanonicalEvent]:
+    events = []
+    for index in range(count):
+        events.append(_event(
+            f"perm-call-{index}", CanonicalType.TOOL_CALL,
+            payload={"call_id": f"c{index}", "tool_name": "fs_write",
+                     "input": {"path": "/etc/protected"}},
+            native_join_id=f"c{index}",
+        ))
+        events.append(_event(
+            f"perm-err-{index}", CanonicalType.TOOL_ERROR,
+            payload={"call_id": f"c{index}", "output": "EACCES: permission denied"},
+            native_join_id=f"c{index}",
+        ))
+    return events
+
+
+def test_permission_loop_flags_repeated_denials_of_one_tool_class() -> None:
+    findings = detect_permission_loop(tuple(_denial_events(3)))
+    assert len(findings) == 1
+    assert findings[0].detector == "permission_loop"
+    assert len(findings[0].event_refs) == 3
+
+
+def test_permission_loop_clears_when_the_tool_later_succeeds() -> None:
+    events = _denial_events(3)
+    events.append(_event(
+        "perm-call-ok", CanonicalType.TOOL_CALL,
+        payload={"call_id": "c9", "tool_name": "fs_write", "input": {"path": "/etc/protected"}},
+        native_join_id="c9",
+    ))
+    events.append(_event(
+        "perm-ok", CanonicalType.TOOL_RESULT,
+        payload={"call_id": "c9", "output": "written"},
+        native_join_id="c9",
+    ))
+    assert detect_permission_loop(tuple(events)) == []
+
+
+def test_permission_loop_ignores_denials_below_threshold() -> None:
+    assert detect_permission_loop(tuple(_denial_events(2))) == []
 
 
 def test_control_long_healthy_tool_call_stays_clear(event_sets: dict[str, tuple[CanonicalEvent, ...]]) -> None:

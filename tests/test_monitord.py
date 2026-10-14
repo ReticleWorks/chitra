@@ -26,6 +26,7 @@ from chitra.journal import ByteRange, CanonicalEvent, CanonicalType, Client, Tra
 from chitra.journal.store import EventJournal, classify_progress
 from chitra.monitord import (
     MonitordConfig,
+    append_determination,
     append_finding_records,
     build_arg_parser,
     check_enrollment_and_receipts,
@@ -97,7 +98,7 @@ def test_unseen_version_ingests_and_logs_unknown_count(tmp_path: Path) -> None:
     assert len(EventJournal(tmp_path, "lane-x").load()) == 13
     (drift,) = [entry for entry in logs if entry["event"] == "monitord_unknown_events_ingested"]
     assert drift["lane"] == "lane-x"
-    assert drift["events"] == 7
+    assert drift["events"] == 1
     assert drift["types"]["brand-new-record"] == 1
 
 
@@ -226,7 +227,119 @@ def test_append_finding_records_writes_schema_stamped_jsonl(tmp_path: Path) -> N
     assert record["schema"] == "chitra.monitord.pass.v1"
     assert record["lane"] == LANE
     assert record["detector"] == "drift"
-    assert record["shadow_mode"] is True
+
+
+def test_repeated_finding_class_opens_a_class_record_on_the_third_reopen(
+    tmp_path: Path,
+) -> None:
+    """One detector reopening the same unmet item three times is a class, not noise."""
+    config = _config(tmp_path)
+    from chitra.detect import Finding
+
+    def stall_finding(cycle: int) -> Finding:
+        return Finding(
+            detector="stall",
+            fingerprint_seed={"lane": LANE, "cycle": cycle},
+            event_refs=("e1",),
+            unmet_item="implementation-complete",
+            expected_next_progress="progress on implementation-complete",
+            detail="lane quiet",
+        )
+
+    appended = 0
+    for cycle in range(3):
+        appended += append_finding_records(config, LANE, [stall_finding(cycle)])
+        appended += append_finding_records(config, LANE, [])
+
+    lines = (config.state_dir / "monitord-findings.jsonl").read_text(encoding="utf-8").splitlines()
+    records = [json.loads(line) for line in lines]
+    classes = [record for record in records if record["detector"] == "repeated_finding_class"]
+    assert len(classes) == 1
+    assert classes[0]["unmet_item"] == "implementation-complete"
+    assert classes[0]["repeated_detector"] == "stall"
+
+
+def test_append_determination_emits_one_record_per_transition(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    assert append_determination(
+        config, LANE, "lane-a", determination="not_live",
+        next_action="bind the transcript",
+    )
+    assert not append_determination(
+        config, LANE, "lane-a", determination="not_live",
+        next_action="bind the transcript",
+    )
+    assert append_determination(config, LANE, "lane-a", determination="live")
+
+    records = [
+        json.loads(line)
+        for line in (config.state_dir / "determinations.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["determination"] for record in records] == ["not_live", "live"]
+    assert all(record["schema"] == "chitra.determination-input.v1" for record in records)
+    assert all(record["shadow_mode"] is True for record in records)
+    assert records[0]["next_action"] == "bind the transcript"
+    with pytest.raises(ValueError, match="next action"):
+        append_determination(config, LANE, "lane-a", determination="not_live", next_action="")
+
+
+def test_run_once_emits_determinations_for_unenrolled_and_enrolled_lanes(
+    tmp_path: Path,
+) -> None:
+    """A lane without a goal record reads UNKNOWN; an enrolled lane with a
+    standing finding reads not_live plus the finding's next action."""
+    journal = EventJournal(tmp_path, SEEDED_LANE)
+    journal.append(tuple(_event(f"e{i}", CanonicalType.TOOL_CALL, lane=SEEDED_LANE) for i in range(1, 4)))
+    (tmp_path / "goal-records.json").write_text(
+        json.dumps({
+            "schema": "chitra.goal-records.v1",
+            "records": [{
+                "session_ref": SEEDED_LANE, "lane": SEEDED_LANE,
+                "goal": "finish the task", "done_when": "receipt exists",
+                "source": "lane-run brief", "updated_at": "2026-10-14T00:00:00Z",
+                "intent": "", "scope": "",
+                "enrolled_done_when_items": [
+                    {"id": "done-1", "text": "receipt exists", "required_receipt": "done-1"}
+                ],
+            }],
+        }),
+        encoding="utf-8",
+    )
+    summary = run_once(resolve_config(state_dir=tmp_path))
+    assert summary["lanes_observed"] == 1
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "determinations.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    lane_records = [record for record in records if record["lane"] == SEEDED_LANE]
+    assert len(lane_records) == 1
+    record = lane_records[0]
+    assert record["schema"] == "chitra.determination-input.v1"
+    assert record["determination"] == "not_live"
+    assert record["next_action"]
+    assert record["evidence"]["goal_enrolled"] is True
+    assert record["evidence"]["open_findings"]
+
+
+def test_run_once_records_unknown_determination_without_goal_or_events(
+    tmp_path: Path,
+) -> None:
+    """An unenrolled, unbound lane stays UNKNOWN rather than guessing."""
+    journal = EventJournal(tmp_path, SEEDED_LANE)
+    journal.append((_event("e1", CanonicalType.TOOL_CALL, lane=SEEDED_LANE),))
+    summary = run_once(resolve_config(state_dir=tmp_path))
+    assert summary["lanes_observed"] == 1
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "determinations.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    lane_records = [record for record in records if record["lane"] == SEEDED_LANE]
+    assert len(lane_records) == 1
+    assert lane_records[0]["determination"] == "UNKNOWN"
+    assert lane_records[0]["next_action"] == ""
+
 
 def test_run_once_observes_real_journal_and_composes_outputs(tmp_path: Path) -> None:
     journal = EventJournal(tmp_path, SEEDED_LANE)

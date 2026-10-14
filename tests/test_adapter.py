@@ -36,6 +36,7 @@ from chitra.adapter.contract import (
 from chitra.adapter.plugs.amp_orb import AmpOrbPlug, amp_events_from_export
 from chitra.adapter.plugs.claude_tmux import ClaudeTmuxPlug
 from chitra.adapter.plugs.codex_tmux import CodexTmuxPlug
+from chitra.adapter.plugs.db_sources import DevinDbPlug, HermesDbPlug
 from chitra.adapter.plugs.lane_run import LaneRunPlug
 from chitra.adapter.plugs.opencode_tmux import OpenCodeTmuxPlug
 from chitra.adapter.proof import prove_read_from_events
@@ -149,9 +150,11 @@ def _write_uri_binding(path: Path, *, session_ref: str, lane: str, ref: str, cli
 
 def test_registry_resolves_builtins_and_fails_closed() -> None:
     assert plug("claude-tmux") is plug("claude-tmux")
-    assert set(plug_names()) == {"claude-tmux", "codex-tmux", "lane-run", "opencode-tmux", "amp-orb"}
+    assert set(plug_names()) == {"claude-tmux", "codex-tmux", "lane-run", "opencode-tmux", "amp-orb", "devin-db", "hermes-db"}
     assert isinstance(plug_for_client(Client.CLAUDE), ClaudeTmuxPlug)
     assert isinstance(plug_for_client(Client.CODEX), CodexTmuxPlug)
+    assert isinstance(plug_for_client(Client.DEVIN), DevinDbPlug)
+    assert isinstance(plug_for_client(Client.HERMES), HermesDbPlug)
     assert isinstance(plug_for_client("amp"), AmpOrbPlug)
     assert isinstance(plug_for_client("lane-run-codex"), LaneRunPlug)
     assert isinstance(plug_for_client("lane-run-claude"), LaneRunPlug)
@@ -167,7 +170,7 @@ def test_registry_resolves_builtins_and_fails_closed() -> None:
 
 def test_make_normalizer_fails_closed_on_unknown_client() -> None:
     """An unrecognized harness must not silently normalize as Codex."""
-    context = NormalizationContext(instance="i", lane="lane-a", client="amp", client_version="1.0")
+    context = NormalizationContext(instance="i", lane="lane-a", client="polyphony-x", client_version="1.0")
     with pytest.raises(ValueError, match="no JSONL transcript normalizer"):
         make_normalizer(context)
     codex_context = NormalizationContext(instance="i", lane="l", client=Client.CODEX, client_version="1.0")
@@ -179,11 +182,14 @@ def test_make_normalizer_fails_closed_on_unknown_client() -> None:
 
 def test_uri_binding_keeps_locator_and_widened_client(tmp_path: Path) -> None:
     binding = _binding()
-    assert binding.client == "amp"
-    assert not isinstance(binding.client, Client)
+    assert binding.client is Client.AMP
     assert binding.is_uri_locator
     ref = binding.resolved_ref(manifest_path=tmp_path / "manifest.json", transcript_root=tmp_path)
     assert ref == "amp-orb:ops-1"
+
+    widened = _binding(client="polyphony-x")
+    assert widened.client == "polyphony-x"
+    assert not isinstance(widened.client, Client)
 
     file_binding = _binding(path="session.jsonl", client="claude")
     assert file_binding.client is Client.CLAUDE

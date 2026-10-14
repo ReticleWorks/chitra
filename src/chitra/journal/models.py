@@ -17,12 +17,17 @@ class CanonicalType(StrEnum):
     FINAL_RESPONSE = "final_response"
     COMPACTION = "compaction"
     RESUME = "resume"
+    USER_INPUT = "user_input"
+    CONTEXT = "context"
     UNKNOWN = "unknown"
 
 
 class Client(StrEnum):
     CLAUDE = "claude"
     CODEX = "codex"
+    DEVIN = "devin"
+    HERMES = "hermes"
+    AMP = "amp"
 
 
 class ByteRange(BaseModel):
