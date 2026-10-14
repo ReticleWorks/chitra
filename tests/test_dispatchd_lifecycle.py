@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -252,3 +254,84 @@ def test_active_lifecycle_recheck_still_delivers(
 
     assert results[0].status == DispatchStatus.SENT
     assert calls == [order.order_id]
+
+
+def _write_lane_record(lanes_root: Path, lane: str, record: dict[str, Any]) -> None:
+    lane_dir = lanes_root / lane
+    lane_dir.mkdir(parents=True, exist_ok=True)
+    (lane_dir / "lane.json").write_text(json.dumps(record), encoding="utf-8")
+
+
+def test_nonce_order_for_lane_with_no_live_owner_reaches_terminal_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash-reconciling order terminalizes when its lane has no live owner.
+
+    Regression for the dispatchd retry loop: a nonce-bearing order whose
+    target lane's lane-run record reports a dead/ended owner used to be
+    DELIVERY_UNCONFIRMED forever (it could not be pasted again and no
+    consumption proof could ever appear). It must finalize BLOCKED and
+    clear the nonce so the queue stops retrying it.
+    """
+    queue_dir = tmp_path / "queue"
+    state_root = tmp_path / "state"
+    lanes_root = tmp_path / "lanes"
+    order = DispatchOrder(order_id="retired-owner", session_ref="cx-dead-lane", nudge="continue the goal")
+    _write_order(queue_dir, order)
+    in_flight = queue_dir / "in_flight"
+    in_flight.mkdir(parents=True, exist_ok=True)
+    (in_flight / f".{order.order_id}.nonce").write_text("{}", encoding="utf-8")
+    _write_lane_record(
+        lanes_root,
+        "cx-dead-lane",
+        {"state": "failed", "ended_at": "2026-10-12T11:30:58+00:00", "owner_session_id": 999_999_999},
+    )
+    calls: list[str] = []
+
+    def fake_dispatch(dispatched: DispatchOrder, **_: Any) -> DispatchResult:
+        calls.append(dispatched.order_id)
+        return _sent(dispatched)
+
+    monkeypatch.setenv("AGENT_TOOLS_LANE_ROOT", str(lanes_root))
+    monkeypatch.setattr(dispatchd_mod, "get_lane_lifecycle", lambda *_: SimpleNamespace(state="active"))
+    monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", fake_dispatch)
+
+    results = _run_once(queue_dir, state_root)
+
+    assert calls == []
+    assert results[0].status == DispatchStatus.BLOCKED
+    assert results[0].reason == "target lane retired; order abandoned"
+    assert (queue_dir / "processed" / f"{order.order_id}.json").exists()
+    assert (queue_dir / "results" / f"{order.order_id}.json").exists()
+    assert not (in_flight / f".{order.order_id}.nonce").exists()
+
+
+def test_order_for_lane_with_live_owner_still_delivers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The owner check must not terminalize a lane whose owner is alive."""
+    queue_dir = tmp_path / "queue"
+    state_root = tmp_path / "state"
+    lanes_root = tmp_path / "lanes"
+    order = DispatchOrder(order_id="live-owner", session_ref="cx-live-lane", nudge="continue the goal")
+    _write_order(queue_dir, order)
+    _write_lane_record(
+        lanes_root,
+        "cx-live-lane",
+        {"state": "running", "owner_session_id": os.getpid(), "worker_pid": 999_999_999},
+    )
+    calls: list[str] = []
+
+    def fake_dispatch(dispatched: DispatchOrder, **_: Any) -> DispatchResult:
+        calls.append(dispatched.order_id)
+        return _sent(dispatched)
+
+    monkeypatch.setenv("AGENT_TOOLS_LANE_ROOT", str(lanes_root))
+    monkeypatch.setattr(dispatchd_mod, "get_lane_lifecycle", lambda *_: SimpleNamespace(state="active"))
+    monkeypatch.setattr(dispatchd_mod, "dispatch_to_tmux", fake_dispatch)
+
+    results = _run_once(queue_dir, state_root)
+
+    assert results[0].status == DispatchStatus.SENT
+    assert calls == [order.order_id]
+    assert (queue_dir / "processed" / f"{order.order_id}.json").exists()

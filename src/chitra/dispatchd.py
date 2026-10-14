@@ -119,6 +119,7 @@ import argparse
 import contextlib
 import json
 import os
+import sys
 import threading
 import time
 from collections.abc import Mapping, Sequence
@@ -222,6 +223,81 @@ def note_goals_schema_state(goals_root: Path | None) -> None:
         return
     _SCHEMA_NOTICED_ROOTS.add(key)
     print(f"{GOALS_SCHEMA_NEWER_MESSAGE} goals_root={key} file_schema={file_schema} installed_schema={GOALS_INSTALLED_SCHEMA}")
+
+
+_LANE_RECORD_NAME = "lane.json"
+_LANE_OWNER_PID_FIELDS = ("owner_session_id", "worker_pid", "pane_pid")
+_LANE_RECORD_LIVE_STATES = {"starting", "running"}
+_LANE_STARTING_GRACE_SECONDS = 60
+
+
+def _lane_records_root() -> Path:
+    """The agent-tools lane-record root, matching lane-handoff's convention."""
+    override = os.environ.get("AGENT_TOOLS_LANE_ROOT", "").strip()
+    if override:
+        return Path(override).expanduser()
+    if sys.platform == "darwin":
+        return Path.home() / ".local/share/agent-tools/lanes"
+    return Path("/var/lib/agent-tools/lanes")
+
+
+def _pid_alive(pid: Any) -> bool:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        # EPERM means the process exists under another owner.
+        return True
+    return True
+
+
+def _lane_owner_retired(session_ref: str, *, now: datetime | None = None) -> str | None:
+    """Why the order's target lane has no live owner, or ``None``.
+
+    The lane-run record (``<lanes>/<session_ref>/lane.json``) is the launch
+    plane's authority for who owns a lane. Its states mirror lane-status:
+    ``starting``/``running`` are live, ``exited``/``failed`` (or any record
+    with ``ended_at``) are retired, and a nominally live record whose owner,
+    worker, and pane pids are all gone is retired the moment the starting
+    grace window passes -- a controller that disappeared mid-start never
+    reaches a lifecycle transition, so the record itself is the signal.
+
+    An absent, unreadable, or foreign-shape record cannot prove retirement:
+    non-lane-run delivery targets own no lane.json and must stay retryable
+    on their own evidence paths.
+    """
+    if not session_ref or any(sep in session_ref for sep in ("/", "\\", "..")):
+        return None
+    record_path = _lane_records_root() / session_ref / _LANE_RECORD_NAME
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    state = record.get("state")
+    if record.get("ended_at") or (isinstance(state, str) and state not in _LANE_RECORD_LIVE_STATES):
+        return f"lane record state {state!r}"
+    if state in _LANE_RECORD_LIVE_STATES:
+        if any(_pid_alive(record.get(field)) for field in _LANE_OWNER_PID_FIELDS):
+            return None
+        if state == "starting" and not record.get("pane_pid"):
+            # The supervisor writes state=starting before it spawns the
+            # worker; grant the same grace window lane-status's admission
+            # check does, and treat an unparseable age as live.
+            observed = now or datetime.now(UTC)
+            try:
+                created = datetime.fromisoformat(str(record.get("created_at") or ""))
+                starting_age = (observed - created).total_seconds()
+            except (TypeError, ValueError):
+                return None
+            if starting_age < _LANE_STARTING_GRACE_SECONDS:
+                return None
+        return "lane record has no live owner, worker, or pane process"
+    return None
 
 
 def _goal_contract_rejection(order: DispatchOrder, goals_root: Path | None) -> str | None:
@@ -1358,6 +1434,34 @@ def _compute_delivery_outcome(call: _DeliveryCall) -> _DeliveryOutcome:
                         decision_attestation_id=call.attestation_id,
                     ),
                 )
+
+        # Lane-owner recheck, under the same lock. A controller that
+        # disappears without a lifecycle transition leaves its record
+        # nominally "working" forever; without this check a nonce-bearing
+        # order retries the reconcile path indefinitely (Roundtop,
+        # 2026-10-14: two orders retried ~255k times over two days).
+        retired_detail = _lane_owner_retired(order.session_ref)
+        if retired_detail is not None:
+            logger.warning(
+                "dispatchd_order_target_lane_retired",
+                order_id=order.order_id,
+                session_ref=order.session_ref,
+                detail=retired_detail,
+            )
+            return _DeliveryOutcome(
+                order_id=order.order_id,
+                action="result",
+                result=DispatchResult(
+                    order_id=order.order_id,
+                    session_ref=order.session_ref,
+                    status=DispatchStatus.BLOCKED,
+                    reason="target lane retired; order abandoned",
+                    routing_hint=order.routing_hint,
+                    task_type=order.task_type,
+                    resolved_zdr=call.resolved_zdr,
+                    decision_attestation_id=call.attestation_id,
+                ),
+            )
 
         if call.strict_autonomous and call.bound_transcript is None:
             return _DeliveryOutcome(
