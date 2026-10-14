@@ -4,6 +4,29 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-10-14
+
+### Added
+
+- Hybrid-monitor shadow feed across four agent families: Devin and Hermes
+  transcript normalizers (ATIF steps and state-database rows), Amp
+  normalization, URI-backed transcript bindings, goal-record manifest input
+  (`chitra.goal-records.v1`), and canonical `USER_INPUT`/`CONTEXT` types (#162).
+- Coordinator determinations output (`determinations.jsonl`): live, not live
+  with next action, or `UNKNOWN` per lane (#162).
+- Shadow-mode claim evaluation against stored receipts, including `false_done`,
+  permission-loop, and repeated-finding-class detection (#162).
+
+### Fixed
+
+- Terminalize delivery orders whose target lane has no live owner. A
+  nonce-bearing order for a lane whose controller disappeared without a
+  lifecycle transition used to retry the crash-reconcile path forever; it now
+  reaches a terminal `BLOCKED` result ("target lane retired; order abandoned")
+  and clears its nonce.
+- `list_receipts` no longer parses `.report.json` validator report sidecars
+  as receipt envelopes.
+
 ## [0.23.3] - 2026-10-12
 
 ### Fixed
