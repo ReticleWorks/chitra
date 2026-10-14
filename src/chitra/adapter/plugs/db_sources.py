@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -44,6 +45,7 @@ from chitra.adapter.contract import (
 )
 from chitra.journal.models import CanonicalEvent, CanonicalType, TranscriptIdentity
 from chitra.journal.normalizers import NORMALIZER_VERSION, _canonical_digest
+from chitra.journal.reader import DEFAULT_MAX_BATCH_BYTES
 from chitra.transcript_bindings import BoundTranscript
 
 _DEVIN_URI_PREFIX = "devin-db:"
@@ -108,7 +110,7 @@ class _DbEvidencePlug:
     def _session_locator(self, value: str) -> tuple[str, dict[str, str]]:
         return value, {}
 
-    def _select_rows(self, conn: sqlite3.Connection, session_id: str, after: int | None) -> list[tuple[Any, ...]]:
+    def _select_rows(self, conn: sqlite3.Connection, session_id: str, after: int | None) -> sqlite3.Cursor:
         raise NotImplementedError
 
     def _row_events(self, row: tuple[Any, ...]) -> tuple[RowEvent, ...]:
@@ -162,26 +164,37 @@ class _DbEvidencePlug:
         except ValueError as exc:
             raise StreamUnavailable(f"{self.name} cursor is not a row id") from exc
         conn = self._connect(handle)
+        rows: sqlite3.Cursor | None = None
+        events: list[CanonicalEvent] = []
+        last_row_id = after
         try:
             if not self._session_exists(conn, session_id):
                 raise StreamUnavailable(
                     f"UNKNOWN: {self.client} session {session_id!r} absent from evidence database"
                 )
             rows = self._select_rows(conn, session_id, after)
+            batch_bytes = 0
+            while row := rows.fetchone():
+                row_id = int(row[0])
+                # Move the cursor only after this row has been fully converted.
+                # A row that emits no events still advances and cannot stall.
+                events.extend(self._emit(row, row_id=row_id, handle=handle))
+                last_row_id = row_id
+                batch_bytes += sys.getsizeof(row) + sum(sys.getsizeof(value) for value in row)
+                # Match the JSONL reader's per-poll budget. A single oversized
+                # row is processed whole so the cursor always makes progress.
+                if batch_bytes >= DEFAULT_MAX_BATCH_BYTES:
+                    break
         except sqlite3.Error as exc:
             raise StreamUnavailable(
                 f"UNKNOWN: {self.client} evidence query failed: {type(exc).__name__}"
             ) from exc
         finally:
-            conn.close()
-        events: list[CanonicalEvent] = []
-        last_row_id = after
-        for row in rows:
-            row_id = int(row[0])
-            events.extend(
-                self._emit(row, row_id=row_id, handle=handle)
-            )
-            last_row_id = row_id
+            try:
+                if rows is not None:
+                    rows.close()
+            finally:
+                conn.close()
         return EventBatch(
             events=tuple(events),
             cursor=str(last_row_id) if last_row_id is not None else cursor,
@@ -273,18 +286,18 @@ class DevinDbPlug(_DbEvidencePlug):
             conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone() is not None
         )
 
-    def _select_rows(self, conn: sqlite3.Connection, session_id: str, after: int | None) -> list[tuple[Any, ...]]:
+    def _select_rows(self, conn: sqlite3.Connection, session_id: str, after: int | None) -> sqlite3.Cursor:
         if after is None:
             return conn.execute(
                 "SELECT row_id, node_id, created_at, chat_message FROM message_nodes"
                 " WHERE session_id=? ORDER BY row_id",
                 (session_id,),
-            ).fetchall()
+            )
         return conn.execute(
             "SELECT row_id, node_id, created_at, chat_message FROM message_nodes"
             " WHERE session_id=? AND row_id>? ORDER BY row_id",
             (session_id, after),
-        ).fetchall()
+        )
 
     def _row_events(self, row: tuple[Any, ...]) -> tuple[RowEvent, ...]:
         row_id, node_id, created_at, chat_json = row
@@ -393,17 +406,17 @@ class HermesDbPlug(_DbEvidencePlug):
             conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone() is not None
         )
 
-    def _select_rows(self, conn: sqlite3.Connection, session_id: str, after: int | None) -> list[tuple[Any, ...]]:
+    def _select_rows(self, conn: sqlite3.Connection, session_id: str, after: int | None) -> sqlite3.Cursor:
         columns = "id, role, content, tool_call_id, tool_calls, tool_name, timestamp, finish_reason, reasoning_content"
         if after is None:
             return conn.execute(
                 f"SELECT {columns} FROM messages WHERE session_id=? ORDER BY id",
                 (session_id,),
-            ).fetchall()
+            )
         return conn.execute(
             f"SELECT {columns} FROM messages WHERE session_id=? AND id>? ORDER BY id",
             (session_id, after),
-        ).fetchall()
+        )
 
     def _row_events(self, row: tuple[Any, ...]) -> tuple[RowEvent, ...]:
         (row_id, role, content, tool_call_id, tool_calls_json, tool_name,

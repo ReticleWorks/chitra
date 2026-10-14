@@ -18,6 +18,7 @@ import pytest
 from chitra.adapter.contract import LaunchRefused, StreamUnavailable, Unsupported
 from chitra.adapter.plugs.db_sources import DevinDbPlug, HermesDbPlug
 from chitra.journal.models import CanonicalType
+from chitra.journal.reader import DEFAULT_MAX_BATCH_BYTES
 from chitra.transcript_bindings import BoundTranscript, TranscriptBinding
 
 
@@ -111,6 +112,40 @@ def test_devin_db_streams_canonical_events_and_advances_cursor(
         {event.event_id for event in batch.events}
         | {event.event_id for event in second.events}
     )
+
+
+def test_devin_db_resumes_after_oversized_row_without_losing_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "sessions.db"
+    _devin_db(database)
+    large_text = "x" * (DEFAULT_MAX_BATCH_BYTES + 1)
+    conn = sqlite3.connect(database)
+    for row_id, content in ((5, large_text), (6, "after oversized row")):
+        conn.execute(
+            "INSERT INTO message_nodes (row_id, node_id, session_id, created_at, chat_message)"
+            " VALUES (?,?,?,?,?)",
+            (row_id, f"n{row_id}", "s-1", 1790000000.0 + row_id,
+             json.dumps({"message_id": f"m{row_id}", "role": "assistant", "content": content})),
+        )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("CHITRA_DEVIN_DB", str(database))
+    plug = DevinDbPlug()
+    handle = plug.handle_for_binding(_binding("devin-db:s-1", client="devin"), session_ref="lane-a")
+
+    first = plug.events(handle)
+    assert first.cursor == "5"
+    assert first.events[-1].payload["text"] == large_text
+
+    second = plug.events(handle, cursor=first.cursor)
+    assert second.cursor == "6"
+    assert second.events[0].payload["text"] == "after oversized row"
+    assert len(first.events) + len(second.events) == 6
+
+    exhausted = plug.events(handle, cursor=second.cursor)
+    assert exhausted.events == ()
+    assert exhausted.cursor == second.cursor
 
 
 def test_devin_db_fails_closed_when_session_or_db_missing(
