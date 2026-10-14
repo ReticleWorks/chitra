@@ -4,8 +4,10 @@ Devin keeps its session history in ``~/.local/share/devin/cli/sessions.db``
 (``message_nodes`` rows carrying one JSON chat message each) and Hermes keeps
 its history in ``~/.hermes/state.db`` (``messages`` rows). Neither source is a
 JSONL transcript, so these lanes bind URI locators — ``devin-db:<session>``
-and ``hermes-db:<session>`` — and read canonical events through this plug
-instead of the journal ingestor.
+and ``hermes-db:<session>`` for root or ``hermes-db:<profile>/<session>`` for
+a Hermes profile — and read canonical events through this plug instead of the
+journal ingestor. ``CHITRA_HERMES_DB`` continues to select the root database;
+profile databases are resolved beside it under ``profiles/<profile>/``.
 
 Both plugs are evidence-only: they can ``events()``, ``status()``, and
 ``handle_for_binding()``. Delivery to such lanes belongs to the harness's own
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any, ClassVar
@@ -45,6 +48,7 @@ from chitra.transcript_bindings import BoundTranscript
 
 _DEVIN_URI_PREFIX = "devin-db:"
 _HERMES_URI_PREFIX = "hermes-db:"
+_HERMES_PROFILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 
 # One canonical event template a subclass's ``_row_events`` yields per slot:
 # (slot, normalized type, native type, join id, payload, native time, raw record).
@@ -58,11 +62,14 @@ def _devin_db_path() -> Path:
     return Path.home() / ".local/share/devin/cli/sessions.db"
 
 
-def _hermes_db_path() -> Path:
+def _hermes_db_path(profile: str | None = None) -> Path:
     override = os.environ.get("CHITRA_HERMES_DB")
-    if override:
-        return Path(override)
-    return Path.home() / ".hermes/state.db"
+    if profile is None:
+        return Path(override) if override else Path.home() / ".hermes/state.db"
+    if not isinstance(profile, str) or not _HERMES_PROFILE.fullmatch(profile):
+        raise StreamUnavailable("UNKNOWN: Hermes profile locator is invalid")
+    root = Path(override).expanduser().parent if override else Path.home() / ".hermes"
+    return root / "profiles" / profile / "state.db"
 
 
 def _epoch_iso(value: object) -> str | None:
@@ -95,8 +102,11 @@ class _DbEvidencePlug:
     client_version: ClassVar[str]
 
     # -- subclass contract -------------------------------------------------
-    def _db_path(self) -> Path:
+    def _db_path(self, handle: LaneHandle) -> Path:
         raise NotImplementedError
+
+    def _session_locator(self, value: str) -> tuple[str, dict[str, str]]:
+        return value, {}
 
     def _select_rows(self, conn: sqlite3.Connection, session_id: str, after: int | None) -> list[tuple[Any, ...]]:
         raise NotImplementedError
@@ -111,7 +121,8 @@ class _DbEvidencePlug:
     def handle_for_binding(self, bound: BoundTranscript, *, session_ref: str) -> LaneHandle:
         if not bound.is_uri or not str(bound.path).startswith(self.uri_prefix):
             raise StreamUnavailable(f"{self.name} needs a {self.uri_prefix} locator")
-        session_id = str(bound.path)[len(self.uri_prefix):]
+        session_id, extra = self._session_locator(
+            str(bound.path)[len(self.uri_prefix):])
         if not session_id:
             raise StreamUnavailable(f"{self.uri_prefix} binding carries no session id")
         return LaneHandle(
@@ -124,13 +135,14 @@ class _DbEvidencePlug:
                 "client": self.client,
                 "client_version": self.client_version,
                 "session_id": session_id,
+                **extra,
             },
             binding_ref=str(bound.path),
             native_session_id=session_id,
         )
 
     def _connect(self, handle: LaneHandle) -> sqlite3.Connection:
-        db_path = self._db_path()
+        db_path = self._db_path(handle)
         try:
             conn = sqlite3.connect(
                 f"file:{db_path}?mode=ro", uri=True, timeout=5.0
@@ -177,22 +189,25 @@ class _DbEvidencePlug:
 
     def _emit(self, row: tuple[Any, ...], *, row_id: int, handle: LaneHandle) -> tuple[CanonicalEvent, ...]:
         session_id = str(handle.locator["session_id"])
+        profile = handle.locator.get("profile")
         identity = TranscriptIdentity(path=str(handle.binding_ref or session_id), device=0, inode=0, generation=0)
         out: list[CanonicalEvent] = []
         for slot, normalized, native_type, join_id, payload, native_time, raw_record in self._row_events(row):
-            key = f"{self.client}:{session_id}:{row_id}:{slot}"
+            key = (f"{self.client}:{profile}:{session_id}:{row_id}:{slot}"
+                   if profile is not None else f"{self.client}:{session_id}:{row_id}:{slot}")
             payload_digest = _canonical_digest(payload)
+            event_identity = {
+                "client": self.client,
+                "session_id": session_id,
+                "native_key": key,
+                "normalized_type": normalized.value,
+                "payload_digest": payload_digest,
+            }
+            if profile is not None:
+                event_identity["profile"] = profile
             out.append(
                 CanonicalEvent(
-                    event_id=_canonical_digest(
-                        {
-                            "client": self.client,
-                            "session_id": session_id,
-                            "native_key": key,
-                            "normalized_type": normalized.value,
-                            "payload_digest": payload_digest,
-                        }
-                    ),
+                    event_id=_canonical_digest(event_identity),
                     instance=handle.locator["instance"],
                     lane=handle.lane_id,
                     client=self.client,
@@ -250,7 +265,7 @@ class DevinDbPlug(_DbEvidencePlug):
     uri_prefix: ClassVar[str] = _DEVIN_URI_PREFIX
     client_version: ClassVar[str] = "devin-sessions-db-v1"
 
-    def _db_path(self) -> Path:
+    def _db_path(self, handle: LaneHandle) -> Path:
         return _devin_db_path()
 
     def _session_exists(self, conn: sqlite3.Connection, session_id: str) -> bool:
@@ -361,8 +376,17 @@ class HermesDbPlug(_DbEvidencePlug):
     uri_prefix: ClassVar[str] = _HERMES_URI_PREFIX
     client_version: ClassVar[str] = "hermes-state-db-v1"
 
-    def _db_path(self) -> Path:
-        return _hermes_db_path()
+    def _db_path(self, handle: LaneHandle) -> Path:
+        return _hermes_db_path(handle.locator.get("profile"))
+
+    def _session_locator(self, value: str) -> tuple[str, dict[str, str]]:
+        if "/" not in value:
+            return value, {}
+        profile, separator, session_id = value.partition("/")
+        if (not separator or not _HERMES_PROFILE.fullmatch(profile)
+                or not session_id or "/" in session_id):
+            raise StreamUnavailable("hermes-db profile locator is invalid")
+        return session_id, {"profile": profile}
 
     def _session_exists(self, conn: sqlite3.Connection, session_id: str) -> bool:
         return (
