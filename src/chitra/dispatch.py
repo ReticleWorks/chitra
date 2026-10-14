@@ -70,6 +70,7 @@ import shlex
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -300,6 +301,36 @@ def allowed_remote_dispatch_hosts(env: str | None = None) -> set[str]:
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
+_FQDN_CACHE: list[str | None] = []
+
+
+def _fqdn(timeout_seconds: float = 2.0) -> str:
+    """The local FQDN, or ``""`` when resolution cannot answer promptly.
+
+    ``socket.getfqdn`` performs a reverse-DNS lookup; on a host whose mDNS
+    responder stalls it blocks the caller for minutes — an unacceptable wait
+    inside a monitor pass or a dispatch admission check. A daemon thread
+    bounds the wait; on timeout the alias is simply absent, which fails the
+    closed way (an unrecognized host is not local). The result — including
+    the timeout — is cached for the process: the host's own name does not
+    change between calls, and re-paying the stall on every admission check
+    would put the same minutes back on the loop.
+    """
+    if _FQDN_CACHE:
+        return _FQDN_CACHE[0] or ""
+    result: list[str] = []
+
+    def lookup() -> None:
+        with contextlib.suppress(OSError):
+            result.append(socket.getfqdn())
+
+    worker = threading.Thread(target=lookup, daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+    _FQDN_CACHE.append(result[0] if result else None)
+    return _FQDN_CACHE[0] or ""
+
+
 def local_host_aliases(extra: set[str] | None = None) -> set[str]:
     """Return the set of aliases that refer to the local host.
 
@@ -307,11 +338,11 @@ def local_host_aliases(extra: set[str] | None = None) -> set[str]:
     Tests inject ``extra`` to pin the local identity.
     """
     aliases: set[str] = {"localhost", "127.0.0.1"}
-    try:
+    with contextlib.suppress(OSError):
         aliases.add(socket.gethostname().split(".", 1)[0])
-        aliases.add(socket.getfqdn().split(".", 1)[0])
-    except OSError:
-        pass
+    fqdn = _fqdn()
+    if fqdn:
+        aliases.add(fqdn.split(".", 1)[0])
     override = _env("CHITRA_LOCAL_HOST")
     if override:
         aliases.add(override.split(".", 1)[0])

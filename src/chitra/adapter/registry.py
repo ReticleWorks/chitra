@@ -26,6 +26,7 @@ def _register_builtins() -> None:
     from chitra.adapter.plugs.amp_orb import AmpOrbPlug
     from chitra.adapter.plugs.claude_tmux import ClaudeTmuxPlug
     from chitra.adapter.plugs.codex_tmux import CodexTmuxPlug
+    from chitra.adapter.plugs.db_sources import DevinDbPlug, HermesDbPlug
     from chitra.adapter.plugs.lane_run import LaneRunPlug
     from chitra.adapter.plugs.opencode_tmux import OpenCodeTmuxPlug
 
@@ -36,6 +37,8 @@ def _register_builtins() -> None:
             LaneRunPlug.name: LaneRunPlug,
             OpenCodeTmuxPlug.name: OpenCodeTmuxPlug,
             AmpOrbPlug.name: AmpOrbPlug,
+            DevinDbPlug.name: DevinDbPlug,
+            HermesDbPlug.name: HermesDbPlug,
         }
     )
 
@@ -49,7 +52,9 @@ _UNBUILT: dict[str, str] = {
 }
 
 # Journal client identity -> plug that serves it. File-transcript clients all
-# land on their tmux plug; ``amp`` lands on the orb plug.
+# land on their tmux plug; ``amp`` lands on the orb plug; ``devin`` and
+# ``hermes`` bind ``devin-db:<session>`` / ``hermes-db:<session>`` URI
+# locators and land on their read-only database evidence plugs.
 _CLIENT_PLUGS: dict[str, str] = {
     "claude": "claude-tmux",
     "codex": "codex-tmux",
@@ -59,6 +64,8 @@ _CLIENT_PLUGS: dict[str, str] = {
     "lane-run-amp": "lane-run",
     "opencode": "opencode-tmux",
     "amp": "amp-orb",
+    "devin": "devin-db",
+    "hermes": "hermes-db",
 }
 
 _instances: dict[str, LanePlug] = {}

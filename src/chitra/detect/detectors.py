@@ -1,4 +1,4 @@
-"""Six event-based detectors over the W1 canonical journal (DESIGN-v3 §4).
+"""Event-based detectors over the W1 canonical journal (DESIGN-v3 §4).
 
 Every detector consumes canonical events plus frozen goal data and returns a
 list of :class:`Finding`. A finding binds the exact journal event references
@@ -99,12 +99,16 @@ def met_done_items(
     *,
     receipt_root: Path | None,
     session_ref: str,
+    verified_results: Mapping[str, str] | None = None,
 ) -> frozenset[str]:
     """Return the enrolled item ids whose required receipt verifies right now.
 
     The same per-item receipt check ``detect_false_done`` applies decides
     which items are already met; findings then bind the first item that is
-    genuinely unmet instead of the first enrolled row.
+    genuinely unmet instead of the first enrolled row. When
+    ``verified_results`` is supplied it is a stored-verdict map (receipt name
+    → ``pass``/``fail``) that stands in for re-running ``verify_receipt`` —
+    the path a shadow monitor takes, which executes nothing.
     """
     met: set[str] = set()
     if receipt_root is None or not session_ref:
@@ -116,12 +120,16 @@ def met_done_items(
         if not item_id or not required_receipt:
             continue
         try:
-            verification = verify_receipt(receipt_root, session_ref, required_receipt)
             receipt, _raw = load_receipt_file(receipt_path(receipt_root, session_ref, required_receipt))
+            eligible = (
+                verified_results.get(required_receipt) == "pass"
+                if verified_results is not None
+                else verify_receipt(receipt_root, session_ref, required_receipt).completion_eligible
+            )
         except Exception:
             continue
         validator_names = {str(receipt.validator.get("name"))} if receipt.validator else set()
-        if verification.completion_eligible and validator in validator_names:
+        if eligible and validator in validator_names:
             met.add(item_id)
     return frozenset(met)
 
@@ -928,7 +936,8 @@ def detect_false_done(
         root_available = root is not None and root.exists()
     unmet = first_unmet_item_id(
         enrolled_items,
-        met_done_items(enrolled_items, receipt_root=root, session_ref=session_ref)
+        met_done_items(enrolled_items, receipt_root=root, session_ref=session_ref,
+                       verified_results=verified_results)
         if root_available and root is not None
         else frozenset(),
     )
@@ -1041,6 +1050,89 @@ def detect_false_done(
     return findings
 
 
+_PERMISSION_DENIAL_RE = re.compile(
+    r"permission denied|operation not permitted|not authorized|access denied"
+    r"|requires? (?:approval|permission|elevation)|permission to .{0,80}(?:required|needed)"
+    r"|EACCES|EPERM|user does not allow|tool use was (?:rejected|denied)|denied by (?:policy|user)",
+    re.IGNORECASE,
+)
+
+
+def _denial_output(event: CanonicalEvent) -> str | None:
+    """The denial text when a tool result/error carries a permission refusal."""
+    output = event.payload.get("output")
+    if isinstance(output, str) and _PERMISSION_DENIAL_RE.search(output):
+        return output
+    return None
+
+
+def detect_permission_loop(
+    events: Sequence[CanonicalEvent],
+    *,
+    threshold: int = 3,
+    enrolled_items: Sequence[object] = (),
+    met_items: Set[str] = frozenset(),
+) -> list[Finding]:
+    """Flag a lane hitting the same permission wall without progress.
+
+    A single denied call is a fact, not a loop: the lane may route around it.
+    ``threshold`` denials of the same class — same tool family, same denial
+    signature — with no successful result from that tool afterward is the
+    durable pattern the audit calls a permission loop. The finding class is
+    keyed on tool family + denial class so reworded denial text cannot reset
+    the count.
+    """
+    joined_calls: dict[str, CanonicalEvent] = {
+        event.native_join_id: event
+        for event in events
+        if event.normalized_type is CanonicalType.TOOL_CALL and isinstance(event.native_join_id, str)
+    }
+    denials: list[tuple[CanonicalEvent, str, str]] = []
+    progress_after_last: dict[str, bool] = {}
+    for event in events:
+        if event.normalized_type not in {CanonicalType.TOOL_RESULT, CanonicalType.TOOL_ERROR}:
+            continue
+        call = joined_calls.get(str(event.native_join_id or ""))
+        if call is not None:
+            signature = call_signature(call)
+            label = str(call.payload.get("tool_name") or signature)
+        else:
+            signature = str(event.payload.get("tool_name") or "unknown")
+            label = signature
+        if event.normalized_type is CanonicalType.TOOL_RESULT and _denial_output(event) is None:
+            progress_after_last[signature] = True
+            continue
+        if _denial_output(event) is not None:
+            denials.append((event, signature, label))
+            progress_after_last[signature] = False
+    by_class: dict[str, list[tuple[CanonicalEvent, str]]] = {}
+    for event, signature, label in denials:
+        by_class.setdefault(signature, []).append((event, label))
+    findings: list[Finding] = []
+    unmet = first_unmet_item_id(enrolled_items, met_items)
+    for signature, class_events in sorted(by_class.items()):
+        if len(class_events) < threshold or progress_after_last.get(signature, False):
+            continue
+        label = class_events[0][1]
+        findings.append(
+            Finding(
+                detector="permission_loop",
+                fingerprint_seed={"signature": signature, "count": len(class_events)},
+                event_refs=tuple(event.event_id for event, _label in class_events),
+                unmet_item=unmet,
+                expected_next_progress=(
+                    "route around the denied operation through a permitted path, or carry the blocker "
+                    "forward as an explicit ask instead of retrying it"
+                ),
+                detail=(
+                    f"{len(class_events)} permission denials for {label!r} "
+                    "with no successful result from that tool since"
+                ),
+            )
+        )
+    return findings
+
+
 def detect_deferral_language(
     events: Sequence[CanonicalEvent],
     *,
@@ -1096,6 +1188,7 @@ __all__ = [
     "detect_drift",
     "detect_excessive_testing",
     "detect_false_done",
+    "detect_permission_loop",
     "detect_stall",
     "detect_unnecessary_steps",
     "first_unmet_item",

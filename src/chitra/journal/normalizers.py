@@ -1,4 +1,10 @@
-"""Normalizers for observed Claude Code and Codex JSONL."""
+"""Normalizers for observed Claude Code, Codex, Devin, and Amp JSONL.
+
+Client coverage is explicit: every known record type maps to a canonical
+event type (tool evidence, user input, lifecycle, or ``context`` metadata),
+and only genuinely unrecognized record types land on ``unknown`` -- unknown
+remains the drift signal, never the default for recognized noise.
+"""
 
 from __future__ import annotations
 
@@ -21,7 +27,7 @@ from .models import (
 )
 from .reader import JsonlTailReader
 
-NORMALIZER_VERSION = "chitra-journal-normalizer.v1"
+NORMALIZER_VERSION = "chitra-journal-normalizer.v2"
 
 
 @dataclass(frozen=True)
@@ -319,6 +325,48 @@ class TranscriptNormalizer:
             },
         )
 
+    def _context(self, raw: RawRecord, *, subtype: str, slot: str = "record") -> CanonicalEvent:
+        """A recognized non-evidence record: context, metadata, or noise.
+
+        The record's type is known to the normalizer so it is classified
+        CONTEXT rather than UNKNOWN; genuinely new record types still land on
+        UNKNOWN, which remains the drift signal for unrecognized content.
+        """
+        record = raw.record or {}
+        attachment = record.get("attachment")
+        return self._event(
+            raw,
+            CanonicalType.CONTEXT,
+            slot=slot,
+            payload={
+                "native_type": record.get("type"),
+                "native_subtype": subtype,
+                "attachment_type": attachment.get("type") if isinstance(attachment, dict) else None,
+            },
+        )
+
+
+_CLAUDE_CONTEXT_TYPES = frozenset(
+    {
+        "ai-title",
+        "agent-name",
+        "summary",
+        "artifact-autoreact-ledger",
+        "artifact-comment-monitor",
+        "atis-latch",
+        "bridge-session",
+        "cost-state",
+        "custom-title",
+        "file-history-delta",
+        "file-history-snapshot",
+        "frame-link",
+        "last-prompt",
+        "mode",
+        "permission-mode",
+        "pr-link",
+    }
+)
+
 
 class ClaudeNormalizer(TranscriptNormalizer):
     def __init__(self, context: NormalizationContext) -> None:
@@ -398,6 +446,18 @@ class ClaudeNormalizer(TranscriptNormalizer):
             content = message.get("content")
             if isinstance(content, str):
                 notification = _parse_task_notification(content)
+                if notification is None and not record.get("isCompactSummary") and content.strip():
+                    # A real user turn: operator or harness text input. The
+                    # consumption proof keys on native_type/payload "user".
+                    events.append(
+                        self._event(
+                            raw,
+                            CanonicalType.USER_INPUT,
+                            slot="user_message",
+                            native_type="user",
+                            payload={"native_type": "user", "text": content},
+                        )
+                    )
                 if notification is not None and notification["status"] is not None:
                     task_id = notification["task_id"] or ""
                     task = self._occurrences.execute("SELECT call_id FROM tasks WHERE task_id=?", (task_id,)).fetchone()
@@ -423,6 +483,21 @@ class ClaudeNormalizer(TranscriptNormalizer):
                 # A notification with no <status> is a mid-task <event> tick,
                 # never a completion; an unmapped task id is left unknown.
             else:
+                user_texts = [
+                    block["text"]
+                    for block in _blocks(content)
+                    if block.get("type") == "text" and isinstance(block.get("text"), str)
+                ]
+                if user_texts and not record.get("isCompactSummary"):
+                    events.append(
+                        self._event(
+                            raw,
+                            CanonicalType.USER_INPUT,
+                            slot="user_message",
+                            native_type="user",
+                            payload={"native_type": "user", "text": "\n".join(user_texts)},
+                        )
+                    )
                 for index, block in enumerate(_blocks(content)):
                     if block.get("type") != "tool_result":
                         continue
@@ -481,8 +556,70 @@ class ClaudeNormalizer(TranscriptNormalizer):
                     payload={"compact_metadata": record.get("compactMetadata")},
                 )
             )
+        elif record_type == "queue-operation":
+            operation = record.get("operation")
+            content = record.get("content")
+            if operation == "enqueue" and isinstance(content, str) and content.strip():
+                # Operator text queued while the lane was busy: real input.
+                events.append(
+                    self._event(
+                        raw,
+                        CanonicalType.USER_INPUT,
+                        slot="queued_input",
+                        native_type="queue-operation",
+                        payload={"native_type": "user", "text": content, "source": "queue-operation"},
+                    )
+                )
+            else:
+                events.append(self._context(raw, subtype=str(operation or "queue")))
+        elif record_type == "attachment":
+            attachment_raw = record.get("attachment")
+            attachment = attachment_raw if isinstance(attachment_raw, dict) else {}
+            attachment_type = attachment.get("type")
+            if queued_operator_prompt(record) is not None:
+                events.append(
+                    self._event(
+                        raw,
+                        CanonicalType.USER_INPUT,
+                        slot="queued_command",
+                        native_type="attachment",
+                        payload={
+                            "native_type": "user",
+                            "text": queued_operator_prompt(record),
+                            "source": "queued_command",
+                        },
+                    )
+                )
+            elif attachment_type == "hook_success" and hook_additional_context(record) is not None:
+                events.append(
+                    self._event(
+                        raw,
+                        CanonicalType.USER_INPUT,
+                        slot="hook_context",
+                        native_type="attachment",
+                        payload={
+                            "native_type": "user",
+                            "text": hook_additional_context(record),
+                            "source": "hook_additional_context",
+                        },
+                    )
+                )
+            else:
+                events.append(
+                    self._context(raw, subtype=str(attachment_type or "attachment"))
+                )
+        elif record_type in _CLAUDE_CONTEXT_TYPES:
+            events.append(self._context(raw, subtype=str(record.get("subtype") or record_type)))
         if not events:
-            events.append(self._unknown(raw))
+            if record.get("isCompactSummary"):
+                events.append(self._context(raw, subtype="compact_summary"))
+            elif record_type in _CLAUDE_CONTEXT_TYPES or record_type in ("user", "assistant", "system", "queue-operation", "attachment"):
+                # A recognized record family whose particular shape carries no
+                # evidence this pass (empty user turn, unhandled system or
+                # attachment variant): context, never a false UNKNOWN.
+                events.append(self._context(raw, subtype=str(record.get("subtype") or record_type or "record")))
+            else:
+                events.append(self._unknown(raw))
         return tuple(events)
 
 
@@ -518,7 +655,7 @@ class CodexNormalizer(TranscriptNormalizer):
                 if self.session_id is not None and self.session_id != candidate:
                     raise ValueError("Codex session id changed within one transcript")
                 self.session_id = candidate
-            return (self._unknown(raw),)
+            return (self._context(raw, subtype="session_meta"),)
         if record_type == "response_item" and isinstance(payload, dict):
             payload_type = payload.get("type")
             if payload_type == "function_call":
@@ -557,7 +694,7 @@ class CodexNormalizer(TranscriptNormalizer):
                 return (
                     self._event(
                         raw,
-                        CanonicalType.UNKNOWN,
+                        CanonicalType.USER_INPUT,
                         slot="user_message",
                         native_type="user",
                         payload={"native_type": "user", "text": "\n".join(texts)},
@@ -604,10 +741,12 @@ class CodexNormalizer(TranscriptNormalizer):
                         "\n".join(texts),
                         message_id if isinstance(message_id, str) else None,
                     )
-                return (self._unknown(raw),)
+                return (self._context(raw, subtype="assistant_message"),)
+            return (self._context(raw, subtype=str(payload_type or "response_item")),)
         elif record_type == "event_msg" and isinstance(payload, dict):
             if payload.get("type") == "task_started":
                 self._pending_text = None
+                return (self._context(raw, subtype="task_started"),)
             elif payload.get("type") == "task_complete" and self._pending_text is not None:
                 text, message_id = self._pending_text
                 self._pending_text = None
@@ -625,6 +764,7 @@ class CodexNormalizer(TranscriptNormalizer):
                         },
                     ),
                 )
+            return (self._context(raw, subtype=str(payload.get("type") or "event_msg")),)
         elif record_type == "compacted" and isinstance(payload, dict):
             return (
                 self._event(
@@ -641,16 +781,225 @@ class CodexNormalizer(TranscriptNormalizer):
                     },
                 ),
             )
+        elif record_type in ("world_state", "turn_context", "token_usage_record"):
+            return (self._context(raw, subtype=record_type),)
         return (self._unknown(raw),)
+
+
+class DevinNormalizer(TranscriptNormalizer):
+    """Normalize Devin ATIF transcript documents and per-step mirror rows.
+
+    An ATIF document (``schema_version`` ``ATIF-*``) arrives as one JSON
+    record carrying ``steps[]``; each step expands into canonical events.
+    A per-step mirror row (``{"type": "devin_step", ...}``) carries one step
+    and is emitted identically, so a file binding and a database mirror
+    produce the same canonical stream for the same session.
+    """
+
+    def __init__(self, context: NormalizationContext) -> None:
+        if context.client is not Client.DEVIN:
+            raise ValueError("DevinNormalizer requires the devin client")
+        super().__init__(context)
+
+    def normalize(self, raw: RawRecord) -> tuple[CanonicalEvent, ...]:
+        self._begin_record(raw)
+        if raw.record is None:
+            return (self._unknown(raw),)
+        record = raw.record
+        if isinstance(record.get("steps"), list):
+            return self._document_events(raw, record)
+        if record.get("type") == "devin_step" and isinstance(record.get("step"), dict):
+            self._identify(record.get("session_id"), record.get("schema_version"))
+            return self._step_events(raw, record["step"])
+        return (self._unknown(raw),)
+
+    def _identify(self, session_id: object, schema_version: object) -> None:
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("Devin transcript has no session id")
+        if self.session_id is None:
+            self.session_id = session_id
+        elif self.session_id != session_id:
+            raise ValueError("Devin session id changed within one transcript")
+        if isinstance(schema_version, str) and schema_version != self.context.client_version:
+            raise ValueError(f"Devin ATIF schema changed to {schema_version!r}")
+
+    def _document_events(self, raw: RawRecord, record: dict[str, Any]) -> tuple[CanonicalEvent, ...]:
+        self._identify(record.get("session_id"), record.get("schema_version"))
+        events: list[CanonicalEvent] = [
+            self._context(raw, subtype="session_document", slot="header")
+        ]
+        for step in record["steps"]:
+            if isinstance(step, dict):
+                events.extend(self._step_events(raw, step))
+        return tuple(events)
+
+    def _step_events(self, raw: RawRecord, step: dict[str, Any]) -> tuple[CanonicalEvent, ...]:
+        step_id = step.get("step_id")
+        base = f"step:{step_id}" if step_id is not None else "step"
+        source = str(step.get("source") or "unknown")
+        events: list[CanonicalEvent] = []
+        if source == "user":
+            text = step.get("message")
+            events.append(
+                self._event(
+                    raw,
+                    CanonicalType.USER_INPUT,
+                    slot=f"{base}:input",
+                    native_type="user",
+                    native_join_id=str(step_id) if step_id is not None else None,
+                    payload={"native_type": "user", "text": text if isinstance(text, str) else ""},
+                )
+            )
+        elif source in ("agent", "assistant", "devin"):
+            reasoning = step.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning.strip():
+                events.append(self._context(raw, subtype="reasoning", slot=f"{base}:reasoning"))
+            calls = _blocks(step.get("tool_calls"))
+            for index, call in enumerate(calls):
+                call_id = call.get("tool_call_id") or call.get("id")
+                if not isinstance(call_id, str):
+                    continue
+                events.append(
+                    self._event(
+                        raw,
+                        CanonicalType.TOOL_CALL,
+                        slot=f"{base}:tool_call:{index}",
+                        native_join_id=call_id,
+                        payload={
+                            "call_id": call_id,
+                            "tool_name": call.get("function_name") or call.get("name"),
+                            "input": call.get("arguments"),
+                        },
+                    )
+                )
+            observation = step.get("observation")
+            results = _blocks(observation.get("results")) if isinstance(observation, dict) else []
+            for index, result in enumerate(results):
+                call_id = result.get("source_call_id")
+                if not isinstance(call_id, str):
+                    continue
+                events.append(
+                    self._event(
+                        raw,
+                        CanonicalType.TOOL_RESULT,
+                        slot=f"{base}:tool_result:{index}",
+                        native_join_id=call_id,
+                        payload={"call_id": call_id, "output": result.get("content")},
+                    )
+                )
+            text = step.get("message")
+            if isinstance(text, str) and text.strip():
+                if calls:
+                    events.append(
+                        self._context(raw, subtype="assistant_message", slot=f"{base}:message")
+                    )
+                else:
+                    events.append(
+                        self._event(
+                            raw,
+                            CanonicalType.FINAL_RESPONSE,
+                            slot=f"{base}:response",
+                            native_join_id=str(step_id) if step_id is not None else None,
+                            payload={"text": text, "step_id": step_id},
+                        )
+                    )
+        if not events:
+            events.append(self._context(raw, subtype=source, slot=f"{base}:context"))
+        return tuple(events)
+
+
+class AmpNormalizer(TranscriptNormalizer):
+    """Normalize Amp thread-export JSONL (``amp_thread``/``amp_message`` rows)."""
+
+    def __init__(self, context: NormalizationContext) -> None:
+        if context.client is not Client.AMP:
+            raise ValueError("AmpNormalizer requires the amp client")
+        super().__init__(context)
+
+    def normalize(self, raw: RawRecord) -> tuple[CanonicalEvent, ...]:
+        self._begin_record(raw)
+        if raw.record is None:
+            return (self._unknown(raw),)
+        record = raw.record
+        if record.get("version") != self.context.client_version:
+            raise ValueError(f"Amp record version changed to {record.get('version')!r}")
+        thread_id = record.get("thread_id")
+        if not isinstance(thread_id, str) or not thread_id.startswith("T-"):
+            raise ValueError("Amp record has no thread ID")
+        if self.session_id is not None and self.session_id != thread_id:
+            raise ValueError("Amp thread ID changed within one transcript")
+        self.session_id = thread_id
+        if record.get("type") == "amp_thread":
+            return (self._context(raw, subtype="thread_header"),)
+        message = record.get("message")
+        if record.get("type") != "amp_message" or not isinstance(message, dict):
+            return (self._unknown(raw),)
+        events: list[CanonicalEvent] = []
+        role = message.get("role")
+        for index, block in enumerate(_blocks(message.get("content"))):
+            if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
+                events.append(
+                    self._event(
+                        raw, CanonicalType.TOOL_CALL, slot=f"tool_use:{index}",
+                        native_join_id=block["id"],
+                        payload={"call_id": block["id"], "tool_name": block.get("name"), "input": block.get("input")},
+                    )
+                )
+            elif block.get("type") == "tool_result" and isinstance(block.get("toolUseID"), str):
+                run_raw = block.get("run")
+                run = run_raw if isinstance(run_raw, dict) else {}
+                failed = run.get("status") == "error"
+                events.append(
+                    self._event(
+                        raw, CanonicalType.TOOL_ERROR if failed else CanonicalType.TOOL_RESULT,
+                        slot=f"tool_result:{index}", native_join_id=block["toolUseID"],
+                        payload={"call_id": block["toolUseID"], "run": run, "is_error": failed},
+                    )
+                )
+        texts = "\n".join(
+            block["text"]
+            for block in _blocks(message.get("content"))
+            if block.get("type") == "text" and isinstance(block.get("text"), str)
+        )
+        if role == "user" and texts:
+            events.append(
+                self._event(
+                    raw, CanonicalType.USER_INPUT, slot="user_message",
+                    native_type="user",
+                    payload={"native_type": "user", "text": texts},
+                )
+            )
+        if role == "assistant" and (message.get("state") or {}).get("stopReason") == "end_turn" and texts:
+            events.append(
+                self._event(
+                    raw, CanonicalType.FINAL_RESPONSE, slot="end_turn",
+                    native_join_id=str(message.get("protocolMessageID") or message.get("messageId")),
+                    payload={"text": texts, "message_id": message.get("protocolMessageID")},
+                )
+            )
+        if role == "info" and any(block.get("type") == "summary" for block in _blocks(message.get("content"))):
+            events.append(
+                self._event(
+                    raw, CanonicalType.COMPACTION, slot="summary",
+                    payload={"message_id": message.get("protocolMessageID")},
+                )
+            )
+        return tuple(events) or (self._context(raw, subtype=str(role or "amp_message")),)
 
 
 def make_normalizer(context: NormalizationContext) -> TranscriptNormalizer:
     # Fail closed on a client with no JSONL normalizer: silently defaulting an
-    # unknown harness to Codex normalization would fabricate evidence.
+    # unknown harness to Codex normalization would fabricate evidence. Hermes
+    # evidence has no JSONL form -- it arrives through the hermes-db lane
+    # plug, which emits canonical events directly.
     if context.client is Client.CLAUDE:
         return ClaudeNormalizer(context)
     if context.client is Client.CODEX:
         return CodexNormalizer(context)
+    if context.client is Client.DEVIN:
+        return DevinNormalizer(context)
+    if context.client is Client.AMP:
+        return AmpNormalizer(context)
     raise ValueError(f"no JSONL transcript normalizer for client {context.client!r}")
 
 
@@ -679,8 +1028,10 @@ def native_session_identity(transcript_path: Path | str) -> str | None:
                 client = Client.CLAUDE
             elif record.get("type") == "session_meta":
                 client = Client.CODEX
+            elif record.get("type") == "amp_thread":
+                client = Client.AMP
         payload = record.get("payload")
-        candidate = record.get("version") if client is Client.CLAUDE else (
+        candidate = record.get("version") if client in (Client.CLAUDE, Client.AMP) else (
             payload.get("cli_version") if isinstance(payload, dict) else None
         )
         if isinstance(candidate, str):

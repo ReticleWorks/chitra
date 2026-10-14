@@ -57,7 +57,7 @@ import threading
 import time
 import uuid
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -93,6 +93,7 @@ from chitra.detect import (
     detect_drift,
     detect_excessive_testing,
     detect_false_done,
+    detect_permission_loop,
     detect_stall,
     detect_unnecessary_steps,
     find_rescue_bundle,
@@ -116,6 +117,7 @@ from chitra.goal_enforcement import (
     review_log_path,
     review_watched_session,
 )
+from chitra.goal_records import DEFAULT_GOAL_RECORDS_FILENAME, load_goal_records
 from chitra.goals import (
     RATE_LIMIT_HOLD_REASON_PREFIX,
     GoalNotFoundError,
@@ -166,6 +168,7 @@ from chitra.transcript_bindings import DEFAULT_FILENAME, BoundTranscript, Transc
 from chitra.validation_receipts import (
     lane_worktree_path,
     list_receipts,
+    load_receipt_file,
     load_verification_record,
     receipt_path,
     record_enrolled_validator_runs,
@@ -191,6 +194,7 @@ _BATCH_BYTES = 1024 * 1024
 PRESENCE_INSTANCE = "chitra-monitord"
 MONITORD_SCHEMA = "chitra.monitord.pass.v1"
 IDLE_PURSUIT_SCHEMA = "chitra.monitord.idle-pursuit.v1"
+DETERMINATION_SCHEMA = "chitra.determination-input.v1"
 _VALIDATOR_RUN_MAX_ATTEMPTS = 3
 # At most two concurrent ``claude -p`` judge rounds across all lanes.
 _REVIEW_POOL_MAX_WORKERS = 2
@@ -199,6 +203,9 @@ _REVIEW_POOL_MAX_WORKERS = 2
 # that a lane ignoring a consumed order — or an order the transport never
 # delivers — falls back to the lane's own progress evidence.
 _DELIVERY_PENDING_LEASE_PASSES = 3
+# A detector class (detector + unmet item) opening this many distinct
+# findings counts as a repeated class regardless of wording changes.
+_REPEATED_CLASS_THRESHOLD = 3
 _DETECTOR_ORDER = (
     "canonical_choices.deprecated_path",
     "drift",
@@ -206,6 +213,7 @@ _DETECTOR_ORDER = (
     "excessive_testing",
     "document_dithering",
     "stall",
+    "permission_loop",
     "deferral",
     "false_blocker",
     "changed_excuse",
@@ -232,9 +240,16 @@ class MonitordConfig:
     poll_seconds: float
     shadow_mode: bool
     transcript_bindings_path: Path | None = None
+    # Watcher-projected lane goal records (chitra.goal-records.v1). Records
+    # here enroll a lane for detector evaluation; goals.json stays
+    # authoritative on any session_ref conflict.
+    goal_records_path: Path | None = None
     dispatch_queue_dir: Path | None = None
     ledger_path: Path | None = None
     ledger_key_path: Path | None = None
+    # Coordinator input: one determination record per lane on each transition
+    # (chitra.determination-input.v1). live / not live + next action / UNKNOWN.
+    determinations_path: Path | None = None
     retry_delay_seconds: float = 60.0
     # Lane manifest declaring which tmux sessions this instance's pane sensing
     # owns. Only specs whose state_dir matches this config's are polled.
@@ -273,9 +288,11 @@ def resolve_config(
     poll_seconds: float | None = None,
     shadow_mode: bool | None = None,
     transcript_bindings_path: Path | None = None,
+    goal_records_path: Path | None = None,
     dispatch_queue_dir: Path | None = None,
     ledger_path: Path | None = None,
     ledger_key_path: Path | None = None,
+    determinations_path: Path | None = None,
     retry_delay_seconds: float = 60.0,
     lanes_file: Path | None = None,
     socket_path: Path | None = None,
@@ -317,9 +334,11 @@ def resolve_config(
         poll_seconds=poll_seconds,
         shadow_mode=shadow_mode,
         transcript_bindings_path=resolved_bindings_path,
+        goal_records_path=goal_records_path or resolved_state_dir / DEFAULT_GOAL_RECORDS_FILENAME,
         dispatch_queue_dir=dispatch_queue_dir or resolved_state_dir / "queue",
         ledger_path=ledger_path or resolved_state_dir / "ledger.jsonl",
         ledger_key_path=ledger_key_path or resolved_state_dir / "ledger.key",
+        determinations_path=determinations_path or resolved_state_dir / "determinations.jsonl",
         retry_delay_seconds=retry_delay_seconds,
         lanes_file=lanes_file,
         socket_path=portable_socket_path(socket_path or default_socket_path()),
@@ -793,6 +812,11 @@ def _idle_pursuit_finding(
             goal.enrolled_done_when_items,
             receipt_root=config.state_dir,
             session_ref=goal.session_ref,
+            verified_results=(
+                _stored_receipt_verdicts(config.state_dir, goal.session_ref, goal.enrolled_done_when_items)
+                if config.shadow_mode
+                else None
+            ),
         ),
     )
     if unmet_item is None:
@@ -962,6 +986,39 @@ def _declared_worktree(config: MonitordConfig, goal: object) -> str:
     return checkpoints[-1].binding.worktree_realpath if checkpoints else ""
 
 
+def _stored_receipt_verdicts(
+    state_dir: Path,
+    session_ref: str,
+    enrolled_items: Sequence[object],
+) -> dict[str, str]:
+    """Read-only per-item verdicts for shadow-mode receipt evaluation.
+
+    Shadow executes nothing — no validator run, no re-verification — so a
+    receipt's eligibility is its own stored verdict: the recorded PASS
+    status, validator acceptance, and the not-exercised flag, plus the file
+    parsing cleanly. A missing or unreadable receipt records "fail".
+    """
+    verdicts: dict[str, str] = {}
+    for item in enrolled_items:
+        name = str(getattr(item, "required_receipt", "") or "")
+        if not name:
+            continue
+        try:
+            receipt, _raw = load_receipt_file(receipt_path(state_dir, session_ref, name))
+        except Exception:
+            verdicts[name] = "fail"
+            continue
+        result = receipt.result if isinstance(receipt.result, dict) else {}
+        verdicts[name] = (
+            "pass"
+            if result.get("status") == "PASS"
+            and result.get("validator_acceptance") is True
+            and not getattr(receipt, "not_exercised", False)
+            else "fail"
+        )
+    return verdicts
+
+
 def _worktree_dirty(worktree: Path) -> bool:
     """Live ``git status`` probe: any tracked, staged, or untracked delta is dirty.
 
@@ -1005,7 +1062,18 @@ def run_detectors(
     goal_is_document = "documentation" in f"{intent_text}\n{goal_text}".lower()
     enrolled_items = tuple(getattr(goal, "enrolled_done_when_items", ()) or ())
     session_ref = str(getattr(goal, "session_ref", "") or "")
-    met_items = met_done_items(enrolled_items, receipt_root=config.state_dir, session_ref=session_ref)
+    # Shadow mode never executes a validator: eligibility comes from the
+    # stored receipt's own recorded verdict. Live mode re-verifies.
+    met_items = met_done_items(
+        enrolled_items,
+        receipt_root=config.state_dir,
+        session_ref=session_ref,
+        verified_results=(
+            _stored_receipt_verdicts(config.state_dir, session_ref, enrolled_items)
+            if config.shadow_mode
+            else None
+        ),
+    )
     policy_config = load_policy_config()
     policy = canonical_choices_policy or policy_config.canonical_choices
     declared_worktree = _declared_worktree(config, goal)
@@ -1082,6 +1150,15 @@ def run_detectors(
         return ordered()
     if cached is None or not cached.pending:
         findings.extend(detect_stall(continuous_events, enrolled_items=enrolled_items))
+    if _stop_requested(active_stop):
+        return ordered()
+    findings.extend(
+        detect_permission_loop(
+            events,
+            enrolled_items=enrolled_items,
+            met_items=met_items,
+        )
+    )
     if _stop_requested(active_stop):
         return ordered()
     findings.extend(
@@ -2013,9 +2090,39 @@ def _evaluate_completion_claim(
 
     if config.shadow_mode:
         # Shadow mode is observe-only: it never spawns lane-triggered
-        # validators and never re-executes a stored one, so a claim simply
-        # has nothing to be checked against on this pass.
-        return 0, False, [], False
+        # validators, never re-executes a stored one, and never mutates the
+        # goal. It still compares the claim against stored receipts — the
+        # receipt's own recorded verdict is the evidence — so a done claim
+        # that outruns its receipts still produces a false_done finding.
+        material_questions = (*goal.open_asks, *((goal.needs,) if goal.needs else ()))
+        claimed_evidence = tuple(extract_completion_evidence(final_text))
+        shadow_bindings: dict[str, str] = {}
+        for item in items:
+            if any(
+                proof.done_when_item_id == item.id
+                and proof.receipt_name == item.required_receipt
+                and proof.validator == item.validator
+                for proof in claimed_evidence
+            ):
+                shadow_bindings[item.id] = item.required_receipt
+        if not has_structured_completion_line(final_text):
+            for item in items:
+                shadow_bindings[item.id] = item.required_receipt
+        declared_worktree = _declared_worktree(config, goal)
+        findings = detect_false_done(
+            final_response=claim_event,
+            enrolled_items=items,
+            receipt_names_by_item=shadow_bindings,
+            receipt_roots={session_ref: config.state_dir},
+            session_ref=session_ref,
+            material_questions=material_questions,
+            target_dirty=bool(declared_worktree) and _worktree_dirty(Path(declared_worktree)),
+            # Shadow requires no live proof: nothing executes here. The
+            # stored-verdict map below is the receipt evidence.
+            live_proof_required=False,
+            verified_results=_stored_receipt_verdicts(config.state_dir, session_ref, items),
+        )
+        return 0, bool(findings), findings, False
 
     material_questions = (*goal.open_asks, *((goal.needs,) if goal.needs else ()))
     check_key = _claim_check_key(
@@ -2623,6 +2730,14 @@ def append_finding_records(
         open_findings = {}
         lanes[lane] = open_findings
 
+    class_counts_root = state.setdefault("class_counts", {})
+    if not isinstance(class_counts_root, dict):
+        class_counts_root = {}
+        state["class_counts"] = class_counts_root
+    class_counts = class_counts_root.setdefault(lane, {})
+    if not isinstance(class_counts, dict):
+        class_counts = {}
+        class_counts_root[lane] = class_counts
     current = {finding.fingerprint: finding for finding in findings}
     records: list[dict[str, Any]] = []
     for fingerprint, finding in current.items():
@@ -2635,6 +2750,42 @@ def append_finding_records(
                 "first_seen_at": now_iso,
                 "last_emitted_at": now_iso,
             }
+            # One detector repeatedly reopening the same item is a durable
+            # class even when each occurrence rewords its detail — the class
+            # key is detector + unmet item, never the prose. Past the
+            # threshold the pass emits one repeated_finding_class record so
+            # the loop cannot evade tracking by changing wording.
+            class_key = f"{finding.detector}|{finding.unmet_item}"
+            class_state = class_counts.setdefault(class_key, {"opens": 0})
+            if isinstance(class_state, dict):
+                class_state["opens"] = int(class_state.get("opens") or 0) + 1
+                if class_state["opens"] >= _REPEATED_CLASS_THRESHOLD and not class_state.get("emitted_at"):
+                    class_state["emitted_at"] = now_iso
+                    records.append(
+                        {
+                            "schema": MONITORD_SCHEMA,
+                            "recorded_at": now_iso,
+                            "record_type": "open",
+                            "lane": lane,
+                            "shadow_mode": config.shadow_mode,
+                            "detector": "repeated_finding_class",
+                            "repeated_detector": finding.detector,
+                            "fingerprint": hashlib.sha256(
+                                json.dumps(
+                                    {"detector": "repeated_finding_class", "class": class_key},
+                                    sort_keys=True,
+                                ).encode()
+                            ).hexdigest(),
+                            "event_refs": list(finding.event_refs),
+                            "unmet_item": finding.unmet_item,
+                            "expected_next_progress": finding.expected_next_progress,
+                            "detail": (
+                                f"detector {finding.detector!r} has opened {class_state['opens']} "
+                                f"distinct findings on the same unmet item; the class repeats "
+                                "regardless of wording"
+                            ),
+                        }
+                    )
             continue
         last_emitted = _last_emitted_at(entry)
         if last_emitted is None or (
@@ -2666,6 +2817,78 @@ def append_finding_records(
             handle.write(json.dumps(record, sort_keys=True) + "\n")
     write_json_atomic(state_path, state)
     return len(records)
+
+
+def _determinations_state_path(config: MonitordConfig) -> Path:
+    assert config.determinations_path is not None
+    return config.determinations_path.with_suffix(".state.json")
+
+
+def append_determination(
+    config: MonitordConfig,
+    lane: str,
+    session_ref: str,
+    *,
+    determination: str,
+    next_action: str = "",
+    evidence: Mapping[str, object] | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """Append one coordinator determination input on a value transition.
+
+    ``chitra.determination-input.v1`` records the monitor's honest per-lane
+    reading for the coordinator: ``live`` (bound evidence flowed and no
+    detector finding stands), ``not_live`` plus the exact next action, or
+    ``UNKNOWN`` when the evidence or contract needed to judge is absent.
+    A record is appended only when (determination, next_action) changes, so
+    the log stays an audit trail rather than a per-pass ticker.
+    """
+    if determination not in {"live", "not_live", "UNKNOWN"}:
+        raise ValueError(f"determination must be live/not_live/UNKNOWN, got {determination!r}")
+    if determination == "not_live" and not next_action:
+        raise ValueError("a not_live determination must carry the next action")
+    if config.determinations_path is None:
+        return False
+    now_dt = now if now is not None else datetime.now(UTC)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=UTC)
+    now_iso = now_dt.isoformat()
+    state_path = _determinations_state_path(config)
+    state = _findings_state(state_path)
+    lanes = state.setdefault("lanes", {})
+    if not isinstance(lanes, dict):
+        lanes = {}
+        state["lanes"] = lanes
+    prior = lanes.get(lane)
+    prior_value = (
+        (prior.get("determination"), prior.get("next_action"))
+        if isinstance(prior, dict)
+        else None
+    )
+    if prior_value == (determination, next_action):
+        return False
+    record = {
+        "schema": DETERMINATION_SCHEMA,
+        "emitted_at": now_iso,
+        "instance": PRESENCE_INSTANCE,
+        "lane": lane,
+        "session_ref": session_ref,
+        "determination": determination,
+        "next_action": next_action,
+        "evidence": dict(evidence or {}),
+        "shadow_mode": config.shadow_mode,
+    }
+    config.determinations_path.parent.mkdir(parents=True, exist_ok=True)
+    with config.determinations_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+    lanes[lane] = {
+        "determination": determination,
+        "next_action": next_action,
+        "emitted_at": now_iso,
+        "session_ref": session_ref,
+    }
+    write_json_atomic(state_path, state)
+    return True
 
 
 def _stop_requested(stop_event: threading.Event) -> bool:
@@ -2821,6 +3044,16 @@ def run_once(
         # is rate-limited or unpiped stays reported while supervision is held.
         _sense_governed_panes(config, runtime, goals_by_session={}, bindings=bindings)
         return blocked_summary
+    # Projected lane goal records enroll lanes that never went through the
+    # interactive interview. goals.json records win a session_ref conflict;
+    # a malformed manifest degrades to "no projected records" — the pass
+    # continues with those lanes unenrolled rather than trusting a partial
+    # reading of goal authority.
+    try:
+        for projected in load_goal_records(config.goal_records_path):
+            goals_by_session.setdefault(projected.session_ref, projected)
+    except ValueError as exc:
+        logger.error("monitord_goal_records_manifest_invalid", error=str(exc))
     results: list[LanePassResult] = []
     enrolled_goals_by_lane: dict[str, GoalRecord] = {}
     for enrolled_goal in goals_by_session.values():
@@ -2853,6 +3086,8 @@ def run_once(
         if _stop_requested(active_stop_event):
             stopped_early = True
             break
+        # Pre-bound so an early exception still emits a lane-scoped record.
+        session_ref = lane
         try:
             if lane in lane_errors:
                 raise ValueError(lane_errors[lane])
@@ -2921,6 +3156,11 @@ def run_once(
                         goal.enrolled_done_when_items,
                         receipt_root=config.state_dir,
                         session_ref=goal.session_ref,
+                        verified_results=(
+                            _stored_receipt_verdicts(config.state_dir, goal.session_ref, goal.enrolled_done_when_items)
+                            if config.shadow_mode
+                            else None
+                        ),
                     ),
                 )
                 if goal is not None
@@ -3308,6 +3548,37 @@ def run_once(
                     reason="exact bound goal observed with no corrective finding",
                 )
             append_finding_records(config, lane, findings + internal_findings)
+            # Coordinator input: the determination is emitted on transition.
+            # live requires bound evidence and no standing finding; findings
+            # yield not_live with the first finding's expected next progress;
+            # missing contract or missing evidence yields UNKNOWN — never a
+            # guess dressed as a verdict.
+            open_findings = findings + internal_findings
+            if goal is None or not events:
+                determination, next_action = "UNKNOWN", ""
+            elif open_findings:
+                determination, next_action = "not_live", open_findings[0].expected_next_progress
+            else:
+                determination, next_action = "live", ""
+            try:
+                append_determination(
+                    config,
+                    lane,
+                    session_ref,
+                    determination=determination,
+                    next_action=next_action,
+                    evidence={
+                        "ingested_events": len(events),
+                        "open_findings": [finding.detector for finding in open_findings],
+                        "goal_enrolled": goal is not None,
+                        "completion_disputed": completion_disputed,
+                        "completion_verified": completion_verified,
+                        "question_outcome": question_outcome,
+                        "caught_up": caught_up,
+                    },
+                )
+            except Exception as det_exc:
+                logger.error("monitord_determination_emit_failed", lane=lane, error=str(det_exc))
             results.append(
                 LanePassResult(
                     lane=lane,
@@ -3343,6 +3614,16 @@ def run_once(
                 append_finding_records(config, lane, [finding])
             except Exception as record_exc:
                 logger.error("monitord_lane_error_record_failed", lane=lane, error=str(record_exc))
+            try:
+                append_determination(
+                    config,
+                    lane,
+                    session_ref,
+                    determination="UNKNOWN",
+                    evidence={"lane_error": lane_errors[lane]},
+                )
+            except Exception as det_exc:
+                logger.error("monitord_determination_emit_failed", lane=lane, error=str(det_exc))
     summary: dict[str, Any] = {
         "schema": MONITORD_SCHEMA,
         "lanes_observed": len(results),

@@ -468,7 +468,14 @@ def test_shadow_mode_never_executes_lane_triggered_validators(
         reviewer=_AcceptReviewer(),
     )
 
-    assert result == (0, False, [], False)
+    # Shadow mode still never spawns or writes — but it now evaluates claims
+    # against stored receipts, so a receipt-free claim is disputed and
+    # flagged rather than passing unobserved.
+    recorded, disputed, findings, pending = result
+    assert recorded == 0
+    assert disputed is True
+    assert pending is False
+    assert [finding.detector for finding in findings] == ["false_done"]
     assert not marker.exists()
     assert not (tmp_path / "validation-receipts").exists()
     stored = get_goal(tmp_path, goal.session_ref)
