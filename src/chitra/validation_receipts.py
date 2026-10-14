@@ -1448,6 +1448,8 @@ def list_receipts(root: Path | None, session_ref: str) -> list[ValidationReceipt
         _receipt_path_for_read(root, session_ref, name)
     receipts: list[ValidationReceipt] = []
     for path in sorted(directory.glob("*.json")):
+        if path.name.endswith(".report.json"):
+            continue  # validator report sidecar, not a receipt envelope
         receipt, _raw = load_receipt_file(path)
         receipts.append(receipt)
     return receipts
