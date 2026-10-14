@@ -1,8 +1,8 @@
 """The database evidence plugs stream canonical events and fail closed.
 
 Devin's ``sessions.db`` and Hermes's ``state.db`` back the
-``devin-db:<session>``/``hermes-db:<session>`` URI bindings the hybrid
-watcher writes. These tests run each plug against a real fixture database:
+``devin-db:<session>``/``hermes-db:<session>`` and profile-qualified Hermes
+URI bindings the hybrid watcher writes. These tests use fixture databases:
 row order, join ids, cursor incrementality, replay-stable event ids, and
 the fail-closed contract when the session or the database is absent.
 """
@@ -186,6 +186,23 @@ def test_hermes_db_streams_canonical_events_and_advances_cursor(
     assert second.events == ()
     assert second.cursor == "4"
 
+    # A profile URI resolves beside the selected root DB and can distinguish
+    # the worker DB even when the root DB has the same session id.
+    profile_database = tmp_path / "profiles" / "public-worker" / "state.db"
+    profile_database.parent.mkdir(parents=True)
+    _hermes_db(profile_database)
+    worker = plug.handle_for_binding(
+        _binding("hermes-db:public-worker/classic-kangaroo", client="hermes"),
+        session_ref="lane-a",
+    )
+    worker_batch = plug.events(worker)
+    assert worker.locator["profile"] == "public-worker"
+    assert worker.native_session_id == "classic-kangaroo"
+    assert [event.payload_digest for event in worker_batch.events] == [
+        event.payload_digest for event in batch.events]
+    assert {event.event_id for event in worker_batch.events}.isdisjoint(
+        event.event_id for event in batch.events)
+
 
 def test_hermes_db_fails_closed_when_session_or_db_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -205,6 +222,21 @@ def test_hermes_db_fails_closed_when_session_or_db_missing(
     )
     with pytest.raises(StreamUnavailable):
         plug.events(live)
+
+    # A missing profile binding must not silently fall back to the configured
+    # root DB, even when that DB contains the same session id.
+    missing_profile = plug.handle_for_binding(
+        _binding("hermes-db:missing-worker/classic-kangaroo", client="hermes"),
+        session_ref="lane-a",
+    )
+    monkeypatch.setenv("CHITRA_HERMES_DB", str(database))
+    with pytest.raises(StreamUnavailable):
+        plug.events(missing_profile)
+    with pytest.raises(StreamUnavailable):
+        plug.handle_for_binding(
+            _binding("hermes-db:../state/classic-kangaroo", client="hermes"),
+            session_ref="lane-a",
+        )
 
 
 def test_db_plugs_refuse_delivery_and_lifecycle() -> None:

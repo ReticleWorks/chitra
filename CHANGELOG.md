@@ -4,6 +4,15 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.24.1] - 2026-10-14
+
+### Fixed
+
+- Bind Hermes worker database evidence to profile-qualified session URIs.
+  Missing profile databases fail closed, and matching events from separate
+  profiles receive distinct identities while root-profile event IDs remain
+  unchanged.
+
 ## [0.24.0] - 2026-10-14
 
 ### Added

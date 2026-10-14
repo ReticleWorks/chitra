@@ -53,8 +53,9 @@ _UNBUILT: dict[str, str] = {
 
 # Journal client identity -> plug that serves it. File-transcript clients all
 # land on their tmux plug; ``amp`` lands on the orb plug; ``devin`` and
-# ``hermes`` bind ``devin-db:<session>`` / ``hermes-db:<session>`` URI
-# locators and land on their read-only database evidence plugs.
+# ``hermes`` bind ``devin-db:<session>`` / ``hermes-db:<session>`` or
+# ``hermes-db:<profile>/<session>`` URI locators and land on their read-only
+# database evidence plugs.
 _CLIENT_PLUGS: dict[str, str] = {
     "claude": "claude-tmux",
     "codex": "codex-tmux",
