@@ -1,0 +1,11 @@
+{
+  "name": "chitra-monitor",
+  "version": "0.24.1",
+  "source_commit": "5c94eaf63fe32a6830b38f28b31dfc9f821bcefa",
+  "source_tree": "d3cd715d7c6254124e99f26e0b52c912afc6903c",
+  "build_command": "uv build",
+  "artifact": "chitra_monitor-0.24.1-py3-none-any.whl",
+  "bytes": 672965,
+  "sha256": "b64da53ec973f88388d50889959045d32f1b5be3422c643d5536bc90ba73c519",
+  "publication": "Immutable Git artifact; not a GitHub Release or PyPI publication"
+}
