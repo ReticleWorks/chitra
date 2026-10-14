@@ -142,6 +142,7 @@ from chitra.journal import (
     derive_progress_rows,
     native_session_identity,
 )
+from chitra.journal.reader import DEFAULT_MAX_BATCH_BYTES as _BATCH_BYTES
 from chitra.journal.store import EventJournal, event_dedupe_key
 from chitra.lane_config import LANES_FILE_ENV_VAR, LaneSpec, enabled_lanes
 from chitra.monitor_limits import monitor_limits
@@ -190,7 +191,6 @@ DEFAULT_POLL_SECONDS = 60.0
 # Working context, not evidence retention: originals remain on disk.
 _CACHE_EVENTS = 2048
 _CACHE_BYTES = 8 * 1024 * 1024
-_BATCH_BYTES = 1024 * 1024
 PRESENCE_INSTANCE = "chitra-monitord"
 MONITORD_SCHEMA = "chitra.monitord.pass.v1"
 IDLE_PURSUIT_SCHEMA = "chitra.monitord.idle-pursuit.v1"

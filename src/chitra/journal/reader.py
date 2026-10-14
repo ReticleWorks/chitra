@@ -13,6 +13,8 @@ from typing import Any, BinaryIO
 
 from .models import ByteRange, RawRecord, TranscriptIdentity
 
+DEFAULT_MAX_BATCH_BYTES = 1024 * 1024
+
 
 @dataclass(frozen=True)
 class Rotation:

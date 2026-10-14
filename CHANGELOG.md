@@ -4,6 +4,14 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.24.2] - 2026-10-14
+
+### Fixed
+
+- Stream SQLite transcript rows within the existing poll byte budget so a
+  large history resumes from its last processed row instead of loading the
+  entire session into memory. A single oversized row still advances.
+
 ## [0.24.1] - 2026-10-14
 
 ### Fixed
