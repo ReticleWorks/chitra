@@ -4,6 +4,14 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.24.8] - 2026-10-14
+
+### Fixed
+
+- Spill unfinished transcript records to a temporary file instead of retaining
+  every historical lane's partial record in memory between monitor passes.
+- Release the temporary file when its transcript reader closes.
+
 ## [0.24.7] - 2026-10-14
 
 ### Fixed

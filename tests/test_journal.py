@@ -210,6 +210,53 @@ def test_partial_record_is_deferred_until_newline(tmp_path: Path, case: FixtureC
     assert semantic_projection(first.observed + second.observed) == semantic_projection(ingest(case, tmp_path / "baseline"))
 
 
+def test_large_partial_record_spills_completes_and_rotation_counts_tail(tmp_path: Path) -> None:
+    transcript = tmp_path / "large-partial.jsonl"
+    value = "x" * (128 * 1024)
+    line = json.dumps({"value": value}, separators=(",", ":")).encode() + b"\n"
+    transcript.write_bytes(line[:-1])
+
+    with JsonlTailReader(transcript, max_batch_bytes=1024 * 1024) as reader:
+        first = reader.poll()
+        assert first.records == ()
+        assert reader.pending_bytes == len(line) - 1
+        assert reader._buffer._rolled
+
+        with transcript.open("ab") as output:
+            output.write(b"\n")
+        completed = reader.poll()
+        assert [record.record for record in completed.records] == [{"value": value}]
+        assert reader.pending_bytes == 0
+
+        partial = b'{"unfinished":"' + b"y" * (128 * 1024)
+        with transcript.open("ab") as output:
+            output.write(partial)
+        assert reader.poll().records == ()
+        assert reader.pending_bytes == len(partial)
+
+        transcript.rename(tmp_path / "large-partial.jsonl.1")
+        transcript.write_bytes(b'{"fresh":true}\n')
+        rotated = reader.poll()
+
+    assert reader._buffer.closed
+    with pytest.raises(ValueError, match="reader is closed"):
+        reader.poll()
+    assert len(rotated.rotations) == 1
+    assert rotated.rotations[0].abandoned_partial_bytes == len(partial)
+    assert [record.record for record in rotated.records] == [{"fresh": True}]
+
+
+def test_spilled_partial_record_keeps_eight_batch_limit(tmp_path: Path) -> None:
+    transcript = tmp_path / "oversized-partial.jsonl"
+    transcript.write_bytes(b"x" * (72 * 1024))
+
+    with JsonlTailReader(transcript, chunk_size=64 * 1024, max_batch_bytes=8 * 1024) as reader:
+        assert reader.poll().records == ()
+        with pytest.raises(ValueError, match="transcript record exceeds 65536 bytes"):
+            reader.poll()
+        assert reader.pending_bytes > 8 * 1024 * 8
+
+
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.client.value)
 def test_rotation_replay_matches_without_duplicates(tmp_path: Path, case: FixtureCase) -> None:
     baseline = ingest(case, tmp_path / "baseline")

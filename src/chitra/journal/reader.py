@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from typing import Any, BinaryIO
 from .models import ByteRange, RawRecord, TranscriptIdentity
 
 DEFAULT_MAX_BATCH_BYTES = 1024 * 1024
+_PARTIAL_MEMORY_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -45,7 +47,8 @@ class JsonlTailReader:
         self._handle: BinaryIO | None = None
         self._identity: TranscriptIdentity | None = None
         self._offset = 0
-        self._buffer = bytearray()
+        self._buffer = self._new_buffer()
+        self._pending_bytes = 0
         self._buffer_start = 0
         self._generation = 0
         self._anchor = b""
@@ -68,12 +71,38 @@ class JsonlTailReader:
 
     @property
     def pending_bytes(self) -> int:
-        return len(self._buffer)
+        return self._pending_bytes
 
     def close(self) -> None:
+        self._close_handle()
+        self._buffer.close()
+
+    def _close_handle(self) -> None:
         if self._handle is not None:
             self._handle.close()
         self._handle = None
+
+    @staticmethod
+    def _new_buffer() -> BinaryIO:
+        return tempfile.SpooledTemporaryFile(max_size=_PARTIAL_MEMORY_BYTES, mode="w+b")
+
+    def _reset_buffer(self) -> None:
+        self._buffer.close()
+        self._buffer = self._new_buffer()
+        self._pending_bytes = 0
+
+    def _append_buffer(self, data: bytes) -> None:
+        self._buffer.seek(0, os.SEEK_END)
+        self._buffer.write(data)
+        self._pending_bytes += len(data)
+
+    def _take_buffer(self) -> bytes:
+        self._buffer.seek(0)
+        data = self._buffer.read(self._pending_bytes)
+        self._buffer.seek(0)
+        self._buffer.truncate()
+        self._pending_bytes = 0
+        return data
 
     def __enter__(self) -> JsonlTailReader:
         return self
@@ -82,6 +111,8 @@ class JsonlTailReader:
         self.close()
 
     def poll(self) -> ReadBatch:
+        if self._buffer.closed:
+            raise ValueError("reader is closed")
         rotations: list[Rotation] = []
         if self._handle is None:
             if not self.path.exists():
@@ -112,11 +143,11 @@ class JsonlTailReader:
         records = self._drain() if replaced else []
         if replaced or rewritten:
             previous = self._identity
-            abandoned = len(self._buffer)
-            self.close()
+            abandoned = self._pending_bytes
+            self._close_handle()
+            self._reset_buffer()
             self._generation += 1
             self._offset = 0
-            self._buffer = bytearray()
             self._buffer_start = 0
             self._anchor = b""
             self._consumed_digest = hashlib.sha256()
@@ -136,11 +167,11 @@ class JsonlTailReader:
             self._identity.inode,
         ):
             previous = self._identity
-            abandoned = len(self._buffer)
-            self.close()
+            abandoned = self._pending_bytes
+            self._close_handle()
+            self._reset_buffer()
             self._generation += 1
             self._offset = 0
-            self._buffer = bytearray()
             self._buffer_start = 0
             self._anchor = b""
             self._consumed_digest = hashlib.sha256()
@@ -200,10 +231,14 @@ class JsonlTailReader:
     def _consumed_intact(self) -> bool:
         """Verify earlier record bytes and the buffered tail still match disk."""
         assert self._handle is not None
-        if self._buffer:
-            prefix = os.pread(self._handle.fileno(), len(self._buffer), self._buffer_start)
-            if prefix != bytes(self._buffer):
-                return False
+        if self._pending_bytes:
+            self._buffer.seek(0)
+            position = 0
+            while position < self._pending_bytes:
+                expected = self._buffer.read(min(self.chunk_size, self._pending_bytes - position))
+                if not expected or os.pread(self._handle.fileno(), len(expected), self._buffer_start + position) != expected:
+                    return False
+                position += len(expected)
         hasher = hashlib.sha256()
         position = 0
         while position < self._buffer_start:
@@ -233,26 +268,28 @@ class JsonlTailReader:
             drained_bytes += len(chunk)
             self._offset += len(chunk)
             self._anchor = (self._anchor + chunk)[-64:]
-            if not self._buffer:
-                self._buffer_start = chunk_start
-            self._buffer.extend(chunk)
-            while True:
-                newline = self._buffer.find(b"\n")
+            position = 0
+            while position < len(chunk):
+                newline = chunk.find(b"\n", position)
+                end = newline + 1 if newline >= 0 else len(chunk)
+                if not self._pending_bytes:
+                    self._buffer_start = chunk_start + position
+                self._append_buffer(chunk[position:end])
                 if newline < 0:
+                    if self.max_record_bytes is not None and self._pending_bytes > self.max_record_bytes:
+                        raise ValueError(f"transcript record exceeds {self.max_record_bytes} bytes at {self.path}:{self._buffer_start}")
                     break
-                raw_line = bytes(self._buffer[: newline + 1])
-                if self.max_record_bytes is not None and len(raw_line) > self.max_record_bytes:
+                if self.max_record_bytes is not None and self._pending_bytes > self.max_record_bytes:
                     raise ValueError(f"transcript record exceeds {self.max_record_bytes} bytes at {self.path}:{self._buffer_start}")
+                raw_line = self._take_buffer()
                 line_start = self._buffer_start
                 line_end = line_start + len(raw_line)
-                del self._buffer[: newline + 1]
                 self._buffer_start = line_end
                 if raw_line.strip():
                     records.append(self._decode(raw_line, line_start, line_end))
                 else:
                     self._consumed_digest.update(raw_line)
-            if self.max_record_bytes is not None and len(self._buffer) > self.max_record_bytes:
-                raise ValueError(f"transcript record exceeds {self.max_record_bytes} bytes at {self.path}:{self._buffer_start}")
+                position = end
         return records
 
     def _decode(self, raw_line: bytes, start: int, end: int) -> RawRecord:
