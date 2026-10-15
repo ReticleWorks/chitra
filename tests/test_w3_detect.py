@@ -392,6 +392,40 @@ def test_progress_rows_derive_from_real_tool_signals() -> None:
     assert rows["f-1"].classification is ProgressClass.NON_PROGRESS
 
 
+def test_progress_rows_keep_large_same_check_history_linear() -> None:
+    """Same-signature checks retain only result classifications, not every prior set."""
+    events: list[CanonicalEvent] = []
+    for index in range(512):
+        join = f"check-{index}"
+        events.append(_tool_call(f"call-{index}", "Bash", {"command": "pytest -q"}, join=join))
+        events.append(_tool_result(f"result-{index}", join, f"unique result {index}"))
+    events.extend(
+        (
+            _tool_call("call-repeat", "Bash", {"command": "pytest -q"}, join="check-repeat"),
+            _tool_result("result-repeat", "check-repeat", "unique result 0"),
+        )
+    )
+
+    rows = {row.source_event_ids[0]: row for row in derive_progress_rows(events, goal_version="1")}
+
+    assert rows["result-0"].classification is ProgressClass.PROGRESS
+    assert rows["result-0"].reason == "first check run produced a new result"
+    assert rows["result-511"].classification is ProgressClass.PROGRESS
+    assert rows["result-511"].reason == "check run flipped or differed from its prior result"
+    assert rows["result-repeat"].classification is ProgressClass.NON_PROGRESS
+    assert rows["result-repeat"].reason == "check rerun returned the same outcome as its prior run"
+
+    duplicate_id_events = (
+        _tool_call("duplicate-call-1", "Bash", {"command": "pytest -q"}, join="duplicate-join-1"),
+        _tool_result("duplicate-result", "duplicate-join-1", "12 passed"),
+        _tool_call("duplicate-call-2", "Bash", {"command": "pytest -q"}, join="duplicate-join-2"),
+        _tool_result("duplicate-result", "duplicate-join-2", "12 passed"),
+    )
+    duplicate_id_rows = derive_progress_rows(duplicate_id_events, goal_version="1")
+    assert duplicate_id_rows[1].classification is ProgressClass.PROGRESS
+    assert duplicate_id_rows[3].classification is ProgressClass.NON_PROGRESS
+
+
 def test_repeat_identity_is_normalized_call_plus_outcome_class() -> None:
     """The Cline identity is normalized tool name plus normalized parameters
     qualified by outcome class — byte-different results of the same action

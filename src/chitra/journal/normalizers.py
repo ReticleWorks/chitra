@@ -186,6 +186,11 @@ class TranscriptNormalizer:
     def close(self) -> None:
         self._occurrences.close()
 
+    def commit(self) -> None:
+        """Finish one successful poll and release its transient page cache."""
+        self._occurrences.commit()
+        self._occurrences.execute("PRAGMA shrink_memory")
+
     def seen_generation_head(self, key: str) -> bool:
         seen = self._occurrences.execute("SELECT 1 FROM heads WHERE key=?", (key,)).fetchone() is not None
         self._occurrences.execute("INSERT OR IGNORE INTO heads VALUES (?)", (key,))

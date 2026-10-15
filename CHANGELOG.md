@@ -4,6 +4,17 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.24.6] - 2026-10-14
+
+### Fixed
+
+- Commit each successful transcript poll and shrink its temporary SQLite
+  page cache; commit lane metadata before releasing its in-memory indexes.
+- Keep progress classifications keyed to their result object so repeated
+  event IDs cannot overwrite a separate row's classification.
+- Preserve a complete canonical journal row above the working byte budget
+  instead of rejecting the row or dropping it from the cursor.
+
 ## [0.24.5] - 2026-10-14
 
 ### Fixed
