@@ -203,8 +203,8 @@ def _pace_cpu(samples: list[tuple[float, float]], percent: float, window_seconds
     while len(samples) > 1 and now - samples[1][0] >= window_seconds:
         samples.pop(0)
     elapsed = now - samples[0][0]
-    # Leave room inside the configured budget for watchdog sampling and loop overhead.
-    budget = percent * 0.9 / 100
+    # Leave margin inside the configured budget for watchdog sampling and uneven lane work.
+    budget = percent * 0.8 / 100
     if elapsed > 0 and budget > 0:
         time.sleep(max(0.0, (cpu - samples[0][1]) / budget - elapsed))
 
@@ -486,10 +486,11 @@ def _bound_native_session_id(config: MonitordConfig, transcript_path: Path) -> s
 
 
 # Plug event-reader cursors for URI-bound lanes, keyed by
-# (state_dir, locator). They play the same role the ingestor pool plays for
-# file bindings: each pass only pulls events the lane has not already
-# emitted. Journal append dedupe makes a stale cursor safe, never lossy.
-_PLUG_CURSORS: dict[tuple[str, str], str] = {}
+# (state_dir, locator, lane). They play the same role the ingestor pool plays for
+# URI bindings: each lane keeps its own cursor because read-only database
+# locators can be shared by distinct goal lanes. Journal append dedupe makes a
+# stale cursor safe, never lossy.
+_PLUG_CURSORS: dict[tuple[str, str, str], str] = {}
 
 
 def ingest_transcript_bindings(
@@ -502,9 +503,9 @@ def ingest_transcript_bindings(
 ) -> tuple[CanonicalEvent, ...]:
     """Ingest every explicitly bound transcript before journal discovery.
 
-    File bindings go through the pooled JSONL ingestor; URI locators
-    (``amp-orb:<slug>``) have no local file, so the owning plug's event
-    reader supplies canonical events straight into the lane's journal.
+    File bindings go through the pooled JSONL ingestor; URI locators have no
+    local file, so the owning plug's event reader supplies canonical events
+    straight into the lane's journal.
     """
     observed: list[CanonicalEvent] = []
     observed_count = 0
@@ -518,12 +519,18 @@ def ingest_transcript_bindings(
             logger.error("monitord_binding_resolution_failed", lane=binding.lane, error=str(exc))
             if errors is not None:
                 errors[binding.lane] = f"{type(exc).__name__}: {exc}"
-    live_refs = {(str(config.state_dir), str(ref)) for _binding, ref in resolved_bindings}
+    state_dir = str(config.state_dir)
+    live_refs = {(state_dir, str(ref)) for _binding, ref in resolved_bindings}
+    live_plugin_refs = {
+        (state_dir, str(ref), binding.lane)
+        for binding, ref in resolved_bindings
+        if binding.is_uri_locator
+    }
     for key in tuple(_INGESTOR_POOL):
         if key[0] == str(config.state_dir) and key not in live_refs:
             _INGESTOR_POOL.pop(key)[1].close()
     for key in tuple(_PLUG_CURSORS):
-        if key[0] == str(config.state_dir) and key not in live_refs:
+        if key[0] == state_dir and key not in live_plugin_refs:
             _PLUG_CURSORS.pop(key)
     for binding, ref in resolved_bindings:
         if _cpu_samples is not None:
@@ -599,12 +606,11 @@ def _ingest_uri_binding(
 ) -> tuple[CanonicalEvent, ...]:
     """Pull canonical events for a URI-bound lane through its plug's reader.
 
-    The locator names no local file, so the plug owns the evidence stream
-    (``amp threads export`` for ``amp-orb:<slug>``). Events land in the same
-    lane journal the file path writes to; event ids are stable across
-    replays, so ``EventJournal.append`` dedupe absorbs any overlap the
-    cursor misses. Failures are per-binding, matching the file path: the
-    lane simply contributes no events this pass.
+    The locator names no local file, so the plug owns the evidence stream.
+    Events land in the same lane journal the file path writes to; event ids
+    are stable across replays, so ``EventJournal.append`` dedupe absorbs any
+    overlap the cursor misses. Failures are per-binding, matching the file
+    path: the lane simply contributes no events this pass.
     """
     bound = BoundTranscript(
         binding=binding,
@@ -613,7 +619,7 @@ def _ingest_uri_binding(
     try:
         plug = plug_for_client(binding.client)
         handle = plug.handle_for_binding(bound, session_ref=binding.session_ref)
-        key = (str(config.state_dir), str(bound.path))
+        key = (str(config.state_dir), str(bound.path), binding.lane)
         batch = plug.events(handle, cursor=_PLUG_CURSORS.get(key))
         appended = EventJournal(config.state_dir, binding.lane, lock_timeout=0).append(batch.events)
         if batch.cursor is not None:
@@ -3740,6 +3746,17 @@ def run_once(
                 )
             except Exception as det_exc:
                 logger.error("monitord_determination_emit_failed", lane=lane, error=str(det_exc))
+        finally:
+            # The journal and progress file remain authoritative. Do not retain
+            # derived detector objects and duplicate event-id indexes for every
+            # historical lane between passes; recompute them when that lane is
+            # observed again.
+            cached = _LANE_JOURNALS.get((str(config.state_dir), lane))
+            if cached is not None:
+                cached.progress_key = None
+                cached.progress_rows = ()
+                cached.detector_key = None
+                cached.findings.clear()
     _pace_cpu(cpu_samples, config.max_cpu_percent, config.limit_window_seconds)
     summary: dict[str, Any] = {
         "schema": MONITORD_SCHEMA,

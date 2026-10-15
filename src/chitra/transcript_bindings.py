@@ -59,6 +59,15 @@ class TranscriptBinding(BaseModel):
         """True when ``path`` is a locator URI, not a transcript file."""
         return _URI_LOCATOR_RE.match(self.path) is not None
 
+    @property
+    def is_readonly_db_locator(self) -> bool:
+        """True for the database evidence plugs, which never launch or deliver."""
+        return (
+            self.client == Client.HERMES and self.path.startswith("hermes-db:")
+        ) or (
+            self.client == Client.DEVIN and self.path.startswith("devin-db:")
+        )
+
     def resolved_path(self, *, manifest_path: Path, transcript_root: Path | None) -> Path:
         """Resolve the path and constrain relative paths to the transcript root."""
         candidate = Path(self.path).expanduser()
@@ -149,6 +158,7 @@ def load_transcript_bindings(
         raise ValueError(f"invalid transcript binding manifest {manifest_path}: {exc}") from exc
 
     seen: dict[str, set[str]] = {"session_ref": set(), "lane": set(), "path": set()}
+    repeatable_paths: dict[str, bool] = {}
     bindings: list[TranscriptBinding] = []
     for binding in document.bindings:
         resolved = binding.resolved_ref(manifest_path=manifest_path, transcript_root=transcript_root)
@@ -159,8 +169,12 @@ def load_transcript_bindings(
         }
         for name, value in values.items():
             if value in seen[name]:
+                if name == "path" and binding.is_readonly_db_locator and repeatable_paths.get(value, False):
+                    continue
                 raise ValueError(f"transcript binding {name} is not unique: {value!r}")
             seen[name].add(value)
+            if name == "path":
+                repeatable_paths[value] = binding.is_readonly_db_locator
         bindings.append(binding)
     return tuple(bindings)
 

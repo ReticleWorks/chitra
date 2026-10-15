@@ -4,6 +4,18 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.24.4] - 2026-10-14
+
+### Fixed
+
+- Allow read-only Devin and Hermes database locators to feed multiple goal
+  lanes, with an independent incremental cursor for each lane.
+- Release derived progress and detector caches after each lane so historical
+  journals do not retain duplicate event indexes and classification objects
+  between monitor passes.
+- Pace cold catch-up below the configured CPU budget with margin for uneven
+  lane work; the independent CPU and RSS watchdog thresholds stay unchanged.
+
 ## [0.24.3] - 2026-10-14
 
 ### Fixed

@@ -19,7 +19,9 @@ from chitra.adapter.contract import LaunchRefused, StreamUnavailable, Unsupporte
 from chitra.adapter.plugs.db_sources import DevinDbPlug, HermesDbPlug
 from chitra.journal.models import CanonicalType
 from chitra.journal.reader import DEFAULT_MAX_BATCH_BYTES
-from chitra.transcript_bindings import BoundTranscript, TranscriptBinding
+from chitra.journal.store import EventJournal
+from chitra.monitord import MonitordConfig, ingest_transcript_bindings
+from chitra.transcript_bindings import BoundTranscript, TranscriptBinding, load_transcript_bindings
 
 
 def _binding(path: str, *, client: str, lane: str = "lane-a") -> BoundTranscript:
@@ -237,6 +239,101 @@ def test_hermes_db_streams_canonical_events_and_advances_cursor(
         event.payload_digest for event in batch.events]
     assert {event.event_id for event in worker_batch.events}.isdisjoint(
         event.event_id for event in batch.events)
+
+
+def test_hermes_db_locator_fans_out_with_independent_lane_cursors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "state.db"
+    _hermes_db(database)
+    monkeypatch.setenv("CHITRA_HERMES_DB", str(database))
+    manifest = tmp_path / "bindings.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema": "chitra.transcript-bindings.v1",
+                "bindings": [
+                    {
+                        "session_ref": f"goal-{index}",
+                        "lane": f"lane-{index}",
+                        "path": "hermes-db:classic-kangaroo",
+                        "client": "hermes",
+                        "client_version": "hermes-state-db-v1",
+                        "instance": "hybrid-shadow",
+                    }
+                    for index in range(3)
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    bindings = load_transcript_bindings(manifest)
+    config = MonitordConfig(
+        state_dir=tmp_path / "monitor-state",
+        transcript_root=tmp_path,
+        findings_path=tmp_path / "findings.jsonl",
+        poll_seconds=1.0,
+        shadow_mode=True,
+        transcript_bindings_path=manifest,
+    )
+
+    first = ingest_transcript_bindings(config, bindings)
+    assert len(first) == 12
+    for index in range(3):
+        lane = f"lane-{index}"
+        events = EventJournal(config.state_dir, lane).load()
+        assert len(events) == 4
+        assert all(event.lane == lane and event.goal_ref == f"goal-{index}" for event in events)
+
+    conn = sqlite3.connect(database)
+    conn.execute(
+        "INSERT INTO messages (id, session_id, role, content, tool_call_id, tool_calls,"
+        " tool_name, timestamp, finish_reason, reasoning_content) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (5, "classic-kangaroo", "assistant", "later response", None, None, None,
+         1790000005.0, "stop", None),
+    )
+    conn.commit()
+    conn.close()
+
+    second = ingest_transcript_bindings(config, bindings)
+    assert len(second) == 3
+    for index in range(3):
+        lane = f"lane-{index}"
+        events = EventJournal(config.state_dir, lane).load()
+        assert len(events) == 5
+        assert events[-1].payload["text"] == "later response"
+
+
+@pytest.mark.parametrize(
+    ("client", "path"),
+    (("claude", "same.jsonl"), ("amp", "amp-orb:ops-1"), ("amp", "hermes-db:session")),
+)
+def test_transcript_bindings_reject_repeated_file_and_dispatchable_uri(
+    tmp_path: Path, client: str, path: str
+) -> None:
+    manifest = tmp_path / "bindings.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema": "chitra.transcript-bindings.v1",
+                "bindings": [
+                    {
+                        "session_ref": f"goal-{index}",
+                        "lane": f"lane-{index}",
+                        "path": path,
+                        "client": client,
+                        "client_version": "v1",
+                        "instance": "hybrid-shadow",
+                    }
+                    for index in range(2)
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="path is not unique"):
+        load_transcript_bindings(manifest)
 
 
 def test_hermes_db_fails_closed_when_session_or_db_missing(
