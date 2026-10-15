@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import subprocess
 import threading
+import weakref
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -363,6 +365,35 @@ def test_run_once_observes_real_journal_and_composes_outputs(tmp_path: Path) -> 
     presence_record = json.loads(presence_lines[-1])
     assert presence_record["instance"] == "chitra-monitord"
     assert presence_record["lanes"] == [SEEDED_LANE]
+
+
+def test_run_once_releases_previous_lane_events_before_loading_next(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_lane, second_lane = "lane-a", "lane-b"
+    EventJournal(tmp_path, first_lane).append((_event("first", CanonicalType.UNKNOWN, lane=first_lane),))
+    EventJournal(tmp_path, second_lane).append((_event("second", CanonicalType.UNKNOWN, lane=second_lane),))
+    original_load = monitord_mod.load_lane_events
+    first_event: weakref.ReferenceType[CanonicalEvent] | None = None
+    released_before_next: list[bool] = []
+
+    def load_and_check(config: MonitordConfig, lane: str) -> tuple[CanonicalEvent, ...]:
+        nonlocal first_event
+        if lane == second_lane:
+            gc.collect()
+            released_before_next.append(first_event is not None and first_event() is None)
+        events = original_load(config, lane)
+        if lane == first_lane:
+            first_event = weakref.ref(events[0])
+        return events
+
+    monkeypatch.setattr(monitord_mod, "load_lane_events", load_and_check)
+    summary = run_once(resolve_config(state_dir=tmp_path))
+
+    assert summary["lanes_observed"] == 2
+    assert summary["lane_errors"] == {}
+    assert released_before_next == [True]
 
 def test_run_once_excludes_per_lane_progress_journal_from_lane_discovery(tmp_path: Path) -> None:
     journal = EventJournal(tmp_path, SEEDED_LANE)

@@ -3252,6 +3252,7 @@ def run_once(
     _sense_governed_panes(config, runtime, goals_by_session=goals_by_session, bindings=bindings)
     stopped_early = False
     backlog_lanes: list[str] = []
+    event: CanonicalEvent | None = None
     for lane in observed_lanes:
         _pace_cpu(cpu_samples, config.max_cpu_percent, config.limit_window_seconds)
         if _stop_requested(active_stop_event):
@@ -3644,7 +3645,6 @@ def run_once(
                 decision: LadderDecision,
                 active_goal: GoalRecord | None = goal,
                 active_lane: str = lane,
-                active_events: tuple[CanonicalEvent, ...] = events,
             ) -> None:
                 if active_goal is None:
                     return
@@ -3660,7 +3660,7 @@ def run_once(
                     finding=finding,
                     decision=decision,
                     shadow_mode=config.shadow_mode,
-                    journal_events=active_events,
+                    journal_events=events,
                     ledger_path=config.ledger_path,
                     ledger_key_path=config.ledger_key_path,
                     retry_delay_seconds=config.retry_delay_seconds,
@@ -3812,6 +3812,13 @@ def run_once(
                 except Exception as spill_exc:
                     lane_errors[lane] = f"{type(spill_exc).__name__}: {spill_exc}"
                     logger.error("monitord_lane_cache_spill_failed", lane=lane, error=lane_errors[lane])
+            loaded_events = ()
+            events = ()
+            detector_events = ()
+            final_responses = ()
+            final_response = None
+            progress_rows = ()
+            event = None
     _pace_cpu(cpu_samples, config.max_cpu_percent, config.limit_window_seconds)
     summary: dict[str, Any] = {
         "schema": MONITORD_SCHEMA,

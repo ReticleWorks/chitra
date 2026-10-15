@@ -4,6 +4,13 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.24.7] - 2026-10-14
+
+### Fixed
+
+- Release each lane's event objects before loading the next lane so retained
+  references do not overlap materialization of large historical journals.
+
 ## [0.24.6] - 2026-10-14
 
 ### Fixed
