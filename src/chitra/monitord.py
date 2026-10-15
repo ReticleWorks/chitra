@@ -916,6 +916,7 @@ def _lane_journal_store() -> sqlite3.Connection:
             "payload TEXT NOT NULL, PRIMARY KEY (lane_key, key))"
         )
         store.execute("CREATE INDEX event_payloads_ordinal ON event_payloads (lane_key, ordinal)")
+        store.execute("CREATE TABLE lane_metadata (lane_key TEXT PRIMARY KEY, payload TEXT NOT NULL)")
         _LANE_JOURNAL_STORE = store
     return _LANE_JOURNAL_STORE
 
@@ -943,6 +944,46 @@ class _LaneJournalCache:
     sequence: int = 0
     context_floor: int = -1
     store: sqlite3.Connection = field(default_factory=_lane_journal_store)
+    metadata_loaded: bool = field(default=True, init=False)
+
+    def restore_metadata(self) -> None:
+        if self.metadata_loaded:
+            return
+        row = self.store.execute(
+            "SELECT payload FROM lane_metadata WHERE lane_key=?", (self.store_key,)
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("lane cache metadata is missing; retained context is UNKNOWN")
+        payload = json.loads(row[0])
+        self.sizes = {tuple(key): size for key, size in payload["sizes"]}
+        self.ordinals = {tuple(key): ordinal for key, ordinal in payload["ordinals"]}
+        self.protected = {tuple(key) for key in payload["protected"]}
+        self.pending = {join_id: tuple(key) for join_id, key in payload["pending"]}
+        self.implementation_keys = {
+            tuple(context): tuple(key) for context, key in payload["implementation_keys"]
+        }
+        self.metadata_loaded = True
+
+    def spill_metadata(self) -> None:
+        if not self.metadata_loaded:
+            return
+        payload = {
+            "sizes": [[list(key), size] for key, size in self.sizes.items()],
+            "ordinals": [[list(key), ordinal] for key, ordinal in self.ordinals.items()],
+            "protected": [list(key) for key in self.protected],
+            "pending": [[join_id, list(key)] for join_id, key in self.pending.items()],
+            "implementation_keys": [[list(context), list(key)] for context, key in self.implementation_keys.items()],
+        }
+        self.store.execute(
+            "INSERT OR REPLACE INTO lane_metadata VALUES (?, ?)",
+            (self.store_key, json.dumps(payload, separators=(",", ":"))),
+        )
+        self.sizes.clear()
+        self.ordinals.clear()
+        self.protected.clear()
+        self.pending.clear()
+        self.implementation_keys.clear()
+        self.metadata_loaded = False
 
     def protect_implementation(self, event: CanonicalEvent) -> None:
         context = (event.instance, event.client, event.session_id, event.goal_ref or "")
@@ -1020,6 +1061,7 @@ def _discard_lane_journal(key: tuple[str, str]) -> None:
         return
     cached.store.execute("DELETE FROM event_payloads WHERE lane_key=?", (cached.store_key,))
     cached.store.execute("DELETE FROM seen WHERE lane_key=?", (cached.store_key,))
+    cached.store.execute("DELETE FROM lane_metadata WHERE lane_key=?", (cached.store_key,))
     cached.store.commit()
 
 
@@ -1052,6 +1094,8 @@ def load_lane_events(config: MonitordConfig, lane: str) -> tuple[CanonicalEvent,
     ):
         _discard_lane_journal(key)
         cached = None
+    if cached is not None:
+        cached.restore_metadata()
     if cached is not None and stat.st_size == cached.offset:
         return cached.load_events()
     if cached is None:
@@ -3757,6 +3801,11 @@ def run_once(
                 cached.progress_rows = ()
                 cached.detector_key = None
                 cached.findings.clear()
+                try:
+                    cached.spill_metadata()
+                except Exception as spill_exc:
+                    lane_errors[lane] = f"{type(spill_exc).__name__}: {spill_exc}"
+                    logger.error("monitord_lane_cache_spill_failed", lane=lane, error=lane_errors[lane])
     _pace_cpu(cpu_samples, config.max_cpu_percent, config.limit_window_seconds)
     summary: dict[str, Any] = {
         "schema": MONITORD_SCHEMA,

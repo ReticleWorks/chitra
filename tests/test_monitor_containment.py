@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -54,16 +55,38 @@ def test_monitor_incremental_context_keeps_completion_and_original_evidence(
     with journal.path.open("a") as handle:
         for index in range(5000):
             handle.write(_event(f"event-{index}", CanonicalType.UNKNOWN, lane=lane).model_dump_json() + "\n")
+    sibling_lane = "sibling"
+    sibling_journal = EventJournal(tmp_path, sibling_lane)
+    sibling_journal.append((_event("sibling-event", CanonicalType.UNKNOWN, lane=sibling_lane),))
     while True:
         summary = monitor.run_once(config)
         assert not summary["lane_errors"]
         cache = monitor._LANE_JOURNALS[(str(tmp_path), lane)]
+        sibling_cache = monitor._LANE_JOURNALS[(str(tmp_path), sibling_lane)]
+        for stored_cache in (cache, sibling_cache):
+            assert not stored_cache.metadata_loaded
+            assert not stored_cache.sizes and not stored_cache.ordinals
+            assert not stored_cache.protected and not stored_cache.pending
+            assert not stored_cache.implementation_keys
+            metadata_row = stored_cache.store.execute(
+                "SELECT payload FROM lane_metadata WHERE lane_key=?", (stored_cache.store_key,)
+            ).fetchone()
+            assert metadata_row is not None
+            metadata = json.loads(metadata_row[0])
+            assert len(metadata["sizes"]) <= monitor._CACHE_EVENTS
+            assert stored_cache.store.execute(
+                "SELECT COUNT(*) FROM event_payloads WHERE lane_key=?", (stored_cache.store_key,)
+            ).fetchone()[0] == len(metadata["sizes"])
+        cache.restore_metadata()
         assert len(cache.sizes) <= monitor._CACHE_EVENTS
         assert cache.bytes <= monitor._CACHE_BYTES
-        assert cache.store is not None
-        assert cache.store.execute(
-            "SELECT COUNT(*) FROM event_payloads WHERE lane_key=?", (cache.store_key,)
-        ).fetchone()[0] == len(cache.sizes)
+        assert monitor.event_dedupe_key(claim) in cache.protected
+        assert cache.pending["job"] == monitor.event_dedupe_key(call)
+        assert len(cache.implementation_keys) == len(implementations)
+        cache.spill_metadata()
+        sibling_cache.restore_metadata()
+        assert len(sibling_cache.sizes) == 1
+        sibling_cache.spill_metadata()
         assert cache.progress_key is None
         assert cache.progress_rows == ()
         assert cache.detector_key is None
@@ -144,7 +167,7 @@ def test_monitor_cli_raises_its_descriptor_limit_before_startup(tmp_path: Path) 
     assert "monitord_descriptor_capacity_ready" in result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("failure", ["journal", "ingest", "resolve", "protected", "locked", "cpu", "rss"])
+@pytest.mark.parametrize("failure", ["journal", "ingest", "resolve", "protected", "locked", "metadata", "spill", "cpu", "rss"])
 def test_monitor_contains_failure_without_silent_success(
     failure: str,
     tmp_path: Path,
@@ -184,6 +207,23 @@ def test_monitor_contains_failure_without_silent_success(
         broken.append(tuple(_event(f"claim-{i}", CanonicalType.FINAL_RESPONSE, lane="broken") for i in range(3)))
     elif failure == "locked":
         broken.append((_event("locked", CanonicalType.UNKNOWN, lane="broken"),))
+    elif failure == "spill":
+        broken.append((_event("spill", CanonicalType.UNKNOWN, lane="broken"),))
+        original_spill = monitor._LaneJournalCache.spill_metadata
+
+        def fail_broken_spill(cache: Any) -> None:
+            if cache.store_key == json.dumps((str(tmp_path), "broken")):
+                raise sqlite3.OperationalError("temporary metadata unavailable")
+            original_spill(cache)
+
+        monkeypatch.setattr(monitor._LaneJournalCache, "spill_metadata", fail_broken_spill)
+    elif failure == "metadata":
+        broken.append((_event("metadata", CanonicalType.UNKNOWN, lane="broken"),))
+        assert not monitor.run_once(config)["lane_errors"]
+        cache = monitor._LANE_JOURNALS[(str(tmp_path), "broken")]
+        assert not cache.metadata_loaded
+        cache.store.execute("DELETE FROM lane_metadata WHERE lane_key=?", (cache.store_key,))
+        cache.store.commit()
     else:
         transcript = tmp_path / "denied.jsonl"
         transcript.mkdir()  # Opening a directory must isolate this binding's OSError.
@@ -204,10 +244,20 @@ def test_monitor_contains_failure_without_silent_success(
     with exclusive_lock(broken.lock_path) if failure == "locked" else contextlib.nullcontext():
         summary = monitor.run_once(config)
     assert "broken" in summary["lane_errors"]
-    assert [result["lane"] for result in summary["results"]] == ["healthy"]
-    records = [json.loads(line) for line in config.findings_path.read_text().splitlines()]
-    assert any(row["lane"] == "broken" and row["detector"] == "monitor-internal-error" for row in records)
+    expected_results = ["broken", "healthy"] if failure == "spill" else ["healthy"]
+    assert [result["lane"] for result in summary["results"]] == expected_results
+    if failure != "spill":
+        records = [json.loads(line) for line in config.findings_path.read_text().splitlines()]
+        assert any(row["lane"] == "broken" and row["detector"] == "monitor-internal-error" for row in records)
     if failure == "protected":
         cache = monitor._LANE_JOURNALS[(str(tmp_path), "broken")]
+        assert not cache.metadata_loaded
+        cache.restore_metadata()
         assert len(cache.sizes) <= 2
         assert len(broken.load()) == 3
+        cache.spill_metadata()
+        assert not cache.metadata_loaded
+    if failure == "spill":
+        cache = monitor._LANE_JOURNALS[(str(tmp_path), "broken")]
+        assert cache.metadata_loaded
+        assert cache.sizes
