@@ -4,6 +4,14 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.24.5] - 2026-10-14
+
+### Fixed
+
+- Spill per-lane event indexes and protection metadata into the existing
+  temporary SQLite store between lanes, keeping only the active lane's indexes
+  in memory while preserving the journal as the evidence authority.
+
 ## [0.24.4] - 2026-10-14
 
 ### Fixed
