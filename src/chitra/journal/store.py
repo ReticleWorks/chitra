@@ -165,7 +165,7 @@ def derive_progress_rows(
     positions = {event.event_id: index for index, event in enumerate(events)}
     calls_by_join: dict[str, CanonicalEvent] = {}
     signature_by_join: dict[str, str] = {}
-    fingerprints_by_join: dict[str, set[str]] = {}
+    results_by_join: dict[str, list[tuple[CanonicalEvent, str]]] = {}
     for event in events:
         join = event.native_join_id
         if not isinstance(join, str) or not join:
@@ -174,26 +174,28 @@ def derive_progress_rows(
             calls_by_join[join] = event
             signature_by_join[join] = call_signature(event)
         elif event.normalized_type in {CanonicalType.TOOL_RESULT, CanonicalType.TOOL_ERROR}:
-            fingerprints_by_join.setdefault(join, set()).add(result_fingerprint(event))
+            results_by_join.setdefault(join, []).append((event, result_fingerprint(event)))
     calls_by_signature: dict[str, list[tuple[int, str]]] = {}
     for join, signature in signature_by_join.items():
         calls_by_signature.setdefault(signature, []).append((positions[calls_by_join[join].event_id], join))
-    prior_by_join: dict[str, set[str]] = {}
+    classification_by_event: dict[int, tuple[ProgressClass, str]] = {}
     for entries in calls_by_signature.values():
         entries.sort()
         running: set[str] = set()
         for _position, join in entries:
-            prior_by_join[join] = set(running)
-            running |= fingerprints_by_join.get(join, set())
+            call = calls_by_join[join]
+            results = results_by_join.get(join, ())
+            for result, fingerprint in results:
+                classification_by_event[id(result)] = _classify_tool_outcome(result, call, running)
+            running.update(fingerprint for _result, fingerprint in results)
     rows: list[ProgressClassification] = []
     for event in events:
         if event.normalized_type in {CanonicalType.TOOL_RESULT, CanonicalType.TOOL_ERROR}:
-            join = event.native_join_id if isinstance(event.native_join_id, str) else ""
-            classification, reason = _classify_tool_outcome(
-                event,
-                calls_by_join.get(join),
-                prior_by_join.get(join, set()),
-            )
+            classified = classification_by_event.get(id(event))
+            if classified is None:
+                join = event.native_join_id if isinstance(event.native_join_id, str) else ""
+                classified = _classify_tool_outcome(event, calls_by_join.get(join), set())
+            classification, reason = classified
             rows.append(_progress_row(event, classification, reason, goal_version=goal_version))
         else:
             rows.append(classify_progress(event, goal_version=goal_version))

@@ -57,7 +57,10 @@ def test_monitor_incremental_context_keeps_completion_and_original_evidence(
             handle.write(_event(f"event-{index}", CanonicalType.UNKNOWN, lane=lane).model_dump_json() + "\n")
     sibling_lane = "sibling"
     sibling_journal = EventJournal(tmp_path, sibling_lane)
-    sibling_journal.append((_event("sibling-event", CanonicalType.UNKNOWN, lane=sibling_lane),))
+    oversized_sibling = _event("sibling-event", CanonicalType.UNKNOWN, lane=sibling_lane).model_copy(
+        update={"payload": {"text": "x" * (monitor._CACHE_BYTES + 1024)}}
+    )
+    sibling_journal.append((oversized_sibling,))
     while True:
         summary = monitor.run_once(config)
         assert not summary["lane_errors"]
@@ -86,6 +89,7 @@ def test_monitor_incremental_context_keeps_completion_and_original_evidence(
         cache.spill_metadata()
         sibling_cache.restore_metadata()
         assert len(sibling_cache.sizes) == 1
+        assert sibling_cache.bytes > monitor._CACHE_BYTES
         sibling_cache.spill_metadata()
         assert cache.progress_key is None
         assert cache.progress_rows == ()
@@ -105,6 +109,10 @@ def test_monitor_incremental_context_keeps_completion_and_original_evidence(
     assert cache.evicted > 0
     assert claim.event_id in {event.event_id for event in events}
     assert {event.event_id for event in implementations} <= {event.event_id for event in events}
+    oversized_events = monitor.load_lane_events(config, sibling_lane)
+    assert len(oversized_events) == 1
+    assert oversized_events[0].event_id == oversized_sibling.event_id
+    assert len(oversized_events[0].payload["text"]) == monitor._CACHE_BYTES + 1024
     assert claim.event_id in checked_claims
     assert monitor._lane_work_in_flight(config, "session-1", events) == ("background tool call job (Bash) is still running",)
     assert len(journal.load()) == 5004

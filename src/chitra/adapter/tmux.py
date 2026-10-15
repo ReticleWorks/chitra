@@ -230,6 +230,7 @@ class TmuxLanePlug:
         tail_reader, normalizer = stream
         batch = tail_reader.poll()
         events = [event for record in batch.records for event in normalizer.normalize(record)]
+        normalizer.commit()
         return EventBatch(events=tuple(events), cursor=str(tail_reader.offset))
 
     def _normalizer(self, handle: LaneHandle) -> TranscriptNormalizer:

@@ -978,6 +978,7 @@ class _LaneJournalCache:
             "INSERT OR REPLACE INTO lane_metadata VALUES (?, ?)",
             (self.store_key, json.dumps(payload, separators=(",", ":"))),
         )
+        self.store.commit()
         self.sizes.clear()
         self.ordinals.clear()
         self.protected.clear()
@@ -993,8 +994,6 @@ class _LaneJournalCache:
             self.implementation_keys[context] = key
 
     def add(self, event: CanonicalEvent, size: int) -> None:
-        if size > _CACHE_BYTES:
-            raise ValueError("journal event exceeds monitor working-context byte limit; original journal preserved")
         key = event_dedupe_key(event)
         encoded_key = json.dumps(key)
         if self.store.execute(
@@ -1021,9 +1020,16 @@ class _LaneJournalCache:
                 self.protected.discard(joined)
         # Keep the implementation reset even when it ages out of the tail.
         self.protect_implementation(event)
-        while len(self.sizes) > _CACHE_EVENTS or self.bytes > _CACHE_BYTES:
-            removable = next((candidate for candidate in self.sizes if candidate not in self.protected), None)
+        while len(self.sizes) > _CACHE_EVENTS or (
+            self.bytes > _CACHE_BYTES and len(self.sizes) > 1
+        ):
+            removable = next(
+                (candidate for candidate in self.sizes if candidate != key and candidate not in self.protected),
+                None,
+            )
             if removable is None:
+                if len(self.sizes) <= _CACHE_EVENTS:
+                    break
                 self.store.execute(
                     "DELETE FROM event_payloads WHERE lane_key=? AND key=?", (self.store_key, encoded_key)
                 )
@@ -1114,7 +1120,7 @@ def load_lane_events(config: MonitordConfig, lane: str) -> tuple[CanonicalEvent,
             _discard_lane_journal(key)
             raise ValueError("journal changed while opening working context; retry on next pass")
         _parsed, _start, end_offset, fd_stat = journal.load_from(
-            cached.offset, inode=cached.inode, consume=cached.add, max_bytes=_BATCH_BYTES, max_row_bytes=_CACHE_BYTES,
+            cached.offset, inode=cached.inode, consume=cached.add, max_bytes=_BATCH_BYTES,
         )
     cached.store.commit()
     assert fd_stat is not None

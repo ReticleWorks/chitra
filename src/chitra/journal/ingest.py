@@ -69,6 +69,7 @@ class JournalIngestor:
                 self._normalizer_generation = generation
             observed.extend(self.normalizer.normalize(record))
         appended = self.journal.append(tuple(observed))
+        self.normalizer.commit()
         return IngestResult(observed=tuple(observed), appended=appended, rotations=batch.rotations)
 
     def record_resume(self, receipt: LifecycleReceipt) -> CanonicalEvent:
