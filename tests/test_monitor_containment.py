@@ -64,6 +64,10 @@ def test_monitor_incremental_context_keeps_completion_and_original_evidence(
         assert cache.store.execute(
             "SELECT COUNT(*) FROM event_payloads WHERE lane_key=?", (cache.store_key,)
         ).fetchone()[0] == len(cache.sizes)
+        assert cache.progress_key is None
+        assert cache.progress_rows == ()
+        assert cache.detector_key is None
+        assert cache.findings == []
         if summary["backlog_lanes"]:
             assert not checked_claims
         if not summary["backlog_lanes"]:
@@ -88,11 +92,21 @@ def test_monitor_incremental_context_keeps_completion_and_original_evidence(
     ]
     assert limited and "UNKNOWN" in limited[-1]["detail"]
 
-    def never(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("unchanged detector input was scanned again")
+    detector_calls = 0
+    original_detector = monitor.detect_unnecessary_steps
 
-    monkeypatch.setattr(monitor, "detect_unnecessary_steps", never)
+    def counted_detector(*args: Any, **kwargs: Any) -> Any:
+        nonlocal detector_calls
+        detector_calls += 1
+        return original_detector(*args, **kwargs)
+
+    progress_before = journal.progress_path.read_bytes()
+    monkeypatch.setattr(monitor, "detect_unnecessary_steps", counted_detector)
     assert not monitor.run_once(config)["lane_errors"]
+    assert detector_calls > 0
+    assert journal.progress_path.read_bytes() == progress_before
+    assert cache.progress_rows == ()
+    assert cache.findings == []
     # Dedupe stays correct across fresh instances and a compaction inode swap.
     assert EventJournal(tmp_path, lane).append((claim,)) == ()
     with journal.path.open("ab") as handle:
