@@ -702,7 +702,7 @@ def test_check_enrollment_flags_exit_before_contract_when_the_turn_ended(
     assert finding.event_refs == ("resume-1",)
 
 
-def test_load_lane_events_parses_only_new_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_lane_events_reloads_retained_rows_from_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = _config(tmp_path)
     journal = EventJournal(tmp_path, SEEDED_LANE)
     journal.append((_event("e1", CanonicalType.TOOL_CALL, lane=SEEDED_LANE),))
@@ -719,11 +719,11 @@ def test_load_lane_events_parses_only_new_rows(tmp_path: Path, monkeypatch: pyte
     try:
         journal.append((_event("e2", CanonicalType.TOOL_CALL, lane=SEEDED_LANE),))
         assert [event.event_id for event in monitord_mod.load_lane_events(config, SEEDED_LANE)] == ["e1", "e2"]
-        assert len(parses) == 1
+        assert len(parses) == 3
         assert [event.event_id for event in monitord_mod.load_lane_events(config, SEEDED_LANE)] == ["e1", "e2"]
-        assert len(parses) == 1
+        assert len(parses) == 5
     finally:
-        monitord_mod._LANE_JOURNALS.clear()
+        monitord_mod._clear_lane_journals()
 
 
 def test_load_lane_events_reloads_after_rewrite_and_truncate(tmp_path: Path) -> None:
@@ -743,7 +743,7 @@ def test_load_lane_events_reloads_after_rewrite_and_truncate(tmp_path: Path) -> 
         journal.path.write_text("", encoding="utf-8")
         assert monitord_mod.load_lane_events(config, SEEDED_LANE) == ()
     finally:
-        monitord_mod._LANE_JOURNALS.clear()
+        monitord_mod._clear_lane_journals()
 
 
 def test_ingest_transcript_bindings_pools_the_ingestor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

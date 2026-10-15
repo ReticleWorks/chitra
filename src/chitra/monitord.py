@@ -53,6 +53,7 @@ import re
 import signal
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -191,6 +192,60 @@ DEFAULT_POLL_SECONDS = 60.0
 # Working context, not evidence retention: originals remain on disk.
 _CACHE_EVENTS = 2048
 _CACHE_BYTES = 8 * 1024 * 1024
+
+
+def _pace_cpu(samples: list[tuple[float, float]], percent: float, window_seconds: float) -> None:
+    now = time.monotonic()
+    cpu = time.process_time()
+    if samples and now - samples[-1][0] >= window_seconds:
+        samples.clear()
+    samples.append((now, cpu))
+    while len(samples) > 1 and now - samples[1][0] >= window_seconds:
+        samples.pop(0)
+    elapsed = now - samples[0][0]
+    # Leave room inside the configured budget for watchdog sampling and loop overhead.
+    budget = percent * 0.9 / 100
+    if elapsed > 0 and budget > 0:
+        time.sleep(max(0.0, (cpu - samples[0][1]) / budget - elapsed))
+
+
+def _ensure_descriptor_capacity() -> dict[str, int | str | None]:
+    """Raise this monitor process to its permitted descriptor capacity."""
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    native_ceiling: int | None = None
+    target = hard
+    if hard == resource.RLIM_INFINITY and sys.platform == "darwin":
+        result = subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "kern.maxfilesperproc"],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=5,
+        )
+        native_ceiling = int(result.stdout.strip())
+        if native_ceiling < 1:
+            raise RuntimeError(f"invalid kern.maxfilesperproc value: {native_ceiling}")
+        target = native_ceiling
+
+    needs_raise = soft != resource.RLIM_INFINITY and (
+        target == resource.RLIM_INFINITY or soft < target
+    )
+    if needs_raise:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft != resource.RLIM_INFINITY and (
+        target == resource.RLIM_INFINITY or soft < target
+    ):
+        raise RuntimeError(f"open-file soft limit stayed at {soft}, below permitted target {target}")
+    return {
+        "soft_limit": "unlimited" if soft == resource.RLIM_INFINITY else soft,
+        "hard_limit": "unlimited" if hard == resource.RLIM_INFINITY else hard,
+        "native_ceiling": native_ceiling,
+    }
+
+
 PRESENCE_INSTANCE = "chitra-monitord"
 MONITORD_SCHEMA = "chitra.monitord.pass.v1"
 IDLE_PURSUIT_SCHEMA = "chitra.monitord.idle-pursuit.v1"
@@ -443,6 +498,7 @@ def ingest_transcript_bindings(
     *,
     errors: dict[str, str] | None = None,
     retain_observed: bool = True,
+    _cpu_samples: list[tuple[float, float]] | None = None,
 ) -> tuple[CanonicalEvent, ...]:
     """Ingest every explicitly bound transcript before journal discovery.
 
@@ -470,6 +526,8 @@ def ingest_transcript_bindings(
         if key[0] == str(config.state_dir) and key not in live_refs:
             _PLUG_CURSORS.pop(key)
     for binding, ref in resolved_bindings:
+        if _cpu_samples is not None:
+            _pace_cpu(_cpu_samples, config.max_cpu_percent, config.limit_window_seconds)
         if binding.is_uri_locator:
             try:
                 appended = _ingest_uri_binding(config, binding, manifest_path=manifest_path)
@@ -838,14 +896,32 @@ def _idle_pursuit_finding(
     )
 
 
+_LANE_JOURNAL_STORE: sqlite3.Connection | None = None
+
+
+def _lane_journal_store() -> sqlite3.Connection:
+    global _LANE_JOURNAL_STORE
+    if _LANE_JOURNAL_STORE is None:
+        store = sqlite3.connect("")
+        store.execute("PRAGMA cache_size=-256")
+        store.execute("CREATE TABLE seen (lane_key TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (lane_key, key))")
+        store.execute(
+            "CREATE TABLE event_payloads (lane_key TEXT NOT NULL, key TEXT NOT NULL, ordinal INTEGER NOT NULL, "
+            "payload TEXT NOT NULL, PRIMARY KEY (lane_key, key))"
+        )
+        store.execute("CREATE INDEX event_payloads_ordinal ON event_payloads (lane_key, ordinal)")
+        _LANE_JOURNAL_STORE = store
+    return _LANE_JOURNAL_STORE
+
+
 @dataclass
 class _LaneJournalCache:
     """Bounded working context. The journal remains the evidence authority."""
 
-    events: dict[tuple[str, str, str, str], CanonicalEvent]
     offset: int
     inode: int
     mtime_ns: int
+    store_key: str
     sizes: dict[tuple[str, str, str, str], int] = field(default_factory=dict)
     protected: set[tuple[str, str, str, str]] = field(default_factory=set)
     pending: dict[str, tuple[str, str, str, str]] = field(default_factory=dict)
@@ -860,7 +936,7 @@ class _LaneJournalCache:
     ordinals: dict[tuple[str, str, str, str], int] = field(default_factory=dict)
     sequence: int = 0
     context_floor: int = -1
-    seen: sqlite3.Connection | None = None
+    store: sqlite3.Connection = field(default_factory=_lane_journal_store)
 
     def protect_implementation(self, event: CanonicalEvent) -> None:
         context = (event.instance, event.client, event.session_id, event.goal_ref or "")
@@ -873,14 +949,16 @@ class _LaneJournalCache:
         if size > _CACHE_BYTES:
             raise ValueError("journal event exceeds monitor working-context byte limit; original journal preserved")
         key = event_dedupe_key(event)
-        if self.seen is None:
-            self.seen = sqlite3.connect("")
-            self.seen.execute("PRAGMA cache_size=-256")
-            self.seen.execute("CREATE TABLE seen (key TEXT PRIMARY KEY)")
         encoded_key = json.dumps(key)
-        if self.seen.execute("SELECT 1 FROM seen WHERE key=?", (encoded_key,)).fetchone():
+        if self.store.execute(
+            "SELECT 1 FROM seen WHERE lane_key=? AND key=?", (self.store_key, encoded_key)
+        ).fetchone():
             return
-        self.events[key] = event
+        ordinal = self.sequence
+        self.store.execute(
+            "INSERT INTO event_payloads VALUES (?, ?, ?, ?)",
+            (self.store_key, encoded_key, ordinal, event.model_dump_json()),
+        )
         self.ordinals[key] = self.sequence
         self.sequence += 1
         self.sizes[key] = size
@@ -896,10 +974,12 @@ class _LaneJournalCache:
                 self.protected.discard(joined)
         # Keep the implementation reset even when it ages out of the tail.
         self.protect_implementation(event)
-        while len(self.events) > _CACHE_EVENTS or self.bytes > _CACHE_BYTES:
-            removable = next((candidate for candidate in self.events if candidate not in self.protected), None)
+        while len(self.sizes) > _CACHE_EVENTS or self.bytes > _CACHE_BYTES:
+            removable = next((candidate for candidate in self.sizes if candidate not in self.protected), None)
             if removable is None:
-                self.events.pop(key)
+                self.store.execute(
+                    "DELETE FROM event_payloads WHERE lane_key=? AND key=?", (self.store_key, encoded_key)
+                )
                 self.ordinals.pop(key)
                 self.bytes -= self.sizes.pop(key)
                 self.protected.discard(key)
@@ -907,14 +987,42 @@ class _LaneJournalCache:
                 if event.native_join_id and self.pending.get(event.native_join_id) == key:
                     self.pending.pop(event.native_join_id)
                 raise ValueError("protected completion/turn evidence exceeds monitor working-context limit; original journal preserved")
-            self.events.pop(removable)
+            self.store.execute(
+                "DELETE FROM event_payloads WHERE lane_key=? AND key=?",
+                (self.store_key, json.dumps(removable)),
+            )
             self.context_floor = max(self.context_floor, self.ordinals.pop(removable))
             self.bytes -= self.sizes.pop(removable)
             self.evicted += 1
-        self.seen.execute("INSERT INTO seen VALUES (?)", (encoded_key,))
+        self.store.execute("INSERT INTO seen VALUES (?, ?)", (self.store_key, encoded_key))
+
+    def load_events(self) -> tuple[CanonicalEvent, ...]:
+        return tuple(
+            CanonicalEvent.model_validate_json(payload)
+            for (payload,) in self.store.execute(
+                "SELECT payload FROM event_payloads WHERE lane_key=? ORDER BY ordinal", (self.store_key,)
+            )
+        )
 
 
 _LANE_JOURNALS: dict[tuple[str, str], _LaneJournalCache] = {}
+
+
+def _discard_lane_journal(key: tuple[str, str]) -> None:
+    cached = _LANE_JOURNALS.pop(key, None)
+    if cached is None:
+        return
+    cached.store.execute("DELETE FROM event_payloads WHERE lane_key=?", (cached.store_key,))
+    cached.store.execute("DELETE FROM seen WHERE lane_key=?", (cached.store_key,))
+    cached.store.commit()
+
+
+def _clear_lane_journals() -> None:
+    global _LANE_JOURNAL_STORE
+    _LANE_JOURNALS.clear()
+    if _LANE_JOURNAL_STORE is not None:
+        _LANE_JOURNAL_STORE.close()
+        _LANE_JOURNAL_STORE = None
 
 
 def load_lane_events(config: MonitordConfig, lane: str) -> tuple[CanonicalEvent, ...]:
@@ -928,7 +1036,7 @@ def load_lane_events(config: MonitordConfig, lane: str) -> tuple[CanonicalEvent,
     try:
         stat = journal.path.stat()
     except FileNotFoundError:
-        _LANE_JOURNALS.pop(key, None)
+        _discard_lane_journal(key)
         return ()
     cached = _LANE_JOURNALS.get(key)
     if cached is not None and (
@@ -936,13 +1044,14 @@ def load_lane_events(config: MonitordConfig, lane: str) -> tuple[CanonicalEvent,
         or stat.st_size < cached.offset
         or (stat.st_size == cached.offset and stat.st_mtime_ns != cached.mtime_ns)
     ):
-        _LANE_JOURNALS.pop(key)
+        _discard_lane_journal(key)
         cached = None
     if cached is not None and stat.st_size == cached.offset:
-        return tuple(cached.events.values())
+        return cached.load_events()
     if cached is None:
         stat = journal.path.stat()
-        cached = _LaneJournalCache(events={}, offset=0, inode=stat.st_ino, mtime_ns=stat.st_mtime_ns)
+        cache_key = json.dumps(key)
+        cached = _LaneJournalCache(offset=0, inode=stat.st_ino, mtime_ns=stat.st_mtime_ns, store_key=cache_key)
         _LANE_JOURNALS[key] = cached
     # Hold the lane lock so a replacement cannot mix old and new contexts.
     from chitra._fsio import exclusive_lock
@@ -952,17 +1061,18 @@ def load_lane_events(config: MonitordConfig, lane: str) -> tuple[CanonicalEvent,
             raise BlockingIOError(f"journal writer lock is held: {journal.lock_path}")
         current = journal.path.stat()
         if current.st_ino != cached.inode or current.st_size < cached.offset:
-            _LANE_JOURNALS.pop(key, None)
+            _discard_lane_journal(key)
             raise ValueError("journal changed while opening working context; retry on next pass")
         _parsed, _start, end_offset, fd_stat = journal.load_from(
             cached.offset, inode=cached.inode, consume=cached.add, max_bytes=_BATCH_BYTES, max_row_bytes=_CACHE_BYTES,
         )
+    cached.store.commit()
     assert fd_stat is not None
     cached.offset = end_offset
     cached.inode = fd_stat.st_ino
     cached.mtime_ns = fd_stat.st_mtime_ns
     cached.complete = end_offset >= fd_stat.st_size
-    return tuple(cached.events.values())
+    return cached.load_events()
 
 
 def _final_response(events: tuple[CanonicalEvent, ...]) -> CanonicalEvent | None:
@@ -2989,6 +3099,7 @@ def run_once(
     *,
     runtime: MonitorRuntime | None = None,
     stop_event: threading.Event | None = None,
+    _cpu_samples: list[tuple[float, float]] | None = None,
 ) -> dict[str, Any]:
     """Run one full observe-classify-record-publish pass and return its summary.
 
@@ -2996,6 +3107,7 @@ def run_once(
     promptly; the summary then reports ``stopped_early``. Lane failures are
     recorded in the findings log and ``lane_errors`` without aborting peers.
     """
+    cpu_samples = _cpu_samples if _cpu_samples is not None else [(time.monotonic(), time.process_time())]
     active_stop_event = stop_event if stop_event is not None else threading.Event()
     runtime = runtime or MonitorRuntime(
         broker=AgentStatusBroker(config.state_dir, ManifestRepository(config.manifest_dir))
@@ -3005,7 +3117,9 @@ def run_once(
         transcript_root=config.transcript_root,
     )
     lane_errors: dict[str, str] = {}
-    ingest_transcript_bindings(config, bindings, errors=lane_errors, retain_observed=False)
+    ingest_transcript_bindings(
+        config, bindings, errors=lane_errors, retain_observed=False, _cpu_samples=cpu_samples
+    )
     bindings_by_lane = {binding.lane: binding for binding in bindings}
     binding_refs: dict[str, Path | str] = {}
     binding_native_session_ids: dict[str, str | None] = {}
@@ -3078,11 +3192,12 @@ def run_once(
     observed_lanes = sorted(discovered_lanes - set(unsafe_lanes))
     for key in tuple(_LANE_JOURNALS):
         if key[0] == str(config.state_dir) and key[1] not in discovered_lanes:
-            _LANE_JOURNALS.pop(key)
+            _discard_lane_journal(key)
     _sense_governed_panes(config, runtime, goals_by_session=goals_by_session, bindings=bindings)
     stopped_early = False
     backlog_lanes: list[str] = []
     for lane in observed_lanes:
+        _pace_cpu(cpu_samples, config.max_cpu_percent, config.limit_window_seconds)
         if _stop_requested(active_stop_event):
             stopped_early = True
             break
@@ -3286,11 +3401,12 @@ def run_once(
                         detector_events = events[boundary + 1 :]
                         cached_boundary = _LANE_JOURNALS.get((str(config.state_dir), lane))
                         if cached_boundary is not None:
-                            accounted = {event.event_id for event in events[:boundary]}
                             pending_keys = set(cached_boundary.pending.values())
+                            accounted_keys = {
+                                event_dedupe_key(event) for event in events[:boundary]
+                            }
                             cached_boundary.protected.difference_update(
-                                key for key, event in cached_boundary.events.items()
-                                if event.event_id in accounted and key not in pending_keys
+                                key for key in accounted_keys if key not in pending_keys
                             )
                             cached_boundary.implementation_keys = {
                                 context: key for context, key in cached_boundary.implementation_keys.items()
@@ -3624,6 +3740,7 @@ def run_once(
                 )
             except Exception as det_exc:
                 logger.error("monitord_determination_emit_failed", lane=lane, error=str(det_exc))
+    _pace_cpu(cpu_samples, config.max_cpu_percent, config.limit_window_seconds)
     summary: dict[str, Any] = {
         "schema": MONITORD_SCHEMA,
         "lanes_observed": len(results),
@@ -3695,6 +3812,7 @@ def run_forever(config: MonitordConfig, *, stop_event: threading.Event | None = 
         broker=AgentStatusBroker(config.state_dir, ManifestRepository(config.manifest_dir))
     )
     server = _start_status_server(config, runtime, active_stop_event)
+    cpu_samples = [(time.monotonic(), time.process_time())]
     logger.info(
         "monitord_started",
         state_dir=str(config.state_dir),
@@ -3709,7 +3827,9 @@ def run_forever(config: MonitordConfig, *, stop_event: threading.Event | None = 
             # cleared before the pass so its signal is not consumed early.
             _MONITOR_WAKE.clear()
             try:
-                summary = run_once(config, runtime=runtime, stop_event=active_stop_event)
+                summary = run_once(
+                    config, runtime=runtime, stop_event=active_stop_event, _cpu_samples=cpu_samples
+                )
             except Exception as exc:
                 logger.error("monitord_pass_failed", error=str(exc))
                 summary = {}
@@ -3730,7 +3850,7 @@ def run_forever(config: MonitordConfig, *, stop_event: threading.Event | None = 
         for _key, (_context, ingestor) in _INGESTOR_POOL.items():
             ingestor.close()
         _INGESTOR_POOL.clear()
-        _LANE_JOURNALS.clear()
+        _clear_lane_journals()
         _PLUG_CURSORS.clear()
         if server is not None:
             server.shutdown()
@@ -3808,6 +3928,12 @@ def main(argv: list[str] | None = None) -> int:
         max_rss_mb=args.max_rss_mb,
         limit_window_seconds=args.limit_window_seconds,
     )
+    try:
+        descriptor_capacity = _ensure_descriptor_capacity()
+    except Exception as exc:
+        logger.error("monitord_descriptor_capacity_unavailable", error=f"{type(exc).__name__}: {exc}")
+        return 1
+    logger.info("monitord_descriptor_capacity_ready", **descriptor_capacity)
     if args.once:
         with monitor_limits(config.max_cpu_percent, config.max_rss_mb, config.limit_window_seconds):
             print(json.dumps(run_once(config), indent=2, sort_keys=True))

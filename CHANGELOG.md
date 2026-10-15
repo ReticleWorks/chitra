@@ -4,6 +4,15 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.24.3] - 2026-10-14
+
+### Fixed
+
+- Keep retained canonical journal payloads in the lane cache's bounded-page
+  temporary SQLite store instead of retaining event objects across lanes.
+- Pace catch-up work to the configured CPU budget and raise the monitor
+  process's soft descriptor limit to the permitted host capacity at startup.
+
 ## [0.24.2] - 2026-10-14
 
 ### Fixed

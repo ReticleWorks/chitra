@@ -58,12 +58,22 @@ def test_monitor_incremental_context_keeps_completion_and_original_evidence(
         summary = monitor.run_once(config)
         assert not summary["lane_errors"]
         cache = monitor._LANE_JOURNALS[(str(tmp_path), lane)]
-        assert len(cache.events) <= monitor._CACHE_EVENTS
+        assert len(cache.sizes) <= monitor._CACHE_EVENTS
         assert cache.bytes <= monitor._CACHE_BYTES
+        assert cache.store is not None
+        assert cache.store.execute(
+            "SELECT COUNT(*) FROM event_payloads WHERE lane_key=?", (cache.store_key,)
+        ).fetchone()[0] == len(cache.sizes)
         if summary["backlog_lanes"]:
             assert not checked_claims
         if not summary["backlog_lanes"]:
             break
+    other_state = tmp_path / "other-state"
+    other_lane = "also-healthy"
+    EventJournal(other_state, other_lane).append((_event("other-lane-event", CanonicalType.UNKNOWN, lane=other_lane),))
+    other_config = monitor.resolve_config(state_dir=other_state)
+    assert [event.event_id for event in monitor.load_lane_events(other_config, other_lane)] == ["other-lane-event"]
+    monitor._discard_lane_journal((str(other_state), other_lane))
     events = monitor.load_lane_events(config, lane)
     assert cache.evicted > 0
     assert claim.event_id in {event.event_id for event in events}
@@ -93,6 +103,31 @@ def test_monitor_incremental_context_keeps_completion_and_original_evidence(
     assert Path(result["original"]).read_bytes() == original
     assert EventJournal(tmp_path, lane).append((claim,)) == ()
     assert len(journal.load()) == 5004
+
+
+def test_monitor_cli_raises_its_descriptor_limit_before_startup(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "chitra.monitord",
+            "--once",
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--transcript-root",
+            str(tmp_path / "transcripts"),
+            "--lanes-file",
+            str(tmp_path / "empty-lanes.yaml"),
+            "--agent-manifest-dir",
+            str(tmp_path / "empty-manifests"),
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(Path(monitor.__file__).parents[1])},
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "monitord_descriptor_capacity_ready" in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("failure", ["journal", "ingest", "resolve", "protected", "locked", "cpu", "rss"])
@@ -160,5 +195,5 @@ def test_monitor_contains_failure_without_silent_success(
     assert any(row["lane"] == "broken" and row["detector"] == "monitor-internal-error" for row in records)
     if failure == "protected":
         cache = monitor._LANE_JOURNALS[(str(tmp_path), "broken")]
-        assert len(cache.events) <= 2
+        assert len(cache.sizes) <= 2
         assert len(broken.load()) == 3
