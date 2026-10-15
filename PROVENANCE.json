@@ -1,0 +1,9 @@
+{
+  "source_commit": "bc06944c8a8e231f4ec16807f6571908b7f21b7a",
+  "source_tree": "1db6218f1fcf9fa55ccb30035f272abaee3a9923",
+  "wheel": "chitra_monitor-0.24.4-py3-none-any.whl",
+  "bytes": 674970,
+  "sha256": "729c727f2602ef6cfe94c59e70ed99daef1e77bd12a9d1c9bfa2f83bf7ed3745",
+  "build": "uv build --wheel from clean merged source",
+  "publication": "Immutable Git artifact branch; not GitHub Release or PyPI"
+}
