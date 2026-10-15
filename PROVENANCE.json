@@ -1,0 +1,10 @@
+{
+  "version": "0.24.3",
+  "source_commit": "ef31c656f8ee1f466a27c78f047acebc38c1c5f9",
+  "source_tree": "959e89822737ec6593ff5ebeb796e54c8d15d90d",
+  "wheel": "chitra_monitor-0.24.3-py3-none-any.whl",
+  "wheel_sha256": "99b0c9fe9aa37b02a0d9bb7e63dcc809af911f9669ade8537e02a960f793e6cf",
+  "wheel_bytes": 674606,
+  "build": "uv build --wheel from exact merged source",
+  "publication": "Git artifact branch; not a GitHub Release or PyPI publication"
+}
