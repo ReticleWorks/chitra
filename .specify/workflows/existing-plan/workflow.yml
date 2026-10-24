@@ -1,0 +1,175 @@
+schema_version: '1.0'
+workflow:
+  id: existing-plan
+  name: Existing plan through observed acceptance
+  version: 1.0.0
+  description: Work, independent review, resolution, project acceptance, and normal-use observation; the existing owner retains
+    the goal.
+requires:
+  speckit_version: '>=1.2.3'
+inputs:
+  goal:
+    type: string
+    required: true
+    prompt: Existing owner goal record containing the full instructions and remaining done condition
+  request:
+    type: string
+    required: true
+    prompt: The operator's original request, unchanged
+  plan:
+    type: string
+    required: true
+    prompt: Existing authoritative plan or PRD
+  acceptance:
+    type: string
+    required: true
+    prompt: Existing project acceptance command and arguments
+  integration:
+    type: string
+    required: true
+  model:
+    type: string
+    required: true
+  reviewer:
+    type: string
+    required: true
+  reviewer_model:
+    type: string
+    required: true
+  observation:
+    type: string
+    required: true
+    prompt: Required ordinary-user observations, selected runtime and isolated test data
+steps:
+- id: work
+  type: prompt
+  integration: '{{ inputs.integration }}'
+  model: '{{ inputs.model }}'
+  capture: true
+  timeout: 3600
+  prompt: |
+    Data rules, verbatim:
+    1. Never root a recursive search (`find`, `rg`, `grep -r`, `fd`, `du`) at the home directory or a NAS mount root (`~/NAS`, `/mnt/opshome`). Root it at the exact subdirectory and bound it with `-maxdepth`, or prune the mount.
+    2. Never run `lsof` on a host with SMB mounts. Use python `fcntl.F_GETLK` for locks and `ps` or `fs_usage` for open files.
+    3. Wrap every NAS operation in a timeout and treat a timeout as "mount stalled", never as "file absent". On another host, put the timeout inside the remote command (`ssh renegade 'timeout 120 <cmd>'`); a local `timeout 120 ssh ...` stops only the client and leaves the remote process running.
+    4. Never load a whole large JSON or JSONL file, or a whole set of files, into one `jq` or Python process: no `jq -s`, `jq -n '[inputs]'`, `find ... -exec jq ... {} +`, `json.load` or `readlines()` over transcripts or logs. Stream instead: `grep`, `tail`, `jq -c 'select(...)'` per line, `jq -n 'reduce inputs ...'`, or the transcript catalogue (`traces_query`). One whole-corpus `jq` reached 20 GB and panicked Renegade on 2026-10-23.
+    Read {{ inputs.goal }}, the applicable project instructions, and the complete existing plan:
+    {{ inputs.plan }}
+    Operator request, verbatim:
+    {{ inputs.request }}
+    The parent has selected currently authorized implementation/continuation.
+    You are a subordinate worker; the existing native parent keeps the whole goal.
+    Preserve every part of the request, active stop instructions and exclusions.
+    Preserve that plan and all still-active instructions. Do not generate a competing
+    specification or invent a scope limit, approval requirement, or stop.
+    For new planned work without these artifacts, record spec.md, plan.md and tasks.md
+    in the project's existing spec location or specs/<task-name>/, linking the goal
+    and verbatim instruction sources. For an existing plan, reference it and preserve
+    completed tasks instead of restarting planning. Keep these artifacts aligned with
+    the actual work and evidence; template text alone is not a completed task.
+    State the concrete ordinary-user path this task must make work and the current
+    first unmet result. Trace that path through the actual callers and selected runtime.
+    Implement the first complete currently unmet path with the smallest connected change.
+    Return that path and its consequential assumptions before expanding dependent work.
+    The parent retains every other promised path. Follow existing ownership and apply controls.
+    The project's acceptance command is:
+    {{ inputs.acceptance }}
+    Do not replace it with an agent success statement or weaker check.
+    Do not launch services or external jobs outside the parent's exact authorized slice.
+    Return concise actionable results: plan sections, source paths, changes, observed
+    behavior and unresolved obligations. Preserve the native session ID in the result.
+- id: review
+  type: prompt
+  integration: '{{ inputs.reviewer }}'
+  model: '{{ inputs.reviewer_model }}'
+  capture: true
+  timeout: 1800
+  prompt: |
+    Data rules, verbatim:
+    1. Never root a recursive search (`find`, `rg`, `grep -r`, `fd`, `du`) at the home directory or a NAS mount root (`~/NAS`, `/mnt/opshome`). Root it at the exact subdirectory and bound it with `-maxdepth`, or prune the mount.
+    2. Never run `lsof` on a host with SMB mounts. Use python `fcntl.F_GETLK` for locks and `ps` or `fs_usage` for open files.
+    3. Wrap every NAS operation in a timeout and treat a timeout as "mount stalled", never as "file absent". On another host, put the timeout inside the remote command (`ssh renegade 'timeout 120 <cmd>'`); a local `timeout 120 ssh ...` stops only the client and leaves the remote process running.
+    4. Never load a whole large JSON or JSONL file, or a whole set of files, into one `jq` or Python process: no `jq -s`, `jq -n '[inputs]'`, `find ... -exec jq ... {} +`, `json.load` or `readlines()` over transcripts or logs. Stream instead: `grep`, `tail`, `jq -c 'select(...)'` per line, `jq -n 'reduce inputs ...'`, or the transcript catalogue (`traces_query`). One whole-corpus `jq` reached 20 GB and panicked Renegade on 2026-10-23.
+    Read {{ inputs.goal }}. Independently read {{ inputs.plan }} and inspect the source and connected callers.
+    Original request: {{ inputs.request }}
+    Prior subordinate result (do not treat partial output as complete):
+    exit={{ steps.work.output.exit_code }}, stdout_truncated={{ steps.work.output.stdout_truncated }},
+    stderr_truncated={{ steps.work.output.stderr_truncated }}, timed_out={{ steps.work.output.timed_out }},
+    interrupted={{ steps.work.output.interrupted }}
+    {{ steps.work.output.stdout }}
+    Native stderr remains in the recorded run; stream only relevant errors when needed.
+    If output is partial, inspect the native source/result before judging it.
+    Read the actual current diff and relevant execution path, not just that result.
+    Identify actionable discrepancies in requested behavior, caller coverage, dependencies,
+    selected runtime, and the proposed acceptance command: {{ inputs.acceptance }}
+    For each finding give a concrete failing input/path, source evidence and the smallest
+    disconfirming check. Say no finding when the evidence supports the implementation.
+    Do not edit files or start services. Distinguish product defects from test-harness
+    mismatches, and local/source checks from live acceptance.
+- id: resolve
+  type: prompt
+  integration: '{{ inputs.integration }}'
+  model: '{{ inputs.model }}'
+  capture: true
+  timeout: 3600
+  prompt: |
+    Data rules, verbatim:
+    1. Never root a recursive search (`find`, `rg`, `grep -r`, `fd`, `du`) at the home directory or a NAS mount root (`~/NAS`, `/mnt/opshome`). Root it at the exact subdirectory and bound it with `-maxdepth`, or prune the mount.
+    2. Never run `lsof` on a host with SMB mounts. Use python `fcntl.F_GETLK` for locks and `ps` or `fs_usage` for open files.
+    3. Wrap every NAS operation in a timeout and treat a timeout as "mount stalled", never as "file absent". On another host, put the timeout inside the remote command (`ssh renegade 'timeout 120 <cmd>'`); a local `timeout 120 ssh ...` stops only the client and leaves the remote process running.
+    4. Never load a whole large JSON or JSONL file, or a whole set of files, into one `jq` or Python process: no `jq -s`, `jq -n '[inputs]'`, `find ... -exec jq ... {} +`, `json.load` or `readlines()` over transcripts or logs. Stream instead: `grep`, `tail`, `jq -c 'select(...)'` per line, `jq -n 'reduce inputs ...'`, or the transcript catalogue (`traces_query`). One whole-corpus `jq` reached 20 GB and panicked Renegade on 2026-10-23.
+    Read {{ inputs.goal }} and {{ inputs.plan }}. You are a fresh subordinate resolver;
+    the existing native parent remains owner. Resolve this first connected path only.
+    Original request: {{ inputs.request }}
+    Prior subordinate result completeness:
+    exit={{ steps.work.output.exit_code }}, stdout_truncated={{ steps.work.output.stdout_truncated }},
+    stderr_truncated={{ steps.work.output.stderr_truncated }}, timed_out={{ steps.work.output.timed_out }},
+    interrupted={{ steps.work.output.interrupted }}
+    {{ steps.work.output.stdout }}
+    Native stderr remains in the recorded run; stream only relevant errors when needed.
+    Independent review completeness:
+    exit={{ steps.review.output.exit_code }}, stdout_truncated={{ steps.review.output.stdout_truncated }},
+    stderr_truncated={{ steps.review.output.stderr_truncated }}, timed_out={{ steps.review.output.timed_out }},
+    interrupted={{ steps.review.output.interrupted }}
+    {{ steps.review.output.stdout }}
+    Native stderr remains in the recorded run; stream only relevant errors when needed.
+    If either source is partial, retrieve its native result before assuming all findings arrived.
+    Read the actual evidence and resolve each supported finding at the shared cause;
+    explain any finding rejected by a disconfirming check. Do not add verification
+    machinery or unrelated tests. Preserve all active exclusions and the approved writable scope.
+    The next workflow step executes {{ inputs.acceptance }}, then a fresh native worker performs the required normal-use observation.
+    State exactly which normal behavior this can prove and what remains owed to the
+    original project. A successful agent exit is not acceptance.
+- id: acceptance
+  type: shell
+  run: '{{ inputs.acceptance }}'
+  timeout: 1800
+- id: observe
+  type: prompt
+  integration: '{{ inputs.reviewer }}'
+  model: '{{ inputs.reviewer_model }}'
+  capture: true
+  timeout: 5400
+  prompt: |
+    Data rules, verbatim:
+    1. Never root a recursive search (`find`, `rg`, `grep -r`, `fd`, `du`) at the home directory or a NAS mount root (`~/NAS`, `/mnt/opshome`). Root it at the exact subdirectory and bound it with `-maxdepth`, or prune the mount.
+    2. Never run `lsof` on a host with SMB mounts. Use python `fcntl.F_GETLK` for locks and `ps` or `fs_usage` for open files.
+    3. Wrap every NAS operation in a timeout and treat a timeout as "mount stalled", never as "file absent". On another host, put the timeout inside the remote command (`ssh renegade 'timeout 120 <cmd>'`); a local `timeout 120 ssh ...` stops only the client and leaves the remote process running.
+    4. Never load a whole large JSON or JSONL file, or a whole set of files, into one `jq` or Python process: no `jq -s`, `jq -n '[inputs]'`, `find ... -exec jq ... {} +`, `json.load` or `readlines()` over transcripts or logs. Stream instead: `grep`, `tail`, `jq -c 'select(...)'` per line, `jq -n 'reduce inputs ...'`, or the transcript catalogue (`traces_query`). One whole-corpus `jq` reached 20 GB and panicked Renegade on 2026-10-23.
+    Read {{ inputs.goal }}, the applicable project instructions and {{ inputs.plan }}.
+    Original operator request, unchanged:
+    {{ inputs.request }}
+    You independently observe the first connected path for the existing parent owner.
+    Preserve every active stop, exclusion and concurrent-writer boundary. Read the
+    actual result of {{ inputs.acceptance }} before choosing the next observation.
+    Perform the parent's ordinary-user acceptance contract:
+    {{ inputs.observation }}
+    Use the project's released interfaces and selected runtime. Isolate test data;
+    preserve source data and existing sessions. Do not edit application source.
+    Do not launch a service, publish, apply or use credentials beyond the existing
+    goal's exact authority. Retain commands, output and captures that establish the
+    requested behavior, including the relevant failure/recovery path. Report each
+    observation as PASS, FAIL or UNKNOWN, and distinguish source, merge, apply,
+    runtime and behavior. A successful command or agent exit cannot prove a later
+    stage. Return your native session ID and evidence paths. The parent reads the
+    evidence, repairs unmet observations within its authority and retains acceptance.
