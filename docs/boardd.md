@@ -337,7 +337,7 @@ and, through `chitra-goals resolve-ask` only, writing ack/answer
 resolutions back into them; reachable only over the tailnet.
 
 1. Release boardd (and the vendored agenttrail Node process) as a pinned
-   artifact through a Runline unit on twinridge — no checkouts, no
+   artifact through the managed deploy path — no checkouts, no
    hand-copied files on the host.
 2. Reach it over Tailscale Serve, tailnet only; no public listener. boardd
    spawns and supervises the vendored agenttrail Node process itself
