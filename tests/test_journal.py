@@ -159,6 +159,56 @@ def semantic_projection(events: tuple[CanonicalEvent, ...]) -> list[tuple[str, s
     return [(event.event_id, event.normalized_type.value, event.native_join_id, event.payload_digest) for event in events]
 
 
+def test_amp_ingestion_keeps_record_versions_across_live_release_changes(tmp_path: Path) -> None:
+    from chitra.monitord import _drop_pooled_ingestor, ingest_transcript_bindings, resolve_config
+    from chitra.transcript_bindings import TranscriptBinding
+
+    transcript = tmp_path / "amp.jsonl"
+    thread = "T-fixture"
+    first = {"type": "amp_thread", "id": "thread:" + thread, "thread_id": thread, "version": "old"}
+    second = {"type": "amp_message", "id": "message:1", "thread_id": thread, "version": "old",
+              "message": {"role": "user", "content": [{"type": "text", "text": "first"}]}}
+    third = {"type": "amp_message", "id": "message:2", "thread_id": thread, "version": "new",
+             "message": {"role": "user", "content": [{"type": "text", "text": "second"}]}}
+    last = {"type": "amp_message", "id": "message:3", "thread_id": thread, "version": "old",
+            "message": {"role": "user", "content": [{"type": "text", "text": "third"}]}}
+    initial = "".join(json.dumps(row) + "\n" for row in (first, second))
+    transcript.write_text(initial)
+    binding = TranscriptBinding(instance="fixture", lane="orb", client=Client.AMP, client_version="old",
+                                session_ref="goal", path=str(transcript))
+    config = resolve_config(state_dir=tmp_path / "state")
+    try:
+        before = ingest_transcript_bindings(config, (binding,))
+        with transcript.open("a") as stream:
+            stream.write(json.dumps(third) + "\n" + json.dumps(last) + "\n")
+        after = ingest_transcript_bindings(config, (binding,))
+        assert not ingest_transcript_bindings(config, (binding,))
+    finally:
+        _drop_pooled_ingestor(config, transcript.resolve())
+    events = before + after
+    assert [event.client_version for event in events] == ["old", "old", "new", "old"]
+    assert all(event.session_id == thread for event in events)
+    assert transcript.read_text() == initial + json.dumps(third) + "\n" + json.dumps(last) + "\n"
+
+
+@pytest.mark.parametrize("changes", ({"version": ""}, {"thread_id": "T-other"}))
+def test_amp_ingestion_still_rejects_invalid_identity_or_version(tmp_path: Path, changes: dict) -> None:
+    transcript = tmp_path / "amp.jsonl"
+    rows = [
+        {"type": "amp_thread", "id": "thread:T-fixture", "thread_id": "T-fixture", "version": "old"},
+        {"type": "amp_message", "id": "message:1", "thread_id": "T-fixture", "version": "new",
+         "message": {"role": "user", "content": [{"type": "text", "text": "work"}]}, **changes},
+    ]
+    transcript.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    ctx = NormalizationContext(instance="fixture", lane="orb", client=Client.AMP,
+                               client_version="old", goal_ref="goal")
+    with (
+        JournalIngestor(state_root=tmp_path / "state", transcript_path=transcript, context=ctx) as ingestor,
+        pytest.raises(ValueError),
+    ):
+        ingestor.poll()
+
+
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.client.value)
 def test_w11_fixture_yields_exact_duplicate_free_events(tmp_path: Path, case: FixtureCase) -> None:
     events = ingest(case, tmp_path)

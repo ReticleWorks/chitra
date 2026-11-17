@@ -921,13 +921,21 @@ class AmpNormalizer(TranscriptNormalizer):
             raise ValueError("AmpNormalizer requires the amp client")
         super().__init__(context)
 
+    def _event(self, raw: RawRecord, normalized_type: CanonicalType, **kwargs: Any) -> CanonicalEvent:
+        event = super()._event(raw, normalized_type, **kwargs)
+        version = (raw.record or {}).get("version")
+        if isinstance(version, str) and version.strip():
+            return event.model_copy(update={"client_version": version})
+        return event
+
     def normalize(self, raw: RawRecord) -> tuple[CanonicalEvent, ...]:
         self._begin_record(raw)
         if raw.record is None:
             return (self._unknown(raw),)
         record = raw.record
-        if record.get("version") != self.context.client_version:
-            raise ValueError(f"Amp record version changed to {record.get('version')!r}")
+        version = record.get("version")
+        if not isinstance(version, str) or not version.strip():
+            raise ValueError("Amp record has no client version")
         thread_id = record.get("thread_id")
         if not isinstance(thread_id, str) or not thread_id.startswith("T-"):
             raise ValueError("Amp record has no thread ID")

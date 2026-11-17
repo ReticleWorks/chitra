@@ -90,6 +90,9 @@ Every active lane must appear in a validated
 `chitra.transcript-bindings.v1` manifest. A binding names the exact
 `session_ref`, lane, transcript path, client, client version, and instance.
 Unbound journals remain observable but cannot borrow another goal.
+An Amp thread can contain records from different client versions as releases
+change. Each normalized event keeps its record's version; a missing version or
+a different thread ID is still rejected.
 
 The shipped systemd pair uses one connected state topology. Render each lane's
 `state_dir` in `/etc/chitra/lanes.yaml` as
