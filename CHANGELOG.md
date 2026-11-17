@@ -4,6 +4,11 @@ All notable changes to this project are documented here, in the [Keep a Changelo
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve each Amp record's client version when a bound thread spans releases,
+  while continuing to validate the thread identity and require a version.
+
 ## [0.24.8] - 2026-10-14
 
 ### Fixed
