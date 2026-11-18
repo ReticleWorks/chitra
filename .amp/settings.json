@@ -1,0 +1,10 @@
+{
+  "amp.mcpServers": {
+    "connector": {
+      "url": "https://twinridge.taila5e55a.ts.net/agents/mcp",
+      "headers": {
+        "Authorization": "Bearer ${amp:id-token}"
+      }
+    }
+  }
+}
